@@ -77,4 +77,8 @@ def test_model_tier_values():
     assert ModelTier.COMPLEX == "default/complex"
     assert ModelTier.LIGHT == "default/light"
     assert ModelTier.REASONING == "default/reasoning"
-    assert ModelTier.DETERMINISTIC == "DETERMINISTIC"
+    # DETERMINISTIC was removed from ModelTier in the 2026-04-09 remediation
+    # (finding M6) — it is now a standalone sentinel constant, not an LLM tier.
+    from henchmen.models.llm import DETERMINISTIC_SENTINEL
+
+    assert DETERMINISTIC_SENTINEL == "deterministic"

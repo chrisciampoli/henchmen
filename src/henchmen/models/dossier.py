@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from henchmen.models._base import StrictBase
 
 
-class RuleFile(BaseModel):
+class RuleFile(StrictBase):
     """A repository rule or instruction file (e.g. CLAUDE.md, .cursorrules)."""
 
     path: str = Field(..., description="Path to the rule file within the repository")
@@ -13,7 +15,7 @@ class RuleFile(BaseModel):
     content: str = Field(..., description="Full text content of the rule file")
 
 
-class RelatedPR(BaseModel):
+class RelatedPR(StrictBase):
     """A pull request related to the task."""
 
     number: int = Field(..., description="PR number")
@@ -23,7 +25,7 @@ class RelatedPR(BaseModel):
     files_changed: list[str] = Field(default_factory=list, description="Files changed in this PR")
 
 
-class RelatedIssue(BaseModel):
+class RelatedIssue(StrictBase):
     """An issue or ticket related to the task."""
 
     number: int = Field(..., description="Issue number")
@@ -33,7 +35,7 @@ class RelatedIssue(BaseModel):
     labels: list[str] = Field(default_factory=list, description="Issue labels")
 
 
-class CodeSearchResult(BaseModel):
+class CodeSearchResult(StrictBase):
     """A code search match from the repository."""
 
     file_path: str = Field(..., description="Path to the matching file")
@@ -41,7 +43,7 @@ class CodeSearchResult(BaseModel):
     context: str = Field(default="", description="Surrounding context for the match")
 
 
-class SemanticChunk(BaseModel):
+class SemanticChunk(StrictBase):
     """A code chunk retrieved via semantic search from the vector index."""
 
     file_path: str = Field(..., description="Relative path to the source file")
@@ -53,7 +55,7 @@ class SemanticChunk(BaseModel):
     relevance_score: float = Field(..., description="Similarity score from vector search (0-1)")
 
 
-class Dossier(BaseModel):
+class Dossier(StrictBase):
     """Complete context package assembled for an operative prior to execution."""
 
     task_id: str = Field(..., description="ID of the parent HenchmenTask")

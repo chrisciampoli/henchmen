@@ -3,7 +3,9 @@
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from henchmen.models._base import StrictBase
 
 
 class MessageRole(StrEnum):
@@ -13,14 +15,18 @@ class MessageRole(StrEnum):
     TOOL = "tool"
 
 
+# Sentinel used by scheme nodes that need no LLM call (e.g. eslint --fix, ruff --fix).
+# Intentionally NOT a ModelTier value — there is no provider dispatch for it.
+DETERMINISTIC_SENTINEL = "deterministic"
+
+
 class ModelTier(StrEnum):
     COMPLEX = "default/complex"
     LIGHT = "default/light"
     REASONING = "default/reasoning"
-    DETERMINISTIC = "DETERMINISTIC"
 
 
-class Message(BaseModel):
+class Message(StrictBase):
     """A single message in a conversation."""
 
     role: MessageRole = Field(..., description="Role of the message sender")
@@ -29,7 +35,7 @@ class Message(BaseModel):
     tool_calls: list["ToolCall"] | None = Field(default=None, description="Tool calls made in this message")
 
 
-class ToolParameter(BaseModel):
+class ToolParameter(StrictBase):
     """A parameter definition for a tool."""
 
     name: str = Field(..., description="Parameter name")
@@ -39,7 +45,7 @@ class ToolParameter(BaseModel):
     enum: list[str] | None = Field(default=None, description="Allowed values")
 
 
-class ToolDefinition(BaseModel):
+class ToolDefinition(StrictBase):
     """A tool that can be called by an LLM."""
 
     name: str = Field(..., description="Tool name (must be unique within a request)")
@@ -47,7 +53,7 @@ class ToolDefinition(BaseModel):
     parameters: list[ToolParameter] = Field(default_factory=list, description="Tool parameters")
 
 
-class ToolCall(BaseModel):
+class ToolCall(StrictBase):
     """A tool invocation from an LLM response."""
 
     id: str = Field(..., description="Unique call identifier")
@@ -55,7 +61,7 @@ class ToolCall(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict, description="Arguments to pass to the tool")
 
 
-class TokenUsage(BaseModel):
+class TokenUsage(StrictBase):
     """Token consumption metrics for an LLM call."""
 
     input_tokens: int = Field(default=0, description="Input tokens consumed")
@@ -65,7 +71,7 @@ class TokenUsage(BaseModel):
     estimated_cost_usd: float = Field(default=0.0, description="Estimated cost in USD")
 
 
-class LLMResponse(BaseModel):
+class LLMResponse(StrictBase):
     """Unified response from any LLM provider."""
 
     content: str = Field(..., description="Text content of the response")

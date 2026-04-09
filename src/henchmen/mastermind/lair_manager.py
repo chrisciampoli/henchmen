@@ -3,13 +3,16 @@
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from henchmen.models.operative import OperativeReport, OperativeStatus
 from henchmen.models.scheme import SchemeNode
 from henchmen.models.task import HenchmenTask
 from henchmen.providers.interfaces.container_orchestrator import ContainerOrchestrator, JobStatus
 from henchmen.providers.interfaces.document_store import DocumentStore
+
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +26,7 @@ class LairManager:
 
     def __init__(
         self,
-        settings: Any,
+        settings: "Settings",
         container_orchestrator: ContainerOrchestrator | None = None,
         document_store: DocumentStore | None = None,
     ) -> None:
@@ -99,7 +102,7 @@ class LairManager:
             # Fix/retry nodes must clone the feature branch (not main)
             # so they can see and push to the operative's prior work.
             "BRANCH": (
-                f"henchmen/{task.id[:8]}" if node.id in ("fix_lint", "fix_tests") else (task.context.branch or "main")
+                task.branch_name if node.id in ("fix_lint", "fix_tests") else (task.context.branch or "main")
             ),
             "TASK_TITLE": task.title[:200],
             "TASK_DESCRIPTION": task.description[:500],
@@ -145,7 +148,7 @@ class LairManager:
             ),
         }
 
-        print(f"[LAIR] Creating lair {lair_id} for task {task.id} node {node.id}", flush=True)
+        logger.info("[LAIR] Creating lair %s for task %s node %s", lair_id, task.id, node.id)
 
         orchestrator = self._get_orchestrator()
         exec_id = await orchestrator.run_job(
@@ -159,7 +162,7 @@ class LairManager:
             secrets=secrets,
         )
 
-        print(f"[LAIR] Execution started: {exec_id}", flush=True)
+        logger.info("[LAIR] Execution started: %s", exec_id)
 
         self._active_lairs[lair_id] = {
             "execution_id": exec_id,

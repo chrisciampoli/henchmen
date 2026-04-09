@@ -16,12 +16,13 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
-from henchmen.config.settings import get_settings
+from henchmen.config.settings import Environment, get_settings
 from henchmen.dispatch.handlers.cli import handle_cli_request
 from henchmen.dispatch.handlers.github import handle_github_webhook
 from henchmen.dispatch.handlers.jira import handle_jira_webhook
 from henchmen.dispatch.handlers.slack import handle_slack_event
 from henchmen.dispatch.normalizer import TaskNormalizer
+from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
 from henchmen.providers.registry import ProviderRegistry
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,48 @@ def _verify_slack_signature(body: bytes, timestamp: str, signature: str, secret:
     return hmac.compare_digest(expected, signature)
 
 
+def _verify_jira_signature(body: bytes, signature_header: str, secret: str) -> bool:
+    """Verify Jira webhook HMAC-SHA256 signature.
+
+    Atlassian sends the signature in the X-Atlassian-Webhook-Signature header as
+    ``sha256=<hex-digest>``.
+    """
+    if not signature_header or not secret:
+        return False
+    expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
+
+
+def _require_signing_secret(
+    env: Environment,
+    secret: str,
+    *,
+    integration: str,
+) -> None:
+    """Raise 401 if a signing secret is required but missing.
+
+    Fail-closed policy: STAGING and PROD must have a signing secret configured.
+    DEV tolerates missing secrets for local iteration but logs a warning.
+    """
+    if secret:
+        return
+    if env in (Environment.STAGING, Environment.PROD):
+        logger.error(
+            "[%s] Refusing request: signing secret is not configured in %s environment",
+            integration,
+            env.value,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail=f"{integration} webhook signing secret is not configured",
+        )
+    logger.warning(
+        "[%s] Signing secret is empty; accepting request in %s environment only",
+        integration,
+        env.value,
+    )
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
@@ -191,7 +234,8 @@ async def slack_webhook(request: Request) -> dict[str, Any]:
     if payload.get("type") == "url_verification":
         return {"challenge": payload.get("challenge")}
 
-    # Verify Slack request signature
+    # Verify Slack request signature (fail-closed in staging/prod).
+    _require_signing_secret(settings.environment, settings.slack_signing_secret, integration="slack")
     if settings.slack_signing_secret:
         ts = request.headers.get("X-Slack-Request-Timestamp", "")
         sig = request.headers.get("X-Slack-Signature", "")
@@ -208,7 +252,8 @@ async def github_webhook(request: Request) -> dict[str, Any]:
     settings = get_settings()
     body = await request.body()
 
-    # Verify GitHub webhook signature
+    # Verify GitHub webhook signature (fail-closed in staging/prod).
+    _require_signing_secret(settings.environment, settings.github_webhook_secret, integration="github")
     if settings.github_webhook_secret:
         sig = request.headers.get("X-Hub-Signature-256", "")
         if not _verify_github_signature(body, sig, settings.github_webhook_secret):
@@ -225,10 +270,20 @@ async def github_webhook(request: Request) -> dict[str, Any]:
 
 @app.post("/webhooks/jira")
 async def jira_webhook(request: Request) -> dict[str, Any]:
-    """Jira webhook endpoint."""
+    """Jira webhook endpoint with HMAC-SHA256 signature verification."""
     settings = get_settings()
+    body = await request.body()
+
+    # Verify Jira webhook signature (fail-closed in staging/prod).
+    _require_signing_secret(settings.environment, settings.jira_webhook_secret, integration="jira")
+    if settings.jira_webhook_secret:
+        sig = request.headers.get("X-Atlassian-Webhook-Signature", "")
+        if not _verify_jira_signature(body, sig, settings.jira_webhook_secret):
+            logger.warning("[jira] Invalid signature from %s", request.client.host if request.client else "unknown")
+            raise HTTPException(status_code=401, detail="Invalid Jira signature")
+
     try:
-        payload = await request.json()
+        payload = json.loads(body)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}") from exc
 
@@ -238,6 +293,8 @@ async def jira_webhook(request: Request) -> dict[str, Any]:
 @app.post("/pubsub/task-planned")
 async def task_planned_handler(request: Request) -> dict[str, Any]:
     """Pub/Sub push handler for task status updates."""
+    settings = get_settings()
+    await verify_pubsub_oidc(request, settings)
     try:
         envelope = await request.json()
     except Exception as exc:

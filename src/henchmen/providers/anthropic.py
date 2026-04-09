@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from henchmen.models.llm import LLMResponse, Message, MessageRole, ModelTier, TokenUsage, ToolCall, ToolDefinition
@@ -9,11 +10,20 @@ from henchmen.models.llm import LLMResponse, Message, MessageRole, ModelTier, To
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
 
-_TIER_DEFAULTS: dict[str, str] = {
-    ModelTier.COMPLEX: "claude-sonnet-4-6-20250514",
-    ModelTier.LIGHT: "claude-haiku-4-5-20251001",
-    ModelTier.REASONING: "claude-opus-4-6-20250514",
-}
+logger = logging.getLogger(__name__)
+
+
+def _build_tier_defaults(settings: Settings) -> dict[str, str]:
+    """Build the tier-to-model map from Settings.
+
+    Sourcing model names from settings (L10 fix) means operators can roll to
+    new Anthropic models via env var rather than a code change and redeploy.
+    """
+    return {
+        ModelTier.COMPLEX: settings.anthropic_model_complex,
+        ModelTier.LIGHT: settings.anthropic_model_light,
+        ModelTier.REASONING: settings.anthropic_model_reasoning,
+    }
 
 
 class AnthropicProvider:
@@ -23,14 +33,33 @@ class AnthropicProvider:
         import anthropic
 
         self._client = anthropic.AsyncAnthropic(api_key=getattr(settings, "anthropic_api_key", None))
+        self._tier_defaults: dict[str, str] = _build_tier_defaults(settings)
+        logger.info(
+            "AnthropicProvider tier mapping: complex=%s light=%s reasoning=%s",
+            self._tier_defaults.get(ModelTier.COMPLEX, ""),
+            self._tier_defaults.get(ModelTier.LIGHT, ""),
+            self._tier_defaults.get(ModelTier.REASONING, ""),
+        )
 
     def resolve_tier(self, tier: str) -> str:
         """Map a model tier to the default Anthropic model for that tier."""
-        return _TIER_DEFAULTS.get(tier, tier)
+        return self._tier_defaults.get(tier, tier)
 
     def supported_models(self) -> list[str]:
         """Return the list of supported Anthropic model identifiers."""
-        return ["claude-sonnet-4-6-20250514", "claude-opus-4-6-20250514", "claude-haiku-4-5-20251001"]
+        # Dedupe while preserving order so operators see the actual tier
+        # mapping first, plus any other known models.
+        seen: set[str] = set()
+        out: list[str] = []
+        for name in (
+            self._tier_defaults.get(ModelTier.COMPLEX, ""),
+            self._tier_defaults.get(ModelTier.REASONING, ""),
+            self._tier_defaults.get(ModelTier.LIGHT, ""),
+        ):
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
 
     async def count_tokens(self, text: str, model: str) -> int:
         """Count tokens using the Anthropic token counting API."""

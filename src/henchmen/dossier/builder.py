@@ -14,6 +14,7 @@ from henchmen.models.dossier import CodeSearchResult, Dossier, RelatedIssue, Rel
 from henchmen.models.scheme import DossierRequirement
 from henchmen.models.task import HenchmenTask
 from henchmen.providers.interfaces.object_store import ObjectStore
+from henchmen.utils.git import clone_repo
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +35,21 @@ class DossierBuilder:
         return self._object_store
 
     async def build(self, task: HenchmenTask, requirement: DossierRequirement) -> Dossier:
-        """Build a dossier based on task and requirements."""
+        """Build a dossier based on task and requirements.
+
+        Under ``HENCHMEN_PROVIDER=local``, RAG-dependent steps are skipped
+        entirely (see L7 fix). This lets developers run the dossier pipeline
+        without a Vertex AI RAG Engine corpus, falling back to grep-only
+        context. Steps that only require GitHub API access (related PRs,
+        related issues, code search) still run when a GitHub token is present.
+        """
         dossier = Dossier(task_id=task.id)
+        local_mode = (self.settings.provider or "").lower() == "local"
+        if local_mode:
+            logger.info(
+                "DossierBuilder running in local mode — Vertex AI RAG Engine "
+                "steps are skipped; context will be grep-only."
+            )
 
         if requirement.fetch_files:
             dossier.relevant_files = await self._fetch_relevant_files(task)
@@ -49,8 +63,10 @@ class DossierBuilder:
         if requirement.fetch_related_issues:
             dossier.related_issues = await self._fetch_related_issues(task)
 
-        if requirement.code_search_symbols:
+        if requirement.code_search_symbols and not local_mode:
             dossier.code_search_results = await self._code_search(task, requirement.code_search_symbols)
+        elif requirement.code_search_symbols and local_mode:
+            logger.info("Skipping code_search in local mode; grep-based context only.")
 
         # Serialize and upload to GCS
         dossier.artifact_uri = await self._upload_artifact(dossier)
@@ -82,30 +98,21 @@ class DossierBuilder:
             return []
 
         github_token = _get_github_token(self.settings)
-        clone_url = (
-            f"https://x-access-token:{github_token}@github.com/{repo}.git"
-            if github_token
-            else f"https://github.com/{repo}.git"
-        )
         branch = task.context.branch or "main"
 
         tmp_dir = tempfile.mkdtemp(prefix="henchmen-rules-")
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                "clone",
-                "--depth=1",
-                "--branch",
-                branch,
-                "--no-checkout",
-                clone_url,
-                tmp_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                logger.warning("Failed to clone repo for rules: %s", stderr.decode())
+            try:
+                await clone_repo(
+                    repo,
+                    branch,
+                    tmp_dir,
+                    token=github_token or None,
+                    depth=1,
+                    no_checkout=True,
+                )
+            except RuntimeError as exc:
+                logger.warning("Failed to clone repo for rules: %s", exc)
                 return []
 
             # Sparse-checkout only rule files

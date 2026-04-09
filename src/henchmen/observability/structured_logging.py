@@ -47,12 +47,17 @@ def emit_metric(
         value: Numeric metric value (default 1.0 for counters).
         severity: Log severity — one of debug, info, warning, error, critical.
     """
+    # Cloud Logging metric labels must be strings — cast every value to str so
+    # int/float/bool labels (e.g. recovered counts, ceiling amounts) do not get
+    # rejected by the log-based metric extractor or break downstream parsers.
+    str_labels: dict[str, str] = {k: str(v) for k, v in (labels or {}).items()}
+
     entry: dict[str, Any] = {
         "severity": _SEVERITY_MAP.get(severity, "INFO"),
         "message": f"metric:{metric_name}",
         "metric_name": metric_name,
         "metric_value": value,
-        "metric_labels": labels or {},
+        "metric_labels": str_labels,
     }
 
     # Write as a single JSON line — Cloud Run's logging agent parses this

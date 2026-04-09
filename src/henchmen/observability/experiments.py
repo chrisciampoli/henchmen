@@ -7,7 +7,10 @@ Feature-flagged via ``vertex_ai_experiments_enabled`` in settings.
 """
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +84,7 @@ async def log_experiment_run(
 
 
 async def maybe_log_experiment(
-    settings: Any,
+    settings: "Settings",
     task_data: dict[str, Any],
 ) -> None:
     """Log experiment if enabled in settings. Convenience wrapper for the mastermind."""

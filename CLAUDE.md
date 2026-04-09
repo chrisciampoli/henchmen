@@ -1,5 +1,15 @@
 # CLAUDE.md — Henchmen
 
+> **Audience:** This file is instructions for AI assistants and LLM-based
+> contributors (Claude, Cursor, Copilot-style agents, etc.). It is kept at
+> the repo root with the filename `CLAUDE.md` because many AI tools look for
+> that exact path.
+>
+> **Human contributors:** please read `CONTRIBUTING.md` first for workflow,
+> PR conventions, and the task completion checklist. The architecture,
+> directory layout, and conventions sections below are authoritative for
+> both audiences -- humans and AI alike should follow them.
+
 Henchmen is an AI agent factory. It receives tasks from Slack, Jira, GitHub, and CLI, dispatches AI coding agents (Operatives) in ephemeral containers, and delivers human-reviewable pull requests on the configured target repository.
 
 ## Quick Start

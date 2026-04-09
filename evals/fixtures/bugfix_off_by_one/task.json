@@ -1,0 +1,5 @@
+{
+  "title": "Fix off-by-one in list_utils.last_n",
+  "description": "The last_n function returns n+1 items instead of n. Fix it so it returns exactly n items, and the test passes.",
+  "scheme": "bugfix_standard"
+}

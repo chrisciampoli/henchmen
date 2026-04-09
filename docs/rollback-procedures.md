@@ -1,5 +1,20 @@
 # Rollback Procedures -- Henchmen
 
+> Self-hosted users: this document assumes GCP (Artifact Registry + Cloud
+> Run + Terraform). If you are running docker-compose or `henchmen serve`,
+> the equivalents are much simpler:
+>
+> - **Container rollback** -> `git checkout <previous-commit>` and
+>   `docker compose up --build` (or restart `henchmen serve`). You are
+>   rebuilding from source, not pulling tagged images.
+> - **Cloud Run revision rollback** -> N/A. Restart the process or container.
+> - **Terraform rollback** -> N/A. You do not have infrastructure state to revert.
+> - **Emergency stop** -> `docker compose down` or kill `henchmen serve`.
+> - **Drain the task queue** -> delete rows from `tasks` in `henchmen_dev.db`
+>   (or the JSON files under `./henchmen-data/tasks/`) before restarting.
+>
+> See `docs/incident-runbook.md` for the self-hosted operations mapping.
+
 ## Container Rollback
 
 All container images are stored in Artifact Registry at `us-central1-docker.pkg.dev/${PROJECT_ID}/henchmen-dev/`.

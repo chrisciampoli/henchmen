@@ -134,7 +134,7 @@ create_pr    run_lint_retry
 |------|------|-------|-------|---------|
 | `create_branch` | DETERMINISTIC | -- | -- | 30s |
 | `prefetch_context` | DETERMINISTIC | -- | -- | 60s |
-| `implement_fix` | AGENTIC | Claude Sonnet 4 | 40 | 1800s |
+| `implement_fix` | AGENTIC | Gemini 2.5 Pro | 40 | 1800s |
 | `verify_changes` | AGENTIC | Gemini 2.5 Flash | 10 | 600s |
 | `run_lint` | DETERMINISTIC | -- | -- | 60s |
 | `fix_lint` | DETERMINISTIC | -- | -- | 120s |
@@ -171,7 +171,7 @@ prefetch_context
     |
 plan_implementation   (AGENTIC, Gemini 2.5 Flash, 10 steps)
     |
-implement_feature     (AGENTIC, Claude Sonnet 4, 40 steps)
+implement_feature     (AGENTIC, Gemini 2.5 Pro, 40 steps)
     |
 verify_changes  <-----(same retry/lint/test structure as bugfix)
     |
@@ -182,7 +182,7 @@ run_tests -> fix_tests -> run_tests_retry
 create_pr / escalate
 ```
 
-**Key difference from bugfix_standard:** The `plan_implementation` node uses Gemini 2.5 Flash (fast and cheap) to explore the codebase with read-only tools (`code_intel`) and create an implementation plan before the expensive Claude Sonnet 4 `implement_feature` step begins.
+**Key difference from bugfix_standard:** The `plan_implementation` node uses Gemini 2.5 Flash (fast and cheap) to explore the codebase with read-only tools (`code_intel`) and create an implementation plan before the more expensive Gemini 2.5 Pro `implement_feature` step begins.
 
 ### goal_decomposition
 
@@ -197,7 +197,7 @@ analyze_goal -> report_plan
 
 | Node | Type | Model | Steps | Timeout |
 |------|------|-------|-------|---------|
-| `analyze_goal` | AGENTIC | Gemini 3.1 Pro Preview (customtools) | 5 | 300s |
+| `analyze_goal` | AGENTIC | Gemini 3.1 Pro | 5 | 300s |
 | `report_plan` | DETERMINISTIC | -- | -- | 30s |
 
 **analyze_goal instruction template:** The operative explores the codebase using read-only tools and produces 3-5 specific, concrete sub-tasks in a structured format:
@@ -248,7 +248,7 @@ REFACTOR_STANDARD = SchemeDefinition(
             ),
             max_steps=30,
             timeout_seconds=1200,
-            model_name="claude-sonnet-4@20250514",
+            model_name="gemini-2.5-pro",
             instruction_template="Your refactoring instructions here...",
         ),
         # ... more nodes
@@ -300,10 +300,10 @@ If validation fails, a `ValueError` is raised at import time with detailed error
 
 1. **Start with deterministic nodes:** `create_branch` should always be the root. `create_pr` or `escalate` should be terminal.
 
-2. **Use the cheapest model that works:**
+2. **Use the cheapest Gemini tier that works** (hard rule: no Claude on Vertex AI):
    - Verification and planning: Gemini 2.5 Flash (fast, cheap)
-   - Test fixes: Gemini 3.1 Pro (good reasoning, moderate cost)
-   - Core implementation: Claude Sonnet 4 (best coding quality, highest cost)
+   - Test fixes: Gemini 3.1 Pro (strongest reasoning, moderate cost)
+   - Core implementation: Gemini 2.5 Pro (best coding quality in the Gemini lineup)
 
 3. **Add retry loops for quality gates:** The pattern `run_check -> fix_check -> run_check_retry -> escalate` catches many issues automatically.
 
@@ -315,16 +315,16 @@ If validation fails, a `ValueError` is raised at import time with detailed error
 
 ### Model Tiering Per Node
 
-The `model_name` field on each `SchemeNode` determines the LLM used. If not set, it falls back to the `vertex_ai_model_complex` setting (Claude Sonnet 4 by default).
+The `model_name` field on each `SchemeNode` determines the LLM used. If not set, it falls back to the `vertex_ai_model_complex` setting (Gemini 2.5 Pro by default).
 
-Available models and their recommended use:
+**Hard rule:** Henchmen uses Gemini on Vertex AI exclusively. No Claude models on Vertex AI.
+
+Available models and their recommended use (mirrors the tiering in `CLAUDE.md`):
 
 | Model | Price Tier | Best For |
 |-------|-----------|----------|
-| `claude-sonnet-4@20250514` | High | Core code generation, complex bug fixes |
-| `gemini-3.1-pro` | Medium | Test fixing, moderate reasoning tasks |
-| `gemini-3.1-pro-preview-customtools` | Medium | Goal analysis with custom tools |
-| `gemini-2.5-flash` | Low | Verification gates, planning, classification |
-| `gemini-2.5-pro` | Medium | General-purpose fallback |
+| `gemini-3.1-pro` | High | Test fixing and other reasoning-heavy steps (`fix_tests`, `analyze_goal`) |
+| `gemini-2.5-pro` | Medium | Core code generation (`implement_fix`, `implement_feature`); default for `vertex_ai_model_complex` |
+| `gemini-2.5-flash` | Low | Verification gates, planning, classification (`verify_changes`, `plan_implementation`) |
 
-The operative agent handles model routing automatically: model names containing "claude" route to `_call_claude` (via Anthropic-on-Vertex), all others to `_call_gemini` (via google-genai SDK). Claude calls automatically fall back to Gemini on rate limits or unavailability.
+All model calls route through `_call_gemini` (via the google-genai SDK against Vertex AI). There is no Anthropic/Claude routing path.

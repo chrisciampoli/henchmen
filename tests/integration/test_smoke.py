@@ -287,12 +287,12 @@ class TestIntegrationAssertions:
         with pytest.raises(AssertionError, match="No messages published"):
             assertions.assert_pubsub_message_contains(mock_pubsub, "task-intake", source="cli")
 
-    def test_assert_state_machine_reached(self, assertions: IntegrationAssertions):
-        assertions.assert_state_machine_reached({"current_state": "planning"}, "planning")
+    def test_assert_execution_state_reached(self, assertions: IntegrationAssertions):
+        assertions.assert_execution_state_reached({"execution_state": "planning"}, "planning")
 
-    def test_assert_state_machine_reached_fails(self, assertions: IntegrationAssertions):
+    def test_assert_execution_state_reached_fails(self, assertions: IntegrationAssertions):
         with pytest.raises(AssertionError):
-            assertions.assert_state_machine_reached({"current_state": "pending"}, "planning")
+            assertions.assert_execution_state_reached({"execution_state": "pending"}, "planning")
 
 
 # ---------------------------------------------------------------------------

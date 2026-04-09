@@ -48,6 +48,22 @@ All five must pass. No exceptions.
 - snake_case for variables and functions, PascalCase for classes
 - Pydantic models for all data crossing component boundaries — never raw dicts
 
+## Async Test Conventions
+
+Henchmen uses **strict** `asyncio_mode` in pytest (`pyproject.toml`). This means:
+
+- Every async test function **must** carry an explicit `@pytest.mark.asyncio` decorator.
+- Every async fixture **must** be declared with `@pytest_asyncio.fixture` instead of `@pytest.fixture`.
+- Settings isolation between tests is handled by the `_isolate_settings`
+  autouse fixture in `tests/conftest.py` — do **not** call
+  `get_settings.cache_clear()` manually in individual tests.
+- Shared fixtures such as `mock_settings` (in `tests/conftest.py`) and
+  `dispatch_client` (in `tests/integration/conftest.py`) should be preferred
+  over hand-rolled helpers or re-instantiating ASGI clients per test.
+
+Rationale: "explicit over implicit" keeps the asyncio mode load-bearing, so a
+future mode flip cannot silently skip async tests.
+
 ## Adding a Provider
 
 Providers live in `src/henchmen/providers/`. Each provider implements a set of abstract interfaces defined in `src/henchmen/providers/base.py`.

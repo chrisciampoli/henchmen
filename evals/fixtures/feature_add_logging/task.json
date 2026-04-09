@@ -1,0 +1,5 @@
+{
+  "title": "Add debug logging to process_batch",
+  "description": "The process_batch function in batch_processor.py should log each item as it's processed using the standard logging module at DEBUG level. Add the logging without changing the function's behavior.",
+  "scheme": "feature_standard"
+}

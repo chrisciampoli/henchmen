@@ -2,17 +2,69 @@
 
 Provides mock GCP services, test workspaces, and assertion helpers
 so integration tests can run locally without any real GCP resources.
+
+.. note::
+   The integration suite installs in-memory mocks for several
+   ``google.cloud.*`` submodules via :func:`unittest.mock.patch` with a
+   string target path. That patch form requires the underlying module to be
+   importable — if ``google-cloud-pubsub``/``firestore``/``storage`` are not
+   installed, the whole suite fails at fixture setup with a cryptic
+   ``AttributeError``. To give contributors a clear signal, each required
+   SDK is probed via :func:`pytest.importorskip` at module import time. When
+   running a minimal ``[dev]`` install without ``[dev-integration]``, the
+   suite is cleanly skipped instead of crashing. This is the R1 fix from the
+   2026-04-09 expert panel review.
 """
 
 import json
 import os
 import subprocess
 import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
 
-from henchmen.config.settings import Settings, get_settings
+# R1: probe GCP SDK availability at collection time so the integration suite
+# is skipped cleanly under a bare [dev] install instead of failing with a
+# cryptic AttributeError inside a monkeypatch.setattr call.
+pytest.importorskip(
+    "google.cloud.pubsub_v1",
+    reason="integration suite requires the [dev-integration] extras — run `pip install -e .[dev-integration]`",
+)
+pytest.importorskip(
+    "google.cloud.firestore",
+    reason="integration suite requires the [dev-integration] extras — run `pip install -e .[dev-integration]`",
+)
+pytest.importorskip(
+    "google.cloud.storage",
+    reason="integration suite requires the [dev-integration] extras — run `pip install -e .[dev-integration]`",
+)
+
+from henchmen.config.settings import Settings, get_settings  # noqa: E402 — importorskip must run first
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Auto-tag every test in this directory with the `integration` marker.
+
+    This lets contributors run only the fast unit loop via
+    ``pytest -m 'not integration'`` and keeps new integration files automatically
+    covered without requiring every author to remember to add the marker.
+    """
+    integration_root = Path(__file__).parent.resolve()
+    marker = pytest.mark.integration
+    for item in items:
+        try:
+            item_path = Path(str(item.fspath)).resolve()
+        except Exception:
+            continue
+        try:
+            item_path.relative_to(integration_root)
+        except ValueError:
+            continue
+        item.add_marker(marker)
 
 # ---------------------------------------------------------------------------
 # MockPubSub
@@ -358,15 +410,40 @@ def test_login_missing_credentials():
 # ---------------------------------------------------------------------------
 
 
+@pytest_asyncio.fixture
+async def dispatch_client() -> AsyncIterator[AsyncClient]:
+    """Yield an ``httpx.AsyncClient`` wired to the dispatch FastAPI app.
+
+    Replaces the 18 hand-rolled ``async with AsyncClient(transport=ASGITransport(app=app), ...)``
+    blocks that previously lived inside ``test_dispatch_pipeline.py``. Tests
+    consume this fixture by adding ``dispatch_client`` to their signature and
+    using it in place of the old ``client`` local variable.
+    """
+    from henchmen.dispatch.server import app as dispatch_app
+
+    async with AsyncClient(
+        transport=ASGITransport(app=dispatch_app),
+        base_url="http://test",
+    ) as client:
+        yield client
+
+
 @pytest.fixture
 def integration_settings(monkeypatch) -> Settings:
-    """Settings with test-appropriate defaults."""
+    """Settings with test-appropriate defaults.
+
+    The root ``_isolate_settings`` autouse fixture clears the
+    ``get_settings`` ``lru_cache`` on both sides of every test, so this
+    fixture only has to set env vars and return a freshly-constructed
+    instance.
+    """
     monkeypatch.setenv("HENCHMEN_GCP_PROJECT_ID", "test-project")
     monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "dev")
     monkeypatch.setenv("HENCHMEN_GCP_REGION", "us-central1")
+    # Clear once more so the setenv calls above are reflected in the returned
+    # instance (autouse fixture already ran before monkeypatch was applied).
     get_settings.cache_clear()
-    yield get_settings()
-    get_settings.cache_clear()
+    return get_settings()
 
 
 # ---------------------------------------------------------------------------
@@ -502,10 +579,17 @@ class IntegrationAssertions:
         assert False, f"No message on {topic} matched {expected_fields}"  # noqa: B011
 
     @staticmethod
-    def assert_state_machine_reached(state_data: dict, expected_state: str) -> None:
-        """Assert a task state machine reached the expected state."""
-        assert state_data.get("current_state") == expected_state, (
-            f"Expected state {expected_state!r}, got {state_data.get('current_state')!r}"
+    def assert_execution_state_reached(exec_state: dict, expected_state: str) -> None:
+        """Assert a task execution document reached the expected state.
+
+        Replaces the former ``assert_state_machine_reached`` helper. After the
+        2026-04-09 expert panel remediation (finding E1) the in-memory
+        ``TaskStateMachine`` was deleted; lifecycle state now lives in
+        Firestore ``task_executions/{task_id}`` documents managed by
+        ``SchemeExecutor``.
+        """
+        assert exec_state.get("execution_state") == expected_state, (
+            f"Expected execution_state {expected_state!r}, got {exec_state.get('execution_state')!r}"
         )
 
 

@@ -1,0 +1,12 @@
+{
+  "name": "henchmen-eval-bugfix-null-check",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Fixture repo for the bugfix_null_check evaluation scenario.",
+  "scripts": {
+    "test": "jest"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0"
+  }
+}

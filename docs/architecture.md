@@ -23,7 +23,7 @@ Henchmen Agent Factory is a production AI agent system that dispatches coding op
      +---------v------+  +-------v--------+  +------v----------+
      |  Lair (CRJ)    |  |  Lair (CRJ)    |  |  Lair (CRJ)     |
      | implement_fix  |  | verify_changes |  | fix_tests        |
-     | Claude Sonnet 4|  | Gemini Flash   |  | Gemini 3.1 Pro   |
+     | Gemini 2.5 Pro |  | Gemini 2.5 Flash|  | Gemini 3.1 Pro  |
      +---------+------+  +-------+--------+  +------+----------+
                |                  |                  |
                |  Pub/Sub: operative-complete        |
@@ -48,7 +48,7 @@ Henchmen Agent Factory is a production AI agent system that dispatches coding op
 | **Operative** | Cloud Run Job (Lair) | Ephemeral agent container. Clones repo, runs an agentic tool loop against an LLM, commits and pushes changes. |
 | **Arsenal** | In-process registry | Tool system providing `code_intel`, `code_edit`, `git_ops`, and `test_runner` tools to operatives. |
 | **Forge** | Cloud Run Service | Post-PR CI pipeline. Clones the PR branch, runs lint/tests/silent-failure detection, comments on PR, publishes results. |
-| **Dossier** | Library (in Mastermind) | Context assembly. Fetches file trees, rule files, related PRs/issues, semantic code chunks from Pinecone. |
+| **Dossier** | Library (in Mastermind) | Context assembly. Fetches file trees, rule files, related PRs/issues, semantic code chunks from Vertex AI RAG Engine (corpus: `henchmen-code`). |
 | **Tracker** | Library (in Mastermind) | Observability layer. Persists per-task and per-node telemetry (tokens, cost, duration) to Firestore. |
 
 ## Detailed Component Architecture
@@ -83,7 +83,7 @@ The Mastermind is the brain of the system. It receives tasks via Pub/Sub push su
    - Runs `TaskAnalyzer` to extract mentioned files, error patterns, and keywords
    - Fetches CI failure data if the task is CI-related
    - Pre-fetches file contents for explicitly mentioned files
-   - Queries Pinecone for semantically relevant code chunks (RAG)
+   - Queries Vertex AI RAG Engine (corpus: `henchmen-code`) for semantically relevant code chunks
    - Fetches repo rule files (CLAUDE.md, etc.) and related PRs via `DossierBuilder`
 
 3. **Scheme Execution** (`SchemeExecutor`): Walks the scheme DAG from root to terminal node:
@@ -126,7 +126,6 @@ The agent includes:
 - **Phase-aware nudging:** If the model spends too many steps only reading files, it receives an escalating prompt to start editing.
 - **Commit detection:** The loop breaks immediately after a successful `git_commit` call.
 - **Timeout management:** Agent timeout is `node.timeout_seconds - 120s` (buffer for branch push).
-- **Fallback:** Claude calls fall back to Gemini on failure (rate limits, unavailability).
 
 **REPORT:** After execution, the operative checks for changes (uncommitted or committed-ahead-of-main), creates the branch and pushes to origin, then publishes an `OperativeReport` to the `operative-complete` Pub/Sub topic.
 
@@ -189,7 +188,7 @@ The Dossier subsystem assembles context packages for operatives:
 
 - **DossierBuilder**: Orchestrates fetching relevant files, rule files (CLAUDE.md, .cursorrules, etc.), related PRs, related issues, and code search results. Uploads the assembled dossier as JSON to GCS.
 - **TaskAnalyzer**: Classifies tasks by type (bug_fix, test_fix, feature, refactor, generic), extracts mentioned files, error patterns, and keywords using regex patterns.
-- **Embedder/Chunker**: Indexes repository code into Pinecone for semantic search (RAG). The Mastermind queries Pinecone for the top 20 chunks relevant to each task.
+- **Embedder/Chunker**: Indexes repository code into Vertex AI RAG Engine (corpus: `henchmen-code`) for semantic search. The Mastermind queries the RAG corpus for the top 20 chunks relevant to each task.
 - **SnapshotCache**: Caches cloned repository snapshots in GCS to speed up workspace initialization.
 
 ## Data Flow
@@ -214,10 +213,10 @@ The Dossier subsystem assembles context packages for operatives:
    create_branch -> prefetch_context -> implement_fix (AGENTIC)
                                                |
                                          [Lair provisioned]
-                                         [Operative runs Claude Sonnet 4]
+                                         [Operative runs Gemini 2.5 Pro]
                                          [Reads code, makes fix, commits]
                                                |
-                                         verify_changes (AGENTIC, Gemini Flash)
+                                         verify_changes (AGENTIC, Gemini 2.5 Flash)
                                                |
                                          [pass] -> run_lint (DETERMINISTIC)
                                                |
@@ -261,11 +260,11 @@ All push subscriptions use OIDC authentication tokens with the Mastermind servic
 | **Pub/Sub** | Async message passing between all components |
 | **Firestore** | Task execution tracking, merge queue state, operative reports |
 | **Cloud Storage (GCS)** | Dossier artifacts, Terraform state, operative snapshots |
-| **Secret Manager** | GitHub token, Slack tokens, Pinecone API key, Jira API token |
+| **Secret Manager** | GitHub token, Slack tokens, Jira API token |
 | **Artifact Registry** | Docker images for all containers |
 | **VPC Connector** | Private networking for Cloud Run services |
 | **Cloud Scheduler** | Periodic cleanup and merge queue processing |
-| **Vertex AI** | LLM access (Claude via Anthropic-on-Vertex, Gemini native) |
+| **Vertex AI** | LLM access (Gemini only) and RAG Engine corpus (`henchmen-code`) |
 
 ### Container Resources
 
@@ -317,13 +316,13 @@ terraform/
 
 ## Model Routing
 
-The system uses a tiered model strategy to balance cost and quality:
+The system uses a tiered Gemini strategy to balance cost and quality. **Hard rule:** no Claude models on Vertex AI -- Gemini only.
 
 | Model | Used For | Why |
 |-------|----------|-----|
-| **Claude Sonnet 4** (`claude-sonnet-4@20250514`) | `implement_fix`, `implement_feature` | Best-in-class coding quality. Used for the core code generation step where accuracy matters most. Accessed via Anthropic-on-Vertex in `us-east5`. |
-| **Gemini 3.1 Pro** (`gemini-3.1-pro`) | `fix_tests` | Strong reasoning for diagnosing test failures and making targeted fixes. Cost-effective for the retry step. |
-| **Gemini 3.1 Pro Preview** (`gemini-3.1-pro-preview-customtools`) | `analyze_goal` (goal decomposition) | Planning and analysis of high-level goals with custom tool support. |
-| **Gemini 2.5 Flash** (`gemini-2.5-flash`) | `verify_changes`, `plan_implementation` | Fast and cheap for verification gates and planning steps. Low-latency turnaround for quality checks. |
+| **Gemini 2.5 Pro** (`gemini-2.5-pro`) | `implement_fix`, `implement_feature` | Strongest Gemini tier for core code generation where accuracy matters most. Also the default for `vertex_ai_model_complex`. |
+| **Gemini 3.1 Pro** (`gemini-3.1-pro`) | `fix_tests`, `analyze_goal` | Strongest reasoning tier for diagnosing test failures and decomposing high-level goals. |
+| **Gemini 2.5 Flash** (`gemini-2.5-flash`) | `verify_changes`, `plan_implementation` | Fast and cheap (~95% less than Pro) for verification gates and planning steps. Low-latency turnaround for quality checks. |
+| **Deterministic** | `fix_lint` | `eslint --fix` / `ruff --fix` -- zero LLM cost, no Cloud Run Job. |
 
-The `model_name` field on each `SchemeNode` determines which model is used. If not set, it falls back to the `vertex_ai_model_complex` setting (Claude Sonnet 4 by default). The operative's `_call_model` method routes to `_call_claude` or `_call_gemini` based on the model name prefix, with automatic fallback from Claude to Gemini on failure.
+The `model_name` field on each `SchemeNode` determines which model is used. If not set, it falls back to the `vertex_ai_model_complex` setting (Gemini 2.5 Pro by default). All model calls route through `_call_gemini` (via the google-genai SDK against Vertex AI); there is no Anthropic/Claude routing path.

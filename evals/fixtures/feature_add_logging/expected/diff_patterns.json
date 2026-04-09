@@ -1,0 +1,7 @@
+{
+  "must_contain_file_change": ["batch_processor.py"],
+  "must_fix_tests": false,
+  "expected_substrings_in_changed_code": ["import logging", "logger.debug"],
+  "test_runner": null,
+  "test_command": null
+}

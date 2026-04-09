@@ -24,6 +24,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Vertex AI RAG Engine is optional. When ``vertexai`` is not installed or the
+# ``rag`` submodule is unavailable (e.g. running locally without a GCP SDK),
+# the dossier pipeline degrades to a grep-only mode: retrieval returns an
+# empty list, and indexing is a no-op. This lets ``HENCHMEN_PROVIDER=local``
+# developers run the system without a cloud account.
+try:
+    from vertexai import rag as _rag_module
+except ImportError:  # pragma: no cover — exercised by local-mode runs
+    _rag_module = None  # type: ignore[assignment]
+
+
+def _rag_available() -> bool:
+    """Return True when the Vertex AI RAG Engine SDK is importable."""
+    return _rag_module is not None
+
+
 _UPLOAD_BATCH_SIZE: int = 50  # Chunks per batch to avoid rate limits
 
 
@@ -56,7 +72,14 @@ async def get_or_create_corpus(
     """Get an existing RAG corpus by display name, or create one.
 
     Returns the corpus resource name (e.g. ``projects/.../locations/.../ragCorpora/...``).
+    Returns an empty string when the Vertex AI RAG Engine SDK is unavailable
+    (e.g. local mode), allowing callers to gracefully skip RAG operations.
     """
+    if not _rag_available():
+        logger.warning(
+            "Vertex AI RAG is not available — dossier will run in grep-only mode (get_or_create_corpus is a no-op)"
+        )
+        return ""
 
     def _do() -> str:
         from vertexai import rag  # TODO: Abstract RAG provider
@@ -111,9 +134,17 @@ async def upsert_chunks(
     The file display_name encodes metadata (repo, file_path, lines, symbol)
     so we can reconstruct it on retrieval.
 
-    Returns the number of chunks uploaded.
+    Returns the number of chunks uploaded. When the Vertex AI RAG Engine SDK
+    is unavailable, returns ``0`` and logs a warning.
     """
     if not chunks:
+        return 0
+
+    if not _rag_available():
+        logger.warning(
+            "Vertex AI RAG is not available — skipping upsert of %d chunks (grep-only mode)",
+            len(chunks),
+        )
         return 0
 
     if not corpus_name:
@@ -202,7 +233,17 @@ async def delete_file_chunks(
     pinecone_api_key: str = "",
     index_name: str = "",
 ) -> None:
-    """Delete RAG files for the given source file paths."""
+    """Delete RAG files for the given source file paths.
+
+    No-op when the Vertex AI RAG Engine SDK is unavailable (local mode).
+    """
+    if not _rag_available():
+        logger.warning(
+            "Vertex AI RAG is not available — skipping delete for %d files (grep-only mode)",
+            len(file_paths),
+        )
+        return
+
     if not corpus_name:
         try:
             corpus_name = await get_or_create_corpus(
@@ -262,8 +303,13 @@ async def query_similar_chunks(
     """Search for semantically similar code chunks using RAG Engine retrieval.
 
     The corpus handles embedding the query automatically.
-    Returns an empty list on any error (graceful degradation).
+    Returns an empty list on any error or when the Vertex AI RAG Engine SDK
+    is unavailable (graceful degradation).
     """
+    if not _rag_available():
+        logger.warning("Vertex AI RAG is not available — returning empty retrieval result (grep-only mode)")
+        return []
+
     if not corpus_name:
         try:
             corpus_name = await get_or_create_corpus(

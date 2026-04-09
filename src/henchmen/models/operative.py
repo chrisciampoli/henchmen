@@ -3,7 +3,9 @@
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from henchmen.models._base import StrictBase
 
 
 class OperativeStatus(StrEnum):
@@ -15,9 +17,10 @@ class OperativeStatus(StrEnum):
     FAILED = "failed"
     TIMED_OUT = "timed_out"
     BLOCKED = "blocked"  # Agent can't proceed, needs human help
+    INTERRUPTED = "interrupted"  # Graceful SIGTERM shutdown — partial work preserved
 
 
-class OperativeConfig(BaseModel):
+class OperativeConfig(StrictBase):
     """Configuration used to spawn a Cloud Run operative container."""
 
     task_id: str = Field(..., description="ID of the parent HenchmenTask")
@@ -28,8 +31,18 @@ class OperativeConfig(BaseModel):
     memory: str = Field(default="8Gi", description="Memory allocation for the Cloud Run container")
     timeout_seconds: int = Field(default=1800, description="Maximum execution time in seconds")
 
+    @property
+    def branch_name(self) -> str:
+        """Canonical Henchmen branch name for this task.
 
-class OperativeReport(BaseModel):
+        Mirrors :attr:`henchmen.models.task.HenchmenTask.branch_name` so the
+        operative bootstrap (which only has an ``OperativeConfig``) computes
+        the same value as the mastermind side.
+        """
+        return f"henchmen/{self.task_id[:8]}"
+
+
+class OperativeReport(StrictBase):
     """Report produced by an operative upon completion or failure."""
 
     task_id: str = Field(..., description="ID of the parent HenchmenTask")

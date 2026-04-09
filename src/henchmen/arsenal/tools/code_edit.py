@@ -1,8 +1,17 @@
-"""Code editing tools - create, write, edit, and delete files."""
+"""Code editing tools - create, write, edit, and delete files.
+
+All file-system tools in this module route paths through
+:func:`henchmen.arsenal._workspace.ensure_in_workspace` before opening, writing,
+or deleting. This is the in-tool enforcement of the workspace boundary — it
+closes the class of bypasses where the outer :class:`OperativeGuardrails`
+check fails because a parameter is named differently than ``path``, ``file``,
+or ``dir``.
+"""
 
 import os
 from typing import Any
 
+from henchmen.arsenal._workspace import ensure_in_workspace
 from henchmen.arsenal.registry import tool
 
 
@@ -14,8 +23,12 @@ from henchmen.arsenal.registry import tool
 async def file_write(path: str, content: str) -> dict[str, Any]:
     """Write content to a file, creating parent directories as needed."""
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
+        safe_path = ensure_in_workspace(path)
+    except PermissionError as exc:
+        return {"error": f"access denied: {exc}"}
+    try:
+        os.makedirs(os.path.dirname(safe_path), exist_ok=True)
+        with open(safe_path, "w", encoding="utf-8") as fh:
             fh.write(content)
         return {"path": path, "bytes_written": len(content.encode("utf-8")), "success": True}
     except Exception as exc:
@@ -33,13 +46,17 @@ async def file_write(path: str, content: str) -> dict[str, Any]:
 async def file_edit(path: str, old_text: str, new_text: str) -> dict[str, Any]:
     """Replace text in a file with fuzzy whitespace matching."""
     try:
-        with open(path, encoding="utf-8") as fh:
+        safe_path = ensure_in_workspace(path)
+    except PermissionError as exc:
+        return {"error": f"access denied: {exc}"}
+    try:
+        with open(safe_path, encoding="utf-8") as fh:
             original = fh.read()
 
         # Try exact match first
         if old_text in original:
             updated = original.replace(old_text, new_text, 1)
-            with open(path, "w", encoding="utf-8") as fh:
+            with open(safe_path, "w", encoding="utf-8") as fh:
                 fh.write(updated)
             return {"path": path, "success": True, "replacements": 1}
 
@@ -64,7 +81,7 @@ async def file_edit(path: str, old_text: str, new_text: str) -> dict[str, Any]:
             if updated == original:
                 # Fallback: replace in normalized form
                 updated = norm_original.replace(norm_old, new_text, 1)
-            with open(path, "w", encoding="utf-8") as fh:
+            with open(safe_path, "w", encoding="utf-8") as fh:
                 fh.write(updated)
             return {"path": path, "success": True, "replacements": 1, "note": "matched with whitespace normalization"}
 
@@ -100,10 +117,14 @@ async def file_edit(path: str, old_text: str, new_text: str) -> dict[str, Any]:
 async def file_create(path: str, content: str) -> dict[str, Any]:
     """Create a new file; raises an error if it already exists."""
     try:
-        if os.path.exists(path):
+        safe_path = ensure_in_workspace(path)
+    except PermissionError as exc:
+        return {"error": f"access denied: {exc}"}
+    try:
+        if os.path.exists(safe_path):
             return {"error": f"File already exists: {path}"}
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "x", encoding="utf-8") as fh:
+        os.makedirs(os.path.dirname(safe_path), exist_ok=True)
+        with open(safe_path, "x", encoding="utf-8") as fh:
             fh.write(content)
         return {"path": path, "bytes_written": len(content.encode("utf-8")), "success": True}
     except FileExistsError:
@@ -123,7 +144,11 @@ async def file_create(path: str, content: str) -> dict[str, Any]:
 async def file_insert_at_line(path: str, line_number: int, text: str) -> dict[str, Any]:
     """Insert text at a specific line number (1-indexed). Existing content shifts down."""
     try:
-        with open(path, encoding="utf-8") as fh:
+        safe_path = ensure_in_workspace(path)
+    except PermissionError as exc:
+        return {"error": f"access denied: {exc}"}
+    try:
+        with open(safe_path, encoding="utf-8") as fh:
             lines = fh.readlines()
         # Clamp line_number to valid range
         idx = max(0, min(line_number - 1, len(lines)))
@@ -131,7 +156,7 @@ async def file_insert_at_line(path: str, line_number: int, text: str) -> dict[st
         if text and not text.endswith("\n"):
             text += "\n"
         lines.insert(idx, text)
-        with open(path, "w", encoding="utf-8") as fh:
+        with open(safe_path, "w", encoding="utf-8") as fh:
             fh.writelines(lines)
         return {"path": path, "success": True, "inserted_at_line": line_number}
     except FileNotFoundError:
@@ -149,9 +174,13 @@ async def file_insert_at_line(path: str, line_number: int, text: str) -> dict[st
 async def file_delete(path: str) -> dict[str, Any]:
     """Delete a file. This is a destructive, irreversible operation."""
     try:
-        if not os.path.exists(path):
+        safe_path = ensure_in_workspace(path)
+    except PermissionError as exc:
+        return {"error": f"access denied: {exc}"}
+    try:
+        if not os.path.exists(safe_path):
             return {"error": f"File not found: {path}"}
-        os.remove(path)
+        os.remove(safe_path)
         return {"path": path, "success": True}
     except Exception as exc:
         return {"error": str(exc)}

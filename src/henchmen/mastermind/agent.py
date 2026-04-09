@@ -1,4 +1,15 @@
-"""MastermindAgent - central orchestrator that receives tasks, selects schemes, and manages execution."""
+"""MastermindAgent - central orchestrator that receives tasks, selects schemes, and manages execution.
+
+Task lifecycle state lives in Firestore ``task_executions/{task_id}``
+documents, managed by :class:`SchemeExecutor` (node-level results,
+retry counts, and execution_state checkpoints) and
+:class:`~henchmen.observability.tracker.TaskTracker` (cost / cumulative
+metrics, heartbeat, finalization).  There is no in-memory state
+machine — an earlier ``TaskStateMachine`` was decorative (built per
+request, mutated, discarded, never persisted) and has been removed.
+Crash recovery flows through ``resume_task`` reading the Firestore
+checkpoint fields written by the executor.
+"""
 
 import json
 import logging
@@ -10,7 +21,6 @@ from henchmen.dossier.embedder import query_similar_chunks
 from henchmen.forge.error_extractor import extract_ci_errors, format_errors_for_operative
 from henchmen.mastermind.lair_manager import LairManager
 from henchmen.mastermind.scheme_executor import SchemeExecutor
-from henchmen.mastermind.state_machine import TaskState, TaskStateMachine
 from henchmen.models.dossier import CodeSearchResult, Dossier, RelatedIssue
 from henchmen.models.scheme import NodeType
 from henchmen.models.task import HenchmenTask
@@ -23,7 +33,8 @@ from henchmen.schemes.registry import SchemeRegistry
 
 logger = logging.getLogger(__name__)
 
-# Maximum number of completed tasks to retain in memory
+# Maximum number of in-flight task IDs to retain in the local tracking set.
+# Used only for in-memory dedup hints — authoritative state is in Firestore.
 _MAX_ACTIVE_TASKS = 200
 _MAX_PENDING_CI = 200
 
@@ -45,7 +56,10 @@ class MastermindAgent:
             container_orchestrator=container_orchestrator,
             document_store=document_store,
         )
-        self._active_tasks: dict[str, TaskStateMachine] = {}
+        # In-memory set of task IDs currently being handled by this process.
+        # Authoritative state lives in Firestore `task_executions/{task_id}`;
+        # this set is only a hint for local cleanup and test introspection.
+        self._active_tasks: set[str] = set()
         self._pending_ci: dict[str, dict[str, Any]] = {}  # request_id -> {event, result}
         self.tracker = TaskTracker(self.settings, document_store=document_store)
 
@@ -58,18 +72,19 @@ class MastermindAgent:
         return self._broker
 
     def _cleanup_in_memory_state(self) -> None:
-        """Evict completed/terminal tasks from in-memory dicts to prevent unbounded growth."""
-        # Evict terminal-state tasks from _active_tasks
+        """Evict stale entries from in-memory dicts to prevent unbounded growth.
+
+        Authoritative task lifecycle state lives in Firestore; these in-memory
+        structures are only used for request-scoped bookkeeping.
+        """
+        # Bound the active-task set. Without a per-task terminal marker in
+        # memory, simply trim arbitrarily when we exceed the cap — the real
+        # source of truth is Firestore.
         if len(self._active_tasks) > _MAX_ACTIVE_TASKS:
-            terminal = [
-                tid
-                for tid, sm in self._active_tasks.items()
-                if sm.current_state in (TaskState.COMPLETED, TaskState.ESCALATED)
-            ]
-            for tid in terminal:
-                self._active_tasks.pop(tid, None)
-            if terminal:
-                logger.info("[cleanup] Evicted %d terminal tasks from _active_tasks", len(terminal))
+            excess = len(self._active_tasks) - _MAX_ACTIVE_TASKS
+            for tid in list(self._active_tasks)[:excess]:
+                self._active_tasks.discard(tid)
+            logger.info("[cleanup] Evicted %d entries from _active_tasks", excess)
 
         # Evict resolved (event already set) entries from _pending_ci
         if len(self._pending_ci) > _MAX_PENDING_CI:
@@ -80,7 +95,12 @@ class MastermindAgent:
                 logger.info("[cleanup] Evicted %d resolved entries from _pending_ci", len(resolved))
 
     async def handle_task(self, task: HenchmenTask) -> dict[str, Any]:
-        """Process a task through its full lifecycle."""
+        """Process a task through its full lifecycle.
+
+        Lifecycle state is written to Firestore by ``TaskTracker`` and the
+        ``SchemeExecutor`` as execution progresses; this method does not
+        maintain any separate in-memory state machine.
+        """
         self._cleanup_in_memory_state()
 
         # Layer 3: Task-level dedup — don't process if already running or stalled
@@ -89,55 +109,39 @@ class MastermindAgent:
             logger.info("Task %s already in state '%s', skipping", task.id, existing["execution_state"])
             return {"status": "already_running", "task_id": task.id}
 
-        # 1. Create state machine
-        sm = TaskStateMachine(task.id)
-        self._active_tasks[task.id] = sm
+        self._active_tasks.add(task.id)
 
         try:
-            # 2. Select scheme
+            # 1. Select scheme and persist start-of-task marker
             scheme_id = await self._select_scheme(task)
-            sm.transition(TaskState.SCHEME_SELECTED, {"scheme_id": scheme_id})
             await self.tracker.start_task(task, scheme_id)
 
-            # 3. Get scheme graph
+            # 2. Get scheme graph
             scheme_graph = SchemeRegistry.get(scheme_id)
             if not scheme_graph:
-                sm.transition(TaskState.ESCALATED, {"reason": f"Unknown scheme: {scheme_id}"})
-                return {"status": "escalated", "reason": f"Unknown scheme: {scheme_id}"}
+                reason = f"Unknown scheme: {scheme_id}"
+                await self.tracker.finalize_task(task.id, "escalated")
+                return {"status": "escalated", "reason": reason, "task_id": task.id}
 
-            # 4. Provision lair / build dossier
-            sm.transition(TaskState.LAIR_PROVISIONED)
+            # 3. Build dossier
             dossier = await self._build_dossier(task, scheme_graph)
-            sm.transition(TaskState.DOSSIER_BUILT)
 
-            # 5. Execute scheme
-            sm.transition(TaskState.EXECUTING)
+            # 4. Execute scheme — SchemeExecutor writes node_results and
+            #    execution_state checkpoints to Firestore as it runs.
             executor = SchemeExecutor(scheme_graph, self.lair_manager, self.settings, tracker=self.tracker)
             result = await executor.execute(task, dossier)
 
-            # 6. Trigger CI if we have a real PR
+            # 5. Trigger CI if we have a real PR
             pr_url = result.get("pr_url", "")
-            ci_dispatched = False
             if pr_url and "pull/" in pr_url:
                 try:
                     broker = self._get_broker()
                     ci_data = json.dumps({"pr_url": pr_url, "action": "run_ci", "task_id": task.id}).encode("utf-8")
                     await broker.publish(self.settings.pubsub_topic_forge_request, ci_data)
-                    print(f"[MASTERMIND] CI triggered for {pr_url}", flush=True)
-                    ci_dispatched = True
+                    logger.info("[MASTERMIND] CI triggered for %s", pr_url)
                 except Exception as ci_exc:
                     logger.error("Failed to trigger CI for task %s: %s", task.id, ci_exc)
-                    print(f"[MASTERMIND] Failed to trigger CI: {ci_exc}", flush=True)
-
-            if ci_dispatched:
-                # PR exists and CI was dispatched — move to CI_RUNNING.
-                # The forge-result handler will advance state to COMPLETED.
-                sm.transition(TaskState.AWAITING_REVIEW)
-                sm.transition(TaskState.COMPLETED)
-            else:
-                # No PR created or CI dispatch failed — complete directly
-                sm.transition(TaskState.AWAITING_REVIEW)
-                sm.transition(TaskState.COMPLETED)
+                    logger.error("[MASTERMIND] Failed to trigger CI: %s", ci_exc)
 
             pr_url_final = result.get("pr_url", "")
             pr_number = result.get("node_results", {}).get("create_pr", {}).get("pr_number")
@@ -155,7 +159,7 @@ class MastermindAgent:
                 logger.debug("Experiment logging failed (non-fatal): %s", exp_exc)
 
             return {
-                "status": sm.current_state.value,
+                "status": final_status,
                 "task_id": task.id,
                 "scheme_id": scheme_id,
                 "result": result,
@@ -163,11 +167,6 @@ class MastermindAgent:
 
         except Exception as e:
             logger.exception("Error handling task %s", task.id)
-            try:
-                sm.transition(TaskState.ESCALATED, {"reason": str(e)})
-            except ValueError:
-                # Already in a terminal state
-                pass
             await self.tracker.finalize_task(task.id, "escalated")
             return {"status": "escalated", "task_id": task.id, "error": str(e)}
 
@@ -208,23 +207,16 @@ class MastermindAgent:
         executor.node_results = saved_node_results
         executor._retry_counts = saved_retry_counts
 
-        print(
-            f"[MASTERMIND] Resuming task {task_id} from checkpoint "
-            f"(completed nodes: {list(saved_node_results.keys())})",
-            flush=True,
+        logger.info(
+            "[MASTERMIND] Resuming task %s from checkpoint (completed nodes: %s)",
+            task_id,
+            list(saved_node_results.keys()),
         )
 
-        # Execute (will skip already-completed nodes)
-        sm = TaskStateMachine(task_id)
-        sm.transition(TaskState.SCHEME_SELECTED, {"scheme_id": scheme_id})
-        sm.transition(TaskState.LAIR_PROVISIONED)
-        sm.transition(TaskState.DOSSIER_BUILT)
-        sm.transition(TaskState.EXECUTING)
-
+        # Execute (will skip already-completed nodes). The executor and
+        # tracker persist state to Firestore as work progresses.
+        self._active_tasks.add(task_id)
         result = await executor.execute(task, dossier)
-
-        sm.transition(TaskState.AWAITING_REVIEW)
-        sm.transition(TaskState.COMPLETED)
 
         pr_url_final = result.get("pr_url", "")
         pr_number = result.get("node_results", {}).get("create_pr", {}).get("pr_number")
@@ -232,7 +224,7 @@ class MastermindAgent:
         await self.tracker.finalize_task(task_id, final_status, pr_url_final, pr_number)
 
         return {
-            "status": sm.current_state.value,
+            "status": final_status,
             "task_id": task_id,
             "scheme_id": scheme_id,
             "result": result,
@@ -368,12 +360,12 @@ class MastermindAgent:
         # Analyze the task to extract context clues
         analyzer = TaskAnalyzer()
         analysis = analyzer.analyze(task.title, task.description)
-        print(
-            f"[DOSSIER] Task analysis: type={analysis.task_type}, "
-            f"ci_related={analysis.ci_related}, "
-            f"files={analysis.mentioned_files}, "
-            f"errors={analysis.mentioned_errors}",
-            flush=True,
+        logger.info(
+            "[DOSSIER] Task analysis: type=%s, ci_related=%s, files=%s, errors=%s",
+            analysis.task_type,
+            analysis.ci_related,
+            analysis.mentioned_files,
+            analysis.mentioned_errors,
         )
 
         # Pre-fetch file tree from GitHub so the operative knows the codebase structure
@@ -391,9 +383,9 @@ class MastermindAgent:
                 # Was 200, reduced to 0 in dossier context (operative uses tools to explore).
                 # Keep a small set for the file scoring algorithm in _build_file_context.
                 dossier.relevant_files = file_paths[:50]
-                print(f"[DOSSIER] Fetched {len(file_paths)} files from {repo}", flush=True)
+                logger.info("[DOSSIER] Fetched %d files from %s", len(file_paths), repo)
             except Exception as exc:
-                print(f"[DOSSIER] Failed to fetch file tree: {exc}", flush=True)
+                logger.warning("[DOSSIER] Failed to fetch file tree: %s", exc)
 
             # If CI/test related, try to fetch latest failed workflow run
             if analysis.ci_related:
@@ -412,9 +404,9 @@ class MastermindAgent:
                                             labels=["ci_failure"],
                                         )
                                     )
-                    print(f"[DOSSIER] Fetched {len(dossier.related_issues)} CI failure(s)", flush=True)
+                    logger.info("[DOSSIER] Fetched %d CI failure(s)", len(dossier.related_issues))
                 except Exception as exc:
-                    print(f"[DOSSIER] Failed to fetch CI failures (non-fatal): {exc}", flush=True)
+                    logger.warning("[DOSSIER] Failed to fetch CI failures (non-fatal): %s", exc)
 
             # Fetch specifically mentioned files
             if analysis.mentioned_files:
@@ -433,9 +425,9 @@ class MastermindAgent:
                         # File path might be partial or not found -- not fatal
                         pass
                 if dossier.code_search_results:
-                    print(
-                        f"[DOSSIER] Pre-fetched {len(dossier.code_search_results)} mentioned file(s)",
-                        flush=True,
+                    logger.info(
+                        "[DOSSIER] Pre-fetched %d mentioned file(s)",
+                        len(dossier.code_search_results),
                     )
 
         # Store the task analysis in the dossier as a typed field
@@ -459,7 +451,7 @@ class MastermindAgent:
                         dossier.related_prs = built.related_prs
                     break
         except Exception as exc:
-            print(f"[DOSSIER] DossierBuilder failed (non-fatal): {exc}", flush=True)
+            logger.warning("[DOSSIER] DossierBuilder failed (non-fatal): %s", exc)
 
         return dossier
 
@@ -484,10 +476,10 @@ class MastermindAgent:
                 top_k=20,
             )
             if chunks:
-                print(f"[DOSSIER] Retrieved {len(chunks)} semantic chunks from RAG Engine", flush=True)
+                logger.info("[DOSSIER] Retrieved %d semantic chunks from RAG Engine", len(chunks))
             return chunks
         except Exception as exc:
-            print(f"[DOSSIER] Semantic search failed (non-fatal): {exc}", flush=True)
+            logger.warning("[DOSSIER] Semantic search failed (non-fatal): %s", exc)
             return []
 
     async def _run_ci(self, pr_url: str, timeout: int = 600) -> dict[str, Any]:
@@ -525,14 +517,6 @@ class MastermindAgent:
         if pending:
             pending["result"] = result
             pending["event"].set()
-
-    async def recover_task(self, task_id: str, state_data: dict[str, Any]) -> dict[str, Any]:
-        """Recover a task from persisted state after crash."""
-        sm = TaskStateMachine.from_dict(state_data)
-        recovery_state = sm.get_recovery_state()
-        # Resume from last accepted state
-        self._active_tasks[task_id] = sm
-        return {"recovered_state": recovery_state.value, "task_id": task_id}
 
     async def handle_pubsub_message(self, message: dict[str, Any]) -> dict[str, Any]:
         """Handle incoming Pub/Sub messages (task intake, operative complete, forge result)."""

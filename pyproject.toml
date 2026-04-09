@@ -24,6 +24,22 @@ dependencies = [
 henchmen = "henchmen.cli:main"
 
 [project.optional-dependencies]
+# Extras layout
+# -----------------------------------------------------------------------------
+# Henchmen is cloud-agnostic. The base install is deliberately lean so that
+# contributors running locally with Ollama or OpenAI do not have to download
+# ~300MB of GCP and AWS SDKs. Pick the extras you actually need:
+#
+#   pip install -e ".[local]"            # single-process local mode (OpenAI / Anthropic / Ollama)
+#   pip install -e ".[gcp]"              # GCP backends (Pub/Sub, Firestore, GCS, Vertex)
+#   pip install -e ".[aws]"              # AWS backends
+#   pip install -e ".[all]"              # everything (power users)
+#   pip install -e ".[local,dev]"        # local mode + dev tooling
+#   pip install -e ".[dev-integration]"  # everything + dev tooling + integration tests
+#
+# Note: `dev` only installs developer tooling (pytest, ruff, mypy, etc.) on
+# top of whatever runtime extras you picked. It does NOT pull `all`. If you
+# need the full stack for integration tests, use `dev-integration` instead.
 gcp = [
     "google-cloud-pubsub",
     "google-cloud-firestore",
@@ -57,17 +73,31 @@ observability = [
     "opentelemetry-sdk>=1.20",
     "opentelemetry-exporter-gcp-trace>=1.6",
     "opentelemetry-instrumentation-fastapi>=0.44b0",
+    "prometheus-client>=0.19",
+]
+# Minimal runtime extras to run Henchmen locally in single-process mode with
+# Ollama (no extra deps beyond base) or a direct-LLM provider like OpenAI /
+# Anthropic. Deliberately excludes GCP and AWS SDKs.
+local = [
+    "henchmen[openai,anthropic]",
 ]
 all = [
     "henchmen[gcp,aws,openai,anthropic,slack,jira,observability]",
 ]
+# Developer tooling only. Layer this on top of whichever runtime extras you
+# installed, e.g. `pip install -e ".[local,dev]"`.
 dev = [
-    "henchmen[all]",
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
     "ruff",
     "mypy",
+]
+# Full stack + dev tooling. Needed to run the integration test suite because
+# tests/integration/conftest.py imports google.cloud.{pubsub_v1,firestore,storage}
+# (patched with in-memory fakes, but the modules must still be importable).
+dev-integration = [
+    "henchmen[all,dev]",
 ]
 
 [tool.setuptools.packages.find]
@@ -78,12 +108,20 @@ line-length = 120
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "W", "UP"]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "RET", "ASYNC", "T20", "C4"]
 ignore = []
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
+# Strict asyncio mode: every async test must be explicitly marked with
+# @pytest.mark.asyncio (and every async fixture with @pytest_asyncio.fixture).
+# Rationale: "explicit > implicit" — keeps the marks load-bearing so that the
+# mode cannot be flipped accidentally without breaking tests loudly. See
+# CONTRIBUTING.md for the convention.
+asyncio_mode = "strict"
 testpaths = ["tests"]
+markers = [
+    "integration: end-to-end tests that exercise multiple components. Requires the [dev-integration] extras. Skip with -m 'not integration' for the fast local loop.",
+]
 
 [tool.mypy]
 python_version = "3.12"

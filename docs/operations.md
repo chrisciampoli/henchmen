@@ -1,5 +1,19 @@
 # Operations Guide
 
+> If you are self-hosting Henchmen (docker-compose, `henchmen serve`, SQLite,
+> filesystem, Ollama): most of this guide assumes a GCP deployment. Treat the
+> GCP names as a legend, not as a requirement. The self-hosted equivalents:
+>
+> - Cloud Run services -> containers in docker-compose (or processes spawned by `henchmen serve`)
+> - Firestore -> SQLite at `henchmen_dev.db` (or filesystem JSON under `./henchmen-data/`)
+> - Pub/Sub -> in-memory broker or local HTTP forwarder
+> - Secret Manager -> `.env.local`
+> - Cloud Scheduler -> a local cron hitting `/api/v1/watchdog`
+> - Cloud Logging -> `docker logs` or the single stdout stream of `henchmen serve`
+>
+> See `docs/incident-runbook.md` ("Self-Hosted / Non-GCP Operations") for the
+> full mapping and `docs/troubleshooting.md` for common self-hosted problems.
+
 ## Deployment
 
 ### Prerequisites
@@ -10,7 +24,7 @@
 - `gcloud` CLI authenticated (`gcloud auth application-default login`)
 - GitHub personal access token or GitHub App credentials
 - Slack bot token (for Slack integration)
-- Pinecone API key (for RAG/semantic search)
+- Vertex AI RAG Engine corpus (named `henchmen-code`) for semantic search
 
 ### Build and Push Containers
 
@@ -62,10 +76,12 @@ terraform apply -var="project_id=${PROJECT_ID}" -var="region=${REGION}" -var="en
 
 | Service | Required Secrets |
 |---------|-----------------|
-| Mastermind | `SLACK_BOT_TOKEN`, `GITHUB_TOKEN`, `PINECONE_API_KEY` |
+| Mastermind | `SLACK_BOT_TOKEN`, `GITHUB_TOKEN` |
 | Dispatch | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_APP_TOKEN` |
 | Forge | `GITHUB_TOKEN` |
 | Operative (Lairs) | `GITHUB_TOKEN` (injected by LairManager at job creation time) |
+
+Vertex AI RAG Engine uses the service account's Vertex AI IAM roles, so no separate API key secret is required.
 
 ### Update a Single Cloud Run Service
 
@@ -87,9 +103,6 @@ echo -n "ghp_YourTokenHere" | gcloud secrets versions add henchmen-dev-github-to
 
 # Slack bot token
 echo -n "xoxb-YourTokenHere" | gcloud secrets versions add henchmen-dev-slack-bot-token --data-file=-
-
-# Pinecone API key
-echo -n "pk-YourKeyHere" | gcloud secrets versions add henchmen-dev-pinecone-api-key --data-file=-
 ```
 
 ## Environment Variables
@@ -104,8 +117,9 @@ All settings are managed via `src/henchmen/config/settings.py` using `pydantic-s
 | `HENCHMEN_GCP_REGION` | No | `us-central1` | GCP region |
 | `HENCHMEN_ENVIRONMENT` | No | `dev` | `dev`, `staging`, or `prod` |
 | `HENCHMEN_FIRESTORE_DATABASE` | No | `(default)` | Firestore database name |
-| `HENCHMEN_VERTEX_AI_MODEL_COMPLEX` | No | `claude-sonnet-4@20250514` | Default model for complex tasks |
-| `HENCHMEN_VERTEX_AI_MODEL_LIGHT` | No | `gemini-2.5-pro` | Default model for lightweight tasks |
+| `HENCHMEN_VERTEX_AI_MODEL_COMPLEX` | No | `gemini-2.5-pro` | Default Gemini model for complex tasks (`implement_fix`, `implement_feature`) |
+| `HENCHMEN_VERTEX_AI_MODEL_LIGHT` | No | `gemini-2.5-flash` | Default Gemini model for lightweight tasks (`verify_changes`, `plan_implementation`) |
+| `HENCHMEN_VERTEX_AI_MODEL_REASONING` | No | `gemini-3.1-pro` | Default Gemini model for reasoning-heavy tasks (`fix_tests`, `analyze_goal`) |
 | `HENCHMEN_LAIR_DEFAULT_CPU` | No | `4` | Default CPU for operative containers |
 | `HENCHMEN_LAIR_DEFAULT_MEMORY` | No | `8Gi` | Default memory for operative containers |
 | `HENCHMEN_LAIR_DEFAULT_TIMEOUT` | No | `1800` | Default operative timeout (seconds) |
@@ -121,7 +135,6 @@ These are injected directly as environment variables by Cloud Run secret referen
 | `SLACK_BOT_TOKEN` | Mastermind, Dispatch | Secret Manager |
 | `SLACK_SIGNING_SECRET` | Dispatch | Secret Manager |
 | `SLACK_APP_TOKEN` | Dispatch | Secret Manager |
-| `PINECONE_API_KEY` | Mastermind | Secret Manager |
 
 ### Operative-Specific Variables (injected by LairManager)
 
@@ -216,7 +229,7 @@ textPayload=~"\\[CI-LOOP\\]"
 | `[OPERATIVE] Pushed branch {name}` | bootstrap | Changes pushed to GitHub |
 | `[TOOL] {name}({args})` | OperativeAgent | Tool call with arguments |
 | `[TOOL] {name} -> {result}` | OperativeAgent | Tool call result (truncated) |
-| `[DOSSIER] Retrieved {n} semantic chunks` | MastermindAgent | RAG chunks from Pinecone |
+| `[DOSSIER] Retrieved {n} semantic chunks` | MastermindAgent | RAG chunks from Vertex AI RAG Engine (`henchmen-code`) |
 | `[CREATE_PR] PR created: {url}` | SchemeExecutor | Pull request opened |
 | `[FORGE] CI PASSED/FAILED for {url}` | Forge | CI check result |
 | `[CI-LOOP] Result: {result}` | Mastermind | CI auto-fix loop outcome |

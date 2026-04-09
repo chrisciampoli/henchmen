@@ -1,4 +1,20 @@
-"""Pytest configuration and shared fixtures."""
+"""Pytest configuration and shared fixtures.
+
+Conventions enforced here (see CONTRIBUTING.md for the full rationale):
+
+* ``asyncio_mode = "strict"`` in ``pyproject.toml`` — every async test must be
+  decorated with ``@pytest.mark.asyncio`` and every async fixture with
+  ``@pytest_asyncio.fixture``.
+* ``_isolate_settings`` is an autouse fixture that clears the
+  ``get_settings`` ``lru_cache`` before and after every test so that
+  ``monkeypatch.setenv`` mutations cannot leak between tests. Individual
+  tests should never call ``get_settings.cache_clear()`` manually.
+* ``mock_settings`` returns a real ``Settings`` instance constructed from
+  environment variables, avoiding the duplicated ``_mock_settings()``
+  helpers that used to live in ~8 test modules.
+"""
+
+from collections.abc import Iterator
 
 import pytest
 
@@ -16,8 +32,45 @@ from henchmen.models.scheme import (
 from henchmen.models.task import HenchmenTask, TaskContext, TaskPriority, TaskSource
 
 
+@pytest.fixture(autouse=True)
+def _isolate_settings() -> Iterator[None]:
+    """Clear the ``get_settings`` cache before and after every test.
+
+    Autouse: runs for every test in the suite. Without this fixture, a
+    ``monkeypatch.setenv`` in one test would silently leak into the next
+    because ``get_settings`` is wrapped in ``functools.lru_cache`` and the
+    first call freezes the environment. By clearing the cache on both sides
+    of ``yield`` we guarantee hermetic state.
+
+    This replaces the 53+ hand-rolled ``get_settings.cache_clear()`` calls
+    that previously lived across ``test_config.py``, ``test_dispatch.py``
+    and various conftest files.
+    """
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def mock_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
+    """Return a real ``Settings`` instance with test-safe defaults.
+
+    Shared across unit and integration tests. Replaces per-module
+    ``_mock_settings()`` helpers that built ``MagicMock`` settings objects
+    — using the real class catches schema drift and keeps the tests honest.
+    """
+    monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "dev")
+    monkeypatch.setenv("HENCHMEN_GCP_PROJECT_ID", "test-project")
+    monkeypatch.setenv("HENCHMEN_GCP_REGION", "us-central1")
+    # `_isolate_settings` already cleared the cache; re-clear here defensively
+    # so that the setenv calls above are picked up for this fixture's return.
+    get_settings.cache_clear()
+    return get_settings()
+
+
 @pytest.fixture
 def settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
+    """Alias for backwards compatibility with older tests."""
     monkeypatch.setenv("HENCHMEN_GCP_PROJECT_ID", "test-project")
     get_settings.cache_clear()
     return get_settings()

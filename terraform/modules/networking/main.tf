@@ -33,6 +33,28 @@ resource "google_compute_firewall" "allow_internal" {
   source_ranges = [var.subnet_cidr]
 }
 
+# ---------------------------------------------------------------------------
+# Egress firewall policy
+#
+# The hand-maintained CIDR allowlist below (GitHub, Google APIs, Vertex AI,
+# Slack, Atlassian/Jira) is APPROXIMATE. Third-party providers rotate their
+# IP ranges without notice — Slack's api.slack.com ranges in particular are
+# known to drift, and the published ranges aren't a stable contract. This
+# means the allowlist will silently stop matching new endpoints and cause
+# intermittent 503s from dispatch/forge until the ranges are refreshed.
+#
+# The recommended long-term fix is two-pronged:
+#   1. Private Google Access + VPC Service Controls for everything Google
+#      (Vertex AI, Cloud Run, Pub/Sub, Firestore, Artifact Registry) — this
+#      removes the need to maintain any CIDRs for google.com endpoints.
+#   2. HTTPS egress proxies (e.g. Cloud NAT + a forwarding proxy, or a
+#      dedicated tinyproxy/squid on GCE) for third-party APIs (GitHub, Slack,
+#      Jira). The proxy does DNS at request time, eliminating the IP drift
+#      problem, and gives a single chokepoint for audit logging and WAF.
+#
+# TODO(D12): replace IP allowlist with VPC-SC + egress proxy.
+# ---------------------------------------------------------------------------
+
 # Firewall: deny all egress (default deny)
 resource "google_compute_firewall" "deny_all_egress" {
   project     = var.project_id

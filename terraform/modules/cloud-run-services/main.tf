@@ -32,11 +32,6 @@ resource "google_cloud_run_v2_service" "mastermind" {
   location = var.region
   project  = var.project_id
 
-  # Prevent terraform apply from stripping secret env vars set via gcloud/console.
-  lifecycle {
-    ignore_changes = [template[0].containers[0].env]
-  }
-
   template {
     timeout = "3600s"
     service_account = var.service_account_emails["mastermind"]
@@ -59,7 +54,7 @@ resource "google_cloud_run_v2_service" "mastermind" {
 
       env {
         name = "SLACK_BOT_TOKEN"
-        value_source { secret_key_ref { secret = "henchmen-${var.environment}-slack-bot-token"; version = "1" } }
+        value_source { secret_key_ref { secret = "henchmen-${var.environment}-slack-bot-token"; version = "latest" } }
       }
       env {
         name = "GITHUB_TOKEN"
@@ -92,11 +87,6 @@ resource "google_cloud_run_v2_service" "arsenal" {
   name     = "henchmen-${var.environment}-arsenal"
   location = var.region
   project  = var.project_id
-
-  # Prevent terraform apply from stripping secret env vars set via gcloud/console.
-  lifecycle {
-    ignore_changes = [template[0].containers[0].env]
-  }
 
   template {
     service_account = var.service_account_emails["arsenal"]
@@ -143,11 +133,6 @@ resource "google_cloud_run_v2_service" "dispatch" {
   location = var.region
   project  = var.project_id
 
-  # Prevent terraform apply from stripping secret env vars set via gcloud/console.
-  lifecycle {
-    ignore_changes = [template[0].containers[0].env]
-  }
-
   template {
     service_account = var.service_account_emails["dispatch"]
 
@@ -169,15 +154,15 @@ resource "google_cloud_run_v2_service" "dispatch" {
 
       env {
         name = "SLACK_BOT_TOKEN"
-        value_source { secret_key_ref { secret = "henchmen-${var.environment}-slack-bot-token"; version = "1" } }
+        value_source { secret_key_ref { secret = "henchmen-${var.environment}-slack-bot-token"; version = "latest" } }
       }
       env {
         name = "SLACK_SIGNING_SECRET"
-        value_source { secret_key_ref { secret = "henchmen-${var.environment}-slack-signing-secret"; version = "1" } }
+        value_source { secret_key_ref { secret = "henchmen-${var.environment}-slack-signing-secret"; version = "latest" } }
       }
       env {
         name = "SLACK_APP_TOKEN"
-        value_source { secret_key_ref { secret = "henchmen-${var.environment}-slack-app-token"; version = "1" } }
+        value_source { secret_key_ref { secret = "henchmen-${var.environment}-slack-app-token"; version = "latest" } }
       }
 
       resources {
@@ -205,11 +190,6 @@ resource "google_cloud_run_v2_service" "forge" {
   name     = "henchmen-${var.environment}-forge"
   location = var.region
   project  = var.project_id
-
-  # Prevent terraform apply from stripping secret env vars set via gcloud/console.
-  lifecycle {
-    ignore_changes = [template[0].containers[0].env]
-  }
 
   template {
     service_account = var.service_account_emails["forge"]

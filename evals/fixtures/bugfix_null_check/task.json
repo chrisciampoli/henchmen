@@ -1,0 +1,5 @@
+{
+  "title": "Fix null reference in parseConfig",
+  "description": "parseConfig crashes when given undefined input. Add a null check so it returns an empty object instead.",
+  "scheme": "bugfix_standard"
+}

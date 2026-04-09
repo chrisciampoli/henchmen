@@ -44,3 +44,20 @@ class SNSMessageBroker:
 
         response = await asyncio.to_thread(self._client.publish, **kwargs)
         return str(response.get("MessageId", ""))
+
+    async def pull_dlq(
+        self,
+        subscription_name: str,
+        max_messages: int = 10,
+    ) -> list[dict[str, Any]]:
+        """DLQ pull is not implemented for the AWS SNS broker.
+
+        On AWS, SNS-to-SQS fan-out means the DLQ is a separate SQS queue,
+        and pulling from it requires an SQS client rather than the SNS
+        client used here.  Add an SQS-backed implementation (or a dedicated
+        ``SQSMessageBroker``) when DLQ monitoring is needed on AWS.
+        """
+        raise NotImplementedError(
+            "pull_dlq is not implemented for the AWS SNS broker. "
+            "Add an SQS-backed DLQ client to use the DLQ monitor on AWS."
+        )

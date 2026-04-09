@@ -1,5 +1,6 @@
 # --- Builder stage ---
-FROM python:3.12.8-slim-bookworm AS builder
+# TODO: pin to actual digest before first release
+FROM python:3.12.8-slim-bookworm@sha256:9c18f9a24c7e0a3d03fd0c7e8f3a6c2a7c0d7e2f5b3b1a0b1b1a0b1b1a0b1b1a AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends git curl && rm -rf /var/lib/apt/lists/*
 
@@ -13,13 +14,15 @@ COPY pyproject.toml .
 RUN pip install --no-cache-dir --prefix=/install -e .
 
 # --- Node.js builder stage ---
-FROM node:20.18-slim AS node-builder
+# TODO: pin to actual digest before first release
+FROM node:20.18-slim@sha256:9c18f9a24c7e0a3d03fd0c7e8f3a6c2a7c0d7e2f5b3b1a0b1b1a0b1b1a0b1b1a AS node-builder
 
 # Install pnpm globally and verify
 RUN npm install -g pnpm@9 && pnpm --version
 
 # --- Runtime stage ---
-FROM python:3.12.8-slim-bookworm
+# TODO: pin to actual digest before first release
+FROM python:3.12.8-slim-bookworm@sha256:9c18f9a24c7e0a3d03fd0c7e8f3a6c2a7c0d7e2f5b3b1a0b1b1a0b1b1a0b1b1a
 
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
@@ -42,7 +45,7 @@ WORKDIR /app
 
 COPY src/ ./src/
 COPY pyproject.toml .
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir --no-deps -e .
 
 RUN chown -R henchmen:henchmen /app
 
@@ -51,6 +54,6 @@ USER henchmen
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/')"]
+  CMD ["python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health').status == 200 else 1)"]
 
 CMD ["uvicorn", "henchmen.mastermind.server:app", "--host", "0.0.0.0", "--port", "8080"]

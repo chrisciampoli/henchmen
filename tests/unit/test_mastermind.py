@@ -1,4 +1,14 @@
-"""Unit tests for the Mastermind orchestrator: state machine, scheme executor, lair manager, agent."""
+"""Unit tests for the Mastermind orchestrator: scheme executor, lair manager, agent.
+
+NOTE: The former ``TaskStateMachine`` test classes (Transitions, History,
+AcceptanceChecks, CanTransition, Serialization, CrashRecovery) were removed
+when the decorative in-memory state machine was deleted as part of finding E1.
+Task lifecycle state now lives in Firestore ``task_executions/{task_id}``
+documents owned by :class:`SchemeExecutor` and
+:class:`~henchmen.observability.tracker.TaskTracker` — there is no separate
+object to test.  Those tests were exercising code that was never persisted
+and had no production behavioural effect.
+"""
 
 import os
 from datetime import UTC, datetime
@@ -9,11 +19,6 @@ import pytest
 from henchmen.mastermind.agent import MastermindAgent
 from henchmen.mastermind.lair_manager import LairManager
 from henchmen.mastermind.scheme_executor import SchemeExecutor
-from henchmen.mastermind.state_machine import (
-    VALID_TRANSITIONS,
-    TaskState,
-    TaskStateMachine,
-)
 from henchmen.models.dossier import Dossier
 from henchmen.models.operative import OperativeReport, OperativeStatus
 from henchmen.models.scheme import (
@@ -95,6 +100,13 @@ def _branching_scheme() -> SchemeGraph:
 
 
 def _mock_settings():
+    """TODO(R9): replace with the shared ``mock_settings`` fixture from
+    ``tests/conftest.py``. This helper uses a ``MagicMock`` rather than the
+    real ``Settings`` class because several tests in this module inject
+    lair / vertex / pubsub fields that would otherwise need to be set via
+    ``monkeypatch.setenv``. Threading the fixture through every test would
+    be a larger refactor than fits in a single R9 session.
+    """
     settings = MagicMock()
     settings.gcp_project_id = "test-project"
     settings.gcp_region = "us-central1"
@@ -111,197 +123,13 @@ def _mock_settings():
 
 
 # ===========================================================================
-# TaskStateMachine
+# TaskStateMachine test classes removed — see module docstring above.
+# The classes (TestTaskStateMachineTransitions, TestTaskStateMachineHistory,
+# TestTaskStateMachineAcceptanceChecks, TestTaskStateMachineCanTransition,
+# TestTaskStateMachineSerialization, TestTaskStateMachineCrashRecovery)
+# were testing an in-memory state machine that was never persisted and had
+# no production effect. Deleted alongside ``state_machine.py`` for finding E1.
 # ===========================================================================
-
-
-class TestTaskStateMachineTransitions:
-    """Test valid and invalid state transitions."""
-
-    def test_valid_transition_received_to_scheme_selected(self):
-        sm = TaskStateMachine("t-1")
-        assert sm.current_state == TaskState.RECEIVED
-        t = sm.transition(TaskState.SCHEME_SELECTED, {"scheme_id": "bugfix"})
-        assert sm.current_state == TaskState.SCHEME_SELECTED
-        assert t.from_state == TaskState.RECEIVED
-        assert t.to_state == TaskState.SCHEME_SELECTED
-        assert t.metadata == {"scheme_id": "bugfix"}
-
-    def test_valid_transition_chain(self):
-        sm = TaskStateMachine("t-2")
-        sm.transition(TaskState.SCHEME_SELECTED)
-        sm.transition(TaskState.LAIR_PROVISIONED)
-        sm.transition(TaskState.DOSSIER_BUILT)
-        sm.transition(TaskState.EXECUTING)
-        sm.transition(TaskState.CI_RUNNING)
-        sm.transition(TaskState.AWAITING_REVIEW)
-        sm.transition(TaskState.COMPLETED)
-        assert sm.current_state == TaskState.COMPLETED
-
-    def test_invalid_transition_raises_value_error(self):
-        sm = TaskStateMachine("t-3")
-        with pytest.raises(ValueError, match="Invalid transition"):
-            sm.transition(TaskState.COMPLETED)
-
-    def test_invalid_skip_transition_raises(self):
-        sm = TaskStateMachine("t-4")
-        # Cannot go from RECEIVED directly to EXECUTING
-        with pytest.raises(ValueError, match="Invalid transition"):
-            sm.transition(TaskState.EXECUTING)
-
-    def test_escalation_from_any_non_terminal_state(self):
-        """ESCALATED should be reachable from most states."""
-        for from_state, allowed in VALID_TRANSITIONS.items():
-            sm = TaskStateMachine("t-esc", initial_state=from_state)
-            assert TaskState.ESCALATED in allowed, f"{from_state} should allow ESCALATED"
-            sm.transition(TaskState.ESCALATED)
-            assert sm.current_state == TaskState.ESCALATED
-
-    def test_ci_retry_loop(self):
-        sm = TaskStateMachine("t-retry")
-        sm.transition(TaskState.SCHEME_SELECTED)
-        sm.transition(TaskState.LAIR_PROVISIONED)
-        sm.transition(TaskState.DOSSIER_BUILT)
-        sm.transition(TaskState.EXECUTING)
-        sm.transition(TaskState.CI_RUNNING)
-        sm.transition(TaskState.CI_RETRY, {"attempt": 1})
-        sm.transition(TaskState.CI_RUNNING)
-        sm.transition(TaskState.AWAITING_REVIEW)
-        assert sm.current_state == TaskState.AWAITING_REVIEW
-
-
-class TestTaskStateMachineHistory:
-    """Test history tracking."""
-
-    def test_history_records_all_transitions(self):
-        sm = TaskStateMachine("t-hist")
-        sm.transition(TaskState.SCHEME_SELECTED)
-        sm.transition(TaskState.LAIR_PROVISIONED)
-        assert len(sm.history) == 2
-        assert sm.history[0].to_state == TaskState.SCHEME_SELECTED
-        assert sm.history[1].to_state == TaskState.LAIR_PROVISIONED
-
-    def test_history_timestamps_are_utc(self):
-        sm = TaskStateMachine("t-ts")
-        sm.transition(TaskState.SCHEME_SELECTED)
-        assert sm.history[0].timestamp.tzinfo is not None
-
-    def test_history_empty_initially(self):
-        sm = TaskStateMachine("t-empty")
-        assert sm.history == []
-
-
-class TestTaskStateMachineAcceptanceChecks:
-    """Test acceptance check registration and execution."""
-
-    def test_register_and_run_acceptance_check(self):
-        sm = TaskStateMachine("t-ac")
-
-        def check_fn(ctx):
-            return ctx.get("scheme_id") == "bugfix_standard"
-
-        sm.register_acceptance_check(TaskState.SCHEME_SELECTED, check_fn)
-
-        assert sm.run_acceptance_check(TaskState.SCHEME_SELECTED, {"scheme_id": "bugfix_standard"}) is True
-        assert sm.run_acceptance_check(TaskState.SCHEME_SELECTED, {"scheme_id": "wrong"}) is False
-
-    def test_unregistered_check_returns_true(self):
-        sm = TaskStateMachine("t-no-ac")
-        assert sm.run_acceptance_check(TaskState.EXECUTING, {}) is True
-
-    def test_multiple_checks_independent(self):
-        sm = TaskStateMachine("t-multi-ac")
-        sm.register_acceptance_check(TaskState.SCHEME_SELECTED, lambda ctx: ctx.get("a") is True)
-        sm.register_acceptance_check(TaskState.EXECUTING, lambda ctx: ctx.get("b") is True)
-
-        assert sm.run_acceptance_check(TaskState.SCHEME_SELECTED, {"a": True}) is True
-        assert sm.run_acceptance_check(TaskState.EXECUTING, {"b": False}) is False
-
-
-class TestTaskStateMachineCanTransition:
-    """Test can_transition predicate."""
-
-    def test_can_transition_true(self):
-        sm = TaskStateMachine("t-can")
-        assert sm.can_transition(TaskState.SCHEME_SELECTED) is True
-        assert sm.can_transition(TaskState.ESCALATED) is True
-
-    def test_can_transition_false(self):
-        sm = TaskStateMachine("t-cannot")
-        assert sm.can_transition(TaskState.COMPLETED) is False
-        assert sm.can_transition(TaskState.CI_RUNNING) is False
-
-
-class TestTaskStateMachineSerialization:
-    """Test to_dict and from_dict serialization."""
-
-    def test_round_trip_serialization(self):
-        sm = TaskStateMachine("t-ser")
-        sm.transition(TaskState.SCHEME_SELECTED, {"scheme_id": "bugfix"})
-        sm.transition(TaskState.LAIR_PROVISIONED)
-
-        data = sm.to_dict()
-        assert data["task_id"] == "t-ser"
-        assert data["current_state"] == "lair_provisioned"
-        assert len(data["history"]) == 2
-
-        restored = TaskStateMachine.from_dict(data)
-        assert restored.task_id == "t-ser"
-        assert restored.current_state == TaskState.LAIR_PROVISIONED
-        assert len(restored.history) == 2
-        assert restored.history[0].to_state == TaskState.SCHEME_SELECTED
-        assert restored.history[0].metadata == {"scheme_id": "bugfix"}
-
-    def test_from_dict_empty_history(self):
-        data = {"task_id": "t-empty", "current_state": "received", "history": []}
-        sm = TaskStateMachine.from_dict(data)
-        assert sm.task_id == "t-empty"
-        assert sm.current_state == TaskState.RECEIVED
-        assert sm.history == []
-
-    def test_to_dict_timestamps_are_iso_strings(self):
-        sm = TaskStateMachine("t-iso")
-        sm.transition(TaskState.SCHEME_SELECTED)
-        data = sm.to_dict()
-        ts = data["history"][0]["timestamp"]
-        # Should be parseable as ISO 8601
-        parsed = datetime.fromisoformat(ts)
-        assert parsed.tzinfo is not None
-
-
-class TestTaskStateMachineCrashRecovery:
-    """Test get_recovery_state."""
-
-    def test_recovery_with_all_checks_passing(self):
-        sm = TaskStateMachine("t-rec")
-        sm.transition(TaskState.SCHEME_SELECTED, {"ok": True})
-        sm.transition(TaskState.LAIR_PROVISIONED, {"ok": True})
-        sm.transition(TaskState.DOSSIER_BUILT, {"ok": True})
-        # No acceptance checks registered -> all pass -> last state returned
-        assert sm.get_recovery_state() == TaskState.DOSSIER_BUILT
-
-    def test_recovery_skips_failed_check(self):
-        sm = TaskStateMachine("t-rec-fail")
-        sm.transition(TaskState.SCHEME_SELECTED, {"ok": True})
-        sm.transition(TaskState.LAIR_PROVISIONED, {"ok": True})
-        sm.transition(TaskState.DOSSIER_BUILT, {"ok": False})
-
-        # Register check that fails for DOSSIER_BUILT
-        sm.register_acceptance_check(TaskState.DOSSIER_BUILT, lambda ctx: ctx.get("ok") is True)
-        # DOSSIER_BUILT fails acceptance -> falls back to LAIR_PROVISIONED
-        assert sm.get_recovery_state() == TaskState.LAIR_PROVISIONED
-
-    def test_recovery_empty_history_returns_received(self):
-        sm = TaskStateMachine("t-rec-empty")
-        assert sm.get_recovery_state() == TaskState.RECEIVED
-
-    def test_recovery_all_checks_fail_returns_received(self):
-        sm = TaskStateMachine("t-rec-all-fail")
-        sm.transition(TaskState.SCHEME_SELECTED, {})
-        sm.transition(TaskState.LAIR_PROVISIONED, {})
-        sm.register_acceptance_check(TaskState.SCHEME_SELECTED, lambda ctx: False)
-        sm.register_acceptance_check(TaskState.LAIR_PROVISIONED, lambda ctx: False)
-        assert sm.get_recovery_state() == TaskState.RECEIVED
 
 
 # ===========================================================================
@@ -719,9 +547,9 @@ class TestMastermindHandleTask:
         assert result["scheme_id"] == "bugfix_standard"
         assert result["status"] == "completed"
 
-        # Verify state machine was tracked
-        sm = agent._active_tasks["task-001"]
-        assert sm.current_state == TaskState.COMPLETED
+        # Verify the task was tracked in the in-memory active set.
+        # Authoritative state lives in Firestore `task_executions/{task_id}`.
+        assert "task-001" in agent._active_tasks
 
     @pytest.mark.asyncio
     @patch("henchmen.mastermind.agent.DossierBuilder")

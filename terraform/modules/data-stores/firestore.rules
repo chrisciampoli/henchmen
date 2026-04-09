@@ -1,0 +1,25 @@
+// Henchmen Firestore Security Rules stub.
+//
+// IAM bindings at the project level (google_project_iam_member) cannot
+// express collection-level authorization for Firestore. Least-privilege
+// access for the Mastermind service account is enforced here instead.
+//
+// This file is NOT deployed by terraform today. It must be deployed via:
+//   1. The Firebase CLI:  firebase deploy --only firestore:rules
+//   2. Or a `google_firebaserules_ruleset` + `google_firebaserules_release`
+//      resource wired up in terraform — out of scope for finding A5.
+//
+// The rule below is intentionally minimal. Expand it per collection as the
+// mastermind's data model is split out of the monolithic /tasks collection.
+
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Only the mastermind service account may read or write any document.
+    // Replace <project> at deploy time with the actual GCP project ID, e.g.:
+    //   sa-dev-mastermind@my-gcp-project.iam.gserviceaccount.com
+    allow read, write: if request.auth != null
+      && request.auth.token.email.matches('sa-.*-mastermind@<project>\\.iam\\.gserviceaccount\\.com');
+  }
+}

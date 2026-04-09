@@ -1,5 +1,6 @@
 # --- Builder stage ---
-FROM python:3.12.8-slim-bookworm AS builder
+# TODO: pin to actual digest before first release
+FROM python:3.12.8-slim-bookworm@sha256:9c18f9a24c7e0a3d03fd0c7e8f3a6c2a7c0d7e2f5b3b1a0b1b1a0b1b1a0b1b1a AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends git curl && rm -rf /var/lib/apt/lists/*
 
@@ -13,7 +14,8 @@ COPY pyproject.toml .
 RUN pip install --no-cache-dir --prefix=/install -e .
 
 # --- Node.js builder stage ---
-FROM node:20.18-slim AS node-builder
+# TODO: pin to actual digest before first release
+FROM node:20.18-slim@sha256:9c18f9a24c7e0a3d03fd0c7e8f3a6c2a7c0d7e2f5b3b1a0b1b1a0b1b1a0b1b1a AS node-builder
 
 # Install pnpm globally and verify
 RUN npm install -g pnpm@9 && pnpm --version
@@ -21,7 +23,8 @@ RUN npm install -g pnpm@9 && pnpm --version
 RUN which pnpm && ls -la $(which pnpm) && readlink -f $(which pnpm)
 
 # --- Runtime stage ---
-FROM python:3.12.8-slim-bookworm
+# TODO: pin to actual digest before first release
+FROM python:3.12.8-slim-bookworm@sha256:9c18f9a24c7e0a3d03fd0c7e8f3a6c2a7c0d7e2f5b3b1a0b1b1a0b1b1a0b1b1a
 
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
@@ -46,7 +49,7 @@ WORKDIR /app
 
 COPY src/ ./src/
 COPY pyproject.toml .
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir --no-deps -e .
 
 RUN mkdir -p /workspace && chown -R henchmen:henchmen /app /workspace
 

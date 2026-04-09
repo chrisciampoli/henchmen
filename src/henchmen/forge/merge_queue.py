@@ -2,10 +2,13 @@
 
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from henchmen.providers.interfaces.document_store import DocumentStore
+
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +25,7 @@ _MERGING_TTL = timedelta(minutes=30)
 class MergeQueue:
     """FIFO merge serialization for parallel Operatives using DocumentStore."""
 
-    def __init__(self, settings: Any, document_store: DocumentStore | None = None) -> None:
+    def __init__(self, settings: "Settings", document_store: DocumentStore | None = None) -> None:
         self.settings = settings
         self._document_store = document_store
 
@@ -50,10 +53,23 @@ class MergeQueue:
         return entry_id
 
     async def dequeue(self) -> dict[str, Any] | None:
-        """Get the next PR to merge (FIFO). Returns None if queue empty or another merge in progress.
+        """Get the next PR to merge (FIFO). Returns None if queue empty or a merge is in progress.
 
-        Checks for active merges first, then atomically claims the next pending entry,
-        preventing race conditions when multiple callers attempt to dequeue concurrently.
+        Best-effort FIFO serialization: queries merging entries, then pending
+        entries, then updates the winner to ``merging``.  These three steps are
+        NOT wrapped in a transaction, so two Forge replicas running ``dequeue``
+        concurrently can race and both pick the same pending entry.  Final
+        merge conflicts are resolved downstream by GitHub's merge API, which
+        is the authoritative serialization point — the worst case here is a
+        wasted merge attempt that GitHub rejects with a 409 or a stale-head
+        error.
+
+        # TODO(E7-transaction): replace with a proper conditional write once
+        # the DocumentStore protocol grows a transaction / compare-and-set
+        # primitive.  Firestore supports this natively; SQLite can emulate it
+        # with a ``WHERE status = 'pending'`` update; DynamoDB has
+        # ``ConditionExpression``.  The current interface has none of these,
+        # so we accept the race and rely on GitHub's server-side merge lock.
         """
         store = self._get_store()
 
@@ -83,7 +99,9 @@ class MergeQueue:
         candidate = pending_docs[0]
         entry_id = candidate["id"]
 
-        # Atomically claim the entry
+        # Best-effort claim — see docstring, this update is NOT atomic with
+        # the preceding query and two callers can race here.
+        # TODO(E7-transaction): make this a conditional write.
         await store.update(
             _COLLECTION,
             entry_id,

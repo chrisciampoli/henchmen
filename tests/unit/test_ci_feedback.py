@@ -4,16 +4,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from henchmen.config.settings import Settings
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _mock_settings():
-    s = MagicMock()
-    s.gcp_project_id = "test-project"
-    s.firestore_database = "(default)"
-    return s
+#
+# Settings are provided via the shared ``mock_settings`` fixture in
+# ``tests/conftest.py`` — do NOT reintroduce a local ``_mock_settings()``
+# helper. New tests should take ``mock_settings`` as a parameter.
 
 
 def _make_mock_store() -> MagicMock:
@@ -27,11 +26,11 @@ def _make_mock_store() -> MagicMock:
     return store
 
 
-def _make_tracker(store: MagicMock | None = None):
+def _make_tracker(settings: Settings, store: MagicMock | None = None):
     from henchmen.observability.tracker import TaskTracker
 
     mock_store = store or _make_mock_store()
-    return TaskTracker(_mock_settings(), document_store=mock_store)
+    return TaskTracker(settings, document_store=mock_store)
 
 
 # ---------------------------------------------------------------------------
@@ -40,10 +39,11 @@ def _make_tracker(store: MagicMock | None = None):
 
 
 class TestRecordCIFixAttempt:
-    async def test_increments_and_sets_in_progress(self):
+    @pytest.mark.asyncio
+    async def test_increments_and_sets_in_progress(self, mock_settings):
         store = _make_mock_store()
         store.get = AsyncMock(return_value={"ci_fix_attempts": 1})
-        tracker = _make_tracker(store)
+        tracker = _make_tracker(mock_settings, store)
         await tracker.record_ci_fix_attempt("task-123")
 
         store.update.assert_called_once()
@@ -51,10 +51,11 @@ class TestRecordCIFixAttempt:
         assert update_data["ci_fix_attempts"] == 2  # incremented from 1
         assert update_data["ci_fix_in_progress"] is True
 
-    async def test_firestore_error_does_not_raise(self):
+    @pytest.mark.asyncio
+    async def test_firestore_error_does_not_raise(self, mock_settings):
         store = _make_mock_store()
         store.update = AsyncMock(side_effect=Exception("Store down"))
-        tracker = _make_tracker(store)
+        tracker = _make_tracker(mock_settings, store)
         # Should not raise
         await tracker.record_ci_fix_attempt("task-123")
 
@@ -65,19 +66,21 @@ class TestRecordCIFixAttempt:
 
 
 class TestClearCIFixInProgress:
-    async def test_sets_in_progress_false(self):
+    @pytest.mark.asyncio
+    async def test_sets_in_progress_false(self, mock_settings):
         store = _make_mock_store()
-        tracker = _make_tracker(store)
+        tracker = _make_tracker(mock_settings, store)
         await tracker.clear_ci_fix_in_progress("task-123")
 
         store.update.assert_called_once()
         _coll, _id, update_data = store.update.call_args[0]
         assert update_data["ci_fix_in_progress"] is False
 
-    async def test_firestore_error_does_not_raise(self):
+    @pytest.mark.asyncio
+    async def test_firestore_error_does_not_raise(self, mock_settings):
         store = _make_mock_store()
         store.update = AsyncMock(side_effect=Exception("Store down"))
-        tracker = _make_tracker(store)
+        tracker = _make_tracker(mock_settings, store)
         # Should not raise
         await tracker.clear_ci_fix_in_progress("task-123")
 
@@ -88,27 +91,30 @@ class TestClearCIFixInProgress:
 
 
 class TestGetTaskByIdPrefix:
-    async def test_returns_dict_when_found(self):
+    @pytest.mark.asyncio
+    async def test_returns_dict_when_found(self, mock_settings):
         store = _make_mock_store()
         store.query = AsyncMock(return_value=[{"task_id": "abc-1234-xyz", "title": "Fix bug"}])
-        tracker = _make_tracker(store)
+        tracker = _make_tracker(mock_settings, store)
 
         result = await tracker.get_task_by_id_prefix("abc-1234")
         assert result is not None
         assert result["task_id"] == "abc-1234-xyz"
 
-    async def test_returns_none_when_not_found(self):
+    @pytest.mark.asyncio
+    async def test_returns_none_when_not_found(self, mock_settings):
         store = _make_mock_store()
         store.query = AsyncMock(return_value=[])
-        tracker = _make_tracker(store)
+        tracker = _make_tracker(mock_settings, store)
 
         result = await tracker.get_task_by_id_prefix("nonexistent-prefix")
         assert result is None
 
-    async def test_firestore_error_returns_none(self):
+    @pytest.mark.asyncio
+    async def test_firestore_error_returns_none(self, mock_settings):
         store = _make_mock_store()
         store.query = AsyncMock(side_effect=Exception("Store down"))
-        tracker = _make_tracker(store)
+        tracker = _make_tracker(mock_settings, store)
 
         result = await tracker.get_task_by_id_prefix("abc-1234")
         assert result is None
@@ -120,11 +126,12 @@ class TestGetTaskByIdPrefix:
 
 
 class TestStartTaskCIFixFields:
-    async def test_start_task_includes_ci_fix_attempts(self):
+    @pytest.mark.asyncio
+    async def test_start_task_includes_ci_fix_attempts(self, mock_settings):
         from henchmen.models.task import HenchmenTask, TaskContext, TaskSource
 
         store = _make_mock_store()
-        tracker = _make_tracker(store)
+        tracker = _make_tracker(mock_settings, store)
         task = HenchmenTask(
             source=TaskSource.SLACK,
             source_id="C01234567/1700000000.000001",
@@ -247,15 +254,14 @@ class TestCIFailureWebhook:
 
 
 class TestHandleCIFailure:
-    def _make_agent(self):
+    def _make_agent(self, settings):
         from henchmen.mastermind.agent import MastermindAgent
 
         store = _make_mock_store()
-        agent = MastermindAgent(settings=_mock_settings(), document_store=store)
-        return agent
+        return MastermindAgent(settings=settings, document_store=store)
 
     @pytest.mark.asyncio
-    async def test_dispatches_fix_on_first_failure(self):
+    async def test_dispatches_fix_on_first_failure(self, mock_settings):
         from unittest.mock import AsyncMock
         from unittest.mock import patch as _patch
 
@@ -271,7 +277,7 @@ class TestHandleCIFailure:
             ]
             mock_format.return_value = "## lint\n- `foo.py:10`: err"
 
-            agent = self._make_agent()
+            agent = self._make_agent(mock_settings)
             agent.tracker.get_task_by_id_prefix = AsyncMock(
                 return_value={
                     "task_id": "full-task-id",
@@ -291,8 +297,8 @@ class TestHandleCIFailure:
             agent.tracker.record_ci_fix_attempt.assert_called_once_with("full-task-id")
 
     @pytest.mark.asyncio
-    async def test_escalates_after_max_retries(self):
-        agent = self._make_agent()
+    async def test_escalates_after_max_retries(self, mock_settings):
+        agent = self._make_agent(mock_settings)
         agent.tracker.get_task_by_id_prefix = AsyncMock(
             return_value={
                 "task_id": "full-task-id",
@@ -309,8 +315,8 @@ class TestHandleCIFailure:
         agent.tracker.record_ci_result.assert_called_once_with("full-task-id", False)
 
     @pytest.mark.asyncio
-    async def test_skips_if_fix_in_progress(self):
-        agent = self._make_agent()
+    async def test_skips_if_fix_in_progress(self, mock_settings):
+        agent = self._make_agent(mock_settings)
         agent.tracker.get_task_by_id_prefix = AsyncMock(
             return_value={
                 "task_id": "full-task-id",
@@ -325,7 +331,7 @@ class TestHandleCIFailure:
         assert result["reason"] == "fix in progress"
 
     @pytest.mark.asyncio
-    async def test_skips_if_no_errors(self):
+    async def test_skips_if_no_errors(self, mock_settings):
         from unittest.mock import patch as _patch
 
         with (
@@ -334,7 +340,7 @@ class TestHandleCIFailure:
         ):
             mock_extract.return_value = []
 
-            agent = self._make_agent()
+            agent = self._make_agent(mock_settings)
             agent.tracker.get_task_by_id_prefix = AsyncMock(
                 return_value={
                     "task_id": "full-task-id",
@@ -349,8 +355,8 @@ class TestHandleCIFailure:
             assert result["reason"] == "no errors found"
 
     @pytest.mark.asyncio
-    async def test_skips_if_task_not_found(self):
-        agent = self._make_agent()
+    async def test_skips_if_task_not_found(self, mock_settings):
+        agent = self._make_agent(mock_settings)
         agent.tracker.get_task_by_id_prefix = AsyncMock(return_value=None)
 
         result = await agent.handle_ci_failure("nonexistent", "org/repo", "henchmen/nonexistent", 999)

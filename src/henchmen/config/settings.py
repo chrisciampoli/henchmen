@@ -16,7 +16,7 @@ class Environment(StrEnum):
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="HENCHMEN_",
-        env_file=".env",
+        env_file=(".env.local", ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -106,6 +106,9 @@ class Settings(BaseSettings):
     jira_email: str = Field(default="", description="Jira service account email")
     jira_api_token_secret: str = Field(default="", description="Secret Manager resource name for Jira API token")
     jira_project_key: str = Field(default="", description="Default Jira project key")
+    jira_webhook_secret: str = Field(
+        default="", description="Shared secret for Jira webhook HMAC verification (X-Atlassian-Webhook-Signature)"
+    )
 
     # Vertex AI model names
     vertex_ai_model_complex: str = Field(default="gemini-2.5-pro", description="Model for complex reasoning tasks")
@@ -114,6 +117,40 @@ class Settings(BaseSettings):
     # Operative context limits (token-based)
     operative_max_system_tokens: int = Field(default=20_000, description="Max tokens for system prompt")
     operative_max_message_tokens: int = Field(default=16_000, description="Max tokens for a single message")
+
+    # Operative cost ceilings (L5 fix: task-level ceiling spans all nodes)
+    operative_task_cost_ceiling_usd: float = Field(
+        default=6.0,
+        description="Maximum cumulative cost in USD for a single task across all scheme nodes.",
+    )
+    operative_wallclock_ceiling_seconds: int = Field(
+        default=1800,
+        description="Wall-clock ceiling (seconds) used as a cost proxy for free local providers (e.g. Ollama).",
+    )
+
+    # Operative liveness (K5 fix: intra-node heartbeat)
+    operative_heartbeat_interval_seconds: int = Field(
+        default=60,
+        description="Interval between intra-node heartbeat writes from the operative to Firestore.",
+    )
+
+    # Pub/Sub push authentication (A6 fix: in-app OIDC verification)
+    pubsub_oidc_audience: str = Field(
+        default="",
+        description=(
+            "Expected 'aud' claim on OIDC tokens presented by Pub/Sub push subscriptions. "
+            "Must match the value configured on the subscription. Empty in DEV disables "
+            "verification with a logged warning; empty in STAGING/PROD causes 401."
+        ),
+    )
+    pubsub_oidc_allowed_emails: str = Field(
+        default="",
+        description=(
+            "Comma-separated allow-list of publisher service-account emails. "
+            "When set, the OIDC 'email' claim on incoming push requests must match. "
+            "Leave empty to allow any valid token for the configured audience."
+        ),
+    )
 
     # Vertex AI context caching
     vertex_ai_context_cache_enabled: bool = Field(default=True, description="Enable Gemini context caching")
@@ -159,6 +196,25 @@ class Settings(BaseSettings):
     # Direct API keys (used when llm_provider=openai or anthropic)
     openai_api_key: str = Field(default="", description="OpenAI API key")
     anthropic_api_key: str = Field(default="", description="Anthropic API key")
+
+    # OpenAI model tier mapping (L10 fix — avoid hard-coded model names in providers)
+    openai_model_complex: str = Field(default="gpt-4.1", description="OpenAI model used for the COMPLEX tier")
+    openai_model_light: str = Field(default="gpt-4.1-mini", description="OpenAI model used for the LIGHT tier")
+    openai_model_reasoning: str = Field(default="o3", description="OpenAI model used for the REASONING tier")
+
+    # Anthropic model tier mapping (L10 fix — avoid hard-coded model names in providers)
+    anthropic_model_complex: str = Field(
+        default="claude-sonnet-4-6-20250514",
+        description="Anthropic model used for the COMPLEX tier",
+    )
+    anthropic_model_light: str = Field(
+        default="claude-haiku-4-5-20251001",
+        description="Anthropic model used for the LIGHT tier",
+    )
+    anthropic_model_reasoning: str = Field(
+        default="claude-opus-4-6-20250514",
+        description="Anthropic model used for the REASONING tier",
+    )
 
     # Lair (Cloud Run operative) defaults
     lair_default_cpu: str = Field(default="4", description="Default vCPU allocation for operative containers")

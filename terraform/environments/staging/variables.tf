@@ -10,7 +10,7 @@ variable "region" {
 }
 
 variable "environment" {
-  description = "The deployment environment"
+  description = "The deployment environment. Set in staging.auto.tfvars."
   type        = string
   default     = "staging"
   validation {
@@ -39,4 +39,35 @@ variable "container_image_tag" {
   description = "Container image tag to deploy (e.g. a git short SHA or 'latest')"
   type        = string
   default     = "latest"
+}
+
+# ---------------------------------------------------------------------------
+# Per-environment overrides (values in staging.auto.tfvars).
+# ---------------------------------------------------------------------------
+
+variable "lair_cpu" {
+  description = "CPU limit for each Operative Lair container"
+  type        = string
+}
+
+variable "lair_memory" {
+  description = "Memory limit for each Operative Lair container"
+  type        = string
+}
+
+variable "allowlist_cidrs" {
+  description = "Additional egress CIDR ranges to allow"
+  type        = list(string)
+  default     = []
+}
+
+variable "scheduler_enabled" {
+  description = "Whether to provision periodic Cloud Scheduler jobs"
+  type        = bool
+}
+
+variable "enable_cloud_build" {
+  description = "Whether to provision Cloud Build triggers"
+  type        = bool
+  default     = false
 }

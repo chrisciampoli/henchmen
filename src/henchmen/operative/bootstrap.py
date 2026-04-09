@@ -4,9 +4,11 @@ Lifecycle: SPAWN → INITIALIZE → EXECUTE → REPORT → TERMINATE
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
+import signal
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -15,13 +17,19 @@ from typing import Any
 import henchmen.schemes.bugfix_standard  # noqa: F401
 import henchmen.schemes.feature_standard  # noqa: F401
 import henchmen.schemes.goal_decomposition  # noqa: F401
-from henchmen.config.settings import get_settings
+from henchmen.config.settings import Settings, get_settings
 from henchmen.models.operative import OperativeConfig, OperativeReport, OperativeStatus
 from henchmen.operative.agent_builder import build_operative_agent
 from henchmen.providers.interfaces import MessageBroker, ObjectStore
+from henchmen.providers.interfaces.document_store import DocumentStore
 from henchmen.providers.registry import ProviderRegistry
+from henchmen.utils.git import clone_repo
 
 logger = logging.getLogger(__name__)
+
+# Firestore collection written by the heartbeat and partial report paths.
+# Kept aligned with ``henchmen.observability.tracker._COLLECTION``.
+_TASK_EXECUTIONS_COLLECTION = "task_executions"
 
 
 class _SecretRedactionFilter(logging.Filter):
@@ -43,6 +51,59 @@ class _SecretRedactionFilter(logging.Filter):
         return True
 
 
+async def _heartbeat_loop(
+    document_store: DocumentStore,
+    task_id: str,
+    interval_seconds: int,
+) -> None:
+    """Write ``last_heartbeat`` to the task document on a fixed cadence.
+
+    Runs as a background task alongside the agent loop so the Mastermind
+    watchdog can distinguish a live-but-slow operative from a dead one.
+    Any Firestore write failures are swallowed — observability must never
+    crash the operative.
+    """
+    while True:
+        try:
+            await document_store.update(
+                _TASK_EXECUTIONS_COLLECTION,
+                task_id,
+                {"last_heartbeat": datetime.now(UTC)},
+            )
+        except Exception as exc:
+            logger.debug("Heartbeat write failed (non-fatal): %s", exc)
+        try:
+            await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            raise
+
+
+async def _persist_interrupted_report(
+    document_store: DocumentStore,
+    report: OperativeReport,
+) -> None:
+    """Write a partial INTERRUPTED report to the cross-instance document store.
+
+    Used when SIGTERM fires mid-node so the Mastermind pickup path has
+    an authoritative record of the partial work (tokens, files touched)
+    rather than fabricating a FAILED report with zero telemetry.
+    """
+    try:
+        await document_store.update(
+            _TASK_EXECUTIONS_COLLECTION,
+            report.task_id,
+            {
+                "interrupted_node_id": report.node_id,
+                "interrupted_at": datetime.now(UTC),
+                "interrupted_report": report.model_dump(mode="json"),
+                "execution_state": "interrupted",
+            },
+        )
+        logger.info("Persisted interrupted report for task %s node %s", report.task_id, report.node_id)
+    except Exception as exc:
+        logger.warning("Failed to persist interrupted report: %s", exc)
+
+
 async def run_operative() -> None:
     """Main operative lifecycle: SPAWN → INITIALIZE → EXECUTE → REPORT → TERMINATE"""
     settings = get_settings()
@@ -57,6 +118,12 @@ async def run_operative() -> None:
     broker = registry.get_message_broker()
     object_store = registry.get_object_store()
     llm_provider = registry.get_llm_provider()
+    document_store: DocumentStore | None
+    try:
+        document_store = registry.get_document_store()
+    except Exception as exc:
+        logger.warning("Document store unavailable (heartbeat/accumulator disabled): %s", exc)
+        document_store = None
 
     # 1. Read config from environment
     config = OperativeConfig(
@@ -68,6 +135,25 @@ async def run_operative() -> None:
     operative_id = os.environ.get("OPERATIVE_ID", f"op-{config.task_id}-{config.node_id}")
 
     started_at = datetime.now(UTC)
+
+    # ------------------------------------------------------------------
+    # K5 fix: install SIGTERM handler for graceful shutdown on Cloud Run
+    # eviction. Cloud Run Jobs send SIGTERM followed by SIGKILL after 10s,
+    # so we need to exit the agent loop cleanly before the kill fires.
+    # ------------------------------------------------------------------
+    shutdown_event = asyncio.Event()
+
+    def _sigterm_handler() -> None:
+        logger.warning("[operative] SIGTERM received, initiating graceful shutdown")
+        shutdown_event.set()
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)
+    except NotImplementedError:
+        # Windows doesn't support add_signal_handler — skip gracefully
+        # (matches the pattern used in mastermind/server.py lifespan).
+        logger.debug("add_signal_handler not supported on this platform; SIGTERM handler disabled")
 
     # 2. INITIALIZE: Clone repo, download dossier, set up workspace
     workspace_dir = await initialize_workspace(config, settings, object_store=object_store)
@@ -84,14 +170,47 @@ async def run_operative() -> None:
         fh.write(file_context)
     os.environ["FILE_CONTEXT_PATH"] = file_context_path
 
+    # ------------------------------------------------------------------
+    # Start the heartbeat task. We hold a strong reference so the event
+    # loop can't GC it mid-flight, and cancel it explicitly when the
+    # agent loop exits.
+    # ------------------------------------------------------------------
+    heartbeat_task: asyncio.Task[None] | None = None
+    if document_store is not None:
+        heartbeat_task = asyncio.create_task(
+            _heartbeat_loop(
+                document_store,
+                config.task_id,
+                settings.operative_heartbeat_interval_seconds,
+            ),
+            name=f"heartbeat-{config.task_id[:8]}",
+        )
+
+        def _log_heartbeat_exit(t: asyncio.Task[None]) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.debug("Heartbeat task exited with exception: %s", exc)
+
+        heartbeat_task.add_done_callback(_log_heartbeat_exit)
+
     # 3. EXECUTE: Build and run the agent
+    interrupted = False
     try:
-        agent = await build_operative_agent(config, workspace_dir, settings, llm_provider=llm_provider)
+        agent = await build_operative_agent(
+            config,
+            workspace_dir,
+            settings,
+            llm_provider=llm_provider,
+            document_store=document_store,
+            shutdown_event=shutdown_event,
+        )
         result = await agent.run()  # Returns dict with git_diff, summary, files_changed, confidence
 
         # Always check for changes — even if agent didn't report them
         # (Gemini may have edited files without calling git_commit)
-        branch_name = f"henchmen/{config.task_id[:8]}"
+        branch_name = config.branch_name
         has_changes = await _check_for_changes(workspace_dir)
         if has_changes:
             await _create_branch_and_push(workspace_dir, branch_name)
@@ -101,8 +220,16 @@ async def run_operative() -> None:
         else:
             logger.info("No changes detected in workspace — skipping branch push")
 
-        # Check for blocked status (agent encountered an unresolvable condition)
-        if result.get("blocked"):
+        # Interrupt takes precedence over blocked/completed: the agent exited
+        # early on SIGTERM, so we cannot claim the work is finished.
+        if result.get("interrupted"):
+            interrupted = True
+            status = OperativeStatus.INTERRUPTED
+            result["error"] = result.get("error") or "SIGTERM received during node execution"
+            result["summary"] = (
+                result.get("summary") or "Operative interrupted by SIGTERM — partial work preserved"
+            )
+        elif result.get("blocked"):
             status = OperativeStatus.BLOCKED
         else:
             status = OperativeStatus.COMPLETED
@@ -111,7 +238,7 @@ async def run_operative() -> None:
         status = OperativeStatus.TIMED_OUT
         # Still try to push any changes made before timeout
         try:
-            branch_name = f"henchmen/{config.task_id[:8]}"
+            branch_name = config.branch_name
             has_changes = await _check_for_changes(workspace_dir)
             if has_changes:
                 await _create_branch_and_push(workspace_dir, branch_name)
@@ -121,11 +248,22 @@ async def run_operative() -> None:
             pass
     except Exception as e:
         logger.exception("Operative execution failed")
-        result = {"summary": f"Operative failed: {str(e)}", "error": str(e)}
-        status = OperativeStatus.FAILED
+        # If SIGTERM had already fired, classify this as INTERRUPTED rather
+        # than FAILED — a raised exception during graceful shutdown is
+        # expected (e.g. an in-flight HTTP call cancelled by the shutdown).
+        if shutdown_event.is_set():
+            interrupted = True
+            status = OperativeStatus.INTERRUPTED
+            result = {
+                "summary": "Operative interrupted by SIGTERM — partial work preserved",
+                "error": f"SIGTERM received during node execution: {e}",
+            }
+        else:
+            result = {"summary": f"Operative failed: {str(e)}", "error": str(e)}
+            status = OperativeStatus.FAILED
         # Still try to push any changes made before failure
         try:
-            branch_name = f"henchmen/{config.task_id[:8]}"
+            branch_name = config.branch_name
             has_changes = await _check_for_changes(workspace_dir)
             if has_changes:
                 await _create_branch_and_push(workspace_dir, branch_name)
@@ -133,6 +271,13 @@ async def run_operative() -> None:
                 logger.info("Pushed changes despite error")
         except Exception:
             pass
+    finally:
+        # Cancel the heartbeat before we publish — we don't want a post-report
+        # heartbeat write racing with TaskTracker.finalize_task.
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await heartbeat_task
 
     # 4. REPORT: Publish result
     completed_at = datetime.now(UTC)
@@ -161,6 +306,13 @@ async def run_operative() -> None:
         tool_calls_detail=telemetry.get("tool_calls_detail", {}),
         wall_clock_seconds=wall_clock_seconds,
     )
+
+    # Persist a partial INTERRUPTED record to the cross-instance document
+    # store BEFORE publishing so the Mastermind pickup path has authoritative
+    # state even if the broker publish is killed by SIGKILL.
+    if interrupted and document_store is not None:
+        await _persist_interrupted_report(document_store, report)
+
     await publish_report(report, settings, broker=broker)
 
 
@@ -350,7 +502,9 @@ async def _build_file_context(workspace_dir: str, task_title: str, task_descript
     return context
 
 
-async def initialize_workspace(config: OperativeConfig, settings: Any, object_store: ObjectStore | None = None) -> str:
+async def initialize_workspace(
+    config: OperativeConfig, settings: Settings, object_store: ObjectStore | None = None
+) -> str:
     """Clone repo (or restore from GCS cache), checkout branch, download dossier."""
     workspace = f"/workspace/{config.task_id}"
     os.makedirs(workspace, exist_ok=True)
@@ -367,36 +521,26 @@ async def initialize_workspace(config: OperativeConfig, settings: Any, object_st
         logger.info("Restoring workspace from snapshot cache: %s", snapshot_uri)
         await cache.restore_snapshot(snapshot_uri, workspace)
     elif repo_url:
-        # Build authenticated clone URL
+        # Normalize repo_url to "owner/repo" form expected by clone_repo.
         github_token = os.environ.get("GITHUB_TOKEN", "")
-        if github_token and repo_url.startswith("https://github.com"):
-            clone_url = repo_url.replace("https://", f"https://x-access-token:{github_token}@")
-        elif github_token and "/" in repo_url and not repo_url.startswith("http"):
-            # "owner/repo" format — build full authenticated URL
-            clone_url = f"https://x-access-token:{github_token}@github.com/{repo_url}.git"
-        elif not repo_url.startswith("http") and "/" in repo_url:
-            # "owner/repo" without token
-            clone_url = f"https://github.com/{repo_url}.git"
+        if repo_url.startswith("https://github.com/"):
+            repo_slug = repo_url[len("https://github.com/") :]
+            if repo_slug.endswith(".git"):
+                repo_slug = repo_slug[: -len(".git")]
         else:
-            clone_url = repo_url
+            repo_slug = repo_url
 
         # Use deeper clone for feature branches so we have origin/main for diffing
-        depth = "50" if branch.startswith("henchmen/") else "1"
+        depth = 50 if branch.startswith("henchmen/") else 1
         logger.info("Cloning repo %s (branch: %s, depth: %s)", repo_url, branch, depth)
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "clone",
-            f"--depth={depth}",
-            "--branch",
+        await clone_repo(
+            repo_slug,
             branch,
-            clone_url,
             workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            token=github_token or None,
+            depth=depth,
+            single_branch=False,
         )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"git clone failed: {stderr.decode()}")
     else:
         logger.warning("No REPO_URL set; workspace will be empty")
 
@@ -417,7 +561,7 @@ async def initialize_workspace(config: OperativeConfig, settings: Any, object_st
         await proc.communicate()
 
     # Create the henchmen feature branch so agent commits land on a branch, not main
-    branch_name = f"henchmen/{config.task_id[:8]}"
+    branch_name = config.branch_name
     proc = await asyncio.create_subprocess_exec(
         "git",
         "checkout",
@@ -485,7 +629,7 @@ async def _check_for_changes(workspace_dir: str) -> bool:
         )
         stdout, _ = await proc.communicate()
         if stdout.strip():
-            print("[OPERATIVE] Uncommitted changes detected", flush=True)
+            logger.info("[OPERATIVE] Uncommitted changes detected")
             return True
 
         # Check if current branch has commits ahead of origin/main (agent committed on the branch)
@@ -501,7 +645,7 @@ async def _check_for_changes(workspace_dir: str) -> bool:
         stdout, _ = await proc.communicate()
         count = stdout.decode().strip()
         if count.isdigit() and int(count) > 0:
-            print(f"[OPERATIVE] Branch has {count} commit(s) ahead of origin/main", flush=True)
+            logger.info("[OPERATIVE] Branch has %s commit(s) ahead of origin/main", count)
             return True
 
         return False
@@ -512,7 +656,6 @@ async def _check_for_changes(workspace_dir: str) -> bool:
 
 async def _create_branch_and_push(workspace_dir: str, branch_name: str) -> None:
     """Create a git branch, commit any uncommitted changes, and push to origin."""
-    import sys
 
     async def _git(*args: str) -> tuple[str, str, int]:
         proc = await asyncio.create_subprocess_exec(
@@ -557,17 +700,17 @@ async def _create_branch_and_push(workspace_dir: str, branch_name: str) -> None:
         commit_msg = f"fix: automated changes by Henchmen operative\n\nBranch: {branch_name}"
         _, err, rc = await _git("commit", "-m", commit_msg)
         if rc != 0:
-            print(f"[OPERATIVE] git commit failed: {err}", file=sys.stderr, flush=True)
+            logger.error("[OPERATIVE] git commit failed: %s", err)
     else:
-        print("[OPERATIVE] No staged changes to commit (agent already committed)", flush=True)
+        logger.info("[OPERATIVE] No staged changes to commit (agent already committed)")
 
     # Always push — even if we didn't commit, the agent's earlier commits need to be pushed
     out, err, rc = await _git("push", "-u", "origin", branch_name)
     if rc != 0:
-        print(f"[OPERATIVE] git push failed: {err}", file=sys.stderr, flush=True)
+        logger.error("[OPERATIVE] git push failed: %s", err)
         raise RuntimeError(f"git push failed: {err}")
 
-    print(f"[OPERATIVE] Pushed branch {branch_name} to origin", flush=True)
+    logger.info("[OPERATIVE] Pushed branch %s to origin", branch_name)
 
 
 async def download_dossier(uri: str, workspace: str, object_store: ObjectStore | None = None) -> None:
@@ -612,7 +755,7 @@ async def download_dossier(uri: str, workspace: str, object_store: ObjectStore |
     logger.info("Downloaded dossier from %s → %s", uri, dest_path)
 
 
-async def publish_report(report: OperativeReport, settings: Any, broker: MessageBroker | None = None) -> None:
+async def publish_report(report: OperativeReport, settings: Settings, broker: MessageBroker | None = None) -> None:
     """Publish operative report to the message broker.
 
     Uses the provided MessageBroker provider when available. Falls back to a

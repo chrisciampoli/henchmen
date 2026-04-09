@@ -8,7 +8,7 @@ from henchmen.models.scheme import ArsenalRequirement
 
 
 @dataclass
-class ToolDefinition:
+class ArsenalTool:
     name: str
     description: str
     category: str  # e.g. "code_intel", "code_edit", "git_ops"
@@ -20,11 +20,11 @@ class ToolDefinition:
 class ToolRegistry:
     """Central registry of all available Arsenal tools."""
 
-    _tools: dict[str, ToolDefinition] = {}
+    _tools: dict[str, ArsenalTool] = {}
     _categories: dict[str, list[str]] = {}  # category -> tool names
 
     @classmethod
-    def register(cls, tool_def: ToolDefinition) -> None:
+    def register(cls, tool_def: ArsenalTool) -> None:
         """Register a tool definition."""
         cls._tools[tool_def.name] = tool_def
         if tool_def.category not in cls._categories:
@@ -33,9 +33,9 @@ class ToolRegistry:
             cls._categories[tool_def.category].append(tool_def.name)
 
     @classmethod
-    def get_tools_for_requirement(cls, requirement: ArsenalRequirement) -> list[ToolDefinition]:
+    def get_tools_for_requirement(cls, requirement: ArsenalRequirement) -> list[ArsenalTool]:
         """Filter tools by category membership and destructive flag."""
-        result: list[ToolDefinition] = []
+        result: list[ArsenalTool] = []
         for tool_set in requirement.tool_sets:
             tool_names = cls._categories.get(tool_set, [])
             for name in tool_names:
@@ -48,7 +48,7 @@ class ToolRegistry:
         return result
 
     @classmethod
-    def get_tool(cls, name: str) -> ToolDefinition | None:
+    def get_tool(cls, name: str) -> ArsenalTool | None:
         """Look up a tool by name."""
         return cls._tools.get(name)
 
@@ -92,7 +92,7 @@ def tool(
                 param_info["default"] = param.default
             parameters[param_name] = param_info
 
-        tool_def = ToolDefinition(
+        tool_def = ArsenalTool(
             name=name,
             description=description,
             category=category,

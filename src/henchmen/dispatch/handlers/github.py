@@ -2,10 +2,13 @@
 
 import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from henchmen.dispatch.normalizer import TaskNormalizer
 from henchmen.providers.interfaces.message_broker import MessageBroker
+
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +34,7 @@ def _is_henchmen_pr_comment(payload: dict[str, Any]) -> bool:
 async def handle_github_webhook(
     payload: dict[str, Any],
     normalizer: TaskNormalizer,
-    settings: Any,
+    settings: "Settings",
     broker: MessageBroker | None = None,
 ) -> dict[str, Any]:
     """Process GitHub webhook events.
@@ -82,7 +85,7 @@ def _is_ci_failure_on_henchmen_branch(payload: dict[str, Any]) -> bool:
 
 async def handle_ci_failure_webhook(
     payload: dict[str, Any],
-    settings: Any,
+    settings: "Settings",
     broker: MessageBroker | None = None,
 ) -> dict[str, Any]:
     """Handle a GitHub check_suite failure event on a Henchmen branch."""
@@ -119,7 +122,7 @@ async def handle_ci_failure_webhook(
 
 async def handle_push_embed(
     payload: dict[str, Any],
-    settings: Any,
+    settings: "Settings",
     broker: MessageBroker | None = None,
 ) -> dict[str, Any]:
     """Handle a GitHub push event by requesting an embedding update.

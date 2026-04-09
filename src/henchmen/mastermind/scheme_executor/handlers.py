@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 from henchmen.models.dossier import Dossier
 from henchmen.models.scheme import SchemeNode
 from henchmen.models.task import HenchmenTask
+from henchmen.utils.git import clone_repo
 
 if TYPE_CHECKING:
     from henchmen.mastermind.scheme_executor.executor import SchemeExecutor
@@ -56,13 +57,18 @@ def get_handler(node_id_or_name: str) -> HandlerFn | None:
 async def handle_create_branch(
     executor: SchemeExecutor, node: SchemeNode, task: HenchmenTask, dossier: Dossier
 ) -> dict[str, Any]:
-    """Create a git branch for this task."""
-    branch_name = f"henchmen/{task.id[:8]}"
-    logger.info("Creating branch %s for task %s", branch_name, task.id)
+    """Stub handler — the operative bootstrap is what actually creates the branch.
+
+    Kept so existing schemes that reference the ``create_branch`` node do not
+    break.  Returns the canonical branch name (from
+    :attr:`HenchmenTask.branch_name`) and a pass-through status.
+    """
+    logger.debug("create_branch stub for task %s -> %s", task.id, task.branch_name)
     return {
         "condition": None,  # unconditional next
-        "branch_name": branch_name,
-        "message": f"Branch {branch_name} created",
+        "branch_name": task.branch_name,
+        "status": "ok",
+        "message": f"Branch {task.branch_name} (no-op — created by operative bootstrap)",
     }
 
 
@@ -102,7 +108,7 @@ async def handle_fix_lint(
     This is deterministic — no LLM needed. Auto-fixers handle most lint issues.
     """
     repo = task.context.repo
-    branch = f"henchmen/{task.id[:8]}"
+    branch = task.branch_name
     github_token = os.environ.get("GITHUB_TOKEN", "")
 
     if not repo:
@@ -111,28 +117,10 @@ async def handle_fix_lint(
     workspace = tempfile.mkdtemp(prefix="henchmen-fix-lint-")
     try:
         # Clone the branch
-        clone_url = (
-            f"https://x-access-token:{github_token}@github.com/{repo}.git"
-            if github_token
-            else f"https://github.com/{repo}.git"
-        )
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "clone",
-            "--branch",
-            branch,
-            "--single-branch",
-            clone_url,
-            workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            err = stderr.decode()[:300]
-            if github_token:
-                err = err.replace(github_token, "***")
-            return {"condition": "fail", "message": f"fix_lint failed (clone failed): {err}"}
+        try:
+            await clone_repo(repo, branch, workspace, token=github_token or None)
+        except RuntimeError as exc:
+            return {"condition": "fail", "message": f"fix_lint failed (clone failed): {exc}"}
 
         # Install dependencies
         if os.path.exists(os.path.join(workspace, "package.json")):
@@ -165,7 +153,7 @@ async def handle_fix_lint(
         stdout, stderr = await proc.communicate()
         fix_output = stdout.decode(errors="replace")[:2000]
 
-        print(f"[SCHEME] fix_lint auto-fix ran for task {task.id} (rc={proc.returncode})", flush=True)
+        logger.info("[SCHEME] fix_lint auto-fix ran for task %s (rc=%s)", task.id, proc.returncode)
 
         # Check if any files were changed by the auto-fix
         proc = await asyncio.create_subprocess_exec(
@@ -180,7 +168,7 @@ async def handle_fix_lint(
         changed_files = status_out.decode().strip()
 
         if not changed_files:
-            print("[SCHEME] fix_lint: no files changed by auto-fix", flush=True)
+            logger.info("[SCHEME] fix_lint: no files changed by auto-fix")
             return {"condition": None, "message": "fix_lint: auto-fix made no changes"}
 
         # Commit and push the auto-fixed files
@@ -239,7 +227,7 @@ async def handle_fix_lint(
                 err = err.replace(github_token, "***")
             return {"condition": "fail", "message": f"fix_lint failed (push failed): {err}"}
 
-        print(f"[SCHEME] fix_lint: auto-fixed and pushed for task {task.id}", flush=True)
+        logger.info("[SCHEME] fix_lint: auto-fixed and pushed for task %s", task.id)
         return {
             "condition": None,  # unconditional to run_lint_retry
             "message": "fix_lint: auto-fixed lint issues and pushed",
@@ -311,7 +299,7 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
         check_type: "lint" or "tests"
     """
     repo = task.context.repo
-    branch = f"henchmen/{task.id[:8]}"
+    branch = task.branch_name
     github_token = os.environ.get("GITHUB_TOKEN", "")
 
     if not repo:
@@ -321,29 +309,11 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
     workspace = tempfile.mkdtemp(prefix=f"henchmen-{check_type}-")
     try:
         # Full clone — monorepo turbo builds need all packages, not just the branch tip.
-        clone_url = (
-            f"https://x-access-token:{github_token}@github.com/{repo}.git"
-            if github_token
-            else f"https://github.com/{repo}.git"
-        )
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "clone",
-            "--branch",
-            branch,
-            "--single-branch",
-            clone_url,
-            workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            err = stderr.decode()[:300]
-            if github_token:
-                err = err.replace(github_token, "***")
-            logger.warning("Clone failed for %s check: %s", check_type, err)
-            return {"condition": "fail", "message": f"{check_type} failed (clone failed): {err}"}
+        try:
+            await clone_repo(repo, branch, workspace, token=github_token or None)
+        except RuntimeError as exc:
+            logger.warning("Clone failed for %s check: %s", check_type, exc)
+            return {"condition": "fail", "message": f"{check_type} failed (clone failed): {exc}"}
 
         # Fetch origin/main for diff — must map ref explicitly
         fetch_proc = await asyncio.create_subprocess_exec(
@@ -379,16 +349,17 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
         if is_monorepo:
             affected_packages = await _get_affected_packages(workspace)
             if affected_packages:
-                print(
-                    f"[SCHEME] Scoping {check_type} to affected packages: {affected_packages}",
-                    flush=True,
+                logger.info(
+                    "[SCHEME] Scoping %s to affected packages: %s",
+                    check_type,
+                    affected_packages,
                 )
 
         # Run the check
         if check_type == "lint":
             lint_proc = await _run_lint_check(workspace, is_monorepo, affected_packages)
             if lint_proc is None:
-                print(f"[SCHEME] No lintable files changed for task {task.id}, skipping lint", flush=True)
+                logger.info("[SCHEME] No lintable files changed for task %s, skipping lint", task.id)
                 return {"condition": "pass", "message": "lint passed (no changed files to lint)"}
             proc = lint_proc
         else:  # tests
@@ -421,10 +392,10 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
             output = f"{stdout_text}\n--- stderr ---\n{stderr_text}" if stdout_text.strip() else stderr_text
         passed = proc.returncode == 0
 
-        print(f"[SCHEME] {check_type} {'PASSED' if passed else 'FAILED'} for task {task.id}", flush=True)
+        logger.info("[SCHEME] %s %s for task %s", check_type, "PASSED" if passed else "FAILED", task.id)
         if not passed:
-            print(f"[SCHEME] {check_type} stdout: {stdout_text[:1000]}", flush=True)
-            print(f"[SCHEME] {check_type} stderr: {stderr_text[:1000]}", flush=True)
+            logger.warning("[SCHEME] %s stdout: %s", check_type, stdout_text[:1000])
+            logger.warning("[SCHEME] %s stderr: %s", check_type, stderr_text[:1000])
 
         return {
             "condition": "pass" if passed else "fail",
@@ -513,7 +484,7 @@ async def handle_verify_changes(
 ) -> dict[str, Any]:
     """Deterministic verification: check branch has commits and source file changes."""
     repo = task.context.repo
-    branch = f"henchmen/{task.id[:8]}"
+    branch = task.branch_name
     github_token = os.environ.get("GITHUB_TOKEN", "")
 
     if not repo:
@@ -521,30 +492,12 @@ async def handle_verify_changes(
 
     workspace = tempfile.mkdtemp(prefix="henchmen-verify-")
     try:
-        clone_url = (
-            f"https://x-access-token:{github_token}@github.com/{repo}.git"
-            if github_token
-            else f"https://github.com/{repo}.git"
-        )
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "clone",
-            "--branch",
-            branch,
-            "--single-branch",
-            clone_url,
-            workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            err = stderr.decode()[:300]
-            if github_token:
-                err = err.replace(github_token, "***")
-            return {"condition": "fail", "message": f"verify_changes failed (clone failed): {err}"}
+        try:
+            await clone_repo(repo, branch, workspace, token=github_token or None)
+        except RuntimeError as exc:
+            return {"condition": "fail", "message": f"verify_changes failed (clone failed): {exc}"}
 
-        print(f"[SCHEME] verify_changes: cloned {branch}, fetching origin/main...", flush=True)
+        logger.info("[SCHEME] verify_changes: cloned %s, fetching origin/main...", branch)
 
         fetch_proc = await asyncio.create_subprocess_exec(
             "git",
@@ -561,9 +514,10 @@ async def handle_verify_changes(
             err = fetch_err.decode()[:300]
             if github_token:
                 err = err.replace(github_token, "***")
-            print(
-                f"[SCHEME] verify_changes: fetch origin/main failed (rc={fetch_proc.returncode}): {err}",
-                flush=True,
+            logger.warning(
+                "[SCHEME] verify_changes: fetch origin/main failed (rc=%s): %s",
+                fetch_proc.returncode,
+                err,
             )
 
         # Check for commits beyond origin/main
@@ -578,7 +532,7 @@ async def handle_verify_changes(
         )
         log_out, log_err = await proc.communicate()
         commits = [line for line in log_out.decode().strip().split("\n") if line.strip()]
-        print(f"[SCHEME] verify_changes: git log found {len(commits)} commit(s)", flush=True)
+        logger.info("[SCHEME] verify_changes: git log found %d commit(s)", len(commits))
 
         if not commits:
             log_stderr = log_err.decode()[:200]
@@ -603,10 +557,11 @@ async def handle_verify_changes(
         if not changed_files:
             return {"condition": "fail", "message": "verify_changes failed: no file changes on branch"}
 
-        print(
-            f"[SCHEME] verify_changes PASSED for task {task.id}: "
-            f"{len(commits)} commit(s), {len(changed_files)} file(s) changed",
-            flush=True,
+        logger.info(
+            "[SCHEME] verify_changes PASSED for task %s: %d commit(s), %d file(s) changed",
+            task.id,
+            len(commits),
+            len(changed_files),
         )
         return {
             "condition": "pass",
@@ -633,7 +588,7 @@ async def handle_create_pr(
 ) -> dict[str, Any]:
     """Create a real GitHub pull request."""
     repo = task.context.repo
-    branch_name = f"henchmen/{task.id[:8]}"
+    branch_name = task.branch_name
     github_token = os.environ.get("GITHUB_TOKEN", "")
 
     if not repo or not github_token:
@@ -644,7 +599,7 @@ async def handle_create_pr(
     try:
         from github import Github
 
-        print(f"[CREATE_PR] Creating PR for task {task.id} on {repo} (branch: {branch_name})", flush=True)
+        logger.info("[CREATE_PR] Creating PR for task %s on %s (branch: %s)", task.id, repo, branch_name)
 
         g = Github(github_token)
         github_repo = g.get_repo(repo)
@@ -653,7 +608,7 @@ async def handle_create_pr(
         existing_prs = list(github_repo.get_pulls(head=branch_name, state="open"))
         if existing_prs:
             pr_url = existing_prs[0].html_url
-            print(f"[CREATE_PR] PR already exists: {pr_url}", flush=True)
+            logger.info("[CREATE_PR] PR already exists: %s", pr_url)
             return {
                 "condition": "pass",
                 "pr_url": pr_url,
@@ -692,7 +647,7 @@ async def handle_create_pr(
             pass  # Label may not exist yet
 
         pr_url = pr.html_url
-        print(f"[CREATE_PR] PR created: {pr_url}", flush=True)
+        logger.info("[CREATE_PR] PR created: %s", pr_url)
 
         return {
             "condition": "pass",
@@ -702,7 +657,7 @@ async def handle_create_pr(
         }
 
     except Exception as exc:
-        print(f"[CREATE_PR] Failed to create PR: {exc}", flush=True)
+        logger.error("[CREATE_PR] Failed to create PR: %s", exc)
         logger.error("Failed to create PR for task %s: %s", task.id, exc)
         return {
             "condition": "fail",

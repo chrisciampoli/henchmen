@@ -1,10 +1,15 @@
 """Guardrails – safety and observability middleware for the operative agent loop."""
 
+import asyncio
 import logging
 import os
-from typing import Any
+import time
+from typing import TYPE_CHECKING, Any
 
 from henchmen.models.operative import OperativeConfig
+
+if TYPE_CHECKING:
+    from henchmen.observability.cost_accumulator import TaskCostAccumulator
 
 logger = logging.getLogger(__name__)
 
@@ -24,21 +29,42 @@ class OperativeGuardrails:
     # HENCHMEN_OPERATIVE_COST_CEILING_USD environment variable.
     _DEFAULT_COST_CEILING_USD = 2.0
 
-    def __init__(self, config: OperativeConfig, allowed_tools: set[str], max_steps: int = 20) -> None:
+    # Default wall-clock ceiling in seconds for free/local providers (e.g. Ollama)
+    # where USD cost is $0 and cannot serve as a stop signal.
+    _DEFAULT_WALLCLOCK_CEILING_SECONDS = 1800
+
+    def __init__(
+        self,
+        config: OperativeConfig,
+        allowed_tools: set[str],
+        max_steps: int = 20,
+        task_cost_accumulator: "TaskCostAccumulator | None" = None,
+    ) -> None:
         self.config = config
         self.allowed_tools = allowed_tools
         self.max_steps = max_steps
         self.tool_call_count = 0
-        self.token_usage: dict[str, int] = {"input": 0, "output": 0}
+        self.token_usage: dict[str, int] = {"input": 0, "output": 0, "cached_input": 0}
         self._step_count = 0
         self._tool_call_counts: dict[str, int] = {}
         self._nudge_count: int = 0
         self._last_input_tokens: int = 0
         self._consecutive_blocked: int = 0
         self._estimated_cost_usd: float = 0.0
+        self._task_cost_accumulator = task_cost_accumulator
+        self._start_time: float = time.monotonic()
 
         ceiling_env = os.environ.get("HENCHMEN_OPERATIVE_COST_CEILING_USD", "")
         self._cost_ceiling_usd: float = float(ceiling_env) if ceiling_env else self._DEFAULT_COST_CEILING_USD
+
+        wallclock_env = os.environ.get("HENCHMEN_OPERATIVE_WALLCLOCK_CEILING_SECONDS", "")
+        self._wallclock_ceiling_seconds: int = (
+            int(wallclock_env) if wallclock_env else self._DEFAULT_WALLCLOCK_CEILING_SECONDS
+        )
+
+        # Keep strong references to fire-and-forget accumulator writes so
+        # the event loop doesn't GC them mid-flight.
+        self._pending_accumulator_tasks: set[asyncio.Task[None]] = set()
 
     # ------------------------------------------------------------------
     # Pre-tool hook
@@ -102,29 +128,57 @@ class OperativeGuardrails:
     # ------------------------------------------------------------------
 
     def after_model_response(self, response: dict[str, Any]) -> None:
-        """Track token usage, update running cost estimate, and log model response metadata."""
+        """Track token usage, update running cost estimate, and log model response metadata.
+
+        Cached input tokens are billed at 25% of the standard input rate (Vertex AI
+        context caching discount), so they must be included in the ceiling check
+        and accumulator — the prior implementation ignored them and under-estimated
+        cost by whatever fraction of input was served from cache.
+        """
         usage = response.get("usage", {})
         input_tokens = int(usage.get("input", 0) or 0)
         output_tokens = int(usage.get("output", 0) or 0)
+        cached_input_tokens = int(usage.get("cached_input", 0) or 0)
         self.token_usage["input"] += input_tokens
         self.token_usage["output"] += output_tokens
+        self.token_usage["cached_input"] = self.token_usage.get("cached_input", 0) + cached_input_tokens
         self._last_input_tokens = input_tokens  # Track last context size
         self._step_count += 1
 
-        # Update running cost estimate
+        # Update running cost estimate. Pass cached_input_tokens so tracker.estimate_cost
+        # applies the 0.25x cache discount rather than full-price billing.
         from henchmen.observability.tracker import estimate_cost
 
-        step_cost = estimate_cost(self.config.model_name, input_tokens, output_tokens)
+        step_cost = estimate_cost(
+            self.config.model_name,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens=cached_input_tokens,
+        )
         self._estimated_cost_usd += step_cost
+
+        # Propagate the delta to the task-level accumulator so the ceiling
+        # check reflects cumulative cost across all scheme nodes for this task.
+        if self._task_cost_accumulator is not None and step_cost > 0:
+            try:
+                loop = asyncio.get_running_loop()
+                task = loop.create_task(self._task_cost_accumulator.add(step_cost))
+                self._pending_accumulator_tasks.add(task)
+                task.add_done_callback(lambda t: self._pending_accumulator_tasks.discard(t))
+            except RuntimeError:
+                # No running loop — we're likely being called from a sync context
+                # in tests; silently skip accumulator propagation.
+                pass
 
         content = response.get("content", [])
         tool_use_names = [p.get("name", "") for p in content if p.get("type") == "tool_use"]
 
         logger.info(
-            "[guardrails] Model response step=%d in=%d out=%d cost=$%.4f cumulative=$%.4f tools=%s (task=%s)",
+            "[guardrails] Model response step=%d in=%d out=%d cached=%d cost=$%.4f cumulative=$%.4f tools=%s (task=%s)",
             self._step_count,
             input_tokens,
             output_tokens,
+            cached_input_tokens,
             step_cost,
             self._estimated_cost_usd,
             tool_use_names or "none",
@@ -206,8 +260,49 @@ class OperativeGuardrails:
     # ------------------------------------------------------------------
 
     def check_cost_ceiling(self) -> bool:
-        """Return True if the estimated cost has exceeded the ceiling."""
-        return self._estimated_cost_usd >= self._cost_ceiling_usd
+        """Return True if any cost / wall-clock ceiling has been exceeded.
+
+        Checks three ceilings in order:
+
+        1. Per-node cost ceiling (``_cost_ceiling_usd``) — the historical
+           behaviour, capped at ~$2 by default.
+        2. Task-level cost ceiling (``_task_cost_accumulator.ceiling_usd``)
+           which spans all scheme nodes for this task. Uses the
+           last-cached running total so this remains a sync hot-path;
+           the underlying value is refreshed every time
+           ``after_model_response`` pushes a delta.
+        3. Wall-clock ceiling — a stand-in for free providers where
+           ``_estimated_cost_usd`` is zero (Ollama runs fully local).
+        """
+        if self._estimated_cost_usd >= self._cost_ceiling_usd:
+            return True
+
+        if self._task_cost_accumulator is not None:
+            task_total = self._task_cost_accumulator.cached_total_usd
+            if task_total >= self._task_cost_accumulator.ceiling_usd:
+                logger.warning(
+                    "[guardrails] Task-level cost ceiling reached: $%.4f >= $%.4f (task=%s)",
+                    task_total,
+                    self._task_cost_accumulator.ceiling_usd,
+                    self.config.task_id,
+                )
+                return True
+
+        # Ollama / local providers return estimated_cost_usd == 0 for every
+        # step, so the dollar ceiling can never fire. Substitute a wall-clock
+        # ceiling to guarantee bounded execution time.
+        if self._estimated_cost_usd == 0.0:
+            elapsed = time.monotonic() - self._start_time
+            if elapsed >= self._wallclock_ceiling_seconds:
+                logger.warning(
+                    "[guardrails] Wall-clock ceiling reached for free provider: %.1fs >= %ds (task=%s)",
+                    elapsed,
+                    self._wallclock_ceiling_seconds,
+                    self.config.task_id,
+                )
+                return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Usage report

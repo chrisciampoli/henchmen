@@ -1,15 +1,12 @@
-# PREREQUISITE: The GCS bucket referenced below must be created manually before
-# running `terraform init`. It cannot be managed by Terraform itself because the
-# backend must exist before any state can be stored.
-#
-# Choose a globally-unique bucket name and create it with:
-#   gcloud storage buckets create gs://<YOUR_BUCKET_NAME> \
+# Dev GCS backend. The bucket must exist before `terraform init` and cannot be
+# managed by terraform itself (chicken-and-egg). Create it once with:
+#   gcloud storage buckets create gs://henchmen-tfstate-dev \
 #     --location=us-central1 --uniform-bucket-level-access
 #
-# Then update the bucket value below and run: terraform init
+# Then run:
+#   terraform init -backend-config=bucket=henchmen-tfstate-dev
 terraform {
   backend "gcs" {
-    # bucket = "<YOUR_GCS_BUCKET_FOR_TF_STATE>"
     bucket = "henchmen-tfstate-dev"
     prefix = "terraform/state"
   }

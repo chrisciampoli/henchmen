@@ -1,5 +1,100 @@
 # Incident Runbook -- Henchmen
 
+> Note: The bulk of this runbook is written for operators running Henchmen on
+> GCP. If you are self-hosting on docker-compose, SQLite, or a single VM, read
+> the "Self-Hosted / Non-GCP Operations" section first -- it explains how each
+> `gcloud` / Firestore instruction maps to your environment.
+
+## Self-Hosted / Non-GCP Operations
+
+Henchmen runs in two deployment shapes:
+
+1. GCP-managed (Cloud Run + Firestore + Pub/Sub + Cloud Scheduler).
+2. Self-hosted (docker-compose or bare `henchmen serve`, SQLite / filesystem
+   backends, in-memory broker or a local HTTP forwarder).
+
+The checks below cover what to do in shape #2 -- no `gcloud`, no Cloud
+Logging, no Cloud Scheduler.
+
+### Finding logs
+
+If you started the stack with docker-compose:
+
+```bash
+docker logs -f henchmen-mastermind
+docker logs -f henchmen-dispatch
+docker logs -f henchmen-forge
+docker logs -f henchmen-ollama
+```
+
+If you started it with `henchmen serve` (single-process), all logs are on
+stdout of that process. Redirect to a file for persistence:
+
+```bash
+henchmen serve 2>&1 | tee henchmen.log
+```
+
+### Inspecting task state (local document store)
+
+The local document store persists to `henchmen_dev.db` (SQLite) in the working
+directory. You can poke at it directly:
+
+```bash
+sqlite3 henchmen_dev.db
+sqlite> .tables
+sqlite> SELECT id, title, status, updated_at FROM tasks ORDER BY updated_at DESC LIMIT 10;
+sqlite> SELECT id, status, ci_passed FROM task_executions ORDER BY created_at DESC LIMIT 10;
+```
+
+If you chose the filesystem document store, each document is a JSON file
+under `./henchmen-data/<collection>/<id>.json`. Open them with any editor.
+
+### Recovering a stuck task without gcloud
+
+Symptom: a task is stuck in `dispatched` or `in_progress` and nothing is
+advancing it. Without Firestore you cannot use the GCP fix; instead, patch
+the document store directly:
+
+```bash
+sqlite3 henchmen_dev.db
+sqlite> UPDATE tasks SET status = 'failed', updated_at = datetime('now') WHERE id = '<task-id>';
+sqlite> .quit
+```
+
+For a filesystem store, open the JSON file and change the `status` field.
+Restart `henchmen serve` or the mastermind container so in-memory state
+aligns with the on-disk update.
+
+### Missing Cloud Scheduler cron
+
+The GCP deployment uses Cloud Scheduler to POST to `/api/v1/watchdog` on a
+schedule (stuck-task sweep, merge queue tick). Self-hosted users should call
+this endpoint themselves, either manually or from a local cron:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/watchdog
+```
+
+A reasonable crontab entry:
+
+```
+*/5 * * * * curl -sS -X POST http://localhost:8000/api/v1/watchdog >/dev/null
+```
+
+### Adding a new LLM model to the price map
+
+The cost tracker keeps a static price map in
+`src/henchmen/observability/tracker.py` (look for `_PRICE_MAP`). If you add a
+model that is not listed, token usage will still be recorded but the cost
+column in `/metrics/summary` will read `$0.00`. To fix:
+
+1. Open `src/henchmen/observability/tracker.py`.
+2. Add an entry to `_PRICE_MAP` with the exact model string your provider
+   returns (e.g. `"gpt-4o-mini-2024-07-18"`) and per-1M-token input / output
+   rates in USD.
+3. Restart the process.
+4. Confirm with `curl http://localhost:8000/metrics/summary | jq .total_cost_usd`.
+
 ## Alert Conditions
 
 | Alert | Trigger | Severity |
@@ -36,7 +131,7 @@
 
 **Common fixes:**
 - If context window exhaustion: reduce `max_steps` on the scheme node or add file filtering to the dossier
-- If model timeout: check Vertex AI quota and regional status (Claude models: `us-east5`, Gemini: global)
+- If model timeout: check Vertex AI quota and regional status for Gemini (e.g., `us-central1`). Henchmen uses Gemini on Vertex AI exclusively -- no Claude/Anthropic routing.
 - If stuck in tool loop: review the scheme's `instruction_template` for missing phase constraints
 
 ### Escalation Loop

@@ -1,0 +1,7 @@
+{
+  "must_contain_file_change": ["list_utils.py"],
+  "must_fix_tests": true,
+  "expected_substrings_in_changed_code": ["items[-n:]"],
+  "test_runner": "pytest",
+  "test_command": ["pytest", "-q", "."]
+}
