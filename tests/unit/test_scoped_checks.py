@@ -21,6 +21,7 @@ class TestGetAffectedPackages:
         (tmp_path / "package.json").write_text("{}")
         return str(tmp_path)
 
+    @pytest.mark.asyncio
     async def test_maps_changed_files_to_packages(self, workspace: str) -> None:
         from henchmen.arsenal.tools.test_runner import _get_affected_packages
 
@@ -36,6 +37,7 @@ class TestGetAffectedPackages:
 
         assert result == ["./apps/api"]
 
+    @pytest.mark.asyncio
     async def test_multiple_packages(self, workspace: str) -> None:
         from henchmen.arsenal.tools.test_runner import _get_affected_packages
 
@@ -51,6 +53,7 @@ class TestGetAffectedPackages:
 
         assert result == ["./apps/api", "./packages/shared"]
 
+    @pytest.mark.asyncio
     async def test_root_file_returns_empty(self, workspace: str) -> None:
         from henchmen.arsenal.tools.test_runner import _get_affected_packages
 
@@ -67,6 +70,7 @@ class TestGetAffectedPackages:
         # Root file means we can't scope — return empty
         assert result == []
 
+    @pytest.mark.asyncio
     async def test_git_diff_fails_returns_empty(self, workspace: str) -> None:
         from henchmen.arsenal.tools.test_runner import _get_affected_packages
 
@@ -80,6 +84,7 @@ class TestGetAffectedPackages:
 
         assert result == []
 
+    @pytest.mark.asyncio
     async def test_no_changed_files_returns_empty(self, workspace: str) -> None:
         from henchmen.arsenal.tools.test_runner import _get_affected_packages
 
@@ -128,6 +133,7 @@ class TestIsMonorepo:
 class TestRunLintScoping:
     """Verify run_lint uses --filter in monorepos."""
 
+    @pytest.mark.asyncio
     async def test_monorepo_lint_uses_filter(self, tmp_path: Any) -> None:
         """In a monorepo with affected packages, lint should use pnpm turbo --filter."""
         wd = str(tmp_path)
@@ -159,6 +165,7 @@ class TestRunLintScoping:
         assert "./apps/api" in cmd_args
         assert result["success"] is True
 
+    @pytest.mark.asyncio
     async def test_monorepo_no_affected_falls_back(self, tmp_path: Any) -> None:
         """If can't determine affected packages, falls back to full lint."""
         wd = str(tmp_path)
@@ -186,6 +193,7 @@ class TestRunLintScoping:
         cmd_args = mock_run.call_args[0]
         assert cmd_args == ("pnpm", "run", "lint")
 
+    @pytest.mark.asyncio
     async def test_non_monorepo_pnpm_unchanged(self, tmp_path: Any) -> None:
         """Non-monorepo pnpm project should use pnpm run lint (no turbo)."""
         wd = str(tmp_path)
@@ -215,6 +223,7 @@ class TestRunLintScoping:
 class TestRunTestsScoping:
     """Verify run_tests uses --filter in monorepos."""
 
+    @pytest.mark.asyncio
     async def test_monorepo_tests_uses_filter(self, tmp_path: Any) -> None:
         wd = str(tmp_path)
         (tmp_path / "pnpm-lock.yaml").touch()
@@ -292,6 +301,7 @@ class TestDevModeFixNodeBehavior:
 
         return Dossier(task_id="test-task-id")
 
+    @pytest.mark.asyncio
     async def test_fix_lint_fails_in_dev_mode(self) -> None:
         """fix_lint should fail-closed even in dev mode when lair fails."""
         executor = self._make_executor()
@@ -307,6 +317,7 @@ class TestDevModeFixNodeBehavior:
         assert result["condition"] == "fail"
         assert "dev_mode" not in result
 
+    @pytest.mark.asyncio
     async def test_fix_tests_fails_in_dev_mode(self) -> None:
         """fix_tests should fail-closed even in dev mode when lair fails."""
         executor = self._make_executor()
@@ -321,6 +332,7 @@ class TestDevModeFixNodeBehavior:
         assert result["condition"] == "fail"
         assert "dev_mode" not in result
 
+    @pytest.mark.asyncio
     async def test_implement_feature_simulates_in_dev_mode(self) -> None:
         """Non-fix nodes should still get simulated pass in dev mode."""
         executor = self._make_executor()

@@ -12,11 +12,6 @@ resource "google_cloud_run_v2_job" "lair_template" {
   location = var.region
   project  = var.project_id
 
-  # Prevent terraform apply from stripping secret env vars set via gcloud/console.
-  lifecycle {
-    ignore_changes = [template[0].template[0].containers[0].env]
-  }
-
   template {
     template {
       service_account = var.operative_sa_email

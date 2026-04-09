@@ -3,10 +3,13 @@
 import json
 import logging
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from henchmen.providers.interfaces.ci_provider import CIProvider
 from henchmen.providers.interfaces.message_broker import MessageBroker
+
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +23,7 @@ class CIOrchestrator:
     """Orchestrates CI builds via a CIProvider with retry logic."""
 
     def __init__(
-        self, settings: Any, ci_provider: CIProvider | None = None, broker: MessageBroker | None = None
+        self, settings: "Settings", ci_provider: CIProvider | None = None, broker: MessageBroker | None = None
     ) -> None:
         self.settings = settings
         self._ci_provider = ci_provider

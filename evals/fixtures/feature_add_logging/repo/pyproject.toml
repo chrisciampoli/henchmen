@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "henchmen-eval-feature-add-logging"
+version = "0.0.1"
+description = "Fixture repo for the feature_add_logging evaluation scenario."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+pythonpath = ["."]

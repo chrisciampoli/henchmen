@@ -16,6 +16,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 
 from henchmen.config.settings import get_settings
+from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
+from henchmen.utils.git import clone_repo
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +77,7 @@ async def forge_request_handler(request: Request) -> dict[str, str]:
     Kicks off a background task that clones the PR branch, runs lint/tests,
     comments on the PR, and publishes results to the ``forge-result`` topic.
     """
+    await verify_pubsub_oidc(request, get_settings())
     try:
         envelope = await request.json()
     except Exception as exc:
@@ -94,9 +97,43 @@ async def forge_request_handler(request: Request) -> dict[str, str]:
     if not pr_url or "pull/" not in pr_url:
         raise HTTPException(status_code=422, detail="Valid 'pr_url' is required in message data")
 
-    # Run CI in the background so we can ACK the Pub/Sub push immediately.
-    asyncio.create_task(_run_ci_for_pr(pr_url, task_id, request_id))
+    # Run CI synchronously within the handler so the Pub/Sub ack is gated on completion.
+    # This mirrors the Mastermind pattern: returning before completion would ack the Pub/Sub
+    # message, causing lost CI results if the instance recycles mid-run. Cloud Run Pub/Sub
+    # push tolerates long requests up to the subscription ack deadline. Any exception here
+    # propagates to a 500, and Pub/Sub will retry via the DLQ policy.
+    try:
+        await _run_ci_for_pr(pr_url, task_id, request_id)
+    except Exception:
+        logger.exception("[FORGE] CI run failed for pr=%s task=%s request=%s", pr_url, task_id, request_id)
+        # Publish a failure result so Mastermind's pending-CI waiter is unblocked.
+        try:
+            await _publish_ci_failure(pr_url, task_id, request_id, reason="forge-exception")
+        except Exception:
+            logger.exception("[FORGE] Failed to publish CI failure notice for request=%s", request_id)
+        raise HTTPException(status_code=500, detail="CI run failed; Pub/Sub will retry") from None
     return {"status": "accepted"}
+
+
+async def _publish_ci_failure(pr_url: str, task_id: str, request_id: str, reason: str) -> None:
+    """Publish a forge-result failure so Mastermind's pending-CI waiter is unblocked.
+
+    Best-effort: if the broker is unavailable the caller has already logged the original
+    exception and the Pub/Sub push will be retried.
+    """
+    from henchmen.providers.registry import ProviderRegistry
+
+    settings = get_settings()
+    registry = ProviderRegistry(settings)
+    broker = registry.get_message_broker()
+    payload = {
+        "pr_url": pr_url,
+        "task_id": task_id,
+        "request_id": request_id,
+        "status": "failed",
+        "reason": reason,
+    }
+    await broker.publish("forge-result", payload, attributes={"request_id": request_id})
 
 
 async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
@@ -127,29 +164,16 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
         head_branch = pr.head.ref
 
         # --- Clone the repo (shallow, single branch) ----------------------
-        if github_token:
-            clone_url = f"https://x-access-token:{github_token}@github.com/{full_repo}.git"
-        else:
-            clone_url = f"https://github.com/{full_repo}.git"
-
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "clone",
-            "--depth=1",
-            "--branch",
-            head_branch,
-            clone_url,
-            workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        clone_stdout, clone_stderr = await proc.communicate()
-        if proc.returncode != 0:
-            logger.error(
-                "[FORGE] git clone failed (rc=%d): %s",
-                proc.returncode,
-                clone_stderr.decode(errors="replace")[:500],
+        try:
+            await clone_repo(
+                full_repo,
+                head_branch,
+                workspace,
+                token=github_token or None,
+                depth=1,
             )
+        except RuntimeError as exc:
+            logger.error("[FORGE] %s", exc)
             return
 
         # --- Run CI checks -------------------------------------------------

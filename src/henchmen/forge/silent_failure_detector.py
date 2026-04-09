@@ -162,9 +162,10 @@ class SilentFailureDetector:
 
         lines = [f"Found {len(findings)} potential issue(s):\n"]
 
+        tag_by_severity = {"critical": "[CRITICAL]", "warning": "[WARN]", "info": "[INFO]"}
         for f in findings:
-            emoji = {"critical": "🔴", "warning": "🟡", "info": "🔵"}.get(f.severity, "⚪")
-            lines.append(f"{emoji} **{f.severity.upper()}**: {f.pattern}")
+            tag = tag_by_severity.get(f.severity, "[UNKNOWN]")
+            lines.append(f"{tag} **{f.severity.upper()}**: {f.pattern}")
             lines.append(f"   {f.description}")
             lines.append(f"   File: `{f.file}` {f.line_hint}")
             lines.append("")

@@ -14,6 +14,11 @@ from henchmen.models.task import HenchmenTask, TaskPriority, TaskSource
 
 
 def _mock_settings():
+    """TODO(R9): replace with the shared ``mock_settings`` fixture from
+    ``tests/conftest.py``. The handler tests here do not assert on the
+    topic name, so the migration would be mechanical — add ``mock_settings``
+    as a parameter to each test method and delete this helper.
+    """
     s = MagicMock()
     s.gcp_project_id = "test-project"
     s.pubsub_topic_task_intake = "henchmen-task-intake"
@@ -469,13 +474,12 @@ class TestGithubHandler:
 class TestDispatchServerRoutes:
     @pytest.fixture(autouse=True)
     def _set_env(self, monkeypatch):
+        # `_isolate_settings` (conftest.py) already clears the lru_cache on
+        # both sides of the test, so the only thing this fixture needs to do
+        # is set the env vars this test class cares about.
         monkeypatch.setenv("HENCHMEN_GCP_PROJECT_ID", "test-project")
         monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
-        from henchmen.config.settings import get_settings
-
-        get_settings.cache_clear()
         yield
-        get_settings.cache_clear()
 
     @pytest.fixture
     def client(self):

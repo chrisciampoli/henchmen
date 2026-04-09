@@ -3,7 +3,9 @@
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from henchmen.models._base import StrictBase
 
 
 class NodeType(StrEnum):
@@ -11,7 +13,7 @@ class NodeType(StrEnum):
     AGENTIC = "agentic"
 
 
-class ArsenalRequirement(BaseModel):
+class ArsenalRequirement(StrictBase):
     """Specifies which tool sets an operative node requires from the Arsenal MCP server."""
 
     tool_sets: list[Literal["code_intel", "code_edit", "git_ops", "test_runner", "github", "jira", "slack", "gcp"]] = (
@@ -20,7 +22,7 @@ class ArsenalRequirement(BaseModel):
     allow_destructive: bool = Field(default=False, description="Whether destructive operations are permitted")
 
 
-class DossierRequirement(BaseModel):
+class DossierRequirement(StrictBase):
     """Specifies what context the Dossier builder should fetch for a node."""
 
     fetch_files: bool = Field(default=False, description="Fetch relevant source files")
@@ -32,7 +34,7 @@ class DossierRequirement(BaseModel):
     )
 
 
-class SchemeNode(BaseModel):
+class SchemeNode(StrictBase):
     """A single node in a scheme workflow graph."""
 
     id: str = Field(..., description="Unique node identifier within the scheme")
@@ -61,7 +63,7 @@ class SchemeNode(BaseModel):
     )
 
 
-class SchemeEdge(BaseModel):
+class SchemeEdge(StrictBase):
     """A directed edge connecting two nodes in a scheme workflow graph."""
 
     from_node: str = Field(..., description="Source node ID")
@@ -72,7 +74,7 @@ class SchemeEdge(BaseModel):
     )
 
 
-class SchemeDefinition(BaseModel):
+class SchemeDefinition(StrictBase):
     """A complete workflow scheme definition."""
 
     id: str = Field(..., description="Unique scheme identifier")

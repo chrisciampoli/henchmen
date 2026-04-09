@@ -2,15 +2,13 @@
 
 ## Model Pricing Table
 
-Prices are per 1 million tokens, sourced from the `_PRICE_MAP` in `src/henchmen/observability/tracker.py`.
+Prices are per 1 million tokens, sourced from the `_PRICE_MAP` in `src/henchmen/observability/tracker.py`. These are placeholders -- check Google's Vertex AI pricing page for current rates.
 
 | Model | Input ($/1M tokens) | Output ($/1M tokens) | Used For |
 |-------|---------------------|----------------------|----------|
-| Claude Sonnet 4 (`claude-sonnet-4@20250514`) | $3.00 | $15.00 | `implement_fix`, `implement_feature` |
-| Claude Haiku 4.5 (`claude-haiku-4-5@20251001`) | $0.80 | $4.00 | (Reserved for future use) |
-| Gemini 3.1 Pro (`gemini-3.1-pro`) | $2.00 | $12.00 | `fix_tests` |
-| Gemini 2.5 Pro (`gemini-2.5-pro`) | $1.25 | $10.00 | Fallback model, `vertex_ai_model_light` |
-| Gemini 2.5 Flash (`gemini-2.5-flash`) | $0.15 | $0.60 | `verify_changes`, `plan_implementation` |
+| Gemini 3.1 Pro (`gemini-3.1-pro`) | ~$2.00 | ~$12.00 | `fix_tests` |
+| Gemini 2.5 Pro (`gemini-2.5-pro`) | ~$1.25 | ~$10.00 | `implement_fix`, `implement_feature`, `vertex_ai_model_complex` |
+| Gemini 2.5 Flash (`gemini-2.5-flash`) | ~$0.075 | ~$0.30 | `verify_changes`, `plan_implementation` |
 
 ## Per-Task Cost Breakdown by Node
 
@@ -20,10 +18,10 @@ A typical bugfix task uses 3 model calls across 2 agentic nodes:
 
 | Node | Model | Steps | Est. Input Tokens | Est. Output Tokens | Est. Cost |
 |------|-------|-------|-------------------|--------------------|-----------|
-| `implement_fix` | Claude Sonnet 4 | ~15-25 | ~150K-300K | ~10K-30K | $0.60-$1.35 |
-| `verify_changes` | Gemini 2.5 Flash | ~3-5 | ~20K-50K | ~1K-3K | $0.004-$0.009 |
+| `implement_fix` | Gemini 2.5 Pro | ~15-25 | ~150K-300K | ~10K-30K | $0.29-$0.68 |
+| `verify_changes` | Gemini 2.5 Flash | ~3-5 | ~20K-50K | ~1K-3K | $0.002-$0.005 |
 | Deterministic nodes | -- | -- | -- | -- | $0.00 |
-| **Total** | | | | | **$0.60-$1.36** |
+| **Total** | | | | | **$0.29-$0.68** |
 
 If tests fail and `fix_tests` is invoked:
 
@@ -31,7 +29,7 @@ If tests fail and `fix_tests` is invoked:
 |------|-------|-------|-------------------|--------------------|-----------|
 | `fix_tests` | Gemini 3.1 Pro | ~5-10 | ~50K-100K | ~5K-15K | $0.16-$0.38 |
 
-**Total with test fix retry:** $0.76-$1.74
+**Total with test fix retry:** $0.45-$1.06
 
 ### feature_standard
 
@@ -39,10 +37,10 @@ Feature tasks use the same structure as bugfix plus a planning step:
 
 | Node | Model | Steps | Est. Input Tokens | Est. Output Tokens | Est. Cost |
 |------|-------|-------|-------------------|--------------------|-----------|
-| `plan_implementation` | Gemini 2.5 Flash | ~5-8 | ~30K-80K | ~2K-5K | $0.006-$0.015 |
-| `implement_feature` | Claude Sonnet 4 | ~20-35 | ~200K-500K | ~15K-50K | $0.83-$2.25 |
-| `verify_changes` | Gemini 2.5 Flash | ~3-5 | ~20K-50K | ~1K-3K | $0.004-$0.009 |
-| **Total** | | | | | **$0.84-$2.27** |
+| `plan_implementation` | Gemini 2.5 Flash | ~5-8 | ~30K-80K | ~2K-5K | $0.003-$0.008 |
+| `implement_feature` | Gemini 2.5 Pro | ~20-35 | ~200K-500K | ~15K-50K | $0.40-$1.13 |
+| `verify_changes` | Gemini 2.5 Flash | ~3-5 | ~20K-50K | ~1K-3K | $0.002-$0.005 |
+| **Total** | | | | | **$0.41-$1.14** |
 
 ### goal_decomposition
 
@@ -50,7 +48,7 @@ The cheapest scheme -- planning only, no code changes:
 
 | Node | Model | Steps | Est. Input Tokens | Est. Output Tokens | Est. Cost |
 |------|-------|-------|-------------------|--------------------|-----------|
-| `analyze_goal` | Gemini 3.1 Pro Preview | ~3-5 | ~30K-60K | ~3K-8K | $0.10-$0.22 |
+| `analyze_goal` | Gemini 3.1 Pro | ~3-5 | ~30K-60K | ~3K-8K | $0.10-$0.22 |
 | **Total** | | | | | **$0.10-$0.22** |
 
 ### CI Failure Auto-Fix
@@ -59,9 +57,9 @@ When CI fails on a Henchmen PR, the auto-fix loop dispatches a fix operative:
 
 | Node | Model | Steps | Est. Input Tokens | Est. Output Tokens | Est. Cost |
 |------|-------|-------|-------------------|--------------------|-----------|
-| `implement_fix` (CI fix) | Claude Sonnet 4 | ~10-20 | ~100K-200K | ~5K-20K | $0.38-$0.90 |
+| `implement_fix` (CI fix) | Gemini 2.5 Pro | ~10-20 | ~100K-200K | ~5K-20K | $0.18-$0.45 |
 
-Max 2 retries, so worst case: $0.76-$1.80 for CI auto-fix.
+Max 2 retries, so worst case: $0.36-$0.90 for CI auto-fix.
 
 ## Infrastructure Costs
 
@@ -85,16 +83,16 @@ These are ongoing GCP costs independent of task volume:
 
 ### 1. Model Tiering (Implemented)
 
-The most impactful optimization. Each node uses the cheapest model that can handle its task:
+The most impactful optimization. Each node uses the cheapest Gemini model that can handle its task. **Hard rule:** no Claude models on Vertex AI -- Gemini only.
 
 | Task | Expensive Approach | Henchmen Approach | Savings |
 |------|-------------------|-------------------|---------|
-| Verify changes | Claude Sonnet 4 (~$0.50) | Gemini 2.5 Flash (~$0.01) | 98% |
-| Plan implementation | Claude Sonnet 4 (~$0.50) | Gemini 2.5 Flash (~$0.01) | 98% |
-| Fix test failures | Claude Sonnet 4 (~$0.80) | Gemini 3.1 Pro (~$0.25) | 69% |
-| Core fix/feature | Claude Sonnet 4 ($0.80) | Claude Sonnet 4 ($0.80) | 0% (quality matters) |
+| Verify changes | Gemini 3.1 Pro (~$0.25) | Gemini 2.5 Flash (~$0.005) | 98% |
+| Plan implementation | Gemini 3.1 Pro (~$0.25) | Gemini 2.5 Flash (~$0.005) | 98% |
+| Fix test failures | Gemini 2.5 Pro (fallback) | Gemini 3.1 Pro | reasoning uplift |
+| Core fix/feature | Gemini 3.1 Pro (~$0.90) | Gemini 2.5 Pro (~$0.50) | 44% |
 
-If every node used Claude Sonnet 4, a typical bugfix would cost ~$2.50. With tiering, it costs ~$0.80 -- a 68% reduction.
+Tiering keeps the expensive reasoning model (Gemini 3.1 Pro) reserved for the one node that needs it (`fix_tests`) while everything else uses the cheaper Gemini 2.5 Pro or Flash tiers.
 
 ### 2. Deterministic fix_lint (Implemented)
 
@@ -117,7 +115,7 @@ Large tool results (>30K characters) are truncated before being added to the con
 
 The operative pre-reads the 10 most relevant files (scored by task analysis, RAG results, and keyword matching) before the agent loop begins. This front-loads useful context, reducing the number of `file_read` tool calls the agent needs (each of which adds a model call cycle).
 
-**Estimated savings:** 2-5 fewer model call rounds per task, saving $0.10-$0.30 at Claude Sonnet 4 rates.
+**Estimated savings:** 2-5 fewer model call rounds per task, saving $0.05-$0.15 at Gemini 2.5 Pro rates.
 
 ### 6. Phase-Aware Nudging (Implemented)
 
@@ -125,21 +123,17 @@ The agent loop tracks consecutive read-only steps and nudges the model to start 
 
 **Estimated savings:** Prevents wasted $0.50-$1.50 on tasks that would have timed out without producing changes.
 
-### 7. Automatic Claude-to-Gemini Fallback (Implemented)
-
-When Claude on Vertex AI is rate-limited or unavailable, the operative automatically falls back to Gemini 2.5 Pro. This prevents task failures due to transient availability issues, avoiding the cost of re-running the entire pipeline.
-
 ## Long-Context Pricing
 
 ### The >200K Token Cliff
 
-Most LLM providers apply higher pricing for long-context requests. As the operative conversation grows through tool call cycles, input tokens accumulate:
+Gemini models on Vertex AI may apply higher pricing for long-context requests (>200K tokens). As the operative conversation grows through tool call cycles, input tokens accumulate:
 
 - Steps 1-10: ~50K-100K input tokens (within standard pricing)
 - Steps 10-20: ~100K-200K input tokens (approaching the boundary)
 - Steps 20-40: ~200K-500K input tokens (long-context pricing may apply)
 
-**Impact:** A 40-step Claude Sonnet 4 session with 300K average input tokens costs ~$0.90 in input alone. With extended context pricing, this could increase further.
+**Impact:** A 40-step Gemini 2.5 Pro session with 300K average input tokens costs ~$0.40 in input alone. With extended context pricing, this could increase further. Check Google's pricing page for current long-context multipliers.
 
 **Mitigation strategies (not yet implemented):**
 - Context windowing (see below)
@@ -150,17 +144,17 @@ Most LLM providers apply higher pricing for long-context requests. As the operat
 
 ### Prompt Caching
 
-Both Anthropic (Claude) and Google (Gemini) support prompt caching where repeated prefixes are charged at reduced rates.
+Gemini on Vertex AI supports context caching, where repeated prefixes are charged at reduced rates.
 
 **Opportunity:** The system prompt + dossier context is identical across all model calls within a single operative run. Caching this prefix would reduce input token costs by 60-80% for steps 2+.
 
-**Estimated savings per task:** $0.20-$0.60 for a typical bugfix.
+**Estimated savings per task:** $0.10-$0.40 for a typical bugfix.
 
-**Implementation:** Use the Claude `cache_control` API or Gemini `cached_content` API to mark the system instruction and dossier context as cacheable.
+**Implementation:** Use the Gemini `cached_content` API to mark the system instruction and dossier context as cacheable.
 
 ### Batch API
 
-Both providers offer batch APIs with 50% cost reduction for non-urgent requests.
+Vertex AI offers batch prediction with cost reductions for non-urgent requests.
 
 **Opportunity:** The `verify_changes` and `plan_implementation` nodes are not latency-sensitive. Running them via batch API would halve their already-low costs.
 
@@ -180,13 +174,9 @@ As the conversation grows, older tool results become less relevant. A sliding wi
 
 **Risk:** Dropping context may cause the agent to re-read files it already explored or lose track of its progress.
 
-### Claude Haiku for Verification
-
-The `verify_changes` node currently uses Gemini 2.5 Flash ($0.15/$0.60 per 1M). Claude Haiku 4.5 at $0.80/$4.00 per 1M is more expensive but could provide higher quality verification. However, since verification is a simple pass/fail gate, the cheaper model is usually sufficient.
-
 ### Embedding Model Cost
 
-The RAG pipeline (Pinecone) uses embeddings to index repository code. The embedding cost is a one-time expense per repository indexing run, not per-task. With Pinecone's integrated inference, embedding costs are included in the Pinecone plan.
+The RAG pipeline (Vertex AI RAG Engine, corpus: `henchmen-code`) uses embeddings to index repository code. The embedding cost is a one-time expense per repository indexing run, not per-task. Embedding and vector storage costs are billed through Vertex AI.
 
 ## Cost Tracking
 

@@ -1,0 +1,7 @@
+{
+  "must_contain_file_change": ["parse_config.js"],
+  "must_fix_tests": false,
+  "expected_substrings_in_changed_code": ["if (!input", "return {}"],
+  "test_runner": "npm",
+  "test_command": null
+}

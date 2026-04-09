@@ -1,0 +1,5 @@
+# CODEOWNERS currently routes all PRs to the primary maintainer.
+# As the community grows, add per-path owners here
+# (e.g., `/src/henchmen/arsenal/ @arsenal-maintainers`).
+
+* @chrisciampoli

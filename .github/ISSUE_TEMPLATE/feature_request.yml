@@ -1,0 +1,44 @@
+name: Feature request
+description: Propose a new capability or enhancement for Henchmen
+title: "[feature] "
+labels:
+  - enhancement
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Please describe the problem first,
+        then the solution you have in mind.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or operator pain are you trying to solve? Who is affected?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Describe the change you would like to see. Include API shape, config keys, or UX details when relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other approaches did you evaluate, and why did you rule them out?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links, screenshots, prior art, or anything else that helps frame the request.
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Willingness to contribute
+      options:
+        - label: I would be willing to open a PR implementing this feature.

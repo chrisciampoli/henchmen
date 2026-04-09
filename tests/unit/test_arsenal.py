@@ -2,7 +2,7 @@
 
 import pytest
 
-from henchmen.arsenal.registry import ToolDefinition, ToolRegistry, tool
+from henchmen.arsenal.registry import ArsenalTool, ToolRegistry, tool
 from henchmen.models.scheme import ArsenalRequirement
 
 # ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ class TestToolRegistryRegisterAndGet:
         async def handler() -> dict:  # type: ignore[return]
             return {}
 
-        td = ToolDefinition(
+        td = ArsenalTool(
             name="my_tool",
             description="A test tool",
             category="test_cat",
@@ -59,8 +59,8 @@ class TestToolRegistryRegisterAndGet:
         async def h2() -> dict:  # type: ignore[return]
             return {}
 
-        ToolRegistry.register(ToolDefinition("t1", "desc1", "cat_a", h1))
-        ToolRegistry.register(ToolDefinition("t2", "desc2", "cat_b", h2))
+        ToolRegistry.register(ArsenalTool("t1", "desc1", "cat_a", h1))
+        ToolRegistry.register(ArsenalTool("t2", "desc2", "cat_b", h2))
         assert ToolRegistry.get_tool("t1") is not None
         assert ToolRegistry.get_tool("t2") is not None
 
@@ -71,8 +71,8 @@ class TestToolRegistryRegisterAndGet:
         async def h2() -> dict:  # type: ignore[return]
             return {}
 
-        ToolRegistry.register(ToolDefinition("same_name", "first", "cat", h1))
-        ToolRegistry.register(ToolDefinition("same_name", "second", "cat", h2))
+        ToolRegistry.register(ArsenalTool("same_name", "first", "cat", h1))
+        ToolRegistry.register(ArsenalTool("same_name", "second", "cat", h2))
         assert ToolRegistry.get_tool("same_name").description == "second"  # type: ignore[union-attr]
 
 
@@ -86,9 +86,9 @@ class TestGetToolsForRequirementCategories:
         async def h() -> dict:  # type: ignore[return]
             return {}
 
-        ToolRegistry.register(ToolDefinition("read_file", "read", "code_intel", h))
-        ToolRegistry.register(ToolDefinition("write_file", "write", "code_edit", h))
-        ToolRegistry.register(ToolDefinition("git_commit", "commit", "git_ops", h))
+        ToolRegistry.register(ArsenalTool("read_file", "read", "code_intel", h))
+        ToolRegistry.register(ArsenalTool("write_file", "write", "code_edit", h))
+        ToolRegistry.register(ArsenalTool("git_commit", "commit", "git_ops", h))
 
     def test_returns_only_requested_categories(self):
         self._register_tools()
@@ -125,9 +125,9 @@ class TestGetToolsForRequirementDestructive:
         async def h() -> dict:  # type: ignore[return]
             return {}
 
-        ToolRegistry.register(ToolDefinition("safe_op", "safe", "code_edit", h, is_destructive=False))
-        ToolRegistry.register(ToolDefinition("delete_file", "delete", "code_edit", h, is_destructive=True))
-        ToolRegistry.register(ToolDefinition("force_push", "force", "git_ops", h, is_destructive=True))
+        ToolRegistry.register(ArsenalTool("safe_op", "safe", "code_edit", h, is_destructive=False))
+        ToolRegistry.register(ArsenalTool("delete_file", "delete", "code_edit", h, is_destructive=True))
+        ToolRegistry.register(ArsenalTool("force_push", "force", "git_ops", h, is_destructive=True))
 
     def test_destructive_excluded_when_not_allowed(self):
         self._register_tools()
@@ -158,9 +158,9 @@ class TestListCategoriesAndTools:
         async def h() -> dict:  # type: ignore[return]
             return {}
 
-        ToolRegistry.register(ToolDefinition("t1", "d", "alpha", h))
-        ToolRegistry.register(ToolDefinition("t2", "d", "alpha", h))
-        ToolRegistry.register(ToolDefinition("t3", "d", "beta", h))
+        ToolRegistry.register(ArsenalTool("t1", "d", "alpha", h))
+        ToolRegistry.register(ArsenalTool("t2", "d", "alpha", h))
+        ToolRegistry.register(ArsenalTool("t3", "d", "beta", h))
 
     def test_list_categories(self):
         self._register()
@@ -198,7 +198,7 @@ class TestToolRegistryClear:
         async def h() -> dict:  # type: ignore[return]
             return {}
 
-        ToolRegistry.register(ToolDefinition("t1", "d", "cat", h))
+        ToolRegistry.register(ArsenalTool("t1", "d", "cat", h))
         ToolRegistry.clear()
         assert ToolRegistry.list_tools() == []
         assert ToolRegistry.list_categories() == []

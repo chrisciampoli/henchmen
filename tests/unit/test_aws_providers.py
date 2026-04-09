@@ -42,6 +42,10 @@ def _remove_aws_modules():
 
 
 def _mock_settings(**overrides):
+    """TODO(R9): replace with the shared ``mock_settings`` fixture from
+    ``tests/conftest.py``. Requires threading ``monkeypatch.setenv`` for
+    all AWS-specific fields used here.
+    """
     s = MagicMock()
     s.aws_region = "us-east-1"
     s.aws_account_id = "123456789012"

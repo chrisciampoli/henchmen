@@ -39,6 +39,22 @@ class SchemeGraph:
         if errors:
             return errors
 
+        # Reject fan-out on the same (node_id, condition) key. The SchemeExecutor
+        # walks the DAG by picking ``next_nodes[0]`` — any scheme that produces
+        # multiple outgoing edges for the same condition would silently have
+        # branches 2..N dropped. Schemes must be linear per condition; enforce
+        # that explicitly here so the assumption can't drift.
+        edge_key_counts: dict[tuple[str, str | None], int] = defaultdict(int)
+        for edge in self.definition.edges:
+            edge_key_counts[(edge.from_node, edge.condition)] += 1
+        for (from_node, condition), count in edge_key_counts.items():
+            if count > 1:
+                cond_label = repr(condition) if condition is not None else "unconditional"
+                errors.append(
+                    f"Fan-out not supported: node '{from_node}' has {count} outgoing edges "
+                    f"for condition {cond_label}; schemes must be linear per condition"
+                )
+
         # Find nodes with incoming edges
         nodes_with_incoming: set[str] = set()
         for edge in self.definition.edges:

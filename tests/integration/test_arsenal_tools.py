@@ -40,6 +40,7 @@ from henchmen.models.scheme import ArsenalRequirement
 
 
 class TestCodeIntelTools:
+    @pytest.mark.asyncio
     async def test_file_read_returns_content(self, test_workspace: Path):
         auth_py = str(test_workspace / "src" / "auth.py")
         result = await file_read(auth_py)
@@ -49,6 +50,7 @@ class TestCodeIntelTools:
         assert "def login" in result["content"]
         assert result["total_lines"] > 0
 
+    @pytest.mark.asyncio
     async def test_file_read_with_line_range(self, test_workspace: Path):
         auth_py = str(test_workspace / "src" / "auth.py")
         # Read lines 1-3 (0-indexed: lines at index 1 through 3 exclusive)
@@ -61,6 +63,7 @@ class TestCodeIntelTools:
         lines = result["content"].splitlines()
         assert len(lines) <= 2
 
+    @pytest.mark.asyncio
     async def test_file_search_finds_matching_files(self, test_workspace: Path):
         result = await file_search(pattern="*.py", directory=str(test_workspace))
 
@@ -70,6 +73,7 @@ class TestCodeIntelTools:
         assert "auth.py" in basenames
         assert "test_auth.py" in basenames
 
+    @pytest.mark.asyncio
     async def test_grep_search_finds_pattern(self, test_workspace: Path):
         result = await grep_search(
             pattern="def login",
@@ -82,6 +86,7 @@ class TestCodeIntelTools:
         assert "def login" in result["output"]
         assert "auth.py" in result["output"]
 
+    @pytest.mark.asyncio
     async def test_symbol_lookup_finds_function(self, test_workspace: Path):
         result = await symbol_lookup(symbol="login", directory=str(test_workspace))
 
@@ -90,6 +95,7 @@ class TestCodeIntelTools:
         found_texts = [m.get("text", "") for m in result["matches"]]
         assert any("def login" in t for t in found_texts)
 
+    @pytest.mark.asyncio
     async def test_ast_analysis_lists_functions(self, test_workspace: Path):
         auth_py = str(test_workspace / "src" / "auth.py")
         result = await ast_analysis(path=auth_py)
@@ -106,6 +112,7 @@ class TestCodeIntelTools:
 
 
 class TestCodeEditTools:
+    @pytest.mark.asyncio
     async def test_file_write_creates_content(self, test_workspace: Path):
         new_file = str(test_workspace / "src" / "utils.py")
         content = "def helper():\n    return True\n"
@@ -117,6 +124,7 @@ class TestCodeEditTools:
         assert Path(new_file).exists()
         assert Path(new_file).read_text(encoding="utf-8") == content
 
+    @pytest.mark.asyncio
     async def test_file_edit_replaces_text(self, test_workspace: Path):
         auth_py = str(test_workspace / "src" / "auth.py")
         old_text = '{"token": "abc123", "user": username}'
@@ -130,6 +138,7 @@ class TestCodeEditTools:
         assert "xyz789" in updated
         assert "abc123" not in updated
 
+    @pytest.mark.asyncio
     async def test_file_create_new_file(self, test_workspace: Path):
         new_file = str(test_workspace / "src" / "newmodule.py")
         content = "# new module\n"
@@ -141,6 +150,7 @@ class TestCodeEditTools:
         assert Path(new_file).exists()
         assert Path(new_file).read_text(encoding="utf-8") == content
 
+    @pytest.mark.asyncio
     async def test_file_create_fails_if_exists(self, test_workspace: Path):
         auth_py = str(test_workspace / "src" / "auth.py")
 
@@ -149,6 +159,7 @@ class TestCodeEditTools:
         assert "error" in result
         assert "already exists" in result["error"]
 
+    @pytest.mark.asyncio
     async def test_file_delete_removes_file(self, test_workspace: Path):
         temp_file = test_workspace / "src" / "temp_to_delete.py"
         temp_file.write_text("# temporary\n", encoding="utf-8")
@@ -174,6 +185,7 @@ class TestGitOpsTools:
         """Change cwd to the test workspace for every git test."""
         monkeypatch.chdir(test_workspace)
 
+    @pytest.mark.asyncio
     async def test_git_status_shows_clean_workspace(self, test_workspace: Path):
         result = await git_status()
 
@@ -181,6 +193,7 @@ class TestGitOpsTools:
         # A clean repo has no short-format lines
         assert result["stdout"].strip() == ""
 
+    @pytest.mark.asyncio
     async def test_git_branch_create(self, test_workspace: Path):
         result = await git_branch_create(branch_name="feature/test")
 
@@ -197,6 +210,7 @@ class TestGitOpsTools:
         )
         assert log.stdout.strip() == "feature/test"
 
+    @pytest.mark.asyncio
     async def test_git_commit_stages_and_commits(self, test_workspace: Path):
         # Modify a file so there's something to commit
         auth_py = test_workspace / "src" / "auth.py"
@@ -213,6 +227,7 @@ class TestGitOpsTools:
         log_result = await git_log(max_count=5)
         assert "test commit" in log_result["stdout"]
 
+    @pytest.mark.asyncio
     async def test_git_diff_shows_changes(self, test_workspace: Path):
         # Modify a file without staging it
         auth_py = test_workspace / "src" / "auth.py"
@@ -226,12 +241,14 @@ class TestGitOpsTools:
         assert result["success"] is True
         assert "diff test change" in result["stdout"]
 
+    @pytest.mark.asyncio
     async def test_git_log_shows_history(self, test_workspace: Path):
         result = await git_log(max_count=5)
 
         assert result["success"] is True
         assert "Initial commit" in result["stdout"]
 
+    @pytest.mark.asyncio
     async def test_git_status_shows_modified_files(self, test_workspace: Path):
         # Modify a tracked file
         auth_py = test_workspace / "src" / "auth.py"
@@ -253,6 +270,7 @@ class TestGitOpsTools:
 
 
 class TestTestRunnerTools:
+    @pytest.mark.asyncio
     async def test_run_lint_on_clean_code(self, test_workspace: Path):
         result = await run_lint(path=str(test_workspace))
 
@@ -262,6 +280,7 @@ class TestTestRunnerTools:
         assert "stdout" in result
         assert "return_code" in result
 
+    @pytest.mark.asyncio
     async def test_run_tests_executes_pytest(self, test_workspace: Path):
         test_dir = str(test_workspace / "tests")
         result = await run_tests(test_path=test_dir)

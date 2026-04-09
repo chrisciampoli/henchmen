@@ -1,11 +1,43 @@
-# Henchmen local development stack
-# Usage: cp .env.example .env.local && docker compose up
+# Henchmen local development stack.
+#
+# This docker-compose file is an alternative entry point for users who want
+# service isolation -- each Henchmen component (dispatch, mastermind, forge)
+# runs in its own container and talks to the others over the compose network,
+# with Ollama as a shared LLM sidecar.
+#
+# The recommended quickstart for most users is the single-process CLI:
+#
+#     henchmen serve
+#
+# which runs the same services in one Python process with an in-memory HTTP
+# forwarder. Use docker-compose when you want to match the production
+# topology more closely, debug a single component in isolation, or develop
+# against a long-lived Ollama container.
+#
+# Usage:
+#     cp .env.example .env.local
+#     docker compose up
 
 services:
+  ollama:
+    image: ollama/ollama:0.4.6
+    container_name: henchmen-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
   dispatch:
     build:
       context: .
       dockerfile: containers/dispatch/Dockerfile
+    container_name: henchmen-dispatch
     ports:
       - "8001:8080"
     env_file: .env.local
@@ -13,38 +45,58 @@ services:
       HENCHMEN_PROVIDER: local
       HENCHMEN_ENVIRONMENT: dev
     depends_on:
-      - ollama
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=2).status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   mastermind:
     build:
       context: .
       dockerfile: containers/mastermind/Dockerfile
+    container_name: henchmen-mastermind
     ports:
       - "8002:8080"
     env_file: .env.local
     environment:
       HENCHMEN_PROVIDER: local
       HENCHMEN_ENVIRONMENT: dev
+    command: ["uvicorn", "henchmen.mastermind.server:app", "--host", "0.0.0.0", "--port", "8080"]
     depends_on:
-      - ollama
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=2).status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   forge:
     build:
       context: .
       dockerfile: containers/forge/Dockerfile
+    container_name: henchmen-forge
     ports:
       - "8003:8080"
     env_file: .env.local
     environment:
       HENCHMEN_PROVIDER: local
       HENCHMEN_ENVIRONMENT: dev
-
-  ollama:
-    image: ollama/ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
+    command: ["uvicorn", "henchmen.forge.server:app", "--host", "0.0.0.0", "--port", "8080"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=2).status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
 volumes:
   ollama_data:

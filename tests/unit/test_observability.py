@@ -80,6 +80,16 @@ def _make_report(**kwargs):
 
 
 def _mock_settings():
+    """Compatibility shim. Prefer the shared ``mock_settings`` fixture.
+
+    Many older tests in this module still call this helper directly rather
+    than taking the ``mock_settings`` fixture as a parameter. New tests
+    should use the fixture; this helper stays for the legacy call sites and
+    simply returns a MagicMock with the two fields the local tests touch.
+
+    TODO(R9): thread the shared fixture through every test in this module
+    and delete this helper.
+    """
     s = MagicMock()
     s.gcp_project_id = "test-project"
     s.firestore_database = "(default)"
@@ -111,6 +121,7 @@ class TestTaskTracker:
         tracker = TaskTracker(settings, document_store=mock_store)
         return tracker
 
+    @pytest.mark.asyncio
     async def test_start_task_creates_doc(self):
         store = _make_mock_store()
         tracker = self._make_tracker(store)
@@ -128,6 +139,7 @@ class TestTaskTracker:
         assert call_data["node_metrics"] == {}
         assert "expires_at" in call_data
 
+    @pytest.mark.asyncio
     async def test_record_node_result_updates_doc(self):
         store = _make_mock_store()
         # Return an empty current doc so increments start from zero
@@ -143,6 +155,7 @@ class TestTaskTracker:
         assert node_data["model_calls"] == 15
         assert node_data["confidence_score"] == 0.85
 
+    @pytest.mark.asyncio
     async def test_record_node_result_empty_files_changed(self):
         store = _make_mock_store()
         store.get = AsyncMock(return_value={})
@@ -153,6 +166,7 @@ class TestTaskTracker:
         # files_changed should NOT be in the update when empty
         assert "files_changed" not in update_data
 
+    @pytest.mark.asyncio
     async def test_record_ci_result(self):
         store = _make_mock_store()
         tracker = self._make_tracker(store)
@@ -160,6 +174,7 @@ class TestTaskTracker:
         _coll, _id, update_data = store.update.call_args[0]
         assert update_data["ci_passed"] is True
 
+    @pytest.mark.asyncio
     async def test_finalize_task(self):
         store = _make_mock_store()
         tracker = self._make_tracker(store)
@@ -170,6 +185,7 @@ class TestTaskTracker:
         assert update_data["pr_number"] == 1
         assert "completed_at" in update_data
 
+    @pytest.mark.asyncio
     async def test_firestore_error_does_not_raise(self):
         store = _make_mock_store()
         store.set = AsyncMock(side_effect=Exception("Store down"))
@@ -177,6 +193,7 @@ class TestTaskTracker:
         task = _make_task()
         await tracker.start_task(task, "bugfix_standard")  # Should not raise
 
+    @pytest.mark.asyncio
     async def test_get_task(self):
         store = _make_mock_store()
         store.get = AsyncMock(return_value={"task_id": "t1", "title": "Test"})
@@ -184,6 +201,7 @@ class TestTaskTracker:
         result = await tracker.get_task("t1")
         assert result["task_id"] == "t1"
 
+    @pytest.mark.asyncio
     async def test_get_task_not_found(self):
         store = _make_mock_store()
         store.get = AsyncMock(return_value=None)
@@ -291,12 +309,14 @@ class TestGetMetricsSummary:
         store.query = AsyncMock(return_value=tasks or [])
         return TaskTracker(settings, document_store=store)
 
+    @pytest.mark.asyncio
     async def test_empty_returns_zero_total(self):
         tracker = self._make_tracker([])
         result = await tracker.get_metrics_summary(days=7)
         assert result["total_tasks"] == 0
         assert result["days"] == 7
 
+    @pytest.mark.asyncio
     async def test_success_rate_calculation(self):
         tasks = [
             {
@@ -328,6 +348,7 @@ class TestGetMetricsSummary:
         assert result["success_rate"] == pytest.approx(2 / 3, abs=0.01)
         assert result["escalation_rate"] == pytest.approx(1 / 3, abs=0.01)
 
+    @pytest.mark.asyncio
     async def test_cost_by_model_aggregation(self):
         tasks = [
             {
@@ -356,6 +377,7 @@ class TestGetMetricsSummary:
         assert cbm["claude-sonnet-4@20250514"] == pytest.approx(0.65, abs=0.001)
         assert cbm["gemini-2.5-flash"] == pytest.approx(0.05, abs=0.001)
 
+    @pytest.mark.asyncio
     async def test_escalation_reasons_frequency(self):
         tasks = [
             {
@@ -389,6 +411,7 @@ class TestGetMetricsSummary:
         assert er["Stalled after 3 attempts"] == 2
         assert er["CI failed"] == 1
 
+    @pytest.mark.asyncio
     async def test_token_totals(self):
         tasks = [
             {
@@ -411,6 +434,7 @@ class TestGetMetricsSummary:
         assert result["total_tokens"]["input"] == 300000
         assert result["total_tokens"]["output"] == 15000
 
+    @pytest.mark.asyncio
     async def test_firestore_error_returns_zero_total(self):
         # get_recent_tasks silently catches the store error and returns [].
         # get_metrics_summary then sees an empty task list and returns {"total_tasks": 0}.
@@ -423,6 +447,7 @@ class TestGetMetricsSummary:
         assert result["total_tasks"] == 0
         assert result["days"] == 7
 
+    @pytest.mark.asyncio
     async def test_node_metrics_missing_model_name_uses_unknown(self):
         tasks = [
             {
@@ -663,6 +688,7 @@ class TestTrackerExecutionState:
         mock_store = store or _make_mock_store()
         return TaskTracker(settings, document_store=mock_store)
 
+    @pytest.mark.asyncio
     async def test_update_execution_state(self):
         store = _make_mock_store()
         tracker = self._make_tracker(store)
@@ -678,6 +704,7 @@ class TestTrackerExecutionState:
         assert data["execution_state"] == "running"
         assert "last_heartbeat" in data
 
+    @pytest.mark.asyncio
     async def test_update_execution_state_stores_node_results_and_retry_counts(self):
         store = _make_mock_store()
         tracker = self._make_tracker(store)
@@ -693,6 +720,7 @@ class TestTrackerExecutionState:
         assert data["node_results"] == node_results
         assert data["retry_counts"] == retry_counts
 
+    @pytest.mark.asyncio
     async def test_update_execution_state_swallows_errors(self):
         store = _make_mock_store()
         store.update = AsyncMock(side_effect=Exception("Store down"))
@@ -700,6 +728,7 @@ class TestTrackerExecutionState:
         # Should not raise
         await tracker.update_execution_state("task-1", "node-1", {}, {})
 
+    @pytest.mark.asyncio
     async def test_mark_stalled(self):
         store = _make_mock_store()
         tracker = self._make_tracker(store)
@@ -707,12 +736,14 @@ class TestTrackerExecutionState:
         _coll, _id, data = store.update.call_args[0]
         assert data["execution_state"] == "stalled"
 
+    @pytest.mark.asyncio
     async def test_mark_stalled_swallows_errors(self):
         store = _make_mock_store()
         store.update = AsyncMock(side_effect=Exception("Store down"))
         tracker = self._make_tracker(store)
         await tracker.mark_stalled("task-1")  # Should not raise
 
+    @pytest.mark.asyncio
     async def test_mark_escalated_with_reason(self):
         store = _make_mock_store()
         tracker = self._make_tracker(store)
@@ -722,6 +753,7 @@ class TestTrackerExecutionState:
         assert data["final_status"] == "escalated"
         assert "3 attempts" in data.get("escalation_reason", "")
 
+    @pytest.mark.asyncio
     async def test_mark_escalated_sets_completed_at(self):
         store = _make_mock_store()
         tracker = self._make_tracker(store)
@@ -729,6 +761,7 @@ class TestTrackerExecutionState:
         _coll, _id, data = store.update.call_args[0]
         assert "completed_at" in data
 
+    @pytest.mark.asyncio
     async def test_mark_escalated_default_reason(self):
         store = _make_mock_store()
         tracker = self._make_tracker(store)
@@ -736,6 +769,7 @@ class TestTrackerExecutionState:
         _coll, _id, data = store.update.call_args[0]
         assert data["escalation_reason"] == ""
 
+    @pytest.mark.asyncio
     async def test_increment_recovery_attempts(self):
         store = _make_mock_store()
         store.get = AsyncMock(return_value={"recovery_attempts": 2})
@@ -744,12 +778,14 @@ class TestTrackerExecutionState:
         _coll, _id, data = store.update.call_args[0]
         assert data["recovery_attempts"] == 3
 
+    @pytest.mark.asyncio
     async def test_increment_recovery_attempts_swallows_errors(self):
         store = _make_mock_store()
         store.get = AsyncMock(side_effect=Exception("Store down"))
         tracker = self._make_tracker(store)
         await tracker.increment_recovery_attempts("task-1")  # Should not raise
 
+    @pytest.mark.asyncio
     async def test_get_stalled_tasks_returns_list(self):
         store = _make_mock_store()
         store.query = AsyncMock(
@@ -763,6 +799,7 @@ class TestTrackerExecutionState:
         assert len(results) == 2
         assert results[0]["task_id"] == "t1"
 
+    @pytest.mark.asyncio
     async def test_get_stalled_tasks_returns_empty_on_error(self):
         store = _make_mock_store()
         store.query = AsyncMock(side_effect=Exception("Store down"))
@@ -770,6 +807,7 @@ class TestTrackerExecutionState:
         results = await tracker.get_stalled_tasks()
         assert results == []
 
+    @pytest.mark.asyncio
     async def test_start_task_includes_execution_state_fields(self):
         store = _make_mock_store()
         tracker = self._make_tracker(store)
@@ -791,6 +829,7 @@ class TestTrackerExecutionState:
 class TestMessageDedup:
     """Test Layer 1: Pub/Sub message-level dedup via DocumentStore."""
 
+    @pytest.mark.asyncio
     async def test_new_message_returns_false(self):
         """A new message should not be flagged as duplicate."""
         from henchmen.mastermind.server import _check_message_dedup
@@ -807,6 +846,7 @@ class TestMessageDedup:
         # Verify store.set was called to record the message
         mock_store.set.assert_called_once()
 
+    @pytest.mark.asyncio
     async def test_duplicate_message_returns_true(self):
         """An already-processed message should be flagged as duplicate."""
         from henchmen.mastermind.server import _check_message_dedup
@@ -823,6 +863,7 @@ class TestMessageDedup:
         # set should NOT be called for duplicates
         mock_store.set.assert_not_called()
 
+    @pytest.mark.asyncio
     async def test_empty_message_id_returns_false(self):
         """Empty message IDs should not be checked (early return)."""
         from henchmen.mastermind.server import _check_message_dedup

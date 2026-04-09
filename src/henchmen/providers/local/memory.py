@@ -2,18 +2,51 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import logging
 from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
+logger = logging.getLogger(__name__)
+
 
 class InMemoryMessageBroker:
-    """MessageBroker backed by in-process async queues."""
+    """MessageBroker backed by in-process async queues.
+
+    Optionally forwards publishes as HTTP POSTs to simulate Pub/Sub push
+    delivery when running all services in a single process.
+    """
 
     def __init__(self) -> None:
         self._messages: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._subscribers: dict[str, list[Callable[..., Any]]] = defaultdict(list)
+        self._forward_map: dict[str, str] = {}
+        # Strong references to in-flight forward tasks. Without this, the asyncio
+        # event loop only holds weak references and background tasks can be
+        # garbage collected mid-run (silent message loss in local dev).
+        self._background_tasks: set[asyncio.Task[None]] = set()
+
+    async def drain(self) -> None:
+        """Wait for all in-flight forward tasks to complete.
+
+        Call this from an application lifespan shutdown hook to avoid losing
+        in-transit messages on clean shutdown.
+        """
+        if not self._background_tasks:
+            return
+        await asyncio.gather(*self._background_tasks, return_exceptions=True)
+
+    def set_forward_map(self, mapping: dict[str, str]) -> None:
+        """Set topic -> URL mapping for HTTP forwarding.
+
+        When a message is published to a topic in the map, an HTTP POST is
+        sent to the URL with a Pub/Sub-style envelope. This simulates
+        Pub/Sub push subscriptions for local development.
+        """
+        self._forward_map = mapping
 
     async def publish(self, topic: str, data: bytes, ordering_key: str | None = None, **attributes: str) -> str:
         """Publish a message to the given topic. Returns a local message ID."""
@@ -21,7 +54,50 @@ class InMemoryMessageBroker:
         self._messages[topic].append({"id": msg_id, "data": data, "attributes": attributes})
         for callback in self._subscribers.get(topic, []):
             callback(data, **attributes)
+
+        # HTTP forwarding (non-blocking, best-effort). Hold a strong reference
+        # to the task and clean up via a done-callback to prevent GC from reaping
+        # the in-flight forward before it completes.
+        url = self._forward_map.get(topic)
+        if url:
+            task = asyncio.create_task(self._forward_to_http(url, msg_id, data, attributes))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
         return msg_id
+
+    async def _forward_to_http(self, url: str, msg_id: str, data: bytes, attributes: dict[str, str]) -> None:
+        """POST a Pub/Sub-style envelope to a local HTTP endpoint."""
+        import httpx
+
+        envelope = {
+            "message": {
+                "data": base64.b64encode(data).decode("utf-8"),
+                "attributes": attributes,
+                "messageId": msg_id,
+            },
+            "subscription": "local-dev",
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(url, json=envelope, timeout=30)
+                logger.debug("Forwarded %s to %s (status=%d)", msg_id, url, resp.status_code)
+        except Exception as exc:
+            logger.warning("HTTP forward failed for %s -> %s: %s", msg_id, url, exc)
+
+    async def pull_dlq(
+        self,
+        subscription_name: str,
+        max_messages: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Return an empty list — the in-memory broker has no DLQ concept.
+
+        Local dev does not dead-letter messages; failed handlers surface
+        as exceptions in the same process.  Returning an empty list lets
+        ``check_dlq_handler`` run in local mode without special-casing
+        the provider.
+        """
+        return []
 
     def subscribe(self, topic: str, callback: Callable[..., Any]) -> None:
         """Register a callback to be invoked synchronously on publish."""

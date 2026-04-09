@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "last_updated": "2026-04-09",
+  "providers": {
+    "openai": {
+      "aggregate_score": null,
+      "note": "baseline not yet populated - run `henchmen eval --provider openai --write-baseline`"
+    },
+    "anthropic": {
+      "aggregate_score": null,
+      "note": "baseline not yet populated - run `henchmen eval --provider anthropic --write-baseline`"
+    },
+    "vertex": {
+      "aggregate_score": null,
+      "note": "baseline not yet populated - run `henchmen eval --provider vertex --write-baseline`"
+    },
+    "ollama": {
+      "aggregate_score": null,
+      "note": "baseline not yet populated - run `henchmen eval --provider ollama --write-baseline`"
+    }
+  }
+}

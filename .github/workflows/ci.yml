@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel in-flight runs when a new push arrives to the same ref.
+# Saves CI minutes and prevents stale-branch races on :latest.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -14,14 +20,14 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
         with:
           python-version: "3.12"
           cache: pip
 
-      - name: Install dependencies
+      - name: Install dependencies (lint tooling only)
         run: pip install -e ".[dev]"
 
       - name: Ruff check
@@ -34,15 +40,15 @@ jobs:
     name: Type Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
         with:
           python-version: "3.12"
           cache: pip
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      - name: Install dependencies (full stack — mypy needs cloud SDKs to type-check imports)
+        run: pip install -e ".[dev-integration]"
 
       - name: mypy
         run: mypy src/
@@ -51,18 +57,39 @@ jobs:
     name: Unit Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
         with:
           python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev-integration]"
 
-      - name: pytest
+      - name: pytest (unit only — fast loop)
         env:
           HENCHMEN_PROVIDER: local
           HENCHMEN_GCP_PROJECT_ID: test-project
-        run: pytest tests/unit/ -v --tb=short
+        run: pytest tests/unit/ -v --tb=short -m "not integration"
+
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies (full stack — integration suite imports google.cloud.*)
+        run: pip install -e ".[dev-integration]"
+
+      - name: pytest (integration suite)
+        env:
+          HENCHMEN_PROVIDER: local
+          HENCHMEN_GCP_PROJECT_ID: test-project
+          HENCHMEN_ENVIRONMENT: dev
+        run: pytest tests/integration/ -v --tb=short

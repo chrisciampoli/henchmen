@@ -1,9 +1,11 @@
 """Evaluation models — quality metrics from Vertex AI GenAI Evaluation."""
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from henchmen.models._base import StrictBase
 
 
-class EvaluationResult(BaseModel):
+class EvaluationResult(StrictBase):
     """Quality scores produced by the GenAI Evaluation Service after an operative run."""
 
     fulfillment_score: float = Field(default=0.0, ge=0.0, le=1.0, description="Task fulfillment (0-1)")

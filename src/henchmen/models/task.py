@@ -4,7 +4,9 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from henchmen.models._base import StrictBase
 
 
 class TaskSource(StrEnum):
@@ -30,7 +32,7 @@ class TaskStatus(StrEnum):
     ESCALATED = "escalated"
 
 
-class TaskContext(BaseModel):
+class TaskContext(StrictBase):
     """Contextual information gathered from the task source."""
 
     repo: str = Field(..., description="Repository name (owner/repo)")
@@ -40,7 +42,7 @@ class TaskContext(BaseModel):
     pr_diff: str | None = Field(default=None, description="Pull request diff text")
 
 
-class HenchmenTask(BaseModel):
+class HenchmenTask(StrictBase):
     """A unit of work to be executed by an operative."""
 
     id: str = Field(default_factory=lambda: str(uuid4()), description="Unique task identifier (UUID)")
@@ -55,3 +57,14 @@ class HenchmenTask(BaseModel):
     )
     created_by: str = Field(..., description="User or system that created the task")
     status: TaskStatus = Field(default=TaskStatus.PENDING, description="Current lifecycle status")
+
+    @property
+    def branch_name(self) -> str:
+        """Canonical Henchmen branch name for this task.
+
+        The single source of truth for the feature-branch name convention.
+        Derived from the first eight characters of the task UUID so every
+        component (operative bootstrap, scheme handlers, lair manager,
+        PR creator) computes the same value without duplicating the formula.
+        """
+        return f"henchmen/{self.id[:8]}"

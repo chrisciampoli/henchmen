@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING
 
 from henchmen.models.llm import LLMResponse, Message, MessageRole, ModelTier, TokenUsage, ToolCall, ToolDefinition
@@ -10,11 +11,20 @@ from henchmen.models.llm import LLMResponse, Message, MessageRole, ModelTier, To
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
 
-_TIER_DEFAULTS: dict[str, str] = {
-    ModelTier.COMPLEX: "gpt-4.1",
-    ModelTier.LIGHT: "gpt-4.1-mini",
-    ModelTier.REASONING: "o3",
-}
+logger = logging.getLogger(__name__)
+
+
+def _build_tier_defaults(settings: Settings) -> dict[str, str]:
+    """Build the tier-to-model map from Settings.
+
+    Sourcing model names from settings (L10 fix) means operators can roll to
+    new OpenAI models via env var rather than a code change and redeploy.
+    """
+    return {
+        ModelTier.COMPLEX: settings.openai_model_complex,
+        ModelTier.LIGHT: settings.openai_model_light,
+        ModelTier.REASONING: settings.openai_model_reasoning,
+    }
 
 
 class OpenAIProvider:
@@ -24,14 +34,31 @@ class OpenAIProvider:
         import openai
 
         self._client = openai.AsyncOpenAI(api_key=getattr(settings, "openai_api_key", None))
+        self._tier_defaults: dict[str, str] = _build_tier_defaults(settings)
+        logger.info(
+            "OpenAIProvider tier mapping: complex=%s light=%s reasoning=%s",
+            self._tier_defaults.get(ModelTier.COMPLEX, ""),
+            self._tier_defaults.get(ModelTier.LIGHT, ""),
+            self._tier_defaults.get(ModelTier.REASONING, ""),
+        )
 
     def resolve_tier(self, tier: str) -> str:
         """Map a model tier to the default OpenAI model for that tier."""
-        return _TIER_DEFAULTS.get(tier, tier)
+        return self._tier_defaults.get(tier, tier)
 
     def supported_models(self) -> list[str]:
         """Return the list of supported OpenAI model identifiers."""
-        return ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "o3"]
+        seen: set[str] = set()
+        out: list[str] = []
+        for name in (
+            self._tier_defaults.get(ModelTier.COMPLEX, ""),
+            self._tier_defaults.get(ModelTier.LIGHT, ""),
+            self._tier_defaults.get(ModelTier.REASONING, ""),
+        ):
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
 
     async def count_tokens(self, text: str, model: str) -> int:
         """Approximate token count using a 4-chars-per-token heuristic."""

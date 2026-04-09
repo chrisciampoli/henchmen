@@ -18,7 +18,6 @@ import pytest
 from henchmen.mastermind.agent import MastermindAgent
 from henchmen.mastermind.lair_manager import LairManager
 from henchmen.mastermind.scheme_executor import SchemeExecutor
-from henchmen.mastermind.state_machine import TaskState, TaskStateMachine
 from henchmen.models.dossier import Dossier
 from henchmen.models.operative import OperativeReport, OperativeStatus
 from henchmen.models.scheme import (
@@ -486,90 +485,20 @@ class TestSchemeExecution:
 
 
 # ---------------------------------------------------------------------------
-# TestStateMachineIntegration
+# TestStateMachineIntegration (REMOVED)
 # ---------------------------------------------------------------------------
-
-
-class TestStateMachineIntegration:
-    """Verify TaskStateMachine lifecycle, history, recovery, and error handling."""
-
-    def test_full_lifecycle_happy_path(self):
-        """Happy path: RECEIVED → SCHEME_SELECTED → LAIR_PROVISIONED → DOSSIER_BUILT
-        → EXECUTING → CI_RUNNING → AWAITING_REVIEW → COMPLETED."""
-        sm = TaskStateMachine(task_id="task-001")
-
-        sm.transition(TaskState.SCHEME_SELECTED, {"scheme_id": "bugfix_standard"})
-        sm.transition(TaskState.LAIR_PROVISIONED)
-        sm.transition(TaskState.DOSSIER_BUILT)
-        sm.transition(TaskState.EXECUTING)
-        sm.transition(TaskState.CI_RUNNING)
-        sm.transition(TaskState.AWAITING_REVIEW)
-        sm.transition(TaskState.COMPLETED)
-
-        assert sm.current_state == TaskState.COMPLETED
-        # All states (including initial RECEIVED implied by history start) are recorded
-        state_sequence = [t.to_state for t in sm.history]
-        assert TaskState.SCHEME_SELECTED in state_sequence
-        assert TaskState.COMPLETED in state_sequence
-
-    def test_escalation_on_ci_failure(self):
-        """After max CI retries, state reaches ESCALATED."""
-        sm = TaskStateMachine(task_id="task-002")
-
-        sm.transition(TaskState.SCHEME_SELECTED)
-        sm.transition(TaskState.LAIR_PROVISIONED)
-        sm.transition(TaskState.DOSSIER_BUILT)
-        sm.transition(TaskState.EXECUTING)
-        sm.transition(TaskState.CI_RUNNING)
-        sm.transition(TaskState.CI_RETRY, {"attempt": 1})
-        sm.transition(TaskState.CI_RUNNING)
-        sm.transition(TaskState.CI_RETRY, {"attempt": 2})
-        sm.transition(TaskState.CI_RUNNING)
-        sm.transition(TaskState.ESCALATED, {"reason": "CI failed after max retries"})
-
-        assert sm.current_state == TaskState.ESCALATED
-
-    def test_crash_recovery_resumes_from_last_state(self):
-        """Serialize SM at EXECUTING, deserialize, verify get_recovery_state returns EXECUTING."""
-        sm = TaskStateMachine(task_id="task-003")
-        sm.transition(TaskState.SCHEME_SELECTED)
-        sm.transition(TaskState.LAIR_PROVISIONED)
-        sm.transition(TaskState.DOSSIER_BUILT)
-        sm.transition(TaskState.EXECUTING)
-
-        serialized = sm.to_dict()
-
-        # Simulate a crash and deserialization
-        recovered_sm = TaskStateMachine.from_dict(serialized)
-        assert recovered_sm.current_state == TaskState.EXECUTING
-        recovery_state = recovered_sm.get_recovery_state()
-        assert recovery_state == TaskState.EXECUTING
-
-    def test_state_history_records_all_transitions(self):
-        """Every transition appears in history with timestamps."""
-        sm = TaskStateMachine(task_id="task-004")
-        transitions = [
-            (TaskState.SCHEME_SELECTED, {"scheme_id": "bugfix_standard"}),
-            (TaskState.LAIR_PROVISIONED, {}),
-            (TaskState.DOSSIER_BUILT, {}),
-            (TaskState.EXECUTING, {}),
-        ]
-        for state, meta in transitions:
-            sm.transition(state, meta)
-
-        assert len(sm.history) == len(transitions)
-        for i, (expected_state, _) in enumerate(transitions):
-            assert sm.history[i].to_state == expected_state
-            assert isinstance(sm.history[i].timestamp, datetime)
-
-    def test_invalid_transition_raises_error(self):
-        """Attempting RECEIVED → COMPLETED raises ValueError."""
-        sm = TaskStateMachine(task_id="task-005")
-        # SM starts in RECEIVED; COMPLETED is not a valid next state
-        with pytest.raises(ValueError, match="Invalid transition"):
-            sm.transition(TaskState.COMPLETED)
-
-
+#
+# The TestStateMachineIntegration class (5 tests covering full lifecycle,
+# escalation, crash recovery, history, and invalid transitions) was deleted
+# wholesale.
+#
+# TaskStateMachine was deleted in the 2026-04-09 expert panel remediation
+# (finding E1) - lifecycle state lives in Firestore task_executions
+# documents managed by SchemeExecutor. These tests were exercising an
+# in-memory object that was never persisted, so they had no observable
+# behavior to assert against. Crash recovery is now covered by tests that
+# read the Firestore task_executions/{task_id} document directly.
+#
 # ---------------------------------------------------------------------------
 # TestMastermindEndToEnd
 # ---------------------------------------------------------------------------
@@ -630,7 +559,7 @@ class TestMastermindEndToEnd:
 
     @pytest.mark.asyncio
     async def test_handle_task_ci_retry_then_pass(self):
-        """Mock _run_ci to fail once then pass → CI_RETRY visited, final state COMPLETED."""
+        """Mock _run_ci to fail once then pass → CI retried, final result COMPLETED."""
         task = make_task(title="Fix the crash in login")
         agent = MastermindAgent(self.settings)
 
@@ -657,15 +586,17 @@ class TestMastermindEndToEnd:
 
             result = await agent.handle_task(task)
 
-        sm = agent._active_tasks[task.id]
-        state_history = [t.to_state for t in sm.history]
-
-        assert TaskState.CI_RETRY in state_history
+        # CI was retried (called more than once) and the task ultimately completed.
+        # Previously asserted via TaskState.CI_RETRY in sm.history, but the
+        # in-memory TaskStateMachine was deleted in the 2026-04-09 expert panel
+        # remediation (finding E1).
+        assert call_count >= 2
         assert result["status"] == "completed"
+        assert result["result"]["final_status"] == "completed"
 
     @pytest.mark.asyncio
     async def test_handle_task_ci_max_retries_escalates(self):
-        """Mock _run_ci to always fail → ESCALATED after max retries."""
+        """Mock _run_ci to always fail → escalated after max retries."""
         task = make_task(title="Fix the broken auth flow")
         agent = MastermindAgent(self.settings)
 
@@ -682,5 +613,4 @@ class TestMastermindEndToEnd:
             result = await agent.handle_task(task)
 
         assert result["status"] == "escalated"
-        sm = agent._active_tasks[task.id]
-        assert sm.current_state == TaskState.ESCALATED
+        assert result["result"]["final_status"] == "escalated"

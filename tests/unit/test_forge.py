@@ -13,6 +13,12 @@ from henchmen.providers.interfaces.ci_provider import CIResult, CIStatus
 
 
 def _mock_settings():
+    """TODO(R9): replace with the shared ``mock_settings`` fixture from
+    ``tests/conftest.py``. Requires updating the ``pubsub_topic_forge_result``
+    assertion below — the real Settings class computes topic names with an
+    environment prefix (``henchmen-dev-forge-result``), whereas this helper
+    returns a raw ``henchmen-forge-result``.
+    """
     s = MagicMock()
     s.gcp_project_id = "test-project"
     s.pubsub_topic_forge_result = "henchmen-forge-result"

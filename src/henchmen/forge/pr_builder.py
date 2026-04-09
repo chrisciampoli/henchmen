@@ -1,7 +1,10 @@
 """PR Builder - creates GitHub PRs with Henchmen labeling."""
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +14,7 @@ _HENCHMEN_LABEL = "henchmen-operative"
 class PRBuilder:
     """Creates GitHub PRs with Henchmen labeling."""
 
-    def __init__(self, settings: Any) -> None:
+    def __init__(self, settings: "Settings") -> None:
         self.settings = settings
 
     async def create_pr(

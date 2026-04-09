@@ -8,11 +8,10 @@ All tests target the repo ``acme-org/sample-repo``.
 """
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 
 from henchmen.config.settings import get_settings
 from henchmen.dispatch.normalizer import TaskNormalizer
-from henchmen.dispatch.server import app
 from tests.integration.conftest import IntegrationAssertions, MockPubSubPublisher
 
 TASK_INTAKE_TOPIC = "task-intake"
@@ -54,12 +53,12 @@ class TestCLIDispatchPipeline:
     @pytest.mark.asyncio
     async def test_cli_request_produces_valid_task_on_pubsub(
         self,
+        dispatch_client: AsyncClient,
         cli_task_data: dict,
         assertions: IntegrationAssertions,
     ):
         """POST /api/v1/tasks → a message with correct HenchmenTask shape on task-intake."""
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await _post(client, "/api/v1/tasks", cli_task_data)
+        resp = await _post(dispatch_client, "/api/v1/tasks", cli_task_data)
 
         assert resp["status"] == "dispatched"
         self.mock_pubsub.assert_published_to(TASK_INTAKE_TOPIC, count=1)
@@ -67,36 +66,35 @@ class TestCLIDispatchPipeline:
         assertions.assert_valid_henchmen_task(task_data)
 
     @pytest.mark.asyncio
-    async def test_cli_task_has_correct_source(self, cli_task_data: dict):
+    async def test_cli_task_has_correct_source(self, dispatch_client: AsyncClient, cli_task_data: dict):
         """Source field must be 'cli'."""
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            await _post(client, "/api/v1/tasks", cli_task_data)
+        await _post(dispatch_client, "/api/v1/tasks", cli_task_data)
 
         task_data = _get_first_message(self.mock_pubsub)
         assert task_data["source"] == "cli"
 
     @pytest.mark.asyncio
-    async def test_cli_task_preserves_title_and_description(self, cli_task_data: dict):
+    async def test_cli_task_preserves_title_and_description(
+        self, dispatch_client: AsyncClient, cli_task_data: dict
+    ):
         """Title and description from the request must be preserved in the published task."""
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            await _post(client, "/api/v1/tasks", cli_task_data)
+        await _post(dispatch_client, "/api/v1/tasks", cli_task_data)
 
         task_data = _get_first_message(self.mock_pubsub)
         assert task_data["title"] == cli_task_data["title"]
         assert task_data["description"] == cli_task_data["description"]
 
     @pytest.mark.asyncio
-    async def test_cli_task_preserves_repo_and_branch(self, cli_task_data: dict):
+    async def test_cli_task_preserves_repo_and_branch(self, dispatch_client: AsyncClient, cli_task_data: dict):
         """context.repo must equal 'acme-org/sample-repo'."""
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            await _post(client, "/api/v1/tasks", cli_task_data)
+        await _post(dispatch_client, "/api/v1/tasks", cli_task_data)
 
         task_data = _get_first_message(self.mock_pubsub)
         assert task_data["context"]["repo"] == "acme-org/sample-repo"
         assert task_data["context"]["branch"] == cli_task_data["branch"]
 
     @pytest.mark.asyncio
-    async def test_cli_task_priority_mapping(self):
+    async def test_cli_task_priority_mapping(self, dispatch_client: AsyncClient):
         """Each CLI priority string must survive the round-trip correctly."""
         priority_map = {
             "critical": "critical",
@@ -113,8 +111,7 @@ class TestCLIDispatchPipeline:
                 "priority": input_priority,
                 "created_by": "tester",
             }
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-                await _post(client, "/api/v1/tasks", payload)
+            await _post(dispatch_client, "/api/v1/tasks", payload)
 
             task_data = _get_first_message(self.mock_pubsub)
             assert task_data["priority"] == expected_priority, (
@@ -137,12 +134,12 @@ class TestSlackDispatchPipeline:
     @pytest.mark.asyncio
     async def test_slack_mention_produces_task_on_pubsub(
         self,
+        dispatch_client: AsyncClient,
         slack_event_data: dict,
         assertions: IntegrationAssertions,
     ):
         """POST /webhooks/slack with app_mention → message on task-intake."""
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await _post(client, "/webhooks/slack", slack_event_data)
+        resp = await _post(dispatch_client, "/webhooks/slack", slack_event_data)
 
         assert resp["status"] == "dispatched"
         self.mock_pubsub.assert_published_to(TASK_INTAKE_TOPIC, count=1)
@@ -150,19 +147,17 @@ class TestSlackDispatchPipeline:
         assertions.assert_valid_henchmen_task(task_data)
 
     @pytest.mark.asyncio
-    async def test_slack_task_has_correct_source(self, slack_event_data: dict):
+    async def test_slack_task_has_correct_source(self, dispatch_client: AsyncClient, slack_event_data: dict):
         """Source must be 'slack'."""
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            await _post(client, "/webhooks/slack", slack_event_data)
+        await _post(dispatch_client, "/webhooks/slack", slack_event_data)
 
         task_data = _get_first_message(self.mock_pubsub)
         assert task_data["source"] == "slack"
 
     @pytest.mark.asyncio
-    async def test_slack_task_captures_thread_context(self, slack_event_data: dict):
+    async def test_slack_task_captures_thread_context(self, dispatch_client: AsyncClient, slack_event_data: dict):
         """context.thread_messages must be populated from the event text."""
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            await _post(client, "/webhooks/slack", slack_event_data)
+        await _post(dispatch_client, "/webhooks/slack", slack_event_data)
 
         task_data = _get_first_message(self.mock_pubsub)
         thread_messages = task_data["context"].get("thread_messages") or []
@@ -173,7 +168,7 @@ class TestSlackDispatchPipeline:
         )
 
     @pytest.mark.asyncio
-    async def test_slack_task_strips_bot_mention_from_title(self):
+    async def test_slack_task_strips_bot_mention_from_title(self, dispatch_client: AsyncClient):
         """The @henchmen mention must be stripped from the task title."""
         # Use an event where the mention is the literal "@henchmen" string that the
         # normalizer is designed to strip (not an opaque Slack user-ID like <@B0123456>).
@@ -185,8 +180,7 @@ class TestSlackDispatchPipeline:
             "ts": "1700000000.000001",
             "thread_ts": "1700000000.000001",
         }
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            await _post(client, "/webhooks/slack", payload)
+        await _post(dispatch_client, "/webhooks/slack", payload)
 
         task_data = _get_first_message(self.mock_pubsub)
         # "@henchmen" should be stripped; the remaining task description should be present
@@ -198,7 +192,7 @@ class TestSlackDispatchPipeline:
         )
 
     @pytest.mark.asyncio
-    async def test_slack_non_mention_event_ignored(self):
+    async def test_slack_non_mention_event_ignored(self, dispatch_client: AsyncClient):
         """A non-app_mention event with no @henchmen text returns 200 but publishes nothing."""
         payload = {
             "type": "message",
@@ -207,8 +201,7 @@ class TestSlackDispatchPipeline:
             "channel": "C0123456",
             "ts": "1700000001.000001",
         }
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await _post(client, "/webhooks/slack", payload)
+        resp = await _post(dispatch_client, "/webhooks/slack", payload)
 
         assert resp["status"] == "ignored"
         assert len(self.mock_pubsub.get_messages_for_topic(TASK_INTAKE_TOPIC)) == 0
@@ -229,12 +222,12 @@ class TestGitHubDispatchPipeline:
     @pytest.mark.asyncio
     async def test_github_issue_labeled_produces_task(
         self,
+        dispatch_client: AsyncClient,
         github_issue_event: dict,
         assertions: IntegrationAssertions,
     ):
         """Issue labeled 'henchmen' → task on task-intake topic."""
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await _post(client, "/webhooks/github", github_issue_event)
+        resp = await _post(dispatch_client, "/webhooks/github", github_issue_event)
 
         assert resp["status"] == "dispatched"
         self.mock_pubsub.assert_published_to(TASK_INTAKE_TOPIC, count=1)
@@ -242,19 +235,19 @@ class TestGitHubDispatchPipeline:
         assertions.assert_valid_henchmen_task(task_data)
 
     @pytest.mark.asyncio
-    async def test_github_issue_task_has_correct_source(self, github_issue_event: dict):
+    async def test_github_issue_task_has_correct_source(
+        self, dispatch_client: AsyncClient, github_issue_event: dict
+    ):
         """Source must be 'github'."""
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            await _post(client, "/webhooks/github", github_issue_event)
+        await _post(dispatch_client, "/webhooks/github", github_issue_event)
 
         task_data = _get_first_message(self.mock_pubsub)
         assert task_data["source"] == "github"
 
     @pytest.mark.asyncio
-    async def test_github_issue_task_captures_repo(self, github_issue_event: dict):
+    async def test_github_issue_task_captures_repo(self, dispatch_client: AsyncClient, github_issue_event: dict):
         """context.repo must be 'acme-org/sample-repo'."""
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            await _post(client, "/webhooks/github", github_issue_event)
+        await _post(dispatch_client, "/webhooks/github", github_issue_event)
 
         task_data = _get_first_message(self.mock_pubsub)
         assert task_data["context"]["repo"] == "acme-org/sample-repo"
@@ -262,12 +255,12 @@ class TestGitHubDispatchPipeline:
     @pytest.mark.asyncio
     async def test_github_pr_comment_produces_task(
         self,
+        dispatch_client: AsyncClient,
         github_pr_comment_event: dict,
         assertions: IntegrationAssertions,
     ):
         """PR comment containing '@henchmen' → task on task-intake topic."""
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await _post(client, "/webhooks/github", github_pr_comment_event)
+        resp = await _post(dispatch_client, "/webhooks/github", github_pr_comment_event)
 
         assert resp["status"] == "dispatched"
         self.mock_pubsub.assert_published_to(TASK_INTAKE_TOPIC, count=1)
@@ -275,16 +268,17 @@ class TestGitHubDispatchPipeline:
         assertions.assert_valid_henchmen_task(task_data)
 
     @pytest.mark.asyncio
-    async def test_github_pr_comment_captures_branch(self, github_pr_comment_event: dict):
+    async def test_github_pr_comment_captures_branch(
+        self, dispatch_client: AsyncClient, github_pr_comment_event: dict
+    ):
         """context.branch must equal the PR head branch 'feature/auth-update'."""
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            await _post(client, "/webhooks/github", github_pr_comment_event)
+        await _post(dispatch_client, "/webhooks/github", github_pr_comment_event)
 
         task_data = _get_first_message(self.mock_pubsub)
         assert task_data["context"]["branch"] == "feature/auth-update"
 
     @pytest.mark.asyncio
-    async def test_github_unrelated_event_ignored(self):
+    async def test_github_unrelated_event_ignored(self, dispatch_client: AsyncClient):
         """An event without the henchmen label or @henchmen mention publishes nothing."""
         payload = {
             "action": "opened",
@@ -301,8 +295,7 @@ class TestGitHubDispatchPipeline:
                 "default_branch": "main",
             },
         }
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await _post(client, "/webhooks/github", payload)
+        resp = await _post(dispatch_client, "/webhooks/github", payload)
 
         assert resp["status"] == "ignored"
         assert len(self.mock_pubsub.get_messages_for_topic(TASK_INTAKE_TOPIC)) == 0
@@ -323,12 +316,12 @@ class TestJiraDispatchPipeline:
     @pytest.mark.asyncio
     async def test_jira_transition_produces_task(
         self,
+        dispatch_client: AsyncClient,
         jira_webhook_data: dict,
         assertions: IntegrationAssertions,
     ):
         """Issue transitioned to 'Ready for Henchmen' → task on task-intake topic."""
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await _post(client, "/webhooks/jira", jira_webhook_data)
+        resp = await _post(dispatch_client, "/webhooks/jira", jira_webhook_data)
 
         assert resp["status"] == "dispatched"
         self.mock_pubsub.assert_published_to(TASK_INTAKE_TOPIC, count=1)
@@ -336,16 +329,15 @@ class TestJiraDispatchPipeline:
         assertions.assert_valid_henchmen_task(task_data)
 
     @pytest.mark.asyncio
-    async def test_jira_task_has_correct_source(self, jira_webhook_data: dict):
+    async def test_jira_task_has_correct_source(self, dispatch_client: AsyncClient, jira_webhook_data: dict):
         """Source must be 'jira'."""
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            await _post(client, "/webhooks/jira", jira_webhook_data)
+        await _post(dispatch_client, "/webhooks/jira", jira_webhook_data)
 
         task_data = _get_first_message(self.mock_pubsub)
         assert task_data["source"] == "jira"
 
     @pytest.mark.asyncio
-    async def test_jira_task_priority_mapping(self):
+    async def test_jira_task_priority_mapping(self, dispatch_client: AsyncClient):
         """Jira 'Major' → 'high', 'Blocker' → 'critical'."""
         priority_cases = [
             ("Major", "high"),
@@ -368,8 +360,7 @@ class TestJiraDispatchPipeline:
                 "changelog": {"items": [{"field": "status", "toString": "Ready for Henchmen"}]},
                 "transition": {"transitionName": "Ready for Henchmen"},
             }
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-                await _post(client, "/webhooks/jira", payload)
+            await _post(dispatch_client, "/webhooks/jira", payload)
 
             task_data = _get_first_message(self.mock_pubsub)
             assert task_data["priority"] == expected, (
@@ -377,7 +368,7 @@ class TestJiraDispatchPipeline:
             )
 
     @pytest.mark.asyncio
-    async def test_jira_wrong_transition_ignored(self):
+    async def test_jira_wrong_transition_ignored(self, dispatch_client: AsyncClient):
         """A transition to a status other than 'Ready for Henchmen' publishes nothing."""
         payload = {
             "webhookEvent": "jira:issue_updated",
@@ -394,8 +385,7 @@ class TestJiraDispatchPipeline:
             "changelog": {"items": [{"field": "status", "toString": "In Progress"}]},
             "transition": {"transitionName": "In Progress"},
         }
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await _post(client, "/webhooks/jira", payload)
+        resp = await _post(dispatch_client, "/webhooks/jira", payload)
 
         assert resp["status"] == "ignored"
         assert len(self.mock_pubsub.get_messages_for_topic(TASK_INTAKE_TOPIC)) == 0

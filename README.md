@@ -274,6 +274,42 @@ All four must pass before submitting a PR.
 
 ---
 
+## Troubleshooting
+
+**`henchmen-operative:local` image build fails**
+Check that Docker Desktop is running and has at least 4GB of RAM allocated. Try `henchmen build-operative --no-cache` to force a clean rebuild. On slow networks, first build can take 5–10 minutes.
+
+**Task dispatched but nothing happens**
+Check the server terminal for errors. Verify Docker is running: `docker ps`. Make sure `GITHUB_TOKEN` is set in `.env.local` and has `repo` scope (classic PAT, not fine-grained).
+
+**`401 Unauthorized` when creating PR**
+Your `GITHUB_TOKEN` is missing the `repo` scope or has expired. Create a new classic token at https://github.com/settings/tokens with `repo` checked.
+
+**Operative container runs but PR is empty / wrong files**
+Likely an LLM tool-calling failure. If you're using Ollama with a model smaller than 14B, switch to OpenAI/Anthropic or pull a larger Ollama model. See `HENCHMEN_LLM_PROVIDER` in `.env.local`.
+
+**`Connection refused` to Ollama**
+The operative container calls Ollama at `http://host.docker.internal:11434`. Make sure `ollama serve` is running on the host. Verify with `curl http://localhost:11434/api/tags`.
+
+**Linux: `permission denied` on Docker socket**
+Add your user to the `docker` group: `sudo usermod -aG docker $USER`, then log out and back in.
+
+**PR was opened but CI steps were skipped**
+Expected in local mode. The `run_tests` handler inside Mastermind is hardcoded for JS/TS monorepos and skips gracefully when the target repo doesn't match. Forge runs real CI on the created PR via the full pipeline; local mode short-circuits this to let you see the PR faster.
+
+See [docs/troubleshooting.md](docs/troubleshooting.md) for the full 15-scenario guide.
+
+---
+
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [Schemes](docs/schemes.md)
+- [Cost Model](docs/cost-model.md)
+- [Troubleshooting](docs/troubleshooting.md)
+
+---
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for code style, PR process, and how to add new providers.

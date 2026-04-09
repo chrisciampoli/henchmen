@@ -6,9 +6,12 @@ import logging
 import os
 import tarfile
 import tempfile
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from henchmen.providers.interfaces.object_store import ObjectStore
+
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +22,7 @@ _SNAPSHOT_SUFFIX = ".tar.gz"
 class SnapshotCache:
     """Manages repository snapshot cache for faster workspace setup."""
 
-    def __init__(self, settings: Any, object_store: ObjectStore | None = None) -> None:
+    def __init__(self, settings: "Settings", object_store: ObjectStore | None = None) -> None:
         self.settings = settings
         self._object_store = object_store
 

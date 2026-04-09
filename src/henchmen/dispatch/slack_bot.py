@@ -11,7 +11,7 @@ from typing import Any
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from henchmen.config.settings import get_settings
+from henchmen.config.settings import Settings, get_settings
 from henchmen.dispatch.normalizer import TaskNormalizer
 
 logger = logging.getLogger(__name__)
@@ -81,7 +81,7 @@ def create_slack_app() -> App:
     return app
 
 
-def _sync_publish(task: Any, settings: Any) -> str:
+def _sync_publish(task: Any, settings: Settings) -> str:
     """Synchronously publish a task via the configured MessageBroker."""
     import asyncio
 

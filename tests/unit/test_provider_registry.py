@@ -8,6 +8,12 @@ from henchmen.providers.registry import ProviderRegistry
 
 
 def _mock_settings(**overrides):
+    """TODO(R9): replace with the shared ``mock_settings`` fixture from
+    ``tests/conftest.py``. Every test here uses ``**overrides`` to flip a
+    specific provider field, which is harder to express with env vars —
+    migration would require a helper that wraps the shared fixture with
+    kwargs, or per-test monkeypatching.
+    """
     defaults = {
         "provider": "local",
         "message_broker_provider": "",

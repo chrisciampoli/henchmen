@@ -1,13 +1,37 @@
-"""TaskTracker — persists task execution telemetry to a DocumentStore."""
+"""TaskTracker — persists task execution telemetry to a DocumentStore.
+
+Concurrency notes (K4 fix):
+    Three methods on ``TaskTracker`` perform read-modify-write against
+    Firestore: ``record_node_result``, ``increment_recovery_attempts``,
+    and ``record_ci_fix_attempt``. The underlying ``DocumentStore``
+    protocol has no atomic ``Increment`` primitive, so under concurrent
+    callers (Pub/Sub at-least-once delivery, watchdog double-publish)
+    two handlers can read the same baseline and clobber each other's
+    increments.
+
+    As a first-pass mitigation we serialize these writers *within the
+    current process* using an ``asyncio.Lock`` keyed by ``doc_id``. This
+    eliminates intra-process races without touching the ``DocumentStore``
+    protocol or every provider implementation.
+
+    Cross-process races are **out of scope** for this fix — two
+    Mastermind replicas handling the same task simultaneously can still
+    lose an update. The durable fix is to plumb a Firestore
+    ``Increment`` transform through the ``DocumentStore`` interface; see
+    the ``TODO(K4-cross-process)`` markers below.
+"""
 
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from henchmen.models.operative import OperativeReport
 from henchmen.models.task import HenchmenTask
 from henchmen.providers.interfaces.document_store import DocumentStore
+
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +87,14 @@ class TaskTracker:
     Firestore-backed store when none is provided (legacy compatibility).
     """
 
-    def __init__(self, settings: Any, document_store: DocumentStore | None = None) -> None:
+    def __init__(self, settings: "Settings", document_store: DocumentStore | None = None) -> None:
+        # Per-document asyncio locks serialize read-modify-write blocks
+        # within this process. Populated lazily via ``_get_lock``.
+        # TODO(K4-cross-process): this only protects in-process concurrency;
+        # cross-replica races require Firestore Increment transforms plumbed
+        # through the DocumentStore interface.
+        self._doc_locks: dict[str, asyncio.Lock] = {}
+
         if document_store is not None:
             self._store = document_store
             # Legacy compatibility attributes — some code paths still reference _db/_collection
@@ -90,6 +121,20 @@ class TaskTracker:
                 self._db = None
                 self._collection = None
                 self._store = _NullDocumentStore()
+
+    def _get_lock(self, doc_id: str) -> asyncio.Lock:
+        """Return the per-document asyncio.Lock, creating it on first use.
+
+        The dict grows unbounded over the lifetime of the process, but the
+        entries are tiny and the doc_id space is bounded by active task
+        volume, so this is acceptable for the in-process scope of the K4
+        mitigation.
+        """
+        lock = self._doc_locks.get(doc_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._doc_locks[doc_id] = lock
+        return lock
 
     async def start_task(self, task: HenchmenTask, scheme_id: str) -> None:
         """Create the initial task execution document.
@@ -157,36 +202,41 @@ class TaskTracker:
                 "confidence_score": report.confidence_score,
             }
 
-            # Read current doc to do manual increments (DocumentStore has no Increment primitive)
-            current = await self._store.get(_COLLECTION, task_id) or {}
-            nodes_executed = list(current.get("nodes_executed", []))
-            if node_id not in nodes_executed:
-                nodes_executed.append(node_id)
+            # Serialize read-modify-write so concurrent invocations in the same
+            # process cannot clobber each other's increments.
+            # TODO(K4-cross-process): Firestore Increment transforms would close
+            # the cross-replica gap; this lock only protects intra-process races.
+            async with self._get_lock(task_id):
+                # Read current doc to do manual increments (DocumentStore has no Increment primitive)
+                current = await self._store.get(_COLLECTION, task_id) or {}
+                nodes_executed = list(current.get("nodes_executed", []))
+                if node_id not in nodes_executed:
+                    nodes_executed.append(node_id)
 
-            files_changed = list(current.get("files_changed", []))
-            if report.files_changed:
-                for f in report.files_changed:
-                    if f not in files_changed:
-                        files_changed.append(f)
+                files_changed = list(current.get("files_changed", []))
+                if report.files_changed:
+                    for f in report.files_changed:
+                        if f not in files_changed:
+                            files_changed.append(f)
 
-            node_metrics = dict(current.get("node_metrics", {}))
-            node_metrics[node_id] = node_data
+                node_metrics = dict(current.get("node_metrics", {}))
+                node_metrics[node_id] = node_data
 
-            update_data: dict[str, Any] = {
-                "node_metrics": node_metrics,
-                "nodes_executed": nodes_executed,
-                "total_input_tokens": current.get("total_input_tokens", 0) + report.total_input_tokens,
-                "total_output_tokens": current.get("total_output_tokens", 0) + report.total_output_tokens,
-                "total_model_calls": current.get("total_model_calls", 0) + report.model_calls,
-                "total_tool_calls": current.get("total_tool_calls", 0) + report.tool_calls_count,
-                "estimated_cost_usd": current.get("estimated_cost_usd", 0.0) + cost,
-                "wall_clock_seconds": current.get("wall_clock_seconds", 0.0) + report.wall_clock_seconds,
-                "confidence_score": report.confidence_score,
-            }
-            if report.files_changed:
-                update_data["files_changed"] = files_changed
+                update_data: dict[str, Any] = {
+                    "node_metrics": node_metrics,
+                    "nodes_executed": nodes_executed,
+                    "total_input_tokens": current.get("total_input_tokens", 0) + report.total_input_tokens,
+                    "total_output_tokens": current.get("total_output_tokens", 0) + report.total_output_tokens,
+                    "total_model_calls": current.get("total_model_calls", 0) + report.model_calls,
+                    "total_tool_calls": current.get("total_tool_calls", 0) + report.tool_calls_count,
+                    "estimated_cost_usd": current.get("estimated_cost_usd", 0.0) + cost,
+                    "wall_clock_seconds": current.get("wall_clock_seconds", 0.0) + report.wall_clock_seconds,
+                    "confidence_score": report.confidence_score,
+                }
+                if report.files_changed:
+                    update_data["files_changed"] = files_changed
 
-            await self._store.update(_COLLECTION, task_id, update_data)
+                await self._store.update(_COLLECTION, task_id, update_data)
             logger.info("Recorded node %s for task %s (cost=$%.3f)", node_id, task_id, cost)
         except Exception as exc:
             logger.warning("Failed to record node %s for task %s: %s", node_id, task_id, exc)
@@ -273,9 +323,13 @@ class TaskTracker:
     async def increment_recovery_attempts(self, task_id: str) -> None:
         """Increment recovery attempt count for a stalled task."""
         try:
-            current = await self._store.get(_COLLECTION, task_id) or {}
-            attempts = current.get("recovery_attempts", 0) + 1
-            await self._store.update(_COLLECTION, task_id, {"recovery_attempts": attempts})
+            # TODO(K4-cross-process): Firestore Increment transforms would
+            # close the cross-replica gap; this lock only protects intra-
+            # process races.
+            async with self._get_lock(task_id):
+                current = await self._store.get(_COLLECTION, task_id) or {}
+                attempts = current.get("recovery_attempts", 0) + 1
+                await self._store.update(_COLLECTION, task_id, {"recovery_attempts": attempts})
         except Exception as exc:
             logger.warning("Failed to increment recovery for task %s: %s", task_id, exc)
 
@@ -366,13 +420,17 @@ class TaskTracker:
     async def record_ci_fix_attempt(self, task_id: str) -> None:
         """Increment ci_fix_attempts and mark ci_fix_in_progress=True."""
         try:
-            current = await self._store.get(_COLLECTION, task_id) or {}
-            attempts = current.get("ci_fix_attempts", 0) + 1
-            await self._store.update(
-                _COLLECTION,
-                task_id,
-                {"ci_fix_attempts": attempts, "ci_fix_in_progress": True},
-            )
+            # TODO(K4-cross-process): Firestore Increment transforms would
+            # close the cross-replica gap; this lock only protects intra-
+            # process races.
+            async with self._get_lock(task_id):
+                current = await self._store.get(_COLLECTION, task_id) or {}
+                attempts = current.get("ci_fix_attempts", 0) + 1
+                await self._store.update(
+                    _COLLECTION,
+                    task_id,
+                    {"ci_fix_attempts": attempts, "ci_fix_in_progress": True},
+                )
             logger.info("Recorded CI fix attempt for task %s", task_id)
         except Exception as exc:
             logger.warning("Failed to record CI fix attempt for task %s: %s", task_id, exc)

@@ -14,7 +14,7 @@ import signal
 import traceback
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -24,6 +24,7 @@ import henchmen.schemes.bugfix_standard  # noqa: F401
 import henchmen.schemes.feature_standard  # noqa: F401
 import henchmen.schemes.goal_decomposition  # noqa: F401
 from henchmen.config.settings import get_settings
+from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
 from henchmen.mastermind.agent import MastermindAgent
 from henchmen.models.task import HenchmenTask
 from henchmen.observability.api import create_metrics_router
@@ -131,33 +132,188 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Henchmen Mastermind", description="Task orchestration engine", lifespan=lifespan)
 
 
-async def _check_message_dedup(message_id: str) -> bool:
-    """Check if a Pub/Sub message was already processed.
+async def _acquire_watchdog_lease(
+    store: Any,
+    env: str,
+    instance_id: str,
+    ttl_seconds: int = 60,
+) -> bool:
+    """Try to acquire a short-lived watchdog lease in the document store.
 
-    Uses DocumentStore get-then-set: if the document already exists, it is a
-    duplicate.  The check-then-set is not atomic, but duplicates are harmless
-    (idempotent task intake) — Pub/Sub at-least-once delivery means we accept
-    rare double-processing rather than blocking on distributed locks.
-
-    Returns True if the message is a duplicate (already processed).
+    Uses a get-then-set pattern (not a true transaction) but that is
+    sufficient here: the watchdog is idempotent, a rare double-run is no
+    worse than the current behaviour, and the real fix is a Firestore
+    transaction, tracked as a follow-up.  Returns True if this caller
+    now holds the lease, False if another replica holds an unexpired
+    lease.
     """
-    if not message_id:
-        return False
     try:
-        agent = get_agent()
-        store = agent.tracker._store
-        existing = await store.get("processed_messages", message_id)
-        if existing is not None:
-            return True  # Already processed
+        existing = await store.get("watchdog_leases", env)
+    except Exception as exc:
+        logger.warning("[watchdog] Lease get failed (%s); skipping this tick", exc)
+        return False
+
+    now = datetime.now(UTC)
+    if existing:
+        expires_raw = existing.get("expires_at", "1970-01-01T00:00:00+00:00")
+        try:
+            expires = datetime.fromisoformat(expires_raw)
+        except ValueError:
+            expires = datetime.fromtimestamp(0, tz=UTC)
+        if expires > now:
+            logger.info(
+                "[watchdog] Lease held by %s until %s; skipping",
+                existing.get("holder", "unknown"),
+                expires_raw,
+            )
+            return False
+
+    try:
         await store.set(
-            "processed_messages",
-            message_id,
-            {"processed_at": datetime.now(UTC), "handler": "task-intake"},
+            "watchdog_leases",
+            env,
+            {
+                "holder": instance_id,
+                "acquired_at": now.isoformat(),
+                "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat(),
+            },
         )
-        return False  # New message — document created successfully
-    except Exception:
-        # All other exceptions propagate — Pub/Sub will retry delivery
-        raise
+    except Exception as exc:
+        logger.warning("[watchdog] Lease set failed (%s); skipping this tick", exc)
+        return False
+
+    return True
+
+
+# In-flight markers older than this are considered reclaimable: if a prior
+# handler crashed after marking the message as in_flight but before completing
+# (or before marking as done), a Pub/Sub redelivery should be allowed to retry.
+# This is the E2 fix for the check-then-set race that could silently drop
+# tasks on transient processing failures.
+_DEDUP_INFLIGHT_TTL_SECONDS = 900
+
+
+async def _check_message_dedup(message_id: str, dedup_key: str | None = None) -> bool:
+    """Check if a Pub/Sub message (or an explicit dedup key) was already processed.
+
+    Two-phase dedup (E2 fix):
+
+    1. On first observation, the message is marked ``in_flight`` with an
+       acquisition timestamp. The handler runs, and only on successful
+       completion does the caller upgrade the marker to ``done`` via
+       :func:`_mark_message_done`.
+    2. A subsequent delivery that sees a ``done`` marker is a true duplicate
+       and returns True.
+    3. A subsequent delivery that sees an ``in_flight`` marker inspects its
+       ``acquired_at`` timestamp: if older than ``_DEDUP_INFLIGHT_TTL_SECONDS``
+       the prior handler is assumed crashed and the retry is allowed to
+       reclaim the marker. If newer, a concurrent handler is running and the
+       retry returns True (treat as duplicate — the concurrent handler will
+       ack the original delivery).
+
+    This closes the original failure mode: dedup doc written before
+    processing, processing crashes, Pub/Sub retries, retry sees the dedup doc
+    and silently ack's — the task is lost. With the TTL reclaim path the
+    retry either completes normally (if the prior was short) or reclaims
+    (if the prior crashed).
+
+    When a caller supplies an application-level ``dedup_key`` (e.g. the
+    watchdog's ``resume-<task_id>-<attempts>``), it is checked in addition
+    to the Pub/Sub ``message_id``.
+
+    Returns True if the message should be treated as a duplicate (skipped).
+    """
+    agent = get_agent()
+    store = agent.tracker._store
+    now = datetime.now(UTC)
+
+    async def _check_or_claim(key: str) -> bool:
+        try:
+            existing = await store.get("processed_messages", key)
+        except Exception:
+            raise
+        if existing is not None:
+            status = existing.get("status", "done")
+            if status == "done":
+                return True
+            # in_flight — check TTL
+            acquired_raw = existing.get("acquired_at") or existing.get("processed_at")
+            if acquired_raw:
+                try:
+                    acquired = datetime.fromisoformat(acquired_raw)
+                except ValueError:
+                    acquired = now  # Treat as freshly acquired on parse failure
+                age_seconds = (now - acquired).total_seconds()
+                if age_seconds < _DEDUP_INFLIGHT_TTL_SECONDS:
+                    logger.info(
+                        "[dedup] %s is in_flight (age=%.0fs), treating retry as duplicate",
+                        key,
+                        age_seconds,
+                    )
+                    return True
+                logger.warning(
+                    "[dedup] %s in_flight marker is stale (age=%.0fs); reclaiming for retry",
+                    key,
+                    age_seconds,
+                )
+        # Mark as in_flight — the caller is responsible for upgrading to done
+        # after successful processing, or leaving the marker to expire on
+        # failure (so Pub/Sub's redelivery can reclaim).
+        try:
+            await store.set(
+                "processed_messages",
+                key,
+                {
+                    "status": "in_flight",
+                    "acquired_at": now.isoformat(),
+                    "handler": "task-intake",
+                    "key": key,
+                },
+            )
+        except Exception:
+            raise
+        return False
+
+    # Application-level dedup key takes precedence because it is deterministic.
+    if dedup_key:
+        if await _check_or_claim(dedup_key):
+            return True
+
+    if message_id:
+        if await _check_or_claim(message_id):
+            return True
+
+    return False
+
+
+async def _mark_message_done(message_id: str, dedup_key: str | None = None) -> None:
+    """Upgrade an ``in_flight`` dedup marker to ``done`` after successful processing.
+
+    This is the second half of the E2 two-phase dedup fix. Call this ONLY
+    when the handler has fully committed the task (persisted state, published
+    downstream events, etc.). Best-effort — failures are logged but do not
+    propagate, since a missing upgrade will be harmlessly reclaimed after
+    ``_DEDUP_INFLIGHT_TTL_SECONDS`` by a future retry or the watchdog.
+    """
+    agent = get_agent()
+    store = agent.tracker._store
+    now = datetime.now(UTC).isoformat()
+    for key in (dedup_key, message_id):
+        if not key:
+            continue
+        try:
+            await store.set(
+                "processed_messages",
+                key,
+                {
+                    "status": "done",
+                    "processed_at": now,
+                    "handler": "task-intake",
+                    "key": key,
+                },
+            )
+        except Exception as exc:
+            logger.warning("[dedup] Failed to mark %s as done: %s", key, exc)
 
 
 @app.get("/health")
@@ -179,18 +335,29 @@ async def task_intake_handler(request: Request) -> dict[str, Any]:
       "subscription": "..."
     }
     """
+    await verify_pubsub_oidc(request, get_settings())
     try:
         envelope = await request.json()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}") from exc
 
-    # Layer 1: Pub/Sub message-level dedup via DocumentStore
-    message_id = envelope.get("message", {}).get("messageId", "")
-    if await _check_message_dedup(message_id):
-        logger.info("Duplicate Pub/Sub message %s, skipping", message_id)
-        return {"status": "duplicate", "message_id": message_id}
-
+    # Layer 1: Pub/Sub message-level dedup via DocumentStore. Honor both
+    # Pub/Sub's ``messageId`` and an optional application-level
+    # ``dedup_key`` attribute — the watchdog sets the latter to
+    # ``resume-<task_id>-<attempts>`` so two replicas racing past the
+    # watchdog lease cannot both re-publish the same resume.
     message = envelope.get("message", {})
+    message_id = message.get("messageId", "")
+    attributes = message.get("attributes") or {}
+    dedup_key = attributes.get("dedup_key") if isinstance(attributes, dict) else None
+    if await _check_message_dedup(message_id, dedup_key=dedup_key):
+        logger.info(
+            "Duplicate Pub/Sub message (message_id=%s, dedup_key=%s), skipping",
+            message_id,
+            dedup_key,
+        )
+        return {"status": "duplicate", "message_id": message_id, "dedup_key": dedup_key}
+
     data_b64 = message.get("data", "")
 
     if not data_b64:
@@ -212,16 +379,20 @@ async def task_intake_handler(request: Request) -> dict[str, Any]:
         logger.info("Resuming task from watchdog: %s", resume_task_id)
         try:
             result = await agent.resume_task(resume_task_id)
-            print(f"[MASTERMIND] Resumed task {resume_task_id} completed: {result.get('status')}", flush=True)
+            logger.info("[MASTERMIND] Resumed task %s completed: %s", resume_task_id, result.get("status"))
+            # E2: only upgrade dedup marker to ``done`` after successful processing.
+            await _mark_message_done(message_id, dedup_key=dedup_key)
             return {"status": "completed", "task_id": resume_task_id}
         except Exception as exc:
             tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-            print(f"[MASTERMIND] Resume FAILED for {resume_task_id}: {exc}", flush=True)
-            print(f"[MASTERMIND] Traceback: {tb[:1000]}", flush=True)
+            logger.error("[MASTERMIND] Resume FAILED for %s: %s", resume_task_id, exc)
+            logger.error("[MASTERMIND] Traceback: %s", tb[:1000])
             try:
                 await agent.tracker.mark_escalated(resume_task_id, reason=f"Resume failed: {exc}")
             except Exception:
                 pass
+            # E2: do NOT mark as done — leave the in_flight marker so Pub/Sub
+            # can retry and the stale TTL reclaim path handles it.
             raise HTTPException(status_code=500, detail=f"Resume failed: {exc}") from exc
 
     logger.info("Received task from Pub/Sub: %s (source: %s)", task_data.get("id"), task_data.get("source"))
@@ -237,27 +408,29 @@ async def task_intake_handler(request: Request) -> dict[str, Any]:
     # if the instance recycles.  Returning 500 triggers Pub/Sub retry.
     try:
         await _process_task(agent, task)
+        # E2: only upgrade dedup marker to ``done`` after successful processing.
+        await _mark_message_done(message_id, dedup_key=dedup_key)
         return {"status": "completed", "task_id": task.id}
     except Exception as exc:
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        print(f"[MASTERMIND] Task FAILED for {task.id}: {exc}", flush=True)
-        print(f"[MASTERMIND] Traceback: {tb[:1000]}", flush=True)
+        logger.error("[MASTERMIND] Task FAILED for %s: %s", task.id, exc)
+        logger.error("[MASTERMIND] Traceback: %s", tb[:1000])
         try:
             await agent.tracker.mark_escalated(task.id, reason=f"Unhandled error: {exc}")
         except Exception:
             pass
+        # E2: do NOT mark as done — leave the in_flight marker so Pub/Sub
+        # can retry and the stale TTL reclaim path handles it.
         raise HTTPException(status_code=500, detail=f"Task processing failed: {exc}") from exc
 
 
 async def _process_task(agent: MastermindAgent, task: HenchmenTask) -> None:
     """Process a task in the background."""
-    import sys
-
     try:
-        print(f"[MASTERMIND] Starting task processing: {task.id} ({task.title})", flush=True)
+        logger.info("[MASTERMIND] Starting task processing: %s (%s)", task.id, task.title)
         result = await agent.handle_task(task)
-        print(f"[MASTERMIND] Task {task.id} completed with status: {result.get('status')}", flush=True)
-        print(f"[MASTERMIND] Result: {json.dumps(result, default=str)[:500]}", flush=True)
+        logger.info("[MASTERMIND] Task %s completed with status: %s", task.id, result.get("status"))
+        logger.info("[MASTERMIND] Result: %s", json.dumps(result, default=str)[:500])
 
         # Emit structured metric for Cloud Monitoring
         from henchmen.observability.structured_logging import emit_task_completed
@@ -273,12 +446,11 @@ async def _process_task(agent: MastermindAgent, task: HenchmenTask) -> None:
 
         # Notify Slack if the task came from Slack
         if task.source.value == "slack":
-            print(f"[MASTERMIND] Sending Slack notification for task {task.id}", flush=True)
+            logger.info("[MASTERMIND] Sending Slack notification for task %s", task.id)
             await _notify_slack(task, result)
 
     except Exception as exc:
-        print(f"[MASTERMIND] ERROR processing task {task.id}: {exc}", file=sys.stderr, flush=True)
-        traceback.print_exc()
+        logger.exception("[MASTERMIND] ERROR processing task %s: %s", task.id, exc)
 
 
 def _format_metrics_block(metrics: dict[str, Any]) -> str:
@@ -381,21 +553,21 @@ async def _notify_slack(task: HenchmenTask, result: dict[str, Any]) -> None:
     else:
         text = f"Task status: `{status}` (scheme: `{scheme_id}`)"
 
-    print(f"[MASTERMIND] Slack notification: status={status}, scheme={scheme_id}", flush=True)
+    logger.info("[MASTERMIND] Slack notification: status=%s, scheme=%s", status, scheme_id)
 
     # Extract channel and thread_ts from source_id (format: "channel/thread_ts")
     parts = task.source_id.split("/")
     if len(parts) >= 2:
         channel = parts[0]
         thread_ts = parts[1]
-        print(f"[MASTERMIND] Posting to Slack channel={channel} thread={thread_ts}", flush=True)
+        logger.info("[MASTERMIND] Posting to Slack channel=%s thread=%s", channel, thread_ts)
         try:
             client.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
-            print("[MASTERMIND] Slack notification sent successfully", flush=True)
+            logger.info("[MASTERMIND] Slack notification sent successfully")
         except Exception as exc:
-            print(f"[MASTERMIND] Failed to notify Slack: {exc}", flush=True)
+            logger.error("[MASTERMIND] Failed to notify Slack: %s", exc)
     else:
-        print(f"[MASTERMIND] Cannot parse source_id for Slack: {task.source_id}", flush=True)
+        logger.error("[MASTERMIND] Cannot parse source_id for Slack: %s", task.source_id)
 
 
 @app.post("/pubsub/operative-complete")
@@ -405,6 +577,7 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
     Feeds the real OperativeReport (with tokens, cost, files_changed) to the
     LairManager so wait_for_completion() returns accurate telemetry.
     """
+    await verify_pubsub_oidc(request, get_settings())
     try:
         envelope = await request.json()
 
@@ -462,6 +635,7 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
 @app.post("/pubsub/forge-result")
 async def forge_result_handler(request: Request) -> dict[str, Any]:
     """Handle CI results from Forge via Pub/Sub."""
+    await verify_pubsub_oidc(request, get_settings())
     try:
         envelope = await request.json()
         message = envelope.get("message", {})
@@ -488,6 +662,7 @@ async def forge_result_handler(request: Request) -> dict[str, Any]:
 @app.post("/pubsub/ci-failure")
 async def ci_failure_handler(request: Request) -> dict[str, Any]:
     """Handle CI failure events from Pub/Sub."""
+    await verify_pubsub_oidc(request, get_settings())
     try:
         envelope = await request.json()
         message = envelope.get("message", {})
@@ -508,8 +683,8 @@ async def ci_failure_handler(request: Request) -> dict[str, Any]:
             return {"status": "completed"}
         except Exception as ci_exc:
             tb_str = "".join(traceback.format_exception(type(ci_exc), ci_exc, ci_exc.__traceback__))
-            print(f"[CI-LOOP] FAILED for {task_id_prefix}: {ci_exc}", flush=True)
-            print(f"[CI-LOOP] Traceback: {tb_str[:1000]}", flush=True)
+            logger.error("[CI-LOOP] FAILED for %s: %s", task_id_prefix, ci_exc)
+            logger.error("[CI-LOOP] Traceback: %s", tb_str[:1000])
             raise HTTPException(status_code=500, detail=f"CI failure handling failed: {ci_exc}") from ci_exc
     except Exception as exc:
         logger.error("Failed to process ci-failure: %s", exc)
@@ -526,9 +701,9 @@ async def _handle_ci_failure(
     """Process CI failure in the background."""
     try:
         result = await agent.handle_ci_failure(task_id_prefix, repo, branch, check_suite_id)
-        print(f"[CI-LOOP] Result: {result}", flush=True)
+        logger.info("[CI-LOOP] Result: %s", result)
     except Exception as exc:
-        print(f"[CI-LOOP] Error: {exc}", flush=True)
+        logger.error("[CI-LOOP] Error: %s", exc)
 
 
 @app.get("/api/v1/metrics/summary")
@@ -552,8 +727,27 @@ async def watchdog_handler() -> dict[str, Any]:
     Called every 5 minutes by Cloud Scheduler.  Queries Firestore for
     tasks whose heartbeat has expired (>10 min) and either re-publishes
     them for retry or escalates after 3 failed recovery attempts.
+
+    Gated behind a short-lived Firestore lease (``watchdog_leases/{env}``)
+    so two Mastermind replicas cannot both run the body simultaneously.
+    The lease is best-effort (no true transaction) — the real fix is a
+    Firestore transaction, tracked as a follow-up — but combined with the
+    resume-publish dedup key below it eliminates the most common double
+    re-publish race.
     """
+    import os
+    import uuid
+
     agent = get_agent()
+    env = agent.settings.environment.value
+
+    # Best-effort lease: skip this tick if another replica already holds it.
+    instance_id = os.environ.get("K_REVISION") or os.environ.get("HOSTNAME") or str(uuid.uuid4())
+    store = agent.tracker._store
+    have_lease = await _acquire_watchdog_lease(store, env, instance_id, ttl_seconds=60)
+    if not have_lease:
+        return {"stalled_found": 0, "recovered": 0, "escalated": 0, "skipped": "lease_held"}
+
     stalled = await agent.tracker.get_stalled_tasks(heartbeat_threshold_minutes=10)
 
     recovered = 0
@@ -565,19 +759,35 @@ async def watchdog_handler() -> dict[str, Any]:
         if attempts >= 3:
             await agent.tracker.mark_escalated(task_id, reason="Stalled after 3 recovery attempts")
             escalated += 1
-            print(f"[WATCHDOG] Escalated stalled task {task_id} (attempts={attempts})", flush=True)
+            logger.warning("[WATCHDOG] Escalated stalled task %s (attempts=%d)", task_id, attempts)
         else:
             await agent.tracker.mark_stalled(task_id)
             await agent.tracker.increment_recovery_attempts(task_id)
-            # Re-publish for resume via MessageBroker
+            # Re-publish for resume via MessageBroker.
+            #
+            # Deterministic dedup key: if two replicas race past the lease
+            # (e.g. during lease expiry), the task-intake handler's Layer 1
+            # dedup (`_check_message_dedup`) will reject the duplicate via
+            # this identical ``dedup_key``.  The key is attached as a
+            # Pub/Sub attribute so the receiver can inspect it.
+            dedup_key = f"resume-{task_id}-{attempts}"
             try:
                 broker = agent._get_broker()
                 data = json.dumps({"resume_task_id": task_id}).encode("utf-8")
-                await broker.publish(agent.settings.pubsub_topic_task_intake, data, task_id=task_id)
+                await broker.publish(
+                    agent.settings.pubsub_topic_task_intake,
+                    data,
+                    task_id=task_id,
+                    dedup_key=dedup_key,
+                )
                 recovered += 1
-                print(f"[WATCHDOG] Re-published stalled task {task_id} for recovery", flush=True)
+                logger.info(
+                    "[WATCHDOG] Re-published stalled task %s for recovery (dedup_key=%s)",
+                    task_id,
+                    dedup_key,
+                )
             except Exception as exc:
-                print(f"[WATCHDOG] Failed to re-publish task {task_id}: {exc}", flush=True)
+                logger.error("[WATCHDOG] Failed to re-publish task %s: %s", task_id, exc)
 
     from henchmen.observability.structured_logging import emit_watchdog_event
 
@@ -591,36 +801,32 @@ async def check_dlq_handler() -> dict[str, Any]:
     """Check dead letter queue for lost messages.
 
     Called every 15 minutes by Cloud Scheduler.  Pulls up to 10 messages
-    from the DLQ subscription, logs them, and acknowledges so they don't
-    pile up.  Returns the count of dead-lettered messages found.
-
-    TODO: Add pull() to MessageBroker for DLQ so this can use the provider interface.
-    Pub/Sub pull (subscriber) semantics differ from the push-based publish interface,
-    so this remains a direct SDK call for now.
+    from the DLQ subscription via the ``MessageBroker`` provider interface,
+    logs them, and acknowledges so they don't pile up.  Returns the count
+    of dead-lettered messages found.
     """
-    from google.cloud import pubsub_v1  # type: ignore[attr-defined]
-
     agent = get_agent()
-    project = agent.settings.gcp_project_id
     env = agent.settings.environment.value
-    sub_path = f"projects/{project}/subscriptions/henchmen-{env}-dead-letter-sub"
+    subscription_name = f"henchmen-{env}-dead-letter-sub"
 
     try:
-        subscriber = pubsub_v1.SubscriberClient()
-        response = subscriber.pull(request={"subscription": sub_path, "max_messages": 10})
-        count = len(response.received_messages)
+        broker = agent._get_broker()
+        messages = await broker.pull_dlq(subscription_name, max_messages=10)
+        count = len(messages)
 
         if count > 0:
-            print(f"[DLQ] Found {count} dead-lettered messages", flush=True)
-            for msg in response.received_messages:
-                print(f"[DLQ] Message: {msg.message.data.decode()[:500]}", flush=True)
-            # Ack them so they don't pile up
-            ack_ids = [m.ack_id for m in response.received_messages]
-            subscriber.acknowledge(request={"subscription": sub_path, "ack_ids": ack_ids})
+            logger.warning("[DLQ] Found %d dead-lettered messages", count)
+            for msg in messages:
+                data = str(msg.get("data", ""))[:500]
+                logger.warning("[DLQ] Message: %s", data)
 
         return {"dead_letter_count": count}
+    except NotImplementedError as exc:
+        # Provider (e.g. AWS SNS) does not expose a DLQ pull path.
+        logger.info("[DLQ] Check skipped (provider unsupported): %s", exc)
+        return {"dead_letter_count": 0, "skipped": True, "reason": str(exc)}
     except Exception as exc:
-        print(f"[DLQ] Check failed: {exc}", flush=True)
+        logger.error("[DLQ] Check failed: %s", exc)
         return {"dead_letter_count": -1, "error": str(exc)}
 
 

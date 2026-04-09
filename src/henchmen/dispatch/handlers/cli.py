@@ -5,10 +5,14 @@ import logging
 import os
 import shutil
 import tempfile
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from henchmen.dispatch.normalizer import TaskNormalizer
 from henchmen.providers.interfaces.message_broker import MessageBroker
+from henchmen.utils.git import clone_repo
+
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +20,7 @@ logger = logging.getLogger(__name__)
 async def handle_cli_request(
     data: dict[str, Any],
     normalizer: TaskNormalizer,
-    settings: Any,
+    settings: "Settings",
     broker: MessageBroker | None = None,
 ) -> dict[str, Any]:
     """Process a CLI task creation request."""
@@ -28,7 +32,7 @@ async def handle_cli_request(
 async def handle_embed_command(
     repo: str,
     full: bool,
-    settings: Any,
+    settings: "Settings",
     # Legacy param kept for backward compatibility
     pinecone_api_key: str = "",
 ) -> dict[str, Any]:
@@ -44,7 +48,7 @@ async def handle_embed_command(
 async def run_embedding_pipeline(
     repo: str,
     mode: str,
-    settings: Any,
+    settings: "Settings",
     commit_sha: str | None = None,
     # Legacy param kept for backward compatibility
     pinecone_api_key: str = "",
@@ -70,32 +74,22 @@ async def run_embedding_pipeline(
     region = settings.rag_corpus_region
     github_token = os.environ.get("GITHUB_TOKEN", "")
 
-    print(f"[EMBED] Starting {mode} embedding for {repo}", flush=True)
+    logger.info("[EMBED] Starting %s embedding for %s", mode, repo)
 
     # Clone the repo
     tmp_dir = tempfile.mkdtemp(prefix="henchmen-embed-")
     try:
-        clone_url = (
-            f"https://x-access-token:{github_token}@github.com/{repo}.git"
-            if github_token
-            else f"https://github.com/{repo}.git"
-        )
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "clone",
-            "--depth=50",
-            clone_url,
-            tmp_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            # Sanitize error to avoid leaking tokens
-            err_msg = stderr.decode()[:500]
-            if github_token:
-                err_msg = err_msg.replace(github_token, "***")
-            return {"status": "failed", "error": f"git clone failed: {err_msg}"}
+        try:
+            await clone_repo(
+                repo,
+                "main",
+                tmp_dir,
+                token=github_token or None,
+                depth=50,
+                single_branch=False,
+            )
+        except RuntimeError as exc:
+            return {"status": "failed", "error": str(exc)}
 
         # Get current HEAD sha
         proc = await asyncio.create_subprocess_exec(
@@ -112,12 +106,12 @@ async def run_embedding_pipeline(
         # Determine which files to process
         if mode == "full":
             files_to_embed = _collect_all_files(tmp_dir)
-            print(f"[EMBED] Full mode, processing {len(files_to_embed)} files", flush=True)
+            logger.info("[EMBED] Full mode, processing %d files", len(files_to_embed))
         else:
             # Incremental: diff from last indexed commit
             last_sha = commit_sha or await get_last_indexed_commit(repo, project_id=project_id)
             if not last_sha:
-                print("[EMBED] No last indexed commit found, falling back to full mode", flush=True)
+                logger.info("[EMBED] No last indexed commit found, falling back to full mode")
                 return await run_embedding_pipeline(
                     repo=repo,
                     mode="full",
@@ -130,9 +124,9 @@ async def run_embedding_pipeline(
                 await delete_file_chunks(
                     repo, deleted, collection_name=collection_name, project_id=project_id, region=region
                 )
-                print(f"[EMBED] Deleted chunks for {len(deleted)} removed files", flush=True)
+                logger.info("[EMBED] Deleted chunks for %d removed files", len(deleted))
             files_to_embed = _read_files(tmp_dir, changed)
-            print(f"[EMBED] Incremental: {len(changed)} changed, {len(deleted)} deleted files", flush=True)
+            logger.info("[EMBED] Incremental: %d changed, %d deleted files", len(changed), len(deleted))
 
         # Chunk all files
         all_chunks = []
@@ -141,12 +135,12 @@ async def run_embedding_pipeline(
                 all_chunks.extend(chunk_file(file_path, content))
 
         if not all_chunks:
-            print("[EMBED] No chunks to embed", flush=True)
+            logger.info("[EMBED] No chunks to embed")
             await set_last_indexed_commit(repo, head_sha, project_id=project_id)
             return {"status": "completed", "chunks_upserted": 0}
 
         # Upsert to RAG Engine (handles embedding automatically)
-        print(f"[EMBED] Upserting {len(all_chunks)} chunks to RAG Engine...", flush=True)
+        logger.info("[EMBED] Upserting %d chunks to RAG Engine...", len(all_chunks))
         count = await upsert_chunks(
             chunks=all_chunks,
             repo=repo,
@@ -159,7 +153,7 @@ async def run_embedding_pipeline(
         # Update last indexed commit
         await set_last_indexed_commit(repo, head_sha, project_id=project_id)
 
-        print(f"[EMBED] Completed: {count} chunks upserted for {repo}@{head_sha[:8]}", flush=True)
+        logger.info("[EMBED] Completed: %d chunks upserted for %s@%s", count, repo, head_sha[:8])
         return {"status": "completed", "chunks_upserted": count, "commit_sha": head_sha}
 
     finally:

@@ -15,6 +15,10 @@ from henchmen.providers.interfaces.container_orchestrator import JobStatus
 
 
 def _mock_settings(**overrides):
+    """TODO(R9): replace with the shared ``mock_settings`` fixture from
+    ``tests/conftest.py``. Needs plumbing via ``monkeypatch.setenv`` for the
+    Ollama-specific fields.
+    """
     s = MagicMock()
     s.environment = MagicMock()
     s.environment.value = "dev"

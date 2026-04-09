@@ -2,7 +2,7 @@
 
 import logging
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from henchmen.mastermind.lair_manager import LairManager
 from henchmen.models.dossier import Dossier
@@ -11,6 +11,9 @@ from henchmen.models.scheme import NodeType, SchemeNode
 from henchmen.models.task import HenchmenTask
 from henchmen.observability.tracker import estimate_cost
 from henchmen.schemes.base import SchemeGraph
+
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +25,9 @@ _DEFAULT_COST_CEILING_USD = 2.0
 class SchemeExecutor:
     """Walks a Scheme DAG, dispatching deterministic and agentic nodes."""
 
-    def __init__(self, scheme_graph: SchemeGraph, lair_manager: LairManager, settings: Any, tracker: Any = None):
+    def __init__(
+        self, scheme_graph: SchemeGraph, lair_manager: LairManager, settings: "Settings", tracker: Any = None
+    ):
         self.scheme_graph = scheme_graph
         self.lair_manager = lair_manager
         self.settings = settings
@@ -53,9 +58,10 @@ class SchemeExecutor:
             exec_count = self._retry_counts.get(node_key, 0)
             state_key = (node_key, exec_count)
             if state_key in self._visited_states:
-                print(
-                    f"[SCHEME] Cycle detected: node {node_key} with retry_count={exec_count} already visited",
-                    flush=True,
+                logger.error(
+                    "[SCHEME] Cycle detected: node %s with retry_count=%d already visited",
+                    node_key,
+                    exec_count,
                 )
                 self.node_results[node_key] = {
                     "condition": None,
@@ -75,9 +81,10 @@ class SchemeExecutor:
                 logger.info("Executing node %s (%s)", current_node.id, current_node.node_type.value)
                 # Check if this node has been retried too many times (prevents infinite loops)
                 if exec_count >= self._max_node_retries:
-                    print(
-                        f"[SCHEME] Node {node_key} hit max retries ({self._max_node_retries}), forcing FAIL",
-                        flush=True,
+                    logger.error(
+                        "[SCHEME] Node %s hit max retries (%d), forcing FAIL",
+                        node_key,
+                        self._max_node_retries,
                     )
                     result = {"condition": "fail", "message": f"Max retries reached for {node_key} — escalating"}
                 else:
@@ -175,8 +182,6 @@ class SchemeExecutor:
         In dev mode (when lair provisioning fails), simulates a successful completion
         so the rest of the pipeline can be tested end-to-end.
         """
-        import sys
-
         # Pre-dispatch cost budget validation
         ceiling_env = os.environ.get("HENCHMEN_COST_CEILING_USD", "")
         cost_ceiling = float(ceiling_env) if ceiling_env else _DEFAULT_COST_CEILING_USD
@@ -219,15 +224,15 @@ class SchemeExecutor:
                     f"{str(error_output)[:2000]}"
                 )
 
-        print(f"[SCHEME] Dispatching agentic node '{node.id}' to Lair for task {task.id}", flush=True)
+        logger.info("[SCHEME] Dispatching agentic node '%s' to Lair for task %s", node.id, task.id)
 
         try:
             lair_id = await self.lair_manager.create_lair(
                 enriched_task, node, scheme_id=self.scheme_graph.definition.id
             )
-            print(f"[SCHEME] Lair {lair_id} created, waiting for completion...", flush=True)
+            logger.info("[SCHEME] Lair %s created, waiting for completion...", lair_id)
             report = await self.lair_manager.wait_for_completion(lair_id)
-            print(f"[SCHEME] Lair {lair_id} completed with status: {report.status}", flush=True)
+            logger.info("[SCHEME] Lair %s completed with status: %s", lair_id, report.status)
 
             if self.tracker:
                 await self.tracker.record_node_result(task.id, node.id, report)
@@ -240,7 +245,7 @@ class SchemeExecutor:
             else:
                 return {"condition": "fail", "report": report.model_dump(), "lair_id": lair_id}
         except Exception as exc:
-            print(f"[SCHEME] Lair provisioning failed for node {node.id}: {exc}", file=sys.stderr, flush=True)
+            logger.error("[SCHEME] Lair provisioning failed for node %s: %s", node.id, exc)
 
             # Only simulate pass in dev mode for implementation nodes.
             # Fix nodes (fix_lint, fix_tests) must NEVER simulate pass —
@@ -297,10 +302,11 @@ class SchemeExecutor:
             if result.evaluation_error:
                 logger.warning("Evaluation failed for node %s: %s", node.id, result.evaluation_error)
             else:
-                print(
-                    f"[EVAL] Node {node.id} quality={result.overall_quality:.2f} "
-                    f"(fulfillment={result.fulfillment_score:.2f})",
-                    flush=True,
+                logger.info(
+                    "[EVAL] Node %s quality=%.2f (fulfillment=%.2f)",
+                    node.id,
+                    result.overall_quality,
+                    result.fulfillment_score,
                 )
         except Exception as exc:
             logger.warning("Evaluation skipped for node %s: %s", node.id, exc)

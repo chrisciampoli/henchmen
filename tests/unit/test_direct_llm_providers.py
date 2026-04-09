@@ -14,6 +14,10 @@ from henchmen.models.llm import ModelTier
 
 
 def _mock_settings(**overrides):
+    """TODO(R9): replace with the shared ``mock_settings`` fixture from
+    ``tests/conftest.py``. Needs plumbing via ``monkeypatch.setenv`` for
+    the OpenAI / Anthropic API key fields.
+    """
     s = MagicMock()
     s.openai_api_key = "sk-test-openai"
     s.anthropic_api_key = "sk-ant-test"

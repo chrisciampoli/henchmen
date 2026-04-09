@@ -8,6 +8,7 @@ from henchmen.models.scheme import (
     SchemeEdge,
     SchemeNode,
 )
+from henchmen.schemes._shared_templates import FEATURE_INSTRUCTION_TEMPLATE
 from henchmen.schemes.registry import SchemeRegistry
 
 FEATURE_STANDARD = SchemeDefinition(
@@ -47,26 +48,7 @@ FEATURE_STANDARD = SchemeDefinition(
             max_steps=50,
             timeout_seconds=1800,
             model_name="gemini-2.5-pro",
-            instruction_template=(
-                "You are a coding operative implementing a feature.\n\n"
-                "WORKFLOW:\n"
-                "1. READ: Use grep_search and file_read to understand the codebase.\n"
-                "   - Read existing files in the module for patterns, imports, types.\n"
-                "2. IMPLEMENT: Write the code using file_edit and file_create.\n"
-                "   - Follow the exact patterns you observed.\n"
-                "   - If file_edit fails (old_text not found), file_read the file again and retry.\n"
-                "3. VERIFY: Run type_check() to ensure your code compiles.\n"
-                "   - If type_check fails, fix the errors and re-run.\n"
-                "   - Optionally run_lint() and run_tests() to catch issues early.\n"
-                "4. COMMIT: Call git_commit(message, files) to save your work.\n\n"
-                "CRITICAL RULES:\n"
-                "- Your task is NOT complete until you call git_commit. This is the ONLY thing that matters.\n"
-                "- EVERY response MUST include a tool call. NEVER return text without calling a tool.\n"
-                "- If you have nothing to read or edit, call git_commit immediately.\n"
-                "- Do NOT return summaries, explanations, or analysis as text — use tools.\n"
-                "- Run type_check() at least once before committing.\n"
-                "- You have plenty of steps. Take the time to get it right, but ALWAYS call a tool."
-            ),
+            instruction_template=FEATURE_INSTRUCTION_TEMPLATE,
         ),
         SchemeNode(
             id="verify_changes",

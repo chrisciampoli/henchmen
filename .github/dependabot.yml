@@ -1,0 +1,71 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    assignees:
+      - chrisciampoli
+    labels:
+      - dependencies
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: docker
+    directory: /containers/dispatch
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    assignees:
+      - chrisciampoli
+    labels:
+      - dependencies
+
+  - package-ecosystem: docker
+    directory: /containers/mastermind
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    assignees:
+      - chrisciampoli
+    labels:
+      - dependencies
+
+  - package-ecosystem: docker
+    directory: /containers/forge
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    assignees:
+      - chrisciampoli
+    labels:
+      - dependencies
+
+  - package-ecosystem: docker
+    directory: /containers/operative
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    assignees:
+      - chrisciampoli
+    labels:
+      - dependencies
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    assignees:
+      - chrisciampoli
+    labels:
+      - dependencies

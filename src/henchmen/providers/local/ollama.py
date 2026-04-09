@@ -16,18 +16,76 @@ logger = logging.getLogger(__name__)
 
 
 class OllamaProvider:
-    """LLMProvider backed by a local Ollama server."""
+    """LLMProvider backed by a local Ollama server.
+
+    .. note::
+       BYO-LLM via Ollama is experimental. Scheme nodes that reference cloud
+       model names (e.g. ``gemini-2.5-pro``) are remapped to a local Ollama
+       model. This flattens the scheme's model tiering — a task that intended
+       to use a reasoning-heavy model and a lightweight model will run both
+       nodes on the same local model. A warning is logged on every remap so
+       that degraded parity is visible to the operator.
+
+       For best results, use an Ollama model with native tool-calling support
+       (e.g. ``qwen2.5-coder:7b`` or ``llama3.3``). Models like ``llama3.2``
+       have known weaknesses around function calling under Ollama.
+    """
+
+    # Map cloud model name prefixes or tier names to recommended local Ollama
+    # models. The operator can override any of these via env vars of the form
+    # ``HENCHMEN_LLM_OLLAMA_MODEL_<TIER_NAME>`` (e.g.
+    # ``HENCHMEN_LLM_OLLAMA_MODEL_COMPLEX=qwen2.5-coder:7b``). Future work: wire
+    # these into Settings with proper fields.
+    _TIER_HINTS: dict[str, str] = {
+        "COMPLEX": "qwen2.5-coder:7b (tool-calling capable, strong for code)",
+        "LIGHT": "qwen2.5:3b (smaller, faster for planning/analysis)",
+        "REASONING": "deepseek-r1:8b (reasoning-heavy tasks like fix_tests)",
+    }
 
     def __init__(self, settings: Settings) -> None:
         self._base_url = getattr(settings, "llm_ollama_base_url", "http://localhost:11434")
         self._default_model = getattr(settings, "llm_ollama_model", "llama3.2")
         self._client = httpx.AsyncClient(base_url=self._base_url, timeout=300.0)
+        # Track which tier flattens we've already warned about to avoid log noise.
+        self._warned_tiers: set[str] = set()
 
     def resolve_tier(self, tier: str) -> str:
-        """Map any model tier to the configured default Ollama model."""
+        """Map any model tier or non-local model name to the configured Ollama model.
+
+        In local mode, scheme nodes may reference cloud model names like
+        ``gemini-2.5-pro``. These need to be mapped to the local Ollama model.
+        This flattens the scheme's model tiering; a WARNING is logged per
+        distinct mapping so the operator can see that their default scheme's
+        tier differentiation has collapsed.
+        """
         if tier in (ModelTier.COMPLEX, ModelTier.LIGHT, ModelTier.REASONING):
+            self._warn_tier_flatten(tier)
+            return self._default_model
+        # If the model name doesn't look like a local Ollama model, remap it
+        if tier.startswith(("gemini", "claude", "gpt")):
+            self._warn_tier_flatten(tier)
             return self._default_model
         return tier
+
+    def _warn_tier_flatten(self, tier: str) -> None:
+        """Emit a one-shot warning when a tier/cloud-model name is flattened to the default."""
+        if tier in self._warned_tiers:
+            return
+        self._warned_tiers.add(tier)
+        # Normalize a tier/model-name to a hint key.
+        hint_key = None
+        if tier in (ModelTier.COMPLEX, ModelTier.LIGHT, ModelTier.REASONING):
+            hint_key = tier.name
+        hint = self._TIER_HINTS.get(hint_key) if hint_key else None
+        logger.warning(
+            "[ollama] Flattening tier/model '%s' -> '%s'. "
+            "Your scheme's model tiering is collapsed to a single local model — "
+            "results will diverge from cloud-model parity. "
+            "Recommended local model for this tier: %s",
+            tier,
+            self._default_model,
+            hint or "see docs/schemes.md for recommended local models",
+        )
 
     def supported_models(self) -> list[str]:
         """Return the configured default model as the supported model list."""
@@ -67,6 +125,21 @@ class OllamaProvider:
         tool_calls = self._parse_tool_calls(data.get("message", {}))
         prompt_tokens = data.get("prompt_eval_count", 0)
         completion_tokens = data.get("eval_count", 0)
+
+        # If the caller requested tools but the model returned nothing (no tool
+        # calls AND no content), surface this as a visible warning — often a
+        # signal that the selected Ollama model lacks tool-calling support or
+        # its chat template does not emit function calls.
+        if tools and not tool_calls and not content.strip():
+            logger.warning(
+                "[ollama] Model '%s' returned an empty response to a tool-use prompt. "
+                "This usually means the model does not support native tool calling. "
+                "Raw response keys=%s. Consider switching to qwen2.5-coder:7b, "
+                "llama3.3, or another tool-calling-capable model.",
+                model,
+                sorted(data.keys()),
+            )
+
         return LLMResponse(
             content=content,
             tool_calls=tool_calls,
