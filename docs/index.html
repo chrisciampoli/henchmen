@@ -312,14 +312,14 @@
 
     <div class="hero-badge">
       <span class="dot"></span>
-      Open Source &nbsp;&middot;&nbsp; Apache 2.0 &nbsp;&middot;&nbsp; GCP-native
+      Open Source &nbsp;&middot;&nbsp; Apache 2.0 &nbsp;&middot;&nbsp; Cloud-Agnostic
     </div>
 
     <h1 class="hero-title"><span class="glow">Henchmen</span></h1>
 
     <p class="hero-tagline">
       <strong>AI Agent Factory.</strong> Cloud-Agnostic. Villain-Themed.<br />
-      Submit tasks. Get pull requests. No babysitting required.
+      Submit tasks via CLI, Slack, GitHub, or Jira. Get pull requests. Runs locally or on any cloud.
     </p>
 
     <div class="hero-ctas">
@@ -413,7 +413,7 @@
     <div class="reveal">
       <span class="section-label">Architecture</span>
       <h2 class="section-title">End-to-end pipeline</h2>
-      <p class="section-subtitle">Every component is a Cloud Run service or job, connected by Pub/Sub with OIDC auth. Ephemeral by design &#8212; nothing persists that shouldn&#8217;t.</p>
+      <p class="section-subtitle">Seven components connected by a pluggable message broker. Runs locally with Docker + SQLite, or on GCP/AWS with managed services. Ephemeral by design.</p>
     </div>
 
     <div class="arch-flow reveal">
@@ -576,7 +576,7 @@
             <div class="comp-tag">Library</div>
           </div>
         </div>
-        <p class="comp-desc">Context builder. Gathers project rules, performs RAG via Pinecone (<span class="comp-code">henchmen-code</span> index), and caches artifacts to GCS for reuse across Operatives.</p>
+        <p class="comp-desc">Context builder. Gathers project rules, performs semantic search (RAG), analyzes tasks, and caches artifacts to object storage for reuse across Operatives.</p>
       </div>
 
       <div class="comp-card reveal">
@@ -671,8 +671,8 @@
   <div class="container">
     <div class="reveal">
       <span class="section-label">Quick Start</span>
-      <h2 class="section-title">Up and running in minutes</h2>
-      <p class="section-subtitle">Python 3.12+, Docker, and Git. No cloud account required for local development.</p>
+      <h2 class="section-title">Local end-to-end in 10 minutes</h2>
+      <p class="section-subtitle">Python 3.12+, Docker Desktop, and a GitHub token. Submit a task, watch the operative code, get a PR.</p>
     </div>
 
     <div class="quickstart-wrap">
@@ -681,22 +681,21 @@
           <span class="term-dot term-dot-red"></span>
           <span class="term-dot term-dot-yellow"></span>
           <span class="term-dot term-dot-green"></span>
-          <span class="terminal-title">bash &#8212; step 1: install</span>
+          <span class="terminal-title">bash &#8212; step 1: install &amp; configure</span>
         </div>
         <div class="terminal-body">
           <div class="t-comment"># Clone and install</div>
           <div class="t-cmd">git clone https://github.com/chrisciampoli/henchmen &amp;&amp; cd henchmen</div>
           <div class="t-cmd">pip install -e ".[dev]"</div>
           <div class="t-blank"></div>
-          <div class="t-comment"># Configure for local mode</div>
+          <div class="t-comment"># Configure &#8212; set your GitHub token and LLM choice</div>
           <div class="t-cmd">cp .env.example .env.local</div>
+          <div class="t-cmd">$EDITOR .env.local</div>
           <div class="t-blank"></div>
-          <div class="t-comment"># Start all services + Ollama LLM</div>
-          <div class="t-cmd">docker compose up</div>
-          <div class="t-success">&#10003; Dispatch listening on :8001</div>
-          <div class="t-success">&#10003; Mastermind listening on :8002</div>
-          <div class="t-success">&#10003; Forge listening on :8003</div>
-          <div class="t-success">&#10003; Ollama ready (llama3.2)</div>
+          <div class="t-comment"># .env.local (minimum required)</div>
+          <div class="t-out">GITHUB_TOKEN=ghp_your_token_here</div>
+          <div class="t-out">HENCHMEN_LLM_PROVIDER=openai          <span style="color:var(--muted)"># or: anthropic, local (Ollama)</span></div>
+          <div class="t-out">HENCHMEN_OPENAI_API_KEY=sk-...        <span style="color:var(--muted)"># for OpenAI</span></div>
         </div>
       </div>
 
@@ -705,41 +704,39 @@
           <span class="term-dot term-dot-red"></span>
           <span class="term-dot term-dot-yellow"></span>
           <span class="term-dot term-dot-green"></span>
-          <span class="terminal-title">bash &#8212; step 2: submit your first task</span>
+          <span class="terminal-title">bash &#8212; step 2: start the server</span>
         </div>
         <div class="terminal-body">
-          <div class="t-comment"># Send a task to Dispatch</div>
-          <div class="t-cmd">curl -X POST http://localhost:8001/tasks \</div>
-          <div class="t-out">  -H "Content-Type: application/json" \</div>
-          <div class="t-out">  -d '{"title": "Fix login bug",</div>
-          <div class="t-out">       "description": "Users cannot log in after password reset",</div>
-          <div class="t-out">       "source": "cli",</div>
-          <div class="t-out">       "repo": "your-org/your-repo"}'</div>
-          <div class="t-blank"></div>
-          <div class="t-success">&#10003; Task created: t-8f3a2b1c</div>
-          <div class="t-out">  Mastermind selects scheme: bugfix_standard</div>
-          <div class="t-out">  Operative spawned &#8594; analyzing code &#8594; committing fix</div>
-          <div class="t-out">  Forge running CI &#8594; lint passed &#8594; tests passed</div>
-          <div class="t-success">&#10003; Pull request created: #42</div>
-        </div>
-      </div>
-
-      <div class="terminal reveal">
-        <div class="terminal-bar">
-          <span class="term-dot term-dot-red"></span>
-          <span class="term-dot term-dot-yellow"></span>
-          <span class="term-dot term-dot-green"></span>
-          <span class="terminal-title">bash &#8212; alternative: single process (no Docker)</span>
-        </div>
-        <div class="terminal-body">
-          <div class="t-comment"># Run everything in one process</div>
-          <div class="t-cmd">pip install -e "."</div>
           <div class="t-cmd">henchmen serve</div>
           <div class="t-blank"></div>
-          <div class="t-success">&#10003; Henchmen running in single-process mode</div>
-          <div class="t-out">  Provider: local (SQLite + filesystem + in-memory queues)</div>
-          <div class="t-out">  LLM: Ollama at http://localhost:11434</div>
-          <div class="t-out">  Health: http://localhost:8000/health</div>
+          <div class="t-success">&#10003; Starting Henchmen in single-process mode (provider=local)</div>
+          <div class="t-success">&#10003; HTTP forwarding configured for 4 topics</div>
+          <div class="t-success">&#10003; Uvicorn running on http://0.0.0.0:8000</div>
+          <div class="t-blank"></div>
+          <div class="t-comment"># First run auto-builds the operative Docker image (~2 min)</div>
+        </div>
+      </div>
+
+      <div class="terminal reveal">
+        <div class="terminal-bar">
+          <span class="term-dot term-dot-red"></span>
+          <span class="term-dot term-dot-yellow"></span>
+          <span class="term-dot term-dot-green"></span>
+          <span class="terminal-title">bash &#8212; step 3: submit a task and get a PR</span>
+        </div>
+        <div class="terminal-body">
+          <div class="t-comment"># In a new terminal &#8212; send a task</div>
+          <div class="t-cmd">curl -X POST http://localhost:8000/dispatch/api/v1/tasks \</div>
+          <div class="t-out">  -H "Content-Type: application/json" \</div>
+          <div class="t-out">  -d '{"title": "Create a Python todo app",</div>
+          <div class="t-out">       "description": "Create todo.py with add, list, remove",</div>
+          <div class="t-out">       "repo": "your-user/your-repo"}'</div>
+          <div class="t-blank"></div>
+          <div class="t-success">&#10003; Task dispatched: ab8f2df7</div>
+          <div class="t-out">  Mastermind selects scheme: feature_standard</div>
+          <div class="t-out">  Operative spawned in Docker &#8594; writing code &#8594; pushing branch</div>
+          <div class="t-out">  Verify changes &#8594; lint &#8594; tests &#8594; create PR</div>
+          <div class="t-success">&#10003; PR created: https://github.com/your-user/your-repo/pull/1</div>
         </div>
       </div>
     </div>
