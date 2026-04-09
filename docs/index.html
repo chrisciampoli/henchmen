@@ -6,8 +6,9 @@
   <title>Henchmen &#8212; AI Agent Factory</title>
   <meta name="description" content="Henchmen is an open-source AI agent factory. Submit tasks via Slack, GitHub, Jira, or CLI. Agents execute in ephemeral containers and deliver human-reviewable pull requests." />
   <meta property="og:title" content="Henchmen &#8212; AI Agent Factory" />
-  <meta property="og:description" content="Cloud-agnostic AI coding agents that deliver PRs, not promises." />
+  <meta property="og:description" content="The self-hostable AI engineering team. Tasks in, PRs out." />
   <meta property="og:type" content="website" />
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 28' fill='none' stroke='%23a78bfa' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><path d='M 10 18 C 10 6, 30 6, 30 18'/><line x1='10' y1='18' x2='30' y2='18'/><path d='M 4 20 Q 20 24, 36 20'/></svg>" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -48,9 +49,12 @@
     nav{position:sticky;top:0;z-index:100;
       background:rgba(10,10,15,.85);backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
     .nav-inner{display:flex;align-items:center;justify-content:space-between;height:60px}
-    .nav-logo{font-size:1.1rem;font-weight:700;letter-spacing:-.02em;display:flex;align-items:center;gap:8px}
+    .nav-logo{font-size:1.1rem;font-weight:700;letter-spacing:-.02em;display:flex;align-items:center;gap:10px}
     .nav-logo .logo-text{background:linear-gradient(135deg,#a78bfa,#7c3aed);
       -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+    .logo-mark{color:var(--accent-light);flex-shrink:0}
+    .nav-logo .logo-mark{width:32px;height:22px}
+    .footer-left .logo-mark{width:24px;height:17px;color:var(--muted)}
     .nav-links{display:flex;align-items:center;gap:28px}
     .nav-links a{font-size:.875rem;color:var(--muted);transition:color .2s}
     .nav-links a:hover{color:var(--text)}
@@ -67,6 +71,9 @@
     @keyframes orb-pulse{
       0%,100%{opacity:.6;transform:translateX(-50%) scale(1)}
       50%{opacity:1;transform:translateX(-50%) scale(1.08)}}
+
+    .hero-mark{width:96px;height:68px;color:var(--accent-light);margin:0 auto 24px;
+      display:block;filter:drop-shadow(0 0 24px var(--accent-glow));animation:fade-up .7s ease both}
 
     .hero-badge{display:inline-flex;align-items:center;gap:6px;font-size:.8rem;font-weight:500;
       color:var(--accent-light);background:var(--accent-dim);border:1px solid rgba(124,58,237,.3);
@@ -256,6 +263,33 @@
     .footer-gh:hover{color:#c4b5fd !important}
     .footer-tagline{font-size:.78rem;color:#2a2a4a;margin-top:8px}
 
+    /* Why Henchmen (founder + comparison) */
+    .why-wrap{max-width:780px;margin:0 auto}
+    .why-story{font-size:1.05rem;line-height:1.8;color:var(--text)}
+    .why-story p{margin-bottom:20px}
+    .why-story p:last-child{margin-bottom:0}
+    .why-story strong{color:var(--accent-light);font-weight:600}
+    .why-story .story-sig{display:block;font-size:.85rem;color:var(--muted);
+      margin-top:28px;padding-top:20px;border-top:1px solid var(--border);font-style:italic}
+    .why-story .story-sig a{color:var(--accent-light);transition:color .2s}
+    .why-story .story-sig a:hover{color:#c4b5fd}
+
+    .compare-wrap{margin-top:64px;overflow-x:auto}
+    .compare-table{width:100%;border-collapse:collapse;min-width:720px;font-size:.85rem}
+    .compare-table th,.compare-table td{padding:14px 14px;text-align:center;
+      border-bottom:1px solid var(--border)}
+    .compare-table thead th{color:var(--muted);font-weight:600;font-size:.72rem;
+      text-transform:uppercase;letter-spacing:.06em;background:var(--surface);
+      padding:16px 14px;border-bottom:1px solid var(--border)}
+    .compare-table thead th.highlight{color:var(--accent-light);background:rgba(124,58,237,.08)}
+    .compare-table tbody th{text-align:left;color:var(--text);font-weight:600;
+      background:transparent;padding:14px 14px;text-transform:none;letter-spacing:0;font-size:.85rem}
+    .compare-table td.highlight{background:rgba(124,58,237,.06);color:var(--accent-light);font-weight:600}
+    .compare-table td.yes{color:#34d399;font-weight:600}
+    .compare-table td.no{color:#64748b}
+    .compare-table td.partial{color:#fbbf24}
+    .compare-note{font-size:.78rem;color:var(--muted);margin-top:14px;text-align:center}
+
     @keyframes fade-in{from{opacity:0}to{opacity:1}}
     @keyframes fade-up{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
 
@@ -292,13 +326,17 @@
 <nav>
   <div class="container nav-inner">
     <a href="#" class="nav-logo">
-      <span>&#128128;</span>
+      <svg class="logo-mark" viewBox="0 0 40 28" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M 10 18 C 10 6, 30 6, 30 18" />
+        <line x1="10" y1="18" x2="30" y2="18" />
+        <path d="M 4 20 Q 20 24, 36 20" />
+      </svg>
       <span class="logo-text">Henchmen</span>
     </a>
     <ul class="nav-links">
+      <li><a href="#why">Why</a></li>
       <li><a href="#how-it-works">How It Works</a></li>
       <li><a href="#architecture">Architecture</a></li>
-      <li><a href="#components">Components</a></li>
       <li><a href="#quickstart">Quick Start</a></li>
       <li><a href="https://github.com/chrisciampoli/henchmen" class="btn-nav">GitHub &rarr;</a></li>
     </ul>
@@ -310,20 +348,26 @@
   <div class="container" style="position:relative">
     <div class="hero-orb" aria-hidden="true"></div>
 
+    <svg class="hero-mark" viewBox="0 0 40 28" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M 10 18 C 10 6, 30 6, 30 18" />
+      <line x1="10" y1="18" x2="30" y2="18" />
+      <path d="M 4 20 Q 20 24, 36 20" />
+    </svg>
+
     <div class="hero-badge">
       <span class="dot"></span>
-      Open Source &nbsp;&middot;&nbsp; Apache 2.0 &nbsp;&middot;&nbsp; Cloud-Agnostic
+      Apache 2.0 &nbsp;&middot;&nbsp; Self-Hostable &nbsp;&middot;&nbsp; BYO LLM
     </div>
 
     <h1 class="hero-title"><span class="glow">Henchmen</span></h1>
 
     <p class="hero-tagline">
-      <strong>AI Agent Factory.</strong> Cloud-Agnostic. Villain-Themed.<br />
-      Submit tasks via CLI, Slack, GitHub, or Jira. Get pull requests. Runs locally or on any cloud.
+      <strong>The self-hostable AI engineering team.</strong><br />
+      Assign a task from Slack, GitHub, Jira, or CLI. An army of ephemeral agents does the work and delivers a pull request to your review queue. On your cloud. With your models.
     </p>
 
     <div class="hero-ctas">
-      <a href="#quickstart" class="btn btn-primary">&#9889; Get Started</a>
+      <a href="#quickstart" class="btn btn-primary">&#9889; 10-Minute Quickstart</a>
       <a href="https://github.com/chrisciampoli/henchmen" class="btn btn-secondary"
          target="_blank" rel="noopener">&#9733; View on GitHub</a>
     </div>
@@ -333,21 +377,130 @@
     <div class="container">
       <div class="trust-bar-inner">
         <div class="trust-stat">
-          <div class="value">7</div>
-          <div class="label">Villain Components</div>
+          <div class="value">Apache 2.0</div>
+          <div class="label">Fully open source</div>
         </div>
         <div class="trust-stat">
-          <div class="value">4</div>
-          <div class="label">Task Sources</div>
+          <div class="value">BYO LLM</div>
+          <div class="label">GPT &middot; Claude &middot; Gemini &middot; Ollama</div>
         </div>
         <div class="trust-stat">
-          <div class="value">$0</div>
-          <div class="label">LLM cost for lint fixes</div>
+          <div class="value">3 clouds + local</div>
+          <div class="label">GCP &middot; AWS &middot; Docker</div>
         </div>
         <div class="trust-stat">
-          <div class="value">100%</div>
-          <div class="label">Fail-Closed CI Gates</div>
+          <div class="value">Fail-closed</div>
+          <div class="label">No broken PR ever ships</div>
         </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider" />
+
+<!-- Why Henchmen -->
+<section id="why">
+  <div class="container">
+    <div class="reveal">
+      <span class="section-label">Why Henchmen</span>
+      <h2 class="section-title">Stripe has Minions. You have Henchmen.</h2>
+      <p class="section-subtitle">An open-source answer to the agent factories that big companies build for themselves.</p>
+    </div>
+
+    <div class="why-wrap reveal" style="margin-top:48px">
+      <div class="why-story">
+        <p>I spent six months watching Cursor and Claude Code eat my attention. I&#8217;d ask for something, then sit there watching the agent type. It felt like pair programming with a very fast, very literal intern who needed a driver in the seat at all times.</p>
+        <p>Then I read Stripe&#8217;s post about <strong>Minions</strong> &#8212; their internal agent factory that ships <strong>1,000+ PRs per week</strong> from Slack messages, entirely unattended. And Alex Op&#8217;s <strong>Software Factory</strong> essay arguing that the next team model is specs-in, PRs-out with AI handling the implementation.</p>
+        <p>I wanted that. I wanted to fire a task from Slack, walk into a meeting, and come back to a PR in my review queue &#8212; reviewed the same way I&#8217;d review a teammate&#8217;s work. Stripe built it internally. Nothing existed as open source.</p>
+        <p>So I built <strong>Henchmen</strong>: an agent factory that runs on your laptop, your cloud, or both. Tasks in, PRs out. Fail-closed CI gates. BYO models. The villain theme came second.</p>
+        <span class="story-sig">
+          &mdash; Chris &middot;
+          <a href="https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents" target="_blank" rel="noopener noreferrer">Stripe Minions</a> &middot;
+          <a href="https://alexop.dev/posts/the-software-factory/" target="_blank" rel="noopener noreferrer">The Software Factory</a>
+        </span>
+      </div>
+
+      <div class="compare-wrap">
+        <table class="compare-table">
+          <thead>
+            <tr>
+              <th style="text-align:left">&nbsp;</th>
+              <th class="highlight">Henchmen</th>
+              <th>Devin</th>
+              <th>Copilot Agent</th>
+              <th>OpenHands</th>
+              <th>Cursor BG</th>
+              <th>Aider</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th>Open source</th>
+              <td class="highlight yes">Apache 2.0</td>
+              <td class="no">&mdash;</td>
+              <td class="no">&mdash;</td>
+              <td class="yes">MIT</td>
+              <td class="no">&mdash;</td>
+              <td class="yes">Apache 2.0</td>
+            </tr>
+            <tr>
+              <th>Self-hostable on your cloud</th>
+              <td class="highlight yes">Yes (GCP/AWS/Local)</td>
+              <td class="no">&mdash;</td>
+              <td class="no">&mdash;</td>
+              <td class="partial">K8s VPC</td>
+              <td class="no">&mdash;</td>
+              <td class="partial">Local only</td>
+            </tr>
+            <tr>
+              <th>Async task &rarr; PR loop</th>
+              <td class="highlight yes">Yes</td>
+              <td class="yes">Yes</td>
+              <td class="yes">Yes</td>
+              <td class="partial">Partial</td>
+              <td class="yes">Yes</td>
+              <td class="no">Interactive</td>
+            </tr>
+            <tr>
+              <th>BYO LLM keys</th>
+              <td class="highlight yes">Yes</td>
+              <td class="no">&mdash;</td>
+              <td class="no">&mdash;</td>
+              <td class="yes">Yes</td>
+              <td class="no">&mdash;</td>
+              <td class="yes">Yes</td>
+            </tr>
+            <tr>
+              <th>Fail-closed CI gates</th>
+              <td class="highlight yes">Yes</td>
+              <td class="no">&mdash;</td>
+              <td class="no">&mdash;</td>
+              <td class="no">&mdash;</td>
+              <td class="no">&mdash;</td>
+              <td class="no">&mdash;</td>
+            </tr>
+            <tr>
+              <th>Workflows as code (DAG)</th>
+              <td class="highlight yes">Schemes</td>
+              <td class="no">&mdash;</td>
+              <td class="no">&mdash;</td>
+              <td class="no">&mdash;</td>
+              <td class="no">&mdash;</td>
+              <td class="no">&mdash;</td>
+            </tr>
+            <tr>
+              <th>Price</th>
+              <td class="highlight yes">Free (BYO LLM)</td>
+              <td class="no">$20/mo + usage</td>
+              <td class="no">$10&ndash;39/seat</td>
+              <td class="yes">Free</td>
+              <td class="no">$20+/seat</td>
+              <td class="yes">Free</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="compare-note">Comparison as of April 2026. Correct me on GitHub if any of these are wrong or outdated.</p>
       </div>
     </div>
   </div>
@@ -360,8 +513,8 @@
   <div class="container">
     <div class="reveal">
       <span class="section-label">How It Works</span>
-      <h2 class="section-title">Three steps to autonomous pull requests</h2>
-      <p class="section-subtitle">Henchmen handles everything between &#8220;here&#8217;s a task&#8221; and &#8220;here&#8217;s a PR&#8221; &#8212; so you can focus on reviewing, not implementing.</p>
+      <h2 class="section-title">Tasks in. Pull requests out.</h2>
+      <p class="section-subtitle">You write the task. Henchmen writes the PR. You review it. That&#8217;s the whole loop.</p>
     </div>
 
     <div class="steps-grid">
@@ -384,21 +537,21 @@
         <h3 class="step-title">Agents Execute in Isolation</h3>
         <p class="step-desc">Mastermind selects a Scheme, spins up an ephemeral Operative container, and arms it with the full Arsenal of coding tools. The agent works, then disappears.</p>
         <div class="step-sources">
-          <span class="chip">Gemini 2.5 Pro</span>
-          <span class="chip">Cloud Run Jobs</span>
-          <span class="chip">RAG via Pinecone</span>
+          <span class="chip">Any LLM (GPT / Claude / Gemini / Ollama)</span>
+          <span class="chip">Ephemeral containers</span>
+          <span class="chip">RAG-grounded context</span>
         </div>
       </div>
 
       <div class="step-card reveal">
         <div class="step-number">Step 03</div>
         <span class="step-icon">&#128256;</span>
-        <h3 class="step-title">Get a Human-Reviewable PR</h3>
-        <p class="step-desc">Forge runs CI, verifies lint and tests pass, and opens a pull request. Fail-closed gates ensure nothing reaches human review if checks are broken.</p>
+        <h3 class="step-title">A PR Lands in Your Review Queue</h3>
+        <p class="step-desc">Mastermind verifies the Operative&#8217;s work, runs lint and tests through Forge, and opens a pull request on your repo. If CI breaks, the PR never sees daylight. No exceptions.</p>
         <div class="step-sources">
           <span class="chip">GitHub PR</span>
-          <span class="chip">CI Gates</span>
-          <span class="chip">Merge Queue</span>
+          <span class="chip">Fail-closed CI</span>
+          <span class="chip">Human review gate</span>
         </div>
       </div>
     </div>
@@ -471,29 +624,29 @@
         <div class="legend-item">
           <span class="legend-icon">&#128232;</span>
           <div>
-            <div class="legend-name">Pub/Sub Transport</div>
-            <div class="legend-desc">8 env-prefixed topics with OIDC audience auth between all services</div>
+            <div class="legend-name">Pluggable Message Broker</div>
+            <div class="legend-desc">Pub/Sub, SNS, or in-memory &#8212; services talk through one interface, you pick the backend</div>
           </div>
         </div>
         <div class="legend-item">
           <span class="legend-icon">&#128452;&#65039;</span>
           <div>
-            <div class="legend-name">Firestore State</div>
-            <div class="legend-desc">Task lifecycle, Operative status, metrics &#8212; all persisted</div>
+            <div class="legend-name">Pluggable Document Store</div>
+            <div class="legend-desc">Firestore, DynamoDB, or SQLite. Task state lives where you want it to live</div>
           </div>
         </div>
         <div class="legend-item">
           <span class="legend-icon">&#128269;</span>
           <div>
             <div class="legend-name">Dossier + RAG</div>
-            <div class="legend-desc">Context built per-task via Pinecone semantic search before execution</div>
+            <div class="legend-desc">Context built per-task via semantic search over your codebase before execution</div>
           </div>
         </div>
         <div class="legend-item">
           <span class="legend-icon">&#128203;</span>
           <div>
             <div class="legend-name">Schemes (DAG Plans)</div>
-            <div class="legend-desc">Execution blueprints: bugfix_standard, feature_standard, goal_decomposition</div>
+            <div class="legend-desc">Declarative workflow blueprints committed to your repo. Version-controlled. Reviewable.</div>
           </div>
         </div>
       </div>
@@ -518,10 +671,10 @@
           <div class="comp-icon">&#129504;</div>
           <div>
             <div class="comp-name">Mastermind</div>
-            <div class="comp-tag">Cloud Run Service</div>
+            <div class="comp-tag">The Boss</div>
           </div>
         </div>
-        <p class="comp-desc">Orchestrator. Manages task lifecycle via state machine, selects Schemes, dispatches Operatives. Fail-closed CI gates &#8212; never creates PRs when checks fail.</p>
+        <p class="comp-desc">Sits at the top of the org chart. Reads every task, picks the right Scheme, dispatches Operatives, and fires the ones that botch the job. Fail-closed CI gates &#8212; no broken PR reaches your review queue. Ever.</p>
       </div>
 
       <div class="comp-card reveal">
@@ -529,10 +682,10 @@
           <div class="comp-icon">&#128678;</div>
           <div>
             <div class="comp-name">Dispatch</div>
-            <div class="comp-tag">Cloud Run Service</div>
+            <div class="comp-tag">The Fixer</div>
           </div>
         </div>
-        <p class="comp-desc">Intake router. Receives tasks from Slack (Socket Mode), Jira, GitHub, CLI. Normalizes everything to the Task model. Publishes to Pub/Sub &#8212; nothing more.</p>
+        <p class="comp-desc">Receives jobs from Slack, GitHub, Jira, or CLI. Normalizes every request into a single Task contract and hands it off. Doesn&#8217;t think. Just routes. One job, done clean.</p>
       </div>
 
       <div class="comp-card reveal">
@@ -540,10 +693,10 @@
           <div class="comp-icon">&#129302;</div>
           <div>
             <div class="comp-name">Operative</div>
-            <div class="comp-tag">Cloud Run Job</div>
+            <div class="comp-tag">Disposable Agent</div>
           </div>
         </div>
-        <p class="comp-desc">Coding agent. Bootstraps into an ephemeral environment, executes Scheme nodes, uses Arsenal tools, reports results. Gone when the job ends.</p>
+        <p class="comp-desc">Spawns in an isolated container, executes its assigned Scheme node, leaves no trace. Armed with the Arsenal, briefed by the Dossier, watched by the Mastermind. Works, then disappears.</p>
       </div>
 
       <div class="comp-card reveal">
@@ -551,10 +704,10 @@
           <div class="comp-icon">&#128736;&#65039;</div>
           <div>
             <div class="comp-name">Arsenal</div>
-            <div class="comp-tag">Tool Registry</div>
+            <div class="comp-tag">The Toolkit</div>
           </div>
         </div>
-        <p class="comp-desc">Runs inside Operative. Provides: <span class="comp-code">code_edit</span>, <span class="comp-code">code_intel</span>, <span class="comp-code">github</span>, <span class="comp-code">git_ops</span>, <span class="comp-code">test_runner</span>. Co-located for zero-latency tool calls.</p>
+        <p class="comp-desc">What every Operative carries into the field: <span class="comp-code">code_edit</span>, <span class="comp-code">code_intel</span>, <span class="comp-code">git_ops</span>, <span class="comp-code">test_runner</span>, <span class="comp-code">github</span>. Co-located inside the container for zero-latency tool calls.</p>
       </div>
 
       <div class="comp-card reveal">
@@ -562,10 +715,10 @@
           <div class="comp-icon">&#9874;&#65039;</div>
           <div>
             <div class="comp-name">Forge</div>
-            <div class="comp-tag">Cloud Run Service</div>
+            <div class="comp-tag">Quality Control</div>
           </div>
         </div>
-        <p class="comp-desc">CI and merge queue. Orchestrates CI pipelines, builds PRs, manages the merge queue, and detects silent failures before anything reaches human review.</p>
+        <p class="comp-desc">Runs CI on every Operative&#8217;s branch, manages the merge queue, catches silent failures. If CI breaks, the PR never sees daylight. No exceptions.</p>
       </div>
 
       <div class="comp-card reveal">
@@ -573,10 +726,10 @@
           <div class="comp-icon">&#128194;</div>
           <div>
             <div class="comp-name">Dossier</div>
-            <div class="comp-tag">Library</div>
+            <div class="comp-tag">Intelligence</div>
           </div>
         </div>
-        <p class="comp-desc">Context builder. Gathers project rules, performs semantic search (RAG), analyzes tasks, and caches artifacts to object storage for reuse across Operatives.</p>
+        <p class="comp-desc">The intel file. Gathers project rules, performs RAG-grounded semantic search over the codebase, and builds a per-task brief before the Operative ever touches the keyboard. Cached so the next Operative gets it for free.</p>
       </div>
 
       <div class="comp-card reveal">
@@ -584,10 +737,10 @@
           <div class="comp-icon">&#128203;</div>
           <div>
             <div class="comp-name">Schemes</div>
-            <div class="comp-tag">DAG Blueprints</div>
+            <div class="comp-tag">The Blueprints</div>
           </div>
         </div>
-        <p class="comp-desc">Workflow execution plans. DAG-based blueprints defining node sequences, model assignments, and retry logic: <span class="comp-code">bugfix_standard</span>, <span class="comp-code">feature_standard</span>, <span class="comp-code">goal_decomposition</span>.</p>
+        <p class="comp-desc">Declarative DAG workflows committed to your repo. Version-controlled. Reviewable. Customizable. Comes with <span class="comp-code">bugfix_standard</span>, <span class="comp-code">feature_standard</span>, and <span class="comp-code">goal_decomposition</span>. Fork one. Write your own. Assign different models to different nodes.</p>
       </div>
     </div>
   </div>
@@ -807,9 +960,9 @@
           <li>Pipe output from other tools</li>
         </ul>
         <div class="env-block">
-          <span class="env-key">curl</span> -X POST http://localhost:8001/tasks \<br/>
+          <span class="env-key">curl</span> -X POST http://localhost:8000/dispatch/api/v1/tasks \<br/>
           &nbsp;&nbsp;-H "Content-Type: application/json" \<br/>
-          &nbsp;&nbsp;-d '{"title": "...", "source": "cli"}'
+          &nbsp;&nbsp;-d '{"title": "...", "repo": "you/your-repo"}'
         </div>
       </div>
     </div>
@@ -819,8 +972,8 @@
 <!-- CTA Banner -->
 <div class="container">
   <div class="cta-banner reveal">
-    <h2>Ready to deploy your henchmen?</h2>
-    <p>Open source, Apache 2.0. Clone it, fork it, break it, improve it. The villains are waiting.</p>
+    <h2>Ready to assemble your crew?</h2>
+    <p>Open source. Apache 2.0. Clone it, fork it, break it, improve it. Your henchmen are standing by.</p>
     <div class="btn-group">
       <a href="https://github.com/chrisciampoli/henchmen" class="btn btn-primary"
          target="_blank" rel="noopener">&#9733; Star on GitHub</a>
@@ -835,7 +988,12 @@
   <div class="container">
     <div class="footer-inner">
       <div class="footer-left">
-        <span>&#128128; Henchmen</span>
+        <svg class="logo-mark" viewBox="0 0 40 28" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M 10 18 C 10 6, 30 6, 30 18" />
+          <line x1="10" y1="18" x2="30" y2="18" />
+          <path d="M 4 20 Q 20 24, 36 20" />
+        </svg>
+        <span>Henchmen</span>
         <span class="footer-sep">&middot;</span>
         <span>Apache 2.0</span>
         <span class="footer-sep">&middot;</span>
@@ -847,7 +1005,7 @@
         <a href="https://github.com/chrisciampoli/henchmen/blob/main/CONTRIBUTING.md">Contributing</a>
       </div>
     </div>
-    <div class="footer-tagline">Built with villain-themed determination. No Claude models were harmed on Vertex AI.</div>
+    <div class="footer-tagline">Assembled in a secret lab. Shipped from an undisclosed location.</div>
   </div>
 </footer>
 
