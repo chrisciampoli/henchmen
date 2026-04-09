@@ -1,0 +1,11 @@
+google-cloud-pubsub
+google-cloud-storage
+google-cloud-logging
+vertexai
+google-genai
+google-adk
+mcp
+pydantic>=2.0
+pydantic-settings
+httpx
+anthropic[vertex]>=0.40.0

@@ -1,0 +1,13 @@
+fastapi>=0.100.0
+uvicorn>=0.23.0
+pydantic>=2.0
+pydantic-settings>=2.0
+google-cloud-pubsub>=2.18.0
+google-cloud-secret-manager>=2.16.0
+google-cloud-logging>=3.8.0
+slack-bolt>=1.18.0
+slack-sdk>=3.23.0
+PyGithub>=2.1.0
+jira>=3.5.0
+httpx>=0.25.0
+pinecone>=5.0.0

@@ -1,0 +1,874 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Henchmen &#8212; AI Agent Factory</title>
+  <meta name="description" content="Henchmen is an open-source AI agent factory. Submit tasks via Slack, GitHub, Jira, or CLI. Agents execute in ephemeral containers and deliver human-reviewable pull requests." />
+  <meta property="og:title" content="Henchmen &#8212; AI Agent Factory" />
+  <meta property="og:description" content="Cloud-agnostic AI coding agents that deliver PRs, not promises." />
+  <meta property="og:type" content="website" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{
+      --bg:#0a0a0f;--surface:#1a1a2e;--border:#2a2a4a;
+      --accent:#7c3aed;--accent-light:#a78bfa;
+      --accent-glow:rgba(124,58,237,.35);--accent-dim:rgba(124,58,237,.12);
+      --text:#e2e8f0;--muted:#94a3b8;--success:#34d399;
+      --code-bg:#0d0d1a;--radius:10px;--radius-lg:16px
+    }
+    html{scroll-behavior:smooth}
+    body{font-family:'Inter',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;overflow-x:hidden}
+    a{color:inherit;text-decoration:none}
+    ul{list-style:none}
+
+    /* Animated grid background */
+    .grid-bg{position:fixed;inset:0;z-index:0;
+      background-image:linear-gradient(rgba(124,58,237,.04) 1px,transparent 1px),
+        linear-gradient(90deg,rgba(124,58,237,.04) 1px,transparent 1px);
+      background-size:60px 60px;animation:grid-shift 20s linear infinite;pointer-events:none}
+    .grid-bg::after{content:'';position:absolute;inset:0;
+      background:radial-gradient(ellipse 80% 60% at 50% 0%,transparent 40%,var(--bg) 100%)}
+    @keyframes grid-shift{0%{background-position:0 0}100%{background-position:60px 60px}}
+
+    .container{position:relative;z-index:1;max-width:1100px;margin:0 auto;padding:0 24px}
+    section{padding:96px 0}
+    section+section{padding-top:0}
+
+    .section-label{display:inline-block;font-size:11px;font-weight:600;letter-spacing:.15em;
+      text-transform:uppercase;color:var(--accent-light);background:var(--accent-dim);
+      border:1px solid rgba(124,58,237,.3);padding:4px 12px;border-radius:99px;margin-bottom:20px}
+    .section-title{font-size:clamp(1.75rem,4vw,2.5rem);font-weight:700;line-height:1.2;margin-bottom:16px}
+    .section-subtitle{font-size:1.05rem;color:var(--muted);max-width:560px}
+
+    /* Nav */
+    nav{position:sticky;top:0;z-index:100;
+      background:rgba(10,10,15,.85);backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
+    .nav-inner{display:flex;align-items:center;justify-content:space-between;height:60px}
+    .nav-logo{font-size:1.1rem;font-weight:700;letter-spacing:-.02em;display:flex;align-items:center;gap:8px}
+    .nav-logo .logo-text{background:linear-gradient(135deg,#a78bfa,#7c3aed);
+      -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+    .nav-links{display:flex;align-items:center;gap:28px}
+    .nav-links a{font-size:.875rem;color:var(--muted);transition:color .2s}
+    .nav-links a:hover{color:var(--text)}
+    .nav-links .btn-nav{background:var(--accent);color:#fff;padding:7px 16px;border-radius:8px;
+      font-weight:500;font-size:.875rem;transition:background .2s,box-shadow .2s}
+    .nav-links .btn-nav:hover{background:#6d28d9;box-shadow:0 0 16px var(--accent-glow)}
+
+    /* Hero */
+    .hero{padding:120px 0 0;text-align:center;position:relative;z-index:1}
+    .hero-orb{position:absolute;top:-120px;left:50%;transform:translateX(-50%);
+      width:700px;height:700px;
+      background:radial-gradient(circle,rgba(124,58,237,.15) 0%,transparent 65%);
+      pointer-events:none;animation:orb-pulse 6s ease-in-out infinite}
+    @keyframes orb-pulse{
+      0%,100%{opacity:.6;transform:translateX(-50%) scale(1)}
+      50%{opacity:1;transform:translateX(-50%) scale(1.08)}}
+
+    .hero-badge{display:inline-flex;align-items:center;gap:6px;font-size:.8rem;font-weight:500;
+      color:var(--accent-light);background:var(--accent-dim);border:1px solid rgba(124,58,237,.3);
+      padding:5px 14px;border-radius:99px;margin-bottom:32px;animation:fade-in .6s ease both}
+    .hero-badge .dot{width:6px;height:6px;border-radius:50%;background:var(--accent-light);
+      animation:blink 2s ease-in-out infinite}
+    @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+
+    .hero-title{font-size:clamp(3rem,9vw,6.5rem);font-weight:800;letter-spacing:-.04em;
+      line-height:1;margin-bottom:12px;animation:fade-up .7s ease .1s both}
+    .glow{background:linear-gradient(135deg,#c4b5fd 0%,#7c3aed 40%,#a78bfa 100%);
+      -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+      filter:drop-shadow(0 0 32px rgba(124,58,237,.5))}
+
+    .hero-tagline{font-size:clamp(1rem,2.5vw,1.35rem);color:var(--muted);
+      margin-bottom:48px;animation:fade-up .7s ease .2s both}
+    .hero-tagline strong{color:var(--text);font-weight:500}
+
+    .hero-ctas{display:flex;align-items:center;justify-content:center;gap:16px;
+      flex-wrap:wrap;animation:fade-up .7s ease .3s both}
+
+    .btn{display:inline-flex;align-items:center;gap:8px;padding:13px 28px;
+      border-radius:var(--radius);font-size:.95rem;font-weight:600;
+      cursor:pointer;transition:all .2s;border:none}
+    .btn-primary{background:var(--accent);color:#fff}
+    .btn-primary:hover{background:#6d28d9;
+      box-shadow:0 0 24px var(--accent-glow),0 4px 16px rgba(0,0,0,.4);transform:translateY(-1px)}
+    .btn-secondary{background:transparent;color:var(--text);border:1px solid var(--border)}
+    .btn-secondary:hover{background:var(--surface);border-color:var(--accent);
+      color:var(--accent-light);transform:translateY(-1px)}
+
+    /* Trust bar */
+    .trust-bar{border-top:1px solid var(--border);border-bottom:1px solid var(--border);
+      padding:32px 0;margin-top:80px}
+    .trust-bar-inner{display:flex;align-items:center;justify-content:center;gap:64px;flex-wrap:wrap}
+    .trust-stat{text-align:center}
+    .trust-stat .value{font-size:1.75rem;font-weight:800;letter-spacing:-.03em;
+      background:linear-gradient(135deg,#a78bfa,#7c3aed);
+      -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+    .trust-stat .label{font-size:.8rem;color:var(--muted);margin-top:2px;
+      text-transform:uppercase;letter-spacing:.05em}
+
+    /* Steps */
+    .steps-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+      gap:24px;margin-top:56px}
+    .step-card{background:var(--surface);border:1px solid var(--border);
+      border-radius:var(--radius-lg);padding:36px 32px;position:relative;
+      overflow:hidden;transition:border-color .3s,transform .3s}
+    .step-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
+      background:linear-gradient(90deg,var(--accent),var(--accent-light));
+      opacity:0;transition:opacity .3s}
+    .step-card:hover{border-color:rgba(124,58,237,.5);transform:translateY(-3px)}
+    .step-card:hover::before{opacity:1}
+    .step-number{font-size:.75rem;font-weight:700;letter-spacing:.12em;
+      color:var(--accent-light);text-transform:uppercase;margin-bottom:16px}
+    .step-icon{font-size:2.2rem;margin-bottom:16px;display:block}
+    .step-title{font-size:1.15rem;font-weight:700;margin-bottom:10px}
+    .step-desc{font-size:.9rem;color:var(--muted);line-height:1.65}
+    .step-sources{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+    .chip{font-size:.75rem;font-weight:500;padding:3px 10px;border-radius:99px;
+      background:var(--accent-dim);color:var(--accent-light);
+      border:1px solid rgba(124,58,237,.25)}
+
+    /* Architecture */
+    .arch-flow{margin-top:56px;background:var(--surface);border:1px solid var(--border);
+      border-radius:var(--radius-lg);padding:48px 32px;overflow-x:auto}
+    .flow-nodes{display:flex;align-items:center;justify-content:center;
+      flex-wrap:nowrap;min-width:700px}
+    .flow-node{display:flex;flex-direction:column;align-items:center;text-align:center}
+    .flow-node-box{background:var(--bg);border:1px solid var(--border);
+      border-radius:var(--radius);padding:16px 20px;min-width:110px;
+      transition:border-color .3s,box-shadow .3s}
+    .flow-node-box:hover{border-color:var(--accent);box-shadow:0 0 20px var(--accent-glow)}
+    .flow-node-icon{font-size:1.5rem;margin-bottom:6px}
+    .flow-node-name{font-size:.8rem;font-weight:700;color:var(--text)}
+    .flow-node-role{font-size:.7rem;color:var(--muted);margin-top:3px}
+    .flow-arrow{display:flex;align-items:center;padding:0 6px;flex-shrink:0}
+    .flow-arrow-line{width:28px;height:2px;
+      background:linear-gradient(90deg,var(--accent),var(--accent-light));position:relative}
+    .flow-arrow-line::after{content:'';position:absolute;right:-5px;top:-4px;
+      border:5px solid transparent;border-left:7px solid var(--accent-light)}
+
+    .arch-legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+      gap:12px;margin-top:32px}
+    .legend-item{display:flex;align-items:flex-start;gap:10px;font-size:.82rem}
+    .legend-icon{font-size:1rem;flex-shrink:0;margin-top:1px}
+    .legend-name{font-weight:600;color:var(--text)}
+    .legend-desc{color:var(--muted);line-height:1.4}
+
+    /* Components */
+    .components-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));
+      gap:20px;margin-top:56px}
+    .comp-card{background:var(--surface);border:1px solid var(--border);
+      border-radius:var(--radius-lg);padding:28px 24px;
+      transition:border-color .3s,transform .3s,box-shadow .3s}
+    .comp-card:hover{border-color:rgba(124,58,237,.5);transform:translateY(-3px);
+      box-shadow:0 8px 32px rgba(0,0,0,.3)}
+    .comp-card-header{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+    .comp-icon{font-size:1.6rem;width:44px;height:44px;display:flex;align-items:center;
+      justify-content:center;background:var(--accent-dim);border-radius:10px;
+      border:1px solid rgba(124,58,237,.2);flex-shrink:0}
+    .comp-name{font-size:1rem;font-weight:700;color:var(--text)}
+    .comp-tag{font-size:.68rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+      color:var(--accent-light);background:var(--accent-dim);
+      border:1px solid rgba(124,58,237,.2);padding:2px 8px;border-radius:4px;margin-top:2px}
+    .comp-desc{font-size:.88rem;color:var(--muted);line-height:1.6}
+    .comp-code{color:var(--accent-light);font-size:.8em;font-family:'JetBrains Mono',monospace}
+
+    /* Matrix */
+    .matrix-wrap{margin-top:56px;overflow-x:auto}
+    .matrix-table{width:100%;border-collapse:collapse;min-width:580px}
+    .matrix-table th,.matrix-table td{padding:14px 18px;text-align:left;
+      border-bottom:1px solid var(--border);font-size:.875rem}
+    .matrix-table thead th{color:var(--muted);font-weight:600;font-size:.78rem;
+      text-transform:uppercase;letter-spacing:.06em;background:var(--surface)}
+    .matrix-table thead th:first-child{border-radius:var(--radius) 0 0 0}
+    .matrix-table thead th:last-child{border-radius:0 var(--radius) 0 0}
+    .matrix-table tbody tr{transition:background .15s}
+    .matrix-table tbody tr:hover{background:rgba(124,58,237,.05)}
+    .matrix-table tbody tr:last-child td{border-bottom:none}
+    .row-label{font-weight:600;color:var(--text);display:flex;align-items:center;gap:8px}
+    .check{color:#34d399;font-size:1.1rem}
+    .dash{color:var(--border);font-size:1rem}
+
+    /* Quick start */
+    #quickstart{padding-bottom:96px}
+    .quickstart-wrap{margin-top:56px;display:grid;gap:24px}
+    .terminal{background:var(--code-bg);border:1px solid var(--border);
+      border-radius:var(--radius-lg);overflow:hidden}
+    .terminal-bar{display:flex;align-items:center;gap:8px;padding:12px 18px;
+      background:#111120;border-bottom:1px solid var(--border)}
+    .term-dot{width:11px;height:11px;border-radius:50%}
+    .term-dot-red{background:#ff5f57}
+    .term-dot-yellow{background:#febc2e}
+    .term-dot-green{background:#28c840}
+    .terminal-title{font-size:.75rem;color:var(--muted);margin-left:8px;
+      font-family:'JetBrains Mono',monospace}
+    .terminal-body{padding:24px 28px;font-family:'JetBrains Mono',monospace;
+      font-size:.82rem;line-height:1.9;overflow-x:auto}
+    .t-comment{color:#4a5568}
+    .t-cmd{color:#e2e8f0}
+    .t-cmd::before{content:'$ ';color:var(--accent-light)}
+    .t-out{color:#64748b;padding-left:1.8em}
+    .t-success{color:#34d399}
+    .t-blank{display:block;height:.5rem}
+
+    /* Integration cards */
+    .integrations-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:24px;margin-top:48px}
+    .integration-card{background:var(--surface);border:1px solid var(--border);
+      border-radius:var(--radius-lg);padding:32px 28px;transition:border-color .2s,transform .2s}
+    .integration-card:hover{border-color:var(--accent);transform:translateY(-2px)}
+    .integration-icon{font-size:2rem;margin-bottom:16px;display:block}
+    .integration-card h3{font-size:1.1rem;font-weight:700;margin-bottom:8px;color:var(--text)}
+    .integration-card p{font-size:.85rem;color:var(--muted);line-height:1.6;margin-bottom:16px}
+    .integration-card .env-block{background:var(--code-bg);border-radius:8px;padding:14px 16px;
+      font-family:'JetBrains Mono',monospace;font-size:.72rem;color:var(--muted);line-height:1.8;overflow-x:auto}
+    .integration-card .env-key{color:var(--accent-light)}
+    .integration-card .env-val{color:#34d399}
+    .step-list{list-style:none;padding:0;margin:0 0 16px}
+    .step-list li{font-size:.83rem;color:var(--muted);padding:4px 0;padding-left:20px;position:relative}
+    .step-list li::before{content:'';position:absolute;left:0;top:11px;width:8px;height:8px;
+      border-radius:50%;background:var(--accent);opacity:.6}
+
+    /* CTA banner */
+    .cta-banner{background:linear-gradient(135deg,var(--surface) 0%,#1e1040 100%);
+      border:1px solid rgba(124,58,237,.3);border-radius:var(--radius-lg);
+      padding:64px 48px;text-align:center;position:relative;overflow:hidden;margin:0 0 96px}
+    .cta-banner::before{content:'';position:absolute;inset:0;
+      background:radial-gradient(ellipse 60% 80% at 50% 100%,rgba(124,58,237,.15),transparent);
+      pointer-events:none}
+    .cta-banner h2{font-size:clamp(1.5rem,4vw,2.5rem);font-weight:800;
+      letter-spacing:-.03em;margin-bottom:16px;position:relative}
+    .cta-banner p{color:var(--muted);font-size:1.05rem;margin-bottom:36px;
+      max-width:480px;margin-left:auto;margin-right:auto;position:relative}
+    .btn-group{display:flex;gap:16px;justify-content:center;flex-wrap:wrap;position:relative}
+
+    /* Footer */
+    footer{border-top:1px solid var(--border);padding:40px 0}
+    .footer-inner{display:flex;align-items:center;justify-content:space-between;
+      flex-wrap:wrap;gap:20px}
+    .footer-left{font-size:.875rem;color:var(--muted);display:flex;align-items:center;gap:12px}
+    .footer-sep{color:var(--border)}
+    .footer-right{display:flex;align-items:center;gap:20px}
+    .footer-right a{font-size:.875rem;color:var(--muted);transition:color .2s}
+    .footer-right a:hover{color:var(--text)}
+    .footer-gh{color:var(--accent-light) !important;transition:color .2s}
+    .footer-gh:hover{color:#c4b5fd !important}
+    .footer-tagline{font-size:.78rem;color:#2a2a4a;margin-top:8px}
+
+    @keyframes fade-in{from{opacity:0}to{opacity:1}}
+    @keyframes fade-up{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+
+    .reveal{opacity:0;transform:translateY(24px);
+      transition:opacity .6s ease,transform .6s ease}
+    .reveal.visible{opacity:1;transform:translateY(0)}
+
+    .divider{border:none;border-top:1px solid var(--border);margin:0}
+
+    @media(max-width:680px){
+      section{padding:64px 0}
+      section+section{padding-top:0}
+      .nav-links a:not(.btn-nav){display:none}
+      .hero{padding:80px 0 0}
+      .hero-ctas{flex-direction:column;align-items:center}
+      .hero-orb{width:340px;height:340px}
+      .flow-nodes{gap:2px}
+      .flow-node-box{min-width:78px;padding:10px 8px}
+      .flow-node-name{font-size:.68rem}
+      .flow-node-role{display:none}
+      .flow-arrow-line{width:12px}
+      .trust-bar-inner{gap:36px}
+      .cta-banner{padding:40px 24px}
+      .footer-inner{flex-direction:column;align-items:flex-start}
+    }
+    @media(max-width:480px){.arch-flow{padding:28px 12px}}
+  </style>
+</head>
+<body>
+
+<div class="grid-bg" aria-hidden="true"></div>
+
+<!-- Navigation -->
+<nav>
+  <div class="container nav-inner">
+    <a href="#" class="nav-logo">
+      <span>&#128128;</span>
+      <span class="logo-text">Henchmen</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="#how-it-works">How It Works</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#components">Components</a></li>
+      <li><a href="#quickstart">Quick Start</a></li>
+      <li><a href="https://github.com/chrisciampoli/henchmen" class="btn-nav">GitHub &rarr;</a></li>
+    </ul>
+  </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+  <div class="container" style="position:relative">
+    <div class="hero-orb" aria-hidden="true"></div>
+
+    <div class="hero-badge">
+      <span class="dot"></span>
+      Open Source &nbsp;&middot;&nbsp; Apache 2.0 &nbsp;&middot;&nbsp; GCP-native
+    </div>
+
+    <h1 class="hero-title"><span class="glow">Henchmen</span></h1>
+
+    <p class="hero-tagline">
+      <strong>AI Agent Factory.</strong> Cloud-Agnostic. Villain-Themed.<br />
+      Submit tasks. Get pull requests. No babysitting required.
+    </p>
+
+    <div class="hero-ctas">
+      <a href="#quickstart" class="btn btn-primary">&#9889; Get Started</a>
+      <a href="https://github.com/chrisciampoli/henchmen" class="btn btn-secondary"
+         target="_blank" rel="noopener">&#9733; View on GitHub</a>
+    </div>
+  </div>
+
+  <div class="trust-bar" style="margin-top:80px">
+    <div class="container">
+      <div class="trust-bar-inner">
+        <div class="trust-stat">
+          <div class="value">7</div>
+          <div class="label">Villain Components</div>
+        </div>
+        <div class="trust-stat">
+          <div class="value">4</div>
+          <div class="label">Task Sources</div>
+        </div>
+        <div class="trust-stat">
+          <div class="value">$0</div>
+          <div class="label">LLM cost for lint fixes</div>
+        </div>
+        <div class="trust-stat">
+          <div class="value">100%</div>
+          <div class="label">Fail-Closed CI Gates</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider" />
+
+<!-- How It Works -->
+<section id="how-it-works">
+  <div class="container">
+    <div class="reveal">
+      <span class="section-label">How It Works</span>
+      <h2 class="section-title">Three steps to autonomous pull requests</h2>
+      <p class="section-subtitle">Henchmen handles everything between &#8220;here&#8217;s a task&#8221; and &#8220;here&#8217;s a PR&#8221; &#8212; so you can focus on reviewing, not implementing.</p>
+    </div>
+
+    <div class="steps-grid">
+      <div class="step-card reveal">
+        <div class="step-number">Step 01</div>
+        <span class="step-icon">&#128229;</span>
+        <h3 class="step-title">Submit a Task</h3>
+        <p class="step-desc">Send a task from any interface. Dispatch normalizes it into a structured model and publishes it to the queue &#8212; no manual formatting required.</p>
+        <div class="step-sources">
+          <span class="chip">Slack</span>
+          <span class="chip">GitHub</span>
+          <span class="chip">Jira</span>
+          <span class="chip">CLI</span>
+        </div>
+      </div>
+
+      <div class="step-card reveal">
+        <div class="step-number">Step 02</div>
+        <span class="step-icon">&#129302;</span>
+        <h3 class="step-title">Agents Execute in Isolation</h3>
+        <p class="step-desc">Mastermind selects a Scheme, spins up an ephemeral Operative container, and arms it with the full Arsenal of coding tools. The agent works, then disappears.</p>
+        <div class="step-sources">
+          <span class="chip">Gemini 2.5 Pro</span>
+          <span class="chip">Cloud Run Jobs</span>
+          <span class="chip">RAG via Pinecone</span>
+        </div>
+      </div>
+
+      <div class="step-card reveal">
+        <div class="step-number">Step 03</div>
+        <span class="step-icon">&#128256;</span>
+        <h3 class="step-title">Get a Human-Reviewable PR</h3>
+        <p class="step-desc">Forge runs CI, verifies lint and tests pass, and opens a pull request. Fail-closed gates ensure nothing reaches human review if checks are broken.</p>
+        <div class="step-sources">
+          <span class="chip">GitHub PR</span>
+          <span class="chip">CI Gates</span>
+          <span class="chip">Merge Queue</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider" />
+
+<!-- Architecture -->
+<section id="architecture">
+  <div class="container">
+    <div class="reveal">
+      <span class="section-label">Architecture</span>
+      <h2 class="section-title">End-to-end pipeline</h2>
+      <p class="section-subtitle">Every component is a Cloud Run service or job, connected by Pub/Sub with OIDC auth. Ephemeral by design &#8212; nothing persists that shouldn&#8217;t.</p>
+    </div>
+
+    <div class="arch-flow reveal">
+      <div class="flow-nodes">
+        <div class="flow-node">
+          <div class="flow-node-box">
+            <div class="flow-node-icon">&#128225;</div>
+            <div class="flow-node-name">Source</div>
+            <div class="flow-node-role">Slack / GH / Jira / CLI</div>
+          </div>
+        </div>
+        <div class="flow-arrow"><div class="flow-arrow-line"></div></div>
+        <div class="flow-node">
+          <div class="flow-node-box">
+            <div class="flow-node-icon">&#128678;</div>
+            <div class="flow-node-name">Dispatch</div>
+            <div class="flow-node-role">Intake Router</div>
+          </div>
+        </div>
+        <div class="flow-arrow"><div class="flow-arrow-line"></div></div>
+        <div class="flow-node">
+          <div class="flow-node-box">
+            <div class="flow-node-icon">&#129504;</div>
+            <div class="flow-node-name">Mastermind</div>
+            <div class="flow-node-role">Orchestrator</div>
+          </div>
+        </div>
+        <div class="flow-arrow"><div class="flow-arrow-line"></div></div>
+        <div class="flow-node">
+          <div class="flow-node-box">
+            <div class="flow-node-icon">&#129302;</div>
+            <div class="flow-node-name">Operative</div>
+            <div class="flow-node-role">Coding Agent</div>
+          </div>
+        </div>
+        <div class="flow-arrow"><div class="flow-arrow-line"></div></div>
+        <div class="flow-node">
+          <div class="flow-node-box">
+            <div class="flow-node-icon">&#9874;&#65039;</div>
+            <div class="flow-node-name">Forge</div>
+            <div class="flow-node-role">CI + PR Builder</div>
+          </div>
+        </div>
+        <div class="flow-arrow"><div class="flow-arrow-line"></div></div>
+        <div class="flow-node">
+          <div class="flow-node-box">
+            <div class="flow-node-icon">&#128256;</div>
+            <div class="flow-node-name">Pull Request</div>
+            <div class="flow-node-role">Human Review</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="arch-legend">
+        <div class="legend-item">
+          <span class="legend-icon">&#128232;</span>
+          <div>
+            <div class="legend-name">Pub/Sub Transport</div>
+            <div class="legend-desc">8 env-prefixed topics with OIDC audience auth between all services</div>
+          </div>
+        </div>
+        <div class="legend-item">
+          <span class="legend-icon">&#128452;&#65039;</span>
+          <div>
+            <div class="legend-name">Firestore State</div>
+            <div class="legend-desc">Task lifecycle, Operative status, metrics &#8212; all persisted</div>
+          </div>
+        </div>
+        <div class="legend-item">
+          <span class="legend-icon">&#128269;</span>
+          <div>
+            <div class="legend-name">Dossier + RAG</div>
+            <div class="legend-desc">Context built per-task via Pinecone semantic search before execution</div>
+          </div>
+        </div>
+        <div class="legend-item">
+          <span class="legend-icon">&#128203;</span>
+          <div>
+            <div class="legend-name">Schemes (DAG Plans)</div>
+            <div class="legend-desc">Execution blueprints: bugfix_standard, feature_standard, goal_decomposition</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider" />
+
+<!-- Components -->
+<section id="components">
+  <div class="container">
+    <div class="reveal">
+      <span class="section-label">Components</span>
+      <h2 class="section-title">Seven villain-themed components</h2>
+      <p class="section-subtitle">Each component has one job. No bleed, no bloat &#8212; clean separation enforced by Pub/Sub boundaries and Pydantic contracts.</p>
+    </div>
+
+    <div class="components-grid">
+      <div class="comp-card reveal">
+        <div class="comp-card-header">
+          <div class="comp-icon">&#129504;</div>
+          <div>
+            <div class="comp-name">Mastermind</div>
+            <div class="comp-tag">Cloud Run Service</div>
+          </div>
+        </div>
+        <p class="comp-desc">Orchestrator. Manages task lifecycle via state machine, selects Schemes, dispatches Operatives. Fail-closed CI gates &#8212; never creates PRs when checks fail.</p>
+      </div>
+
+      <div class="comp-card reveal">
+        <div class="comp-card-header">
+          <div class="comp-icon">&#128678;</div>
+          <div>
+            <div class="comp-name">Dispatch</div>
+            <div class="comp-tag">Cloud Run Service</div>
+          </div>
+        </div>
+        <p class="comp-desc">Intake router. Receives tasks from Slack (Socket Mode), Jira, GitHub, CLI. Normalizes everything to the Task model. Publishes to Pub/Sub &#8212; nothing more.</p>
+      </div>
+
+      <div class="comp-card reveal">
+        <div class="comp-card-header">
+          <div class="comp-icon">&#129302;</div>
+          <div>
+            <div class="comp-name">Operative</div>
+            <div class="comp-tag">Cloud Run Job</div>
+          </div>
+        </div>
+        <p class="comp-desc">Coding agent. Bootstraps into an ephemeral environment, executes Scheme nodes, uses Arsenal tools, reports results. Gone when the job ends.</p>
+      </div>
+
+      <div class="comp-card reveal">
+        <div class="comp-card-header">
+          <div class="comp-icon">&#128736;&#65039;</div>
+          <div>
+            <div class="comp-name">Arsenal</div>
+            <div class="comp-tag">Tool Registry</div>
+          </div>
+        </div>
+        <p class="comp-desc">Runs inside Operative. Provides: <span class="comp-code">code_edit</span>, <span class="comp-code">code_intel</span>, <span class="comp-code">github</span>, <span class="comp-code">git_ops</span>, <span class="comp-code">test_runner</span>. Co-located for zero-latency tool calls.</p>
+      </div>
+
+      <div class="comp-card reveal">
+        <div class="comp-card-header">
+          <div class="comp-icon">&#9874;&#65039;</div>
+          <div>
+            <div class="comp-name">Forge</div>
+            <div class="comp-tag">Cloud Run Service</div>
+          </div>
+        </div>
+        <p class="comp-desc">CI and merge queue. Orchestrates CI pipelines, builds PRs, manages the merge queue, and detects silent failures before anything reaches human review.</p>
+      </div>
+
+      <div class="comp-card reveal">
+        <div class="comp-card-header">
+          <div class="comp-icon">&#128194;</div>
+          <div>
+            <div class="comp-name">Dossier</div>
+            <div class="comp-tag">Library</div>
+          </div>
+        </div>
+        <p class="comp-desc">Context builder. Gathers project rules, performs RAG via Pinecone (<span class="comp-code">henchmen-code</span> index), and caches artifacts to GCS for reuse across Operatives.</p>
+      </div>
+
+      <div class="comp-card reveal">
+        <div class="comp-card-header">
+          <div class="comp-icon">&#128203;</div>
+          <div>
+            <div class="comp-name">Schemes</div>
+            <div class="comp-tag">DAG Blueprints</div>
+          </div>
+        </div>
+        <p class="comp-desc">Workflow execution plans. DAG-based blueprints defining node sequences, model assignments, and retry logic: <span class="comp-code">bugfix_standard</span>, <span class="comp-code">feature_standard</span>, <span class="comp-code">goal_decomposition</span>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider" />
+
+<!-- Provider Matrix -->
+<section id="integrations">
+  <div class="container">
+    <div class="reveal">
+      <span class="section-label">Integrations</span>
+      <h2 class="section-title">Works where your team already is</h2>
+      <p class="section-subtitle">Connect Henchmen to every interface your team uses. Dispatch normalizes all inputs to the same internal Task model.</p>
+    </div>
+
+    <div class="matrix-wrap reveal">
+      <table class="matrix-table">
+        <thead>
+          <tr>
+            <th>Interface</th>
+            <th>Task Submission</th>
+            <th>Status Updates</th>
+            <th>PR Links</th>
+            <th>Failure Alerts</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="row-label">&#128172; Slack</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td><span class="row-label">&#128025; GitHub</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td><span class="row-label">&#128309; Jira</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="dash">&#8212;</span></td>
+          </tr>
+          <tr>
+            <td><span class="row-label">&#128187; CLI</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="dash">&#8212;</span></td>
+          </tr>
+          <tr>
+            <td><span class="row-label">&#128257; Pub/Sub direct</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="dash">&#8212;</span></td>
+            <td><span class="dash">&#8212;</span></td>
+          </tr>
+          <tr>
+            <td><span class="row-label">&#127760; HTTP API</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="dash">&#8212;</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<hr class="divider" />
+
+<!-- Quick Start -->
+<section id="quickstart">
+  <div class="container">
+    <div class="reveal">
+      <span class="section-label">Quick Start</span>
+      <h2 class="section-title">Up and running in minutes</h2>
+      <p class="section-subtitle">Python 3.12+, Docker, and Git. No cloud account required for local development.</p>
+    </div>
+
+    <div class="quickstart-wrap">
+      <div class="terminal reveal">
+        <div class="terminal-bar">
+          <span class="term-dot term-dot-red"></span>
+          <span class="term-dot term-dot-yellow"></span>
+          <span class="term-dot term-dot-green"></span>
+          <span class="terminal-title">bash &#8212; step 1: install</span>
+        </div>
+        <div class="terminal-body">
+          <div class="t-comment"># Clone and install</div>
+          <div class="t-cmd">git clone https://github.com/chrisciampoli/henchmen &amp;&amp; cd henchmen</div>
+          <div class="t-cmd">pip install -e ".[dev]"</div>
+          <div class="t-blank"></div>
+          <div class="t-comment"># Configure for local mode</div>
+          <div class="t-cmd">cp .env.example .env.local</div>
+          <div class="t-blank"></div>
+          <div class="t-comment"># Start all services + Ollama LLM</div>
+          <div class="t-cmd">docker compose up</div>
+          <div class="t-success">&#10003; Dispatch listening on :8001</div>
+          <div class="t-success">&#10003; Mastermind listening on :8002</div>
+          <div class="t-success">&#10003; Forge listening on :8003</div>
+          <div class="t-success">&#10003; Ollama ready (llama3.2)</div>
+        </div>
+      </div>
+
+      <div class="terminal reveal">
+        <div class="terminal-bar">
+          <span class="term-dot term-dot-red"></span>
+          <span class="term-dot term-dot-yellow"></span>
+          <span class="term-dot term-dot-green"></span>
+          <span class="terminal-title">bash &#8212; step 2: submit your first task</span>
+        </div>
+        <div class="terminal-body">
+          <div class="t-comment"># Send a task to Dispatch</div>
+          <div class="t-cmd">curl -X POST http://localhost:8001/tasks \</div>
+          <div class="t-out">  -H "Content-Type: application/json" \</div>
+          <div class="t-out">  -d '{"title": "Fix login bug",</div>
+          <div class="t-out">       "description": "Users cannot log in after password reset",</div>
+          <div class="t-out">       "source": "cli",</div>
+          <div class="t-out">       "repo": "your-org/your-repo"}'</div>
+          <div class="t-blank"></div>
+          <div class="t-success">&#10003; Task created: t-8f3a2b1c</div>
+          <div class="t-out">  Mastermind selects scheme: bugfix_standard</div>
+          <div class="t-out">  Operative spawned &#8594; analyzing code &#8594; committing fix</div>
+          <div class="t-out">  Forge running CI &#8594; lint passed &#8594; tests passed</div>
+          <div class="t-success">&#10003; Pull request created: #42</div>
+        </div>
+      </div>
+
+      <div class="terminal reveal">
+        <div class="terminal-bar">
+          <span class="term-dot term-dot-red"></span>
+          <span class="term-dot term-dot-yellow"></span>
+          <span class="term-dot term-dot-green"></span>
+          <span class="terminal-title">bash &#8212; alternative: single process (no Docker)</span>
+        </div>
+        <div class="terminal-body">
+          <div class="t-comment"># Run everything in one process</div>
+          <div class="t-cmd">pip install -e "."</div>
+          <div class="t-cmd">henchmen serve</div>
+          <div class="t-blank"></div>
+          <div class="t-success">&#10003; Henchmen running in single-process mode</div>
+          <div class="t-out">  Provider: local (SQLite + filesystem + in-memory queues)</div>
+          <div class="t-out">  LLM: Ollama at http://localhost:11434</div>
+          <div class="t-out">  Health: http://localhost:8000/health</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Integration Setup Cards -->
+    <div class="reveal" style="margin-top:80px">
+      <span class="section-label">Connect Your Tools</span>
+      <h2 class="section-title">Integrate in minutes</h2>
+      <p class="section-subtitle">Henchmen receives tasks from four sources. Each takes less than 5 minutes to configure.</p>
+    </div>
+
+    <div class="integrations-grid">
+      <div class="integration-card reveal">
+        <span class="integration-icon">&#128025;</span>
+        <h3>GitHub App</h3>
+        <p>Required for the full PR workflow. Henchmen creates branches, pushes commits, and opens pull requests.</p>
+        <ul class="step-list">
+          <li>Create a GitHub App with Contents + PR permissions</li>
+          <li>Install on your target repository</li>
+          <li>Download the private key (.pem file)</li>
+        </ul>
+        <div class="env-block">
+          <span class="env-key">HENCHMEN_GITHUB_APP_ID</span>=<span class="env-val">123456</span><br/>
+          <span class="env-key">HENCHMEN_GITHUB_APP_PRIVATE_KEY_SECRET</span>=<span class="env-val">/path/to/key.pem</span><br/>
+          <span class="env-key">HENCHMEN_GITHUB_DEFAULT_REPO</span>=<span class="env-val">your-org/your-repo</span>
+        </div>
+      </div>
+
+      <div class="integration-card reveal">
+        <span class="integration-icon">&#128172;</span>
+        <h3>Slack</h3>
+        <p>@mention the bot in any channel to create a task. Thread context is automatically included for richer descriptions.</p>
+        <ul class="step-list">
+          <li>Create a Slack App with Socket Mode enabled</li>
+          <li>Add bot scopes: app_mentions:read, chat:write</li>
+          <li>Subscribe to the app_mention event</li>
+        </ul>
+        <div class="env-block">
+          <span class="env-key">HENCHMEN_SLACK_BOT_TOKEN_SECRET</span>=<span class="env-val">xoxb-...</span><br/>
+          <span class="env-key">HENCHMEN_SLACK_APP_TOKEN_SECRET</span>=<span class="env-val">xapp-...</span><br/>
+          <span class="env-key">HENCHMEN_SLACK_SIGNING_SECRET</span>=<span class="env-val">your-secret</span>
+        </div>
+      </div>
+
+      <div class="integration-card reveal">
+        <span class="integration-icon">&#128203;</span>
+        <h3>Jira</h3>
+        <p>Automatically pick up Jira issues when they&#8217;re created or transitioned. Henchmen reads the ticket and gets to work.</p>
+        <ul class="step-list">
+          <li>Create a webhook pointing to Dispatch</li>
+          <li>Select issue created + updated events</li>
+          <li>Generate an API token for your service account</li>
+        </ul>
+        <div class="env-block">
+          <span class="env-key">HENCHMEN_JIRA_BASE_URL</span>=<span class="env-val">https://your-org.atlassian.net</span><br/>
+          <span class="env-key">HENCHMEN_JIRA_API_TOKEN_SECRET</span>=<span class="env-val">your-token</span><br/>
+          <span class="env-key">HENCHMEN_JIRA_PROJECT_KEY</span>=<span class="env-val">PROJ</span>
+        </div>
+      </div>
+
+      <div class="integration-card reveal">
+        <span class="integration-icon">&#9000;</span>
+        <h3>CLI</h3>
+        <p>Submit tasks directly via HTTP. Perfect for scripting, CI pipelines, or quick one-off fixes from the terminal.</p>
+        <ul class="step-list">
+          <li>No setup required &#8212; works out of the box</li>
+          <li>POST JSON to the Dispatch endpoint</li>
+          <li>Pipe output from other tools</li>
+        </ul>
+        <div class="env-block">
+          <span class="env-key">curl</span> -X POST http://localhost:8001/tasks \<br/>
+          &nbsp;&nbsp;-H "Content-Type: application/json" \<br/>
+          &nbsp;&nbsp;-d '{"title": "...", "source": "cli"}'
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CTA Banner -->
+<div class="container">
+  <div class="cta-banner reveal">
+    <h2>Ready to deploy your henchmen?</h2>
+    <p>Open source, Apache 2.0. Clone it, fork it, break it, improve it. The villains are waiting.</p>
+    <div class="btn-group">
+      <a href="https://github.com/chrisciampoli/henchmen" class="btn btn-primary"
+         target="_blank" rel="noopener">&#9733; Star on GitHub</a>
+      <a href="https://github.com/chrisciampoli/henchmen/blob/main/CONTRIBUTING.md"
+         class="btn btn-secondary" target="_blank" rel="noopener">Contribute</a>
+    </div>
+  </div>
+</div>
+
+<!-- Footer -->
+<footer>
+  <div class="container">
+    <div class="footer-inner">
+      <div class="footer-left">
+        <span>&#128128; Henchmen</span>
+        <span class="footer-sep">&middot;</span>
+        <span>Apache 2.0</span>
+        <span class="footer-sep">&middot;</span>
+        <a href="https://github.com/chrisciampoli/henchmen" class="footer-gh">GitHub</a>
+      </div>
+      <div class="footer-right">
+        <a href="https://github.com/chrisciampoli/henchmen/blob/main/SECURITY.md">Security</a>
+        <a href="https://github.com/chrisciampoli/henchmen/blob/main/CODE_OF_CONDUCT.md">Code of Conduct</a>
+        <a href="https://github.com/chrisciampoli/henchmen/blob/main/CONTRIBUTING.md">Contributing</a>
+      </div>
+    </div>
+    <div class="footer-tagline">Built with villain-themed determination. No Claude models were harmed on Vertex AI.</div>
+  </div>
+</footer>
+
+<script>
+(function(){
+  var els=document.querySelectorAll('.reveal');
+  if(!('IntersectionObserver' in window)){
+    els.forEach(function(el){el.classList.add('visible');});
+    return;
+  }
+  var io=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if(e.isIntersecting){e.target.classList.add('visible');io.unobserve(e.target);}
+    });
+  },{threshold:0.1,rootMargin:'0px 0px -40px 0px'});
+  els.forEach(function(el){io.observe(el);});
+})();
+</script>
+
+</body>
+</html>

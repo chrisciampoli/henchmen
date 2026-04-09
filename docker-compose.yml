@@ -1,0 +1,50 @@
+# Henchmen local development stack
+# Usage: cp .env.example .env.local && docker compose up
+
+services:
+  dispatch:
+    build:
+      context: .
+      dockerfile: containers/dispatch/Dockerfile
+    ports:
+      - "8001:8080"
+    env_file: .env.local
+    environment:
+      HENCHMEN_PROVIDER: local
+      HENCHMEN_ENVIRONMENT: dev
+    depends_on:
+      - ollama
+
+  mastermind:
+    build:
+      context: .
+      dockerfile: containers/mastermind/Dockerfile
+    ports:
+      - "8002:8080"
+    env_file: .env.local
+    environment:
+      HENCHMEN_PROVIDER: local
+      HENCHMEN_ENVIRONMENT: dev
+    depends_on:
+      - ollama
+
+  forge:
+    build:
+      context: .
+      dockerfile: containers/forge/Dockerfile
+    ports:
+      - "8003:8080"
+    env_file: .env.local
+    environment:
+      HENCHMEN_PROVIDER: local
+      HENCHMEN_ENVIRONMENT: dev
+
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  ollama_data:

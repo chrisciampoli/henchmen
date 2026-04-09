@@ -1,0 +1,11 @@
+fastapi>=0.100.0
+uvicorn>=0.23.0
+pydantic>=2.0
+pydantic-settings>=2.0
+google-cloud-pubsub>=2.18.0
+google-cloud-firestore>=2.13.0
+google-cloud-build>=0.15.0
+google-cloud-logging>=3.8.0
+PyGithub>=2.1.0
+httpx>=0.25.0
+ruff>=0.4.0
