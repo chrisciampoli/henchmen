@@ -1,12 +1,12 @@
-fastapi==0.115.2
-uvicorn==0.32.0
-pydantic==2.9.2
-pydantic-settings==2.6.1
-google-cloud-pubsub==2.26.1
-google-cloud-secret-manager==2.21.1
-google-cloud-logging==3.11.3
-slack-bolt==1.21.2
-slack-sdk==3.33.1  # TODO: verify version
-PyGithub==2.4.0
-jira==3.8.0
-httpx==0.27.2
+fastapi>=0.115.2
+uvicorn>=0.32.0
+pydantic>=2.9.2
+pydantic-settings>=2.6.1
+google-cloud-pubsub>=2.26.1
+google-cloud-secret-manager>=2.21.1
+google-cloud-logging>=3.11.3
+slack-bolt>=1.21.2
+slack-sdk>=3.33.1
+PyGithub>=2.4.0
+jira>=3.8.0
+httpx>=0.27.2

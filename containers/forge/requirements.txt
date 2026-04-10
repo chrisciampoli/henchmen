@@ -1,11 +1,11 @@
-fastapi==0.115.2
-uvicorn==0.32.0
-pydantic==2.9.2
-pydantic-settings==2.6.1
-google-cloud-pubsub==2.26.1
-google-cloud-firestore==2.19.0
-google-cloud-build==3.26.1
-google-cloud-logging==3.11.3
-PyGithub==2.4.0
-httpx==0.27.2
-ruff==0.7.1  # TODO: verify version
+fastapi>=0.115.2
+uvicorn>=0.32.0
+pydantic>=2.9.2
+pydantic-settings>=2.6.1
+google-cloud-pubsub>=2.26.1
+google-cloud-firestore>=2.19.0
+google-cloud-build>=3.26.1
+google-cloud-logging>=3.11.3
+PyGithub>=2.4.0
+httpx>=0.27.2
+ruff>=0.7.1
