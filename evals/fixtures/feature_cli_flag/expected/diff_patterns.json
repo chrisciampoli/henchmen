@@ -1,0 +1,7 @@
+{
+  "must_contain_file_change": ["greeter.py"],
+  "must_fix_tests": true,
+  "expected_substrings_in_changed_code": ["--verbose", "verbose"],
+  "test_runner": "pytest",
+  "test_command": ["pytest", "-q", "."]
+}

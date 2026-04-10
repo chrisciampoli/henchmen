@@ -13,25 +13,27 @@ from henchmen.models.llm import ModelTier
 # ---------------------------------------------------------------------------
 
 
-def _mock_settings(**overrides):
-    """TODO(R9): replace with the shared ``mock_settings`` fixture from
-    ``tests/conftest.py``. Needs plumbing via ``monkeypatch.setenv`` for
-    the OpenAI / Anthropic API key fields.
+def _settings(**overrides):
+    """Build a real ``Settings`` instance for LLM provider tests.
+
+    Uses ``os.environ`` to seed ``HENCHMEN_*`` env vars (the shared
+    ``mock_settings`` fixture only covers GCP defaults), then applies
+    per-call overrides via Pydantic's ``model_copy``. The autouse
+    ``_isolate_settings`` fixture clears ``get_settings.cache_clear()``
+    between tests, so each invocation rebuilds a fresh instance.
     """
-    s = MagicMock()
-    s.openai_api_key = "sk-test-openai"
-    s.anthropic_api_key = "sk-ant-test"
-    # L10 fix: providers read tier defaults from Settings. Mirror the
-    # real Settings defaults so tests pin the expected behaviour.
-    s.openai_model_complex = "gpt-4.1"
-    s.openai_model_light = "gpt-4.1-mini"
-    s.openai_model_reasoning = "o3"
-    s.anthropic_model_complex = "claude-sonnet-4-6-20250514"
-    s.anthropic_model_light = "claude-haiku-4-5-20251001"
-    s.anthropic_model_reasoning = "claude-opus-4-6-20250514"
-    for k, v in overrides.items():
-        setattr(s, k, v)
-    return s
+    import os
+
+    from henchmen.config.settings import get_settings
+
+    os.environ.setdefault("HENCHMEN_GCP_PROJECT_ID", "test-project")
+    os.environ.setdefault("HENCHMEN_OPENAI_API_KEY", "sk-test-openai")
+    os.environ.setdefault("HENCHMEN_ANTHROPIC_API_KEY", "sk-ant-test")
+    get_settings.cache_clear()
+    settings = get_settings()
+    if overrides:
+        settings = settings.model_copy(update=overrides)
+    return settings
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +43,7 @@ def _mock_settings(**overrides):
 
 class TestOpenAIProvider:
     def _make_provider(self, **settings_overrides):
-        settings = _mock_settings(**settings_overrides)
+        settings = _settings(**settings_overrides)
         mock_client = MagicMock()
         with patch("openai.AsyncOpenAI", return_value=mock_client):
             from henchmen.providers.openai import OpenAIProvider
@@ -256,7 +258,7 @@ class TestOpenAIProvider:
 
 class TestAnthropicProvider:
     def _make_provider(self, **settings_overrides):
-        settings = _mock_settings(**settings_overrides)
+        settings = _settings(**settings_overrides)
         mock_client = MagicMock()
         with patch("anthropic.AsyncAnthropic", return_value=mock_client):
             from henchmen.providers.anthropic import AnthropicProvider

@@ -1,10 +1,10 @@
 locals {
   # Common subscription settings applied to every subscription
-  retention_duration        = "604800s" # 7 days
-  ack_deadline_seconds      = 600
-  dead_letter_max_attempts  = 5
-  retry_min_backoff         = "10s"
-  retry_max_backoff         = "600s"
+  retention_duration       = "604800s" # 7 days
+  ack_deadline_seconds     = 600
+  dead_letter_max_attempts = 5
+  retry_min_backoff        = "10s"
+  retry_max_backoff        = "600s"
 }
 
 # ---------------------------------------------------------------------------
@@ -125,8 +125,8 @@ resource "google_pubsub_subscription" "operative_dispatch" {
   name    = "henchmen-${var.environment}-operative-dispatch-sub"
   topic   = google_pubsub_topic.operative_dispatch.name
 
-  message_retention_duration  = local.retention_duration
-  ack_deadline_seconds        = local.ack_deadline_seconds
+  message_retention_duration   = local.retention_duration
+  ack_deadline_seconds         = local.ack_deadline_seconds
   enable_exactly_once_delivery = true
 
   dead_letter_policy {
@@ -284,8 +284,8 @@ resource "google_pubsub_subscription" "dead_letter" {
   name    = "henchmen-${var.environment}-dead-letter-sub"
   topic   = google_pubsub_topic.dead_letter.name
 
-  message_retention_duration  = local.retention_duration
-  ack_deadline_seconds        = local.ack_deadline_seconds
+  message_retention_duration   = local.retention_duration
+  ack_deadline_seconds         = local.ack_deadline_seconds
   enable_exactly_once_delivery = true
 
   retry_policy {

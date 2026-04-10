@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "henchmen"
-version = "0.1.0"
+version = "0.1.1"
 description = "AI agent factory — cloud-agnostic, villain-themed"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -90,6 +90,7 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
+    "pytest-randomly",
     "ruff",
     "mypy",
 ]
@@ -115,6 +116,7 @@ ignore = []
 # CLI and Slack bot intentionally use print() for user-facing output.
 # structured_logging.py writes JSON lines to stdout for Cloud Run log ingestion.
 "src/henchmen/cli.py" = ["T201"]
+"src/henchmen/cli/*.py" = ["T201", "E501"]
 "src/henchmen/dispatch/slack_bot.py" = ["T201"]
 "src/henchmen/observability/structured_logging.py" = ["T201"]
 # Arsenal file-system tools deliberately use blocking I/O for simplicity —

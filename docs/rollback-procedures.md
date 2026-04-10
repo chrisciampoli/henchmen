@@ -1,19 +1,27 @@
-# Rollback Procedures -- Henchmen
+# Rollback Procedures
 
-> Self-hosted users: this document assumes GCP (Artifact Registry + Cloud
-> Run + Terraform). If you are running docker-compose or `henchmen serve`,
-> the equivalents are much simpler:
->
-> - **Container rollback** -> `git checkout <previous-commit>` and
->   `docker compose up --build` (or restart `henchmen serve`). You are
->   rebuilding from source, not pulling tagged images.
-> - **Cloud Run revision rollback** -> N/A. Restart the process or container.
-> - **Terraform rollback** -> N/A. You do not have infrastructure state to revert.
-> - **Emergency stop** -> `docker compose down` or kill `henchmen serve`.
-> - **Drain the task queue** -> delete rows from `tasks` in `henchmen_dev.db`
->   (or the JSON files under `./henchmen-data/tasks/`) before restarting.
->
-> See `docs/incident-runbook.md` for the self-hosted operations mapping.
+When something goes wrong on a self-hosted Henchmen stack, you have
+three rollback layers available on GCP: container image pin (fastest,
+~30s), Cloud Run revision traffic shift (~15s), and Terraform state
+revert (slowest, ~5 min). This doc walks through each.
+
+If you followed [`deploy-gcp.md`](deploy-gcp.md) to provision the
+stack, the commands below use the same `PROJECT_ID` / `REGION`
+variables.
+
+If you're running Henchmen in local mode (docker-compose or
+`henchmen serve`), GCP-specific rollback steps don't apply — instead:
+
+| GCP procedure          | Local-mode equivalent                               |
+|------------------------|-----------------------------------------------------|
+| Container image pin    | `git checkout <sha>` then `docker compose up --build` |
+| Cloud Run revision     | restart the process / container                    |
+| Terraform revert       | not applicable — no infra state                    |
+| Emergency stop         | `docker compose down` (or kill `henchmen serve`)    |
+| Drain the task queue   | delete rows from `tasks` in `henchmen_dev.db`       |
+
+See [`incident-runbook.md`](incident-runbook.md) for the full
+incident-response flow (triage, communication, postmortem).
 
 ## Container Rollback
 

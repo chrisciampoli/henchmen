@@ -109,27 +109,24 @@ def main() -> None:
 
     app_token = os.environ.get("SLACK_APP_TOKEN", "")
     if not app_token:
-        print("ERROR: SLACK_APP_TOKEN not set", flush=True)
+        logger.error("SLACK_APP_TOKEN not set")
         return
 
     bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
     if not bot_token:
-        print("ERROR: SLACK_BOT_TOKEN not set", flush=True)
+        logger.error("SLACK_BOT_TOKEN not set")
         return
 
-    print(f"SLACK_APP_TOKEN present: {bool(app_token)} (length: {len(app_token)})", flush=True)
-    print(f"SLACK_BOT_TOKEN present: {bool(bot_token)} (length: {len(bot_token)})", flush=True)
+    logger.info("SLACK_APP_TOKEN present: %s (length: %d)", bool(app_token), len(app_token))
+    logger.info("SLACK_BOT_TOKEN present: %s (length: %d)", bool(bot_token), len(bot_token))
 
     try:
         slack_app = create_slack_app()
         handler = SocketModeHandler(slack_app, app_token)
-        print("Starting Henchmen Slack bot in Socket Mode...", flush=True)
+        logger.info("Starting Henchmen Slack bot in Socket Mode...")
         handler.start()  # type: ignore[no-untyped-call]
-    except Exception as exc:
-        print(f"FATAL: Slack bot crashed: {exc}", flush=True)
-        import traceback
-
-        traceback.print_exc()
+    except Exception:
+        logger.exception("FATAL: Slack bot crashed")
         raise
 
 

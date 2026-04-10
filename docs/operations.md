@@ -1,30 +1,48 @@
 # Operations Guide
 
-> If you are self-hosting Henchmen (docker-compose, `henchmen serve`, SQLite,
-> filesystem, Ollama): most of this guide assumes a GCP deployment. Treat the
-> GCP names as a legend, not as a requirement. The self-hosted equivalents:
->
-> - Cloud Run services -> containers in docker-compose (or processes spawned by `henchmen serve`)
-> - Firestore -> SQLite at `henchmen_dev.db` (or filesystem JSON under `./henchmen-data/`)
-> - Pub/Sub -> in-memory broker or local HTTP forwarder
-> - Secret Manager -> `.env.local`
-> - Cloud Scheduler -> a local cron hitting `/api/v1/watchdog`
-> - Cloud Logging -> `docker logs` or the single stdout stream of `henchmen serve`
->
-> See `docs/incident-runbook.md` ("Self-Hosted / Non-GCP Operations") for the
-> full mapping and `docs/troubleshooting.md` for common self-hosted problems.
+This is the day-2 runbook for a self-hosted Henchmen stack on GCP. For
+first-time provisioning, start with [`deploy-gcp.md`](deploy-gcp.md) —
+that doc walks you from a blank GCP account to a running stack in
+~30 minutes. This guide picks up once your stack is live and covers:
+
+- building + pushing new container images
+- updating a single Cloud Run service without a full Terraform apply
+- populating secrets after rotation
+- diagnosing common runtime problems
+- reading task execution state from Firestore
+
+If you're running Henchmen in local mode (docker-compose, SQLite,
+filesystem, Ollama), most of this guide still applies — GCP names map
+to local equivalents as follows:
+
+| GCP resource              | Local equivalent                                  |
+|---------------------------|---------------------------------------------------|
+| Cloud Run service         | container in docker-compose, or `henchmen serve`  |
+| Firestore                 | SQLite (`henchmen_dev.db`)                         |
+| Pub/Sub                   | in-memory broker                                   |
+| Secret Manager            | `.env.local`                                       |
+| Cloud Scheduler           | local cron hitting `/api/v1/watchdog`              |
+| Cloud Logging             | `docker logs` or stdout stream                     |
+
+See [`troubleshooting.md`](troubleshooting.md) for common local-mode
+problems, and [`incident-runbook.md`](incident-runbook.md) for the
+full incident response flow.
 
 ## Deployment
 
 ### Prerequisites
 
-- GCP project with billing enabled
-- Terraform >= 1.7 installed
-- Docker installed
+New to Henchmen? Follow [`deploy-gcp.md`](deploy-gcp.md) first — it
+covers initial GCP project setup, bootstrap, Terraform apply, and
+image push in a linear sequence.
+
+If you're coming back to an already-provisioned stack, you'll need:
+
 - `gcloud` CLI authenticated (`gcloud auth application-default login`)
-- GitHub personal access token or GitHub App credentials
-- Slack bot token (for Slack integration)
-- Vertex AI RAG Engine corpus (named `henchmen-code`) for semantic search
+- Docker running
+- Terraform `>= 1.7` (only if you're re-applying infra)
+- A GitHub personal access token or GitHub App credentials stored in Secret Manager
+- Slack tokens in Secret Manager (if you've wired Slack)
 
 ### Build and Push Containers
 

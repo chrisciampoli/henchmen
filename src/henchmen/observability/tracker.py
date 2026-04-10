@@ -1,24 +1,23 @@
 """TaskTracker — persists task execution telemetry to a DocumentStore.
 
-Concurrency notes (K4 fix):
-    Three methods on ``TaskTracker`` perform read-modify-write against
-    Firestore: ``record_node_result``, ``increment_recovery_attempts``,
-    and ``record_ci_fix_attempt``. The underlying ``DocumentStore``
-    protocol has no atomic ``Increment`` primitive, so under concurrent
-    callers (Pub/Sub at-least-once delivery, watchdog double-publish)
-    two handlers can read the same baseline and clobber each other's
-    increments.
+Concurrency notes:
+    Counter-style fields (``total_input_tokens``, ``estimated_cost_usd``,
+    ``recovery_attempts``, ``ci_fix_attempts``, ...) are incremented
+    through the ``DocumentStore.increment`` primitive, which every
+    provider implements using a server-side atomic operation:
+    Firestore ``Increment`` transforms, DynamoDB ``UpdateExpression``
+    ``ADD``, and a per-doc asyncio lock in SQLite. This eliminates both
+    intra-process and cross-process races between concurrent
+    invocations (Pub/Sub at-least-once delivery, watchdog
+    double-publish) — no more read-modify-write clobbering.
 
-    As a first-pass mitigation we serialize these writers *within the
-    current process* using an ``asyncio.Lock`` keyed by ``doc_id``. This
-    eliminates intra-process races without touching the ``DocumentStore``
-    protocol or every provider implementation.
-
-    Cross-process races are **out of scope** for this fix — two
-    Mastermind replicas handling the same task simultaneously can still
-    lose an update. The durable fix is to plumb a Firestore
-    ``Increment`` transform through the ``DocumentStore`` interface; see
-    the ``TODO(K4-cross-process)`` markers below.
+    Non-counter structured fields (``node_metrics`` dict,
+    ``nodes_executed`` list, ``files_changed`` list) still require a
+    merged update. We hold a per-doc ``asyncio.Lock`` only around that
+    portion of ``record_node_result`` to serialize in-process writers;
+    cross-process races on those fields remain possible but are bounded
+    in impact (at worst we lose a file from ``files_changed``, not a
+    counter value).
 """
 
 import asyncio
@@ -88,11 +87,11 @@ class TaskTracker:
     """
 
     def __init__(self, settings: "Settings", document_store: DocumentStore | None = None) -> None:
-        # Per-document asyncio locks serialize read-modify-write blocks
-        # within this process. Populated lazily via ``_get_lock``.
-        # TODO(K4-cross-process): this only protects in-process concurrency;
-        # cross-replica races require Firestore Increment transforms plumbed
-        # through the DocumentStore interface.
+        # Per-document asyncio locks serialize the non-counter portion of
+        # ``record_node_result`` (node_metrics dict, files_changed list).
+        # Counter-style increments go through ``DocumentStore.increment``
+        # and are atomic across replicas, so the lock is only needed for
+        # the structured-merge branch.
         self._doc_locks: dict[str, asyncio.Lock] = {}
 
         if document_store is not None:
@@ -182,7 +181,14 @@ class TaskTracker:
             logger.warning("Failed to start tracking task %s: %s", task.id, exc)
 
     async def record_node_result(self, task_id: str, node_id: str, report: OperativeReport) -> None:
-        """Record metrics from an agentic node's OperativeReport."""
+        """Record metrics from an agentic node's OperativeReport.
+
+        Counter fields (tokens, model/tool calls, cost, wall clock) are
+        incremented through ``DocumentStore.increment`` so concurrent
+        replicas can't clobber each other's additions. Structured
+        fields (node_metrics dict, files_changed list) still use a
+        merged update guarded by a per-doc asyncio lock.
+        """
         try:
             model_name = getattr(report, "model_name", "") or ""
             cost = estimate_cost(
@@ -202,12 +208,22 @@ class TaskTracker:
                 "confidence_score": report.confidence_score,
             }
 
-            # Serialize read-modify-write so concurrent invocations in the same
-            # process cannot clobber each other's increments.
-            # TODO(K4-cross-process): Firestore Increment transforms would close
-            # the cross-replica gap; this lock only protects intra-process races.
+            # 1) Atomic counter increments — safe under cross-process concurrency.
+            increments: dict[str, int | float] = {
+                "total_input_tokens": report.total_input_tokens,
+                "total_output_tokens": report.total_output_tokens,
+                "total_model_calls": report.model_calls,
+                "total_tool_calls": report.tool_calls_count,
+                "estimated_cost_usd": cost,
+                "wall_clock_seconds": report.wall_clock_seconds,
+            }
+            # Drop zero deltas so providers don't do work for no-ops.
+            increments = {k: v for k, v in increments.items() if v}
+            if increments:
+                await self._store.increment(_COLLECTION, task_id, increments)
+
+            # 2) Structured-field merge — lock only this portion in-process.
             async with self._get_lock(task_id):
-                # Read current doc to do manual increments (DocumentStore has no Increment primitive)
                 current = await self._store.get(_COLLECTION, task_id) or {}
                 nodes_executed = list(current.get("nodes_executed", []))
                 if node_id not in nodes_executed:
@@ -225,12 +241,6 @@ class TaskTracker:
                 update_data: dict[str, Any] = {
                     "node_metrics": node_metrics,
                     "nodes_executed": nodes_executed,
-                    "total_input_tokens": current.get("total_input_tokens", 0) + report.total_input_tokens,
-                    "total_output_tokens": current.get("total_output_tokens", 0) + report.total_output_tokens,
-                    "total_model_calls": current.get("total_model_calls", 0) + report.model_calls,
-                    "total_tool_calls": current.get("total_tool_calls", 0) + report.tool_calls_count,
-                    "estimated_cost_usd": current.get("estimated_cost_usd", 0.0) + cost,
-                    "wall_clock_seconds": current.get("wall_clock_seconds", 0.0) + report.wall_clock_seconds,
                     "confidence_score": report.confidence_score,
                 }
                 if report.files_changed:
@@ -321,15 +331,9 @@ class TaskTracker:
             logger.warning("Failed to escalate task %s: %s", task_id, exc)
 
     async def increment_recovery_attempts(self, task_id: str) -> None:
-        """Increment recovery attempt count for a stalled task."""
+        """Atomically increment the recovery attempt count for a stalled task."""
         try:
-            # TODO(K4-cross-process): Firestore Increment transforms would
-            # close the cross-replica gap; this lock only protects intra-
-            # process races.
-            async with self._get_lock(task_id):
-                current = await self._store.get(_COLLECTION, task_id) or {}
-                attempts = current.get("recovery_attempts", 0) + 1
-                await self._store.update(_COLLECTION, task_id, {"recovery_attempts": attempts})
+            await self._store.increment(_COLLECTION, task_id, {"recovery_attempts": 1})
         except Exception as exc:
             logger.warning("Failed to increment recovery for task %s: %s", task_id, exc)
 
@@ -418,19 +422,10 @@ class TaskTracker:
             return {"total_tasks": 0, "error": str(exc), "days": days}
 
     async def record_ci_fix_attempt(self, task_id: str) -> None:
-        """Increment ci_fix_attempts and mark ci_fix_in_progress=True."""
+        """Atomically increment ``ci_fix_attempts`` and mark in-progress."""
         try:
-            # TODO(K4-cross-process): Firestore Increment transforms would
-            # close the cross-replica gap; this lock only protects intra-
-            # process races.
-            async with self._get_lock(task_id):
-                current = await self._store.get(_COLLECTION, task_id) or {}
-                attempts = current.get("ci_fix_attempts", 0) + 1
-                await self._store.update(
-                    _COLLECTION,
-                    task_id,
-                    {"ci_fix_attempts": attempts, "ci_fix_in_progress": True},
-                )
+            await self._store.increment(_COLLECTION, task_id, {"ci_fix_attempts": 1})
+            await self._store.update(_COLLECTION, task_id, {"ci_fix_in_progress": True})
             logger.info("Recorded CI fix attempt for task %s", task_id)
         except Exception as exc:
             logger.warning("Failed to record CI fix attempt for task %s: %s", task_id, exc)
@@ -519,6 +514,41 @@ class _FirestoreLegacyAdapter:
 
         return await asyncio.to_thread(_query)
 
+    async def increment(self, collection: str, document_id: str, field_deltas: dict[str, int | float]) -> None:
+        from google.cloud import firestore
+
+        if not field_deltas:
+            return
+        payload = {field: firestore.Increment(delta) for field, delta in field_deltas.items()}
+        await asyncio.to_thread(self._db.collection(collection).document(document_id).update, payload)
+
+    async def update_if(
+        self,
+        collection: str,
+        document_id: str,
+        expected_field: str,
+        expected_value: Any,
+        new_values: dict[str, Any],
+    ) -> bool:
+        from google.cloud import firestore
+
+        doc_ref = self._db.collection(collection).document(document_id)
+        transaction = self._db.transaction()
+
+        @firestore.transactional
+        def _txn(txn: Any) -> bool:
+            snapshot = doc_ref.get(transaction=txn)
+            if not snapshot.exists:
+                return False
+            current = snapshot.to_dict() or {}
+            if current.get(expected_field) != expected_value:
+                return False
+            txn.update(doc_ref, new_values)
+            return True
+
+        result: bool = await asyncio.to_thread(_txn, transaction)
+        return result
+
 
 class _NullDocumentStore:
     """No-op DocumentStore used when Firestore initialization fails."""
@@ -544,3 +574,16 @@ class _NullDocumentStore:
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
         return []
+
+    async def increment(self, collection: str, document_id: str, field_deltas: dict[str, int | float]) -> None:
+        pass
+
+    async def update_if(
+        self,
+        collection: str,
+        document_id: str,
+        expected_field: str,
+        expected_value: Any,
+        new_values: dict[str, Any],
+    ) -> bool:
+        return False

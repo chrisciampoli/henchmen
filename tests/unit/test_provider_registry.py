@@ -1,35 +1,26 @@
 """Tests for the provider registry."""
 
-from unittest.mock import MagicMock
-
 import pytest
 
 from henchmen.providers.registry import ProviderRegistry
 
 
 def _mock_settings(**overrides):
-    """TODO(R9): replace with the shared ``mock_settings`` fixture from
-    ``tests/conftest.py``. Every test here uses ``**overrides`` to flip a
-    specific provider field, which is harder to express with env vars —
-    migration would require a helper that wraps the shared fixture with
-    kwargs, or per-test monkeypatching.
+    """Build a real ``Settings`` instance with provider-field overrides.
+
+    Seeds ``HENCHMEN_GCP_PROJECT_ID`` for the required field then applies
+    per-call overrides via ``model_copy``. Default provider is ``local``
+    so tests can flip individual service overrides.
     """
-    defaults = {
-        "provider": "local",
-        "message_broker_provider": "",
-        "document_store_provider": "",
-        "object_store_provider": "",
-        "container_orchestrator_provider": "",
-        "llm_provider": "",
-        "ci_provider": "",
-        "gcp_project_id": "test-project",
-        "gcp_region": "us-central1",
-    }
-    defaults.update(overrides)
-    s = MagicMock()
-    for k, v in defaults.items():
-        setattr(s, k, v)
-    return s
+    import os
+
+    from henchmen.config.settings import get_settings
+
+    os.environ.setdefault("HENCHMEN_GCP_PROJECT_ID", "test-project")
+    get_settings.cache_clear()
+    base_overrides = {"provider": "local"}
+    base_overrides.update(overrides)
+    return get_settings().model_copy(update=base_overrides)
 
 
 def test_registry_resolves_provider_name_local():

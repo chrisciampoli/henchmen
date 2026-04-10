@@ -53,40 +53,41 @@ class MergeQueue:
         return entry_id
 
     async def dequeue(self) -> dict[str, Any] | None:
-        """Get the next PR to merge (FIFO). Returns None if queue empty or a merge is in progress.
+        """Atomically claim the next pending PR from the queue.
 
-        Best-effort FIFO serialization: queries merging entries, then pending
-        entries, then updates the winner to ``merging``.  These three steps are
-        NOT wrapped in a transaction, so two Forge replicas running ``dequeue``
-        concurrently can race and both pick the same pending entry.  Final
-        merge conflicts are resolved downstream by GitHub's merge API, which
-        is the authoritative serialization point — the worst case here is a
-        wasted merge attempt that GitHub rejects with a 409 or a stale-head
-        error.
+        Returns ``None`` if the queue is empty or another replica is
+        already merging. Claiming uses
+        :meth:`DocumentStore.update_if` as a compare-and-swap
+        (``status == 'pending'`` → ``status = 'merging'``), so two
+        Forge replicas racing ``dequeue`` cannot both pick the same
+        entry: at most one CAS succeeds and the others see ``None``.
 
-        # TODO(E7-transaction): replace with a proper conditional write once
-        # the DocumentStore protocol grows a transaction / compare-and-set
-        # primitive.  Firestore supports this natively; SQLite can emulate it
-        # with a ``WHERE status = 'pending'`` update; DynamoDB has
-        # ``ConditionExpression``.  The current interface has none of these,
-        # so we accept the race and rely on GitHub's server-side merge lock.
+        Backed by:
+
+        * Firestore transactions
+        * DynamoDB ``ConditionExpression``
+        * SQLite per-doc asyncio locks
+
+        Callers that lose a CAS race can simply retry on the next
+        poll; no other cleanup is required because the losing caller
+        never performed a write.
         """
         store = self._get_store()
 
-        # First, expire stale "merging" entries that exceeded the TTL
+        # First, expire stale "merging" entries that exceeded the TTL.
         await self._expire_stale_merging(store)
 
-        # Check if any entry is currently merging (serialization guard)
+        # Check if any entry is currently merging (serialization guard).
         merging_docs = await store.query(
             _COLLECTION,
             filters=[("status", "==", _STATUS_MERGING)],
             limit=1,
         )
         if merging_docs:
-            # A merge is already in progress — do not start another
+            # A merge is already in progress — do not start another.
             return None
 
-        # Find the next pending entry, ordered by created_at (FIFO)
+        # Find the next pending entry, ordered by created_at (FIFO).
         pending_docs = await store.query(
             _COLLECTION,
             filters=[("status", "==", _STATUS_PENDING)],
@@ -99,17 +100,26 @@ class MergeQueue:
         candidate = pending_docs[0]
         entry_id = candidate["id"]
 
-        # Best-effort claim — see docstring, this update is NOT atomic with
-        # the preceding query and two callers can race here.
-        # TODO(E7-transaction): make this a conditional write.
-        await store.update(
+        # Atomic claim via compare-and-set: only the replica that sees
+        # ``status == 'pending'`` at commit time wins.
+        claimed = await store.update_if(
             _COLLECTION,
             entry_id,
+            "status",
+            _STATUS_PENDING,
             {
                 "status": _STATUS_MERGING,
                 "merging_started_at": datetime.now(UTC),
             },
         )
+        if not claimed:
+            # Lost the race to another replica — back off and let the
+            # caller retry on the next tick.
+            logger.info(
+                "[merge-queue] CAS lost for entry %s — another replica claimed it",
+                entry_id,
+            )
+            return None
 
         candidate["status"] = _STATUS_MERGING
         return candidate

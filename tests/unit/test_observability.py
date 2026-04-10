@@ -80,20 +80,19 @@ def _make_report(**kwargs):
 
 
 def _mock_settings():
-    """Compatibility shim. Prefer the shared ``mock_settings`` fixture.
+    """Build a real ``Settings`` instance with test-safe defaults.
 
-    Many older tests in this module still call this helper directly rather
-    than taking the ``mock_settings`` fixture as a parameter. New tests
-    should use the fixture; this helper stays for the legacy call sites and
-    simply returns a MagicMock with the two fields the local tests touch.
-
-    TODO(R9): thread the shared fixture through every test in this module
-    and delete this helper.
+    Seeds ``os.environ`` for the required ``HENCHMEN_GCP_PROJECT_ID``
+    field and leverages the autouse ``_isolate_settings`` fixture to
+    guarantee a fresh cache on every call.
     """
-    s = MagicMock()
-    s.gcp_project_id = "test-project"
-    s.firestore_database = "(default)"
-    return s
+    import os
+
+    from henchmen.config.settings import get_settings
+
+    os.environ.setdefault("HENCHMEN_GCP_PROJECT_ID", "test-project")
+    get_settings.cache_clear()
+    return get_settings()
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +108,8 @@ def _make_mock_store() -> MagicMock:
     store.update = AsyncMock()
     store.delete = AsyncMock()
     store.query = AsyncMock(return_value=[])
+    store.increment = AsyncMock()
+    store.update_if = AsyncMock(return_value=True)
     return store
 
 
@@ -141,11 +142,22 @@ class TestTaskTracker:
     @pytest.mark.asyncio
     async def test_record_node_result_updates_doc(self):
         store = _make_mock_store()
-        # Return an empty current doc so increments start from zero
+        # Return an empty current doc so the structured-field merge has a baseline.
         store.get = AsyncMock(return_value={})
         tracker = self._make_tracker(store)
         report = _make_report()
         await tracker.record_node_result("test-task", "implement_fix", report)
+
+        # Counter-style fields go through the atomic increment primitive.
+        store.increment.assert_called_once()
+        _coll, _id, deltas = store.increment.call_args.args
+        assert deltas["total_input_tokens"] == 100_000
+        assert deltas["total_output_tokens"] == 5_000
+        assert deltas["total_model_calls"] == 15
+        # estimated_cost_usd is omitted when the cost is 0 (unknown model in this fixture);
+        # the increment helper filters out zero deltas to avoid no-op writes.
+
+        # Structured-field merge goes through update.
         store.update.assert_called_once()
         _coll, _id, update_data = store.update.call_args[0]
         node_data = update_data["node_metrics"]["implement_fix"]
@@ -547,10 +559,10 @@ class TestAgentTrackerIntegration:
     async def test_handle_task_calls_start_and_finalize(self):
         from henchmen.mastermind.agent import MastermindAgent
 
-        settings = _mock_settings()
-        settings.pinecone_api_key_secret = ""
-        settings.pinecone_index_name = "henchmen-code"
-        settings.vertex_ai_model_complex = "claude-sonnet-4@20250514"
+        # Override vertex_ai_model_complex via model_copy so the agent's
+        # cost accounting resolves to the expected tier. Pinecone fields
+        # were removed from Settings when RAG moved to Vertex AI.
+        settings = _mock_settings().model_copy(update={"vertex_ai_model_complex": "claude-sonnet-4@20250514"})
 
         with patch("henchmen.mastermind.agent.LairManager"):
             agent = MastermindAgent(settings=settings)
@@ -773,16 +785,19 @@ class TestTrackerExecutionState:
     @pytest.mark.asyncio
     async def test_increment_recovery_attempts(self):
         store = _make_mock_store()
-        store.get = AsyncMock(return_value={"recovery_attempts": 2})
         tracker = self._make_tracker(store)
         await tracker.increment_recovery_attempts("task-1")
-        _coll, _id, data = store.update.call_args[0]
-        assert data["recovery_attempts"] == 3
+        # Uses the atomic increment primitive — no read-modify-write.
+        store.increment.assert_called_once()
+        coll, doc_id, deltas = store.increment.call_args.args
+        assert coll == "task_executions"
+        assert doc_id == "task-1"
+        assert deltas == {"recovery_attempts": 1}
 
     @pytest.mark.asyncio
     async def test_increment_recovery_attempts_swallows_errors(self):
         store = _make_mock_store()
-        store.get = AsyncMock(side_effect=Exception("Store down"))
+        store.increment = AsyncMock(side_effect=Exception("Store down"))
         tracker = self._make_tracker(store)
         await tracker.increment_recovery_attempts("task-1")  # Should not raise
 

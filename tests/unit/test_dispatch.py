@@ -14,15 +14,19 @@ from henchmen.models.task import HenchmenTask, TaskPriority, TaskSource
 
 
 def _mock_settings():
-    """TODO(R9): replace with the shared ``mock_settings`` fixture from
-    ``tests/conftest.py``. The handler tests here do not assert on the
-    topic name, so the migration would be mechanical — add ``mock_settings``
-    as a parameter to each test method and delete this helper.
+    """Build a real ``Settings`` instance with test-safe defaults.
+
+    The handler tests in this module don't assert on the specific topic
+    name, so the real Settings class (which applies the ``henchmen-dev-``
+    prefix) works without any further overrides.
     """
-    s = MagicMock()
-    s.gcp_project_id = "test-project"
-    s.pubsub_topic_task_intake = "henchmen-task-intake"
-    return s
+    import os
+
+    from henchmen.config.settings import get_settings
+
+    os.environ.setdefault("HENCHMEN_GCP_PROJECT_ID", "test-project")
+    get_settings.cache_clear()
+    return get_settings()
 
 
 # ---------------------------------------------------------------------------

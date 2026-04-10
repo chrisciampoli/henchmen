@@ -21,6 +21,7 @@ from henchmen.models.dossier import Dossier
 from henchmen.models.scheme import SchemeNode
 from henchmen.models.task import HenchmenTask
 from henchmen.utils.git import clone_repo
+from henchmen.utils.stack_detector import Stack, detect_stack
 
 if TYPE_CHECKING:
     from henchmen.mastermind.scheme_executor.executor import SchemeExecutor
@@ -292,13 +293,19 @@ async def _get_affected_packages(workspace: str) -> list[str]:
 async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type: str) -> dict[str, Any]:
     """Clone the task's branch and run a specific CI check.
 
-    For monorepos, scopes lint/test to affected packages via ``--filter``.
+    Uses :func:`henchmen.utils.stack_detector.detect_stack` to pick the
+    right test / lint commands for the target repo's language. For
+    JS/TS monorepos (pnpm + turbo), scopes lint/test to affected
+    packages via ``--filter``. Other stacks run the detected commands
+    across the full workspace.
 
     Args:
         executor: The scheme executor (provides settings)
         task: The task being executed (provides repo and branch info)
         check_type: "lint" or "tests"
     """
+    from pathlib import Path
+
     repo = task.context.repo
     branch = task.branch_name
     github_token = os.environ.get("GITHUB_TOKEN", "")
@@ -309,7 +316,7 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
 
     workspace = tempfile.mkdtemp(prefix=f"henchmen-{check_type}-")
     try:
-        # Full clone — monorepo turbo builds need all packages, not just the branch tip.
+        # Full clone — monorepo builds need all packages, not just the branch tip.
         try:
             await clone_repo(repo, branch, workspace, token=github_token or None)
         except RuntimeError as exc:
@@ -328,26 +335,29 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
         )
         await fetch_proc.communicate()
 
-        # Install dependencies if needed
-        if os.path.exists(os.path.join(workspace, "package.json")):
-            pnpm_lock = os.path.join(workspace, "pnpm-lock.yaml")
-            cmd = ["pnpm", "install", "--frozen-lockfile"] if os.path.exists(pnpm_lock) else ["npm", "ci"]
+        stack = detect_stack(Path(workspace))
+        logger.info("[SCHEME] Detected stack %s for %s check on task %s", stack.name, check_type, task.id)
+
+        if stack.name == "unknown":
+            # No recognizable manifest — fail open with a clear message.
+            return {
+                "condition": "pass",
+                "message": f"{check_type} skipped — could not detect project stack",
+            }
+
+        # Install dependencies if the stack has an install step
+        if stack.install_command is not None:
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
+                *stack.install_command,
                 cwd=workspace,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             await proc.communicate()
 
-        # Detect project type: monorepo (pnpm + turbo) vs single-package
-        is_pnpm = os.path.exists(os.path.join(workspace, "pnpm-lock.yaml"))
-        is_turbo = os.path.exists(os.path.join(workspace, "turbo.json"))
-        is_monorepo = is_pnpm and is_turbo
-
-        # For monorepos, scope to affected packages
+        # For JS/TS monorepos, scope to affected packages
         affected_packages: list[str] = []
-        if is_monorepo:
+        if stack.is_monorepo:
             affected_packages = await _get_affected_packages(workspace)
             if affected_packages:
                 logger.info(
@@ -358,31 +368,20 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
 
         # Run the check
         if check_type == "lint":
-            lint_proc = await _run_lint_check(workspace, is_monorepo, affected_packages)
+            lint_proc = await _run_lint_check(workspace, stack, affected_packages)
             if lint_proc is None:
                 logger.info("[SCHEME] No lintable files changed for task %s, skipping lint", task.id)
                 return {"condition": "pass", "message": "lint passed (no changed files to lint)"}
             proc = lint_proc
         else:  # tests
-            if is_monorepo:
-                proc = await asyncio.create_subprocess_exec(
-                    "pnpm",
-                    "run",
-                    "test",
-                    cwd=workspace,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-            else:
-                proc = await asyncio.create_subprocess_exec(
-                    "npx",
-                    "jest",
-                    "--passWithNoTests",
-                    "--ci",
-                    cwd=workspace,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
+            test_cmd = list(stack.test_command)
+            # Legacy monorepo path: pnpm run test still works, no extra args.
+            proc = await asyncio.create_subprocess_exec(
+                *test_cmd,
+                cwd=workspace,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
 
         stdout, stderr = await proc.communicate()
         # Capture both stdout and stderr — turbo writes to both streams
@@ -412,10 +411,17 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
 
 
 async def _run_lint_check(
-    workspace: str, is_monorepo: bool, affected_packages: list[str]
+    workspace: str, stack: Stack, affected_packages: list[str]
 ) -> asyncio.subprocess.Process | None:
-    """Run lint check, returning the subprocess or None if no files to lint."""
-    if is_monorepo:
+    """Run lint check, returning the subprocess or None if no files to lint.
+
+    For JS/TS monorepos the historical behaviour is preserved: scope to
+    affected packages via ``pnpm turbo run lint --filter`` when possible.
+    For all other stacks, delegate to ``stack.lint_command`` applied
+    across the workspace. Single-package JS/TS also short-circuits to
+    the ``eslint`` changed-file mode for speed.
+    """
+    if stack.is_monorepo:
         if affected_packages:
             filter_args: list[str] = []
             for pkg in affected_packages:
@@ -431,41 +437,48 @@ async def _run_lint_check(
                 stderr=asyncio.subprocess.PIPE,
             )
         return await asyncio.create_subprocess_exec(
-            "pnpm",
-            "run",
-            "lint",
+            *stack.lint_command,
             cwd=workspace,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-    # Single-package: lint only changed files
-    changed_proc = await asyncio.create_subprocess_exec(
-        "git",
-        "diff",
-        "--name-only",
-        "origin/main",
-        "--diff-filter=ACMR",
-        "--",
-        "*.ts",
-        "*.tsx",
-        "*.js",
-        "*.jsx",
-        "*.py",
-        cwd=workspace,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    changed_out, _ = await changed_proc.communicate()
-    changed_files = [f.strip() for f in changed_out.decode().strip().split("\n") if f.strip()]
 
-    if not changed_files:
-        return None
+    # Single-package JS/TS: lint only changed files via eslint for speed.
+    if stack.name == "node-npm":
+        changed_proc = await asyncio.create_subprocess_exec(
+            "git",
+            "diff",
+            "--name-only",
+            "origin/main",
+            "--diff-filter=ACMR",
+            "--",
+            "*.ts",
+            "*.tsx",
+            "*.js",
+            "*.jsx",
+            cwd=workspace,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        changed_out, _ = await changed_proc.communicate()
+        changed_files = [f.strip() for f in changed_out.decode().strip().split("\n") if f.strip()]
 
+        if not changed_files:
+            return None
+
+        return await asyncio.create_subprocess_exec(
+            "npx",
+            "eslint",
+            *changed_files,
+            "--max-warnings=0",
+            cwd=workspace,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    # All other stacks: run the stack's configured lint command
     return await asyncio.create_subprocess_exec(
-        "npx",
-        "eslint",
-        *changed_files,
-        "--max-warnings=0",
+        *stack.lint_command,
         cwd=workspace,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

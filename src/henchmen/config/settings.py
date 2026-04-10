@@ -183,6 +183,14 @@ class Settings(BaseSettings):
     # Ollama (local LLM)
     llm_ollama_base_url: str = Field(default="http://localhost:11434", description="Ollama server URL")
     llm_ollama_model: str = Field(default="llama3.2", description="Default Ollama model")
+    llm_ollama_skip_probe: bool = Field(
+        default=False,
+        description=(
+            "Skip the Ollama tool-calling capability probe issued on the first "
+            "generate() call with tools. Set to True in CI or when running with "
+            "mocked httpx clients that don't mimic a real Ollama server."
+        ),
+    )
 
     # AWS settings (used when provider=aws)
     aws_region: str = Field(default="us-east-1", description="AWS region")

@@ -23,6 +23,8 @@ def _make_mock_store() -> MagicMock:
     store.update = AsyncMock()
     store.delete = AsyncMock()
     store.query = AsyncMock(return_value=[])
+    store.increment = AsyncMock()
+    store.update_if = AsyncMock(return_value=True)
     return store
 
 
@@ -46,10 +48,16 @@ class TestRecordCIFixAttempt:
         tracker = _make_tracker(mock_settings, store)
         await tracker.record_ci_fix_attempt("task-123")
 
+        # The atomic increment handles the counter; a separate update sets the flag.
+        store.increment.assert_called_once()
+        inc_args = store.increment.call_args.args
+        assert inc_args[0] == "task_executions"
+        assert inc_args[1] == "task-123"
+        assert inc_args[2] == {"ci_fix_attempts": 1}
+
         store.update.assert_called_once()
         _coll, _id, update_data = store.update.call_args[0]
-        assert update_data["ci_fix_attempts"] == 2  # incremented from 1
-        assert update_data["ci_fix_in_progress"] is True
+        assert update_data == {"ci_fix_in_progress": True}
 
     @pytest.mark.asyncio
     async def test_firestore_error_does_not_raise(self, mock_settings):

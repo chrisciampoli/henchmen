@@ -64,3 +64,45 @@ class FirestoreDocumentStore:
             data["_id"] = doc.id
             results.append(data)
         return results
+
+    async def increment(
+        self,
+        collection: str,
+        document_id: str,
+        field_deltas: dict[str, int | float],
+    ) -> None:
+        """Atomically add deltas via Firestore Increment transforms.
+
+        Unlike a read-modify-write loop, the Increment transform is
+        server-side and safe under any number of concurrent writers.
+        """
+        if not field_deltas:
+            return
+        payload: dict[str, Any] = {field: firestore.Increment(delta) for field, delta in field_deltas.items()}
+        await self._client.collection(collection).document(document_id).update(payload)
+
+    async def update_if(
+        self,
+        collection: str,
+        document_id: str,
+        expected_field: str,
+        expected_value: Any,
+        new_values: dict[str, Any],
+    ) -> bool:
+        """Conditionally update under a Firestore transaction."""
+        doc_ref = self._client.collection(collection).document(document_id)
+        transaction = self._client.transaction()
+
+        @firestore.async_transactional
+        async def _txn(txn: Any) -> bool:
+            snapshot = await doc_ref.get(transaction=txn)
+            if not snapshot.exists:
+                return False
+            current = snapshot.to_dict() or {}
+            if current.get(expected_field) != expected_value:
+                return False
+            txn.update(doc_ref, new_values)
+            return True
+
+        result: bool = await _txn(transaction)
+        return result
