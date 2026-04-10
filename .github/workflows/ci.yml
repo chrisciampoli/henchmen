@@ -109,21 +109,23 @@ jobs:
           HENCHMEN_GCP_PROJECT_ID=test-project
           HENCHMEN_LLM_OLLAMA_SKIP_PROBE=1
           EOF
+          # Strip leading whitespace from heredoc (YAML indentation artifact)
+          sed -i 's/^[[:space:]]*//' .env.local
 
       # The real `ollama` image is ~2GB and would bloat CI. The compose
       # file depends on Ollama being healthy, so stub it out with a
-      # tiny HTTP server that returns 200 on any path. This verifies
-      # the rest of the stack can start, wire env vars, and hit its
-      # health endpoints without pulling the full model server.
-      - name: Stub Ollama image (tiny HTTP 200 responder)
+      # tiny HTTP server that returns 200 on any path + a fake `ollama`
+      # CLI that exits 0 (satisfying the `ollama list` healthcheck).
+      - name: Stub Ollama image (HTTP responder + fake CLI)
         run: |
           mkdir -p ci/stub-ollama
-          cat > ci/stub-ollama/Dockerfile <<'EOF'
+          cat > ci/stub-ollama/Dockerfile <<'DEOF'
           FROM python:3.12-alpine
           RUN printf 'from http.server import BaseHTTPRequestHandler, HTTPServer\nclass H(BaseHTTPRequestHandler):\n    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"[]")\n    def do_POST(self): self.send_response(200); self.end_headers(); self.wfile.write(b"{}")\n    def log_message(self, *a): pass\nHTTPServer(("0.0.0.0", 11434), H).serve_forever()\n' > /srv.py
+          RUN printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/ollama && chmod +x /usr/local/bin/ollama
           EXPOSE 11434
           CMD ["python", "/srv.py"]
-          EOF
+          DEOF
           docker build -t ollama/ollama:0.4.6 ci/stub-ollama
 
       - name: docker compose up -d
