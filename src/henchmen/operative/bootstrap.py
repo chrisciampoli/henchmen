@@ -226,9 +226,7 @@ async def run_operative() -> None:
             interrupted = True
             status = OperativeStatus.INTERRUPTED
             result["error"] = result.get("error") or "SIGTERM received during node execution"
-            result["summary"] = (
-                result.get("summary") or "Operative interrupted by SIGTERM — partial work preserved"
-            )
+            result["summary"] = result.get("summary") or "Operative interrupted by SIGTERM — partial work preserved"
         elif result.get("blocked"):
             status = OperativeStatus.BLOCKED
         else:
@@ -451,9 +449,8 @@ async def _build_file_context(workspace_dir: str, task_title: str, task_descript
                     break
 
         # For test_fix tasks, boost test files
-        if analysis.task_type == "test_fix":
-            if "test" in basename or "spec" in basename or "test" in rel_lower:
-                score += 8
+        if analysis.task_type == "test_fix" and ("test" in basename or "spec" in basename or "test" in rel_lower):
+            score += 8
 
         # Prefer source files
         if rel.endswith((".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java")):

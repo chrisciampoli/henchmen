@@ -66,6 +66,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             continue
         item.add_marker(marker)
 
+
 # ---------------------------------------------------------------------------
 # MockPubSub
 # ---------------------------------------------------------------------------
@@ -347,8 +348,15 @@ def mock_gcs(monkeypatch) -> MockStorageClient:
 
 
 @pytest.fixture
-def test_workspace(tmp_path) -> Path:
-    """Create a temporary git workspace with a sample Python project."""
+def test_workspace(tmp_path):
+    """Create a temporary git workspace with a sample Python project.
+
+    Also points the Arsenal workspace boundary at this directory so
+    file_write / file_edit / git_commit accept paths inside it. The cache
+    is cleared on teardown so subsequent tests start with the default.
+    """
+    from henchmen.arsenal import _workspace as _arsenal_workspace
+
     workspace = tmp_path / "test-repo"
     workspace.mkdir()
 
@@ -402,7 +410,12 @@ def test_login_missing_credentials():
         env=git_env,
     )
 
-    return workspace
+    # Point the Arsenal workspace boundary at this temp dir so file-write
+    # tools accept paths inside it. The fixture is function-scoped, so the
+    # finalizer below resets the cache for the next test.
+    _arsenal_workspace.set_workspace_root(workspace)
+    yield workspace
+    _arsenal_workspace.set_workspace_root(None)
 
 
 # ---------------------------------------------------------------------------
@@ -411,21 +424,48 @@ def test_login_missing_credentials():
 
 
 @pytest_asyncio.fixture
-async def dispatch_client() -> AsyncIterator[AsyncClient]:
+async def dispatch_client(mock_pubsub) -> AsyncIterator[AsyncClient]:
     """Yield an ``httpx.AsyncClient`` wired to the dispatch FastAPI app.
 
-    Replaces the 18 hand-rolled ``async with AsyncClient(transport=ASGITransport(app=app), ...)``
-    blocks that previously lived inside ``test_dispatch_pipeline.py``. Tests
-    consume this fixture by adding ``dispatch_client`` to their signature and
+    Replaces the hand-rolled ``async with AsyncClient(...)`` blocks that
+    previously lived inside ``test_dispatch_pipeline.py``. Tests consume
+    this fixture by adding ``dispatch_client`` to their signature and
     using it in place of the old ``client`` local variable.
+
+    ``httpx.AsyncClient`` with ``ASGITransport`` does not trigger FastAPI
+    lifespan hooks, so handlers that read ``app.state.message_broker``
+    would otherwise fail with ``AttributeError``. We inject a minimal
+    broker shim backed by the ``mock_pubsub`` publisher so tests get
+    exactly the same observable behaviour (``published_messages``) as
+    before without bringing up the real provider registry.
     """
     from henchmen.dispatch.server import app as dispatch_app
 
-    async with AsyncClient(
-        transport=ASGITransport(app=dispatch_app),
-        base_url="http://test",
-    ) as client:
-        yield client
+    class _MockBroker:
+        """Minimal MessageBroker that delegates to mock_pubsub."""
+
+        def __init__(self, publisher):
+            self._publisher = publisher
+
+        async def publish(self, topic: str, data: bytes, ordering_key=None, **attributes) -> str:
+            # Route through the mock_pubsub publisher so assertions work.
+            project = os.environ.get("HENCHMEN_GCP_PROJECT_ID", "test-project")
+            topic_path = f"projects/{project}/topics/{topic}"
+            future = self._publisher.publish(topic_path, data, **attributes)
+            return str(future.result(timeout=10))
+
+    dispatch_app.state.message_broker = _MockBroker(mock_pubsub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=dispatch_app),
+            base_url="http://test",
+        ) as client:
+            yield client
+    finally:
+        # Clear the state so later tests that DO exercise the full lifespan
+        # (or that want a fresh broker) are not polluted.
+        if hasattr(dispatch_app.state, "message_broker"):
+            del dispatch_app.state.message_broker
 
 
 @pytest.fixture

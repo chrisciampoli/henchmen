@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -171,10 +172,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     def _sigterm_handler() -> None:
         logger.info("[dispatch] SIGTERM received, initiating graceful shutdown")
 
-    try:
+    # Windows and non-main thread runners do not support add_signal_handler.
+    with contextlib.suppress(NotImplementedError, RuntimeError):
         loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)
-    except (NotImplementedError, RuntimeError):
-        pass  # Windows or non-main thread (e.g., test runner)
 
     from henchmen.observability.tracing import init_tracing, instrument_fastapi, shutdown_tracing
 

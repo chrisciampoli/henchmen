@@ -36,12 +36,8 @@ def _compute_summary(tasks: list[dict[str, Any]], days: int) -> dict[str, Any]:
     total_conf = sum(t.get("confidence_score", 0) for t in tasks)
     count = len(tasks)
 
-    tasks_completed = sum(
-        1 for t in tasks if t.get("final_status") in ("completed", "COMPLETED")
-    )
-    tasks_escalated = sum(
-        1 for t in tasks if t.get("final_status") in ("escalated", "ESCALATED")
-    )
+    tasks_completed = sum(1 for t in tasks if t.get("final_status") in ("completed", "COMPLETED"))
+    tasks_escalated = sum(1 for t in tasks if t.get("final_status") in ("escalated", "ESCALATED"))
 
     by_scheme: dict[str, dict[str, Any]] = {}
     for t in tasks:
@@ -67,9 +63,7 @@ def _compute_summary(tasks: list[dict[str, Any]], days: int) -> dict[str, Any]:
             # Return null rather than 0.0 when there is no decided CI data, so
             # alert rules that fire on low pass rates do not trip on empty
             # windows.
-            "ci_pass_rate": (
-                s["ci_passed"] / s["ci_decided"] if s["ci_decided"] > 0 else None
-            ),
+            "ci_pass_rate": (s["ci_passed"] / s["ci_decided"] if s["ci_decided"] > 0 else None),
             "avg_cost_usd": s["total_cost"] / s["count"] if s["count"] > 0 else 0.0,
         }
 

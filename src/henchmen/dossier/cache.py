@@ -6,7 +6,7 @@ import logging
 import os
 import tarfile
 import tempfile
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from henchmen.providers.interfaces.object_store import ObjectStore
 

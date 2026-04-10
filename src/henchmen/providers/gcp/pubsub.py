@@ -56,9 +56,7 @@ class PubSubMessageBroker:
         subscriber = self._get_subscriber()
         sub_path = f"projects/{self._project_id}/subscriptions/{subscription_name}"
 
-        response = subscriber.pull(
-            request={"subscription": sub_path, "max_messages": max_messages}
-        )
+        response = subscriber.pull(request={"subscription": sub_path, "max_messages": max_messages})
 
         messages: list[dict[str, Any]] = []
         ack_ids: list[str] = []

@@ -110,14 +110,15 @@ async def verify_pubsub_oidc(request: Request, settings: Settings) -> None:
         logger.error("[pubsub-auth] google-auth not available: %s", exc)
         # In DEV we still let the request through with a warning.
         if env == Environment.DEV:
-            logger.warning(
-                "[pubsub-auth] DEV mode: google-auth missing; skipping OIDC verification"
-            )
+            logger.warning("[pubsub-auth] DEV mode: google-auth missing; skipping OIDC verification")
             return
         raise HTTPException(status_code=500, detail="OIDC verifier unavailable") from exc
 
     try:
-        claims = id_token.verify_oauth2_token(token, google_requests.Request(), audience)
+        # google-auth ships without py.typed, so the call is untyped.
+        claims = id_token.verify_oauth2_token(  # type: ignore[no-untyped-call]
+            token, google_requests.Request(), audience
+        )
     except ValueError as exc:
         logger.warning("[pubsub-auth] OIDC verification failed: %s", exc)
         raise HTTPException(status_code=401, detail="Invalid OIDC token") from exc

@@ -72,10 +72,14 @@ class OllamaProvider:
         if tier in self._warned_tiers:
             return
         self._warned_tiers.add(tier)
-        # Normalize a tier/model-name to a hint key.
-        hint_key = None
-        if tier in (ModelTier.COMPLEX, ModelTier.LIGHT, ModelTier.REASONING):
-            hint_key = tier.name
+        # Normalize a tier/model-name to a hint key. ``tier`` may be a plain
+        # string (a cloud model name) or a ModelTier value (string enum), so
+        # we look up the enum member by value rather than using .name.
+        hint_key: str | None = None
+        try:
+            hint_key = ModelTier(tier).name
+        except ValueError:
+            hint_key = None
         hint = self._TIER_HINTS.get(hint_key) if hint_key else None
         logger.warning(
             "[ollama] Flattening tier/model '%s' -> '%s'. "

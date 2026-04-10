@@ -123,11 +123,14 @@ class OperativeAgent:
 
         # Build a task-level cost accumulator when a document store is available
         # so the ceiling spans all scheme nodes, not just this one (L5 fix).
-        task_cost_accumulator: "TaskCostAccumulator | None" = None
+        task_cost_accumulator: TaskCostAccumulator | None = None
         if self.document_store is not None:
-            from henchmen.observability.cost_accumulator import TaskCostAccumulator as _TCA
+            # Lazy import to break a module-load cycle with observability.
+            from henchmen.observability.cost_accumulator import (
+                TaskCostAccumulator as _TaskCostAccumulator,
+            )
 
-            task_cost_accumulator = _TCA(
+            task_cost_accumulator = _TaskCostAccumulator(
                 document_store=self.document_store,
                 task_id=self.config.task_id,
                 ceiling_usd=self.settings.operative_task_cost_ceiling_usd,
@@ -248,8 +251,8 @@ class OperativeAgent:
                 self._agent_loop(system_instruction, guardrails),
                 timeout=agent_timeout,
             )
-        except TimeoutError:
-            raise TimeoutError(f"Agent exceeded timeout of {agent_timeout}s")
+        except TimeoutError as exc:
+            raise TimeoutError(f"Agent exceeded timeout of {agent_timeout}s") from exc
         finally:
             await self._delete_context_cache()
 
@@ -668,8 +671,7 @@ class OperativeAgent:
                 logger.warning("[OPERATIVE] Claude unavailable, falling back to Gemini")
                 return await self._call_gemini(system_instruction, messages, "gemini-2.5-pro")
             return result
-        else:
-            return await self._call_gemini(system_instruction, messages, model_name)
+        return await self._call_gemini(system_instruction, messages, model_name)
 
     async def _call_via_provider(
         self, system_instruction: str, messages: list[dict[str, Any]], model_name: str
@@ -953,7 +955,7 @@ class OperativeAgent:
 
             response = client.models.generate_content(
                 model=model_name,
-                contents=contents,
+                contents=contents,  # type: ignore[arg-type]  # google-genai expects a covariant Sequence
                 config=config,
             )
 
@@ -1006,7 +1008,11 @@ class OperativeAgent:
                     from henchmen.utils.retry import retry_with_backoff
 
                     async def _retry_call() -> Any:
-                        return client.models.generate_content(model=model_name, contents=contents, config=config)
+                        return client.models.generate_content(
+                            model=model_name,
+                            contents=contents,  # type: ignore[arg-type]  # covariant-Sequence mismatch
+                            config=config,
+                        )
 
                     response = await retry_with_backoff(_retry_call, max_retries=3, base_delay=5.0)
                     retry_parts: list[dict[str, Any]] = []
@@ -1332,9 +1338,7 @@ def _build_json_schema(raw_parameters: dict[str, Any]) -> dict[str, Any]:
 
         # Map Python types to JSON Schema types
         prop: dict[str, Any] = {}
-        if annotation is inspect.Parameter.empty or annotation is None:
-            prop["type"] = "string"
-        elif annotation is str:
+        if annotation is inspect.Parameter.empty or annotation is None or annotation is str:
             prop["type"] = "string"
         elif annotation is int:
             prop["type"] = "integer"

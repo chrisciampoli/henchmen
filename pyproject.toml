@@ -111,6 +111,34 @@ target-version = "py312"
 select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "RET", "ASYNC", "T20", "C4"]
 ignore = []
 
+[tool.ruff.lint.per-file-ignores]
+# CLI and Slack bot intentionally use print() for user-facing output.
+# structured_logging.py writes JSON lines to stdout for Cloud Run log ingestion.
+"src/henchmen/cli.py" = ["T201"]
+"src/henchmen/dispatch/slack_bot.py" = ["T201"]
+"src/henchmen/observability/structured_logging.py" = ["T201"]
+# Arsenal file-system tools deliberately use blocking I/O for simplicity —
+# operatives run in single-use Cloud Run Jobs so async file access would
+# add complexity without latency benefit.
+"src/henchmen/arsenal/tools/code_edit.py" = ["ASYNC230", "ASYNC240"]
+"src/henchmen/arsenal/tools/code_intel.py" = ["ASYNC230", "ASYNC240"]
+"src/henchmen/arsenal/tools/test_runner.py" = ["ASYNC230", "ASYNC240", "ASYNC221"]
+"src/henchmen/arsenal/tools/git_ops.py" = ["ASYNC230", "ASYNC240"]
+"src/henchmen/mastermind/scheme_executor/handlers.py" = ["ASYNC230", "ASYNC240"]
+"src/henchmen/operative/bootstrap.py" = ["ASYNC230", "ASYNC240"]
+"src/henchmen/operative/agent_builder.py" = ["ASYNC230", "ASYNC240"]
+"src/henchmen/forge/ci_runner.py" = ["ASYNC230", "ASYNC240"]
+"src/henchmen/dossier/cache.py" = ["ASYNC240"]
+"src/henchmen/dossier/rules.py" = ["ASYNC240"]
+"src/henchmen/utils/git.py" = ["ASYNC221"]
+# `timeout` kwarg on MastermindAgent.handle_task_with_timeout is a
+# wrapper-level budget, not a synchronous timeout — ASYNC109 is a false
+# positive there.
+"src/henchmen/mastermind/agent.py" = ["ASYNC109"]
+# Tests get a relaxed ruleset — assert-raises-Exception, print-for-debug,
+# and blocking-IO-in-async-tests are all idiomatic.
+"tests/**/*.py" = ["T201", "B017", "ASYNC230", "ASYNC240", "ASYNC221", "SIM105"]
+
 [tool.pytest.ini_options]
 # Strict asyncio mode: every async test must be explicitly marked with
 # @pytest.mark.asyncio (and every async fixture with @pytest_asyncio.fixture).
@@ -127,3 +155,8 @@ markers = [
 python_version = "3.12"
 strict = true
 ignore_missing_imports = true
+# Third-party libraries without py.typed markers (yaml, google-auth, etc.)
+# are tolerated globally instead of requiring per-file ``# type: ignore``
+# markers that become stale when CI and dev environments differ in which
+# stub packages they have installed.
+disable_error_code = ["import-untyped"]

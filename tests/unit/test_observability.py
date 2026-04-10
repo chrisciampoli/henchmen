@@ -118,8 +118,7 @@ class TestTaskTracker:
 
         settings = _mock_settings()
         mock_store = store or _make_mock_store()
-        tracker = TaskTracker(settings, document_store=mock_store)
-        return tracker
+        return TaskTracker(settings, document_store=mock_store)
 
     @pytest.mark.asyncio
     async def test_start_task_creates_doc(self):
@@ -231,12 +230,14 @@ class TestMetricsAPI:
         return TestClient(app)
 
     def test_summary_empty(self):
+        # K8 fix: ci_pass_rate is None when ci_decided == 0, not 0.0,
+        # so alerts of the form `rate < 0.5` do not page when there is no data.
         client = self._make_app([])
         resp = client.get("/metrics/summary?days=7")
         assert resp.status_code == 200
         data = resp.json()
         assert data["tasks_total"] == 0
-        assert data["ci_pass_rate"] == 0.0
+        assert data["ci_pass_rate"] is None
 
     def test_summary_with_tasks(self):
         tasks = [

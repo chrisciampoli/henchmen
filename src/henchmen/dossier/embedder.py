@@ -168,16 +168,22 @@ async def upsert_chunks(
                 f"{chunk.end_line}|{chunk.symbol_name or ''}|{chunk.language}|{chunk.chunk_type}"
             )
 
-            # Write chunk to temp file (RAG Engine requires file upload)
+            # Write chunk to temp file (RAG Engine requires file upload).
+            # Use delete=False + manual unlink so the file survives the with
+            # block until rag.upload_file has finished reading it.
             content = f"# {chunk.file_path}\n{chunk.content[:4000]}"
-            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
-            try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".txt",
+                delete=False,
+                encoding="utf-8",
+            ) as tmp:
                 tmp.write(content)
-                tmp.close()
-
+                tmp_path = tmp.name
+            try:
                 rag.upload_file(  # TODO: Abstract RAG provider
                     corpus_name=corpus_name,
-                    path=tmp.name,
+                    path=tmp_path,
                     display_name=display_name,
                     description=f"{chunk.chunk_type}: {chunk.symbol_name or chunk.file_path} "
                     f"(L{chunk.start_line}-{chunk.end_line}) [{commit_sha[:8]}]",
@@ -189,7 +195,7 @@ async def upsert_chunks(
                 else:
                     logger.warning("Failed to upload chunk %s: %s", record_id, exc)
             finally:
-                os.unlink(tmp.name)
+                os.unlink(tmp_path)
 
         return uploaded
 

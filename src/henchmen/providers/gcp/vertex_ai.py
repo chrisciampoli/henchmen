@@ -100,7 +100,7 @@ class VertexAIProvider:
         )
         response = await self._client.aio.models.generate_content(
             model=model,
-            contents=contents,
+            contents=contents,  # type: ignore[arg-type]  # google-genai expects a covariant Sequence
             config=config,
         )
 

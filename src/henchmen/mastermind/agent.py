@@ -343,7 +343,7 @@ class MastermindAgent:
         ]
         if any(kw in title_lower for kw in feature_keywords):
             return "feature_standard"
-        elif any(kw in title_lower for kw in ["bug", "fix", "error", "crash", "broken"]):
+        if any(kw in title_lower for kw in ["bug", "fix", "error", "crash", "broken"]):
             return "bugfix_standard"
 
         # Default to bugfix
@@ -525,10 +525,10 @@ class MastermindAgent:
         if msg_type == "task_intake":
             task = HenchmenTask.model_validate(message.get("data", {}))
             return await self.handle_task(task)
-        elif msg_type == "operative_complete":
+        if msg_type == "operative_complete":
             # Handle operative completion report
             return {"status": "acknowledged"}
-        elif msg_type == "forge_result":
+        if msg_type == "forge_result":
             data = message.get("data", {})
             request_id = data.get("request_id", "")
             self.notify_forge_result(request_id, data)

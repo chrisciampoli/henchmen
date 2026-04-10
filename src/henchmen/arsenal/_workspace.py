@@ -32,10 +32,7 @@ def set_workspace_root(path: str | os.PathLike[str] | None) -> None:
     """
     global _cached_root
     with _lock:
-        if path is None:
-            _cached_root = None
-        else:
-            _cached_root = os.path.realpath(str(path))
+        _cached_root = None if path is None else os.path.realpath(str(path))
 
 
 def get_workspace_root() -> str:
@@ -85,12 +82,8 @@ def ensure_in_workspace(path: str | os.PathLike[str]) -> str:
     try:
         common = os.path.commonpath([resolved, root])
     except ValueError as exc:
-        raise PermissionError(
-            f"Path '{path}' is on a different filesystem root than workspace '{root}'"
-        ) from exc
+        raise PermissionError(f"Path '{path}' is on a different filesystem root than workspace '{root}'") from exc
 
     if common != root:
-        raise PermissionError(
-            f"Path '{path}' (resolved: '{resolved}') escapes workspace root '{root}'"
-        )
+        raise PermissionError(f"Path '{path}' (resolved: '{resolved}') escapes workspace root '{root}'")
     return resolved
