@@ -1,0 +1,52 @@
+# Sample output from the Henchmen metrics endpoint
+#
+# Captured from a local stack running the eval harness against three
+# fixtures with a mock LLM provider. Regenerate with:
+#
+#   henchmen serve &
+#   for fx in bugfix_off_by_one bugfix_null_check feature_add_logging; do
+#     henchmen eval --provider ollama --fixture "$fx"
+#   done
+#   curl -s http://localhost:8000/metrics/prometheus | head -60 > docs/images/metrics-sample.txt
+#
+# The numbers below are illustrative, not live data. Chris will refresh
+# this file on his own hardware before cutting the v0.1.1 tag.
+
+# HELP henchmen_tasks_total Total number of Henchmen tasks processed, labelled by final status.
+# TYPE henchmen_tasks_total counter
+henchmen_tasks_total{status="completed"} 3
+henchmen_tasks_total{status="escalated"} 0
+henchmen_tasks_total{status="failed"} 0
+
+# HELP henchmen_task_duration_seconds End-to-end wall-clock time per task.
+# TYPE henchmen_task_duration_seconds histogram
+henchmen_task_duration_seconds_bucket{le="30.0"} 2
+henchmen_task_duration_seconds_bucket{le="60.0"} 3
+henchmen_task_duration_seconds_bucket{le="300.0"} 3
+henchmen_task_duration_seconds_bucket{le="+Inf"} 3
+henchmen_task_duration_seconds_sum 54.2
+henchmen_task_duration_seconds_count 3
+
+# HELP henchmen_task_cost_usd_total Cumulative estimated cost across all tasks.
+# TYPE henchmen_task_cost_usd_total counter
+henchmen_task_cost_usd_total{provider="ollama"} 0.0
+
+# HELP henchmen_nodes_total Number of scheme nodes executed, labelled by node id and outcome.
+# TYPE henchmen_nodes_total counter
+henchmen_nodes_total{node_id="create_branch",condition="pass"} 3
+henchmen_nodes_total{node_id="prefetch_context",condition="pass"} 3
+henchmen_nodes_total{node_id="implement_fix",condition="pass"} 3
+henchmen_nodes_total{node_id="verify_changes",condition="pass"} 3
+henchmen_nodes_total{node_id="run_lint",condition="pass"} 3
+henchmen_nodes_total{node_id="run_tests",condition="pass"} 3
+henchmen_nodes_total{node_id="create_pr",condition="pass"} 3
+
+# HELP henchmen_ci_pass_rate Ratio of passing CI runs in the last 24h.
+# TYPE henchmen_ci_pass_rate gauge
+henchmen_ci_pass_rate 1.0
+
+# HELP henchmen_operative_tool_calls_total Total tool calls issued by operatives.
+# TYPE henchmen_operative_tool_calls_total counter
+henchmen_operative_tool_calls_total{tool="code_edit.file_write"} 3
+henchmen_operative_tool_calls_total{tool="git_ops.git_commit"} 3
+henchmen_operative_tool_calls_total{tool="test_runner.run_tests"} 6

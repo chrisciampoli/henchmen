@@ -4,6 +4,7 @@ locals {
     "cloudbuild.googleapis.com",
     "pubsub.googleapis.com",
     "firestore.googleapis.com",
+    "firebaserules.googleapis.com",
     "secretmanager.googleapis.com",
     "artifactregistry.googleapis.com",
     "logging.googleapis.com",

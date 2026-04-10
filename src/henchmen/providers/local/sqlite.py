@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from typing import TYPE_CHECKING, Any
@@ -17,6 +18,19 @@ class SQLiteDocumentStore:
         path = db_path or f"henchmen_{settings.environment.value}.db"
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # Per-document asyncio locks serialize read-modify-write blocks
+        # (increment, update_if) within the current process. Cross-process
+        # serialization relies on SQLite's own write lock.
+        self._doc_locks: dict[str, asyncio.Lock] = {}
+
+    def _get_lock(self, collection: str, document_id: str) -> asyncio.Lock:
+        """Return the per-document lock, lazily creating it on first use."""
+        key = f"{collection}/{document_id}"
+        lock = self._doc_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._doc_locks[key] = lock
+        return lock
 
     def _ensure_table(self, collection: str) -> None:
         self._conn.execute(f"CREATE TABLE IF NOT EXISTS [{collection}] (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
@@ -80,6 +94,51 @@ class SQLiteDocumentStore:
         if limit:
             results = results[:limit]
         return results
+
+    async def increment(
+        self,
+        collection: str,
+        document_id: str,
+        field_deltas: dict[str, int | float],
+    ) -> None:
+        """Atomically add deltas to numeric fields under a per-doc lock.
+
+        Missing fields and missing documents are treated as zero. The
+        ``asyncio.Lock`` keyed by ``(collection, document_id)`` serializes
+        concurrent callers within this process; SQLite's file lock covers
+        cross-process concurrency.
+        """
+        if not field_deltas:
+            return
+        async with self._get_lock(collection, document_id):
+            existing = await self.get(collection, document_id)
+            base: dict[str, Any] = {}
+            if existing is not None:
+                base = {k: v for k, v in existing.items() if k != "_id"}
+            for field, delta in field_deltas.items():
+                current = base.get(field, 0) or 0
+                base[field] = current + delta
+            await self.set(collection, document_id, base)
+
+    async def update_if(
+        self,
+        collection: str,
+        document_id: str,
+        expected_field: str,
+        expected_value: Any,
+        new_values: dict[str, Any],
+    ) -> bool:
+        """Conditional update under a per-doc asyncio lock (compare-and-swap)."""
+        async with self._get_lock(collection, document_id):
+            existing = await self.get(collection, document_id)
+            if existing is None:
+                return False
+            if existing.get(expected_field) != expected_value:
+                return False
+            merged = {k: v for k, v in existing.items() if k != "_id"}
+            merged.update(new_values)
+            await self.set(collection, document_id, merged)
+            return True
 
     @staticmethod
     def _matches_filters(data: dict[str, Any], filters: list[tuple[str, str, Any]]) -> bool:

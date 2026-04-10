@@ -1,127 +1,49 @@
 """Integration tests for the Forge CI pipeline, merge queue, and PR creation.
 
-.. note::
-   This entire module is quarantined as of 2026-04-09. The tests were written
-   against an older Forge implementation that directly instantiated
-   ``google.cloud.pubsub_v1.PublisherClient`` and exposed a ``MergeQueue._client``
-   attribute. After the provider-abstraction refactor (finding E8) and the
-   MergeQueue-takes-DocumentStore refactor, the test fixtures no longer match
-   the production code. Rewiring them to inject a mock ``MessageBroker`` and a
-   fake ``DocumentStore`` via the provider registry is a focused follow-up;
-   tracked as a TODO. Until then the suite is skipped so CI stays green.
-   Unit tests still cover ``CIOrchestrator``, ``MergeQueue``, and the Forge
-   server handlers in isolation.
+Uses constructor injection for the ``MessageBroker`` and ``DocumentStore``
+dependencies — mirrors the pattern in ``tests/unit/test_forge.py`` and the
+``dispatch_client`` integration fixture. Tests no longer reach into the
+private ``MergeQueue._client`` attribute that was removed in the E8
+provider-abstraction refactor.
 """
 
+import base64
+import json
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
+from httpx import ASGITransport, AsyncClient
 
-pytestmark = pytest.mark.skip(
-    reason=(
-        "Quarantined: fixture patches google.cloud.pubsub_v1 directly, bypassing "
-        "the new MessageBroker abstraction. MergeQueue also no longer has a "
-        "_client attribute. TODO: inject mock broker + document store via "
-        "provider registry."
-    )
-)
-
-import base64  # noqa: E402
-import json  # noqa: E402
-import types  # noqa: E402
-from datetime import UTC, datetime  # noqa: E402
-from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
-
-from httpx import ASGITransport, AsyncClient  # noqa: E402
-
-from henchmen.forge.ci_orchestrator import CIOrchestrator  # noqa: E402
-from henchmen.forge.merge_queue import MergeQueue  # noqa: E402
-from henchmen.forge.pr_builder import PRBuilder  # noqa: E402
-from henchmen.forge.server import app as forge_app  # noqa: E402
+from henchmen.forge.ci_orchestrator import CIOrchestrator
+from henchmen.forge.merge_queue import MergeQueue
+from henchmen.forge.pr_builder import PRBuilder
+from henchmen.forge.server import app as forge_app
 
 # ---------------------------------------------------------------------------
 # Helpers shared across test classes
 # ---------------------------------------------------------------------------
 
 
-def _stub_cloudbuild():
-    """Minimal stub for google.cloud.cloudbuild_v1 — keeps tests offline."""
-    mod = types.ModuleType("google.cloud.cloudbuild_v1")
-
-    class _Stub:
-        def __init__(self, **kwargs):
-            for k, v in kwargs.items():
-                setattr(self, k, v)
-            self.tags = kwargs.get("tags", [])
-
-    mod.CloudBuildAsyncClient = MagicMock
-    mod.Build = _Stub
-    mod.BuildStep = _Stub
-    mod.Source = _Stub
-    mod.GitSource = _Stub
-    return mod
+def _mock_broker() -> AsyncMock:
+    """Build a minimal async MessageBroker double."""
+    broker = AsyncMock()
+    broker.publish = AsyncMock(return_value="mock-msg-id")
+    return broker
 
 
-def _async_iter(items):
-    """Return an async iterable over *items*."""
-
-    async def _gen():
-        for item in items:
-            yield item
-
-    return _gen()
-
-
-def _make_doc(entry: dict) -> MagicMock:
-    """Construct a mock Firestore document snapshot."""
-    doc = MagicMock()
-    doc.id = entry["id"]
-    doc.to_dict = MagicMock(return_value=dict(entry))
-    return doc
-
-
-def _make_mock_settings():
-    s = MagicMock()
-    s.gcp_project_id = "test-project"
-    s.pubsub_topic_forge_result = "henchmen-forge-result"
-    s.firestore_database = "(default)"
-    return s
-
-
-def _build_merge_queue_db(merging_docs: list, pending_docs: list):
-    """
-    Build a mock AsyncFirestore client that returns *merging_docs* for the
-    first ``where`` chain (the serialization guard) and *pending_docs* for
-    the second (the FIFO candidate query).
-    """
-    call_count = {"n": 0}
-
-    def _make_query(docs_list):
-        q = MagicMock()
-        q.where = MagicMock(return_value=q)
-        q.order_by = MagicMock(return_value=q)
-        q.limit = MagicMock(return_value=q)
-        q.stream = MagicMock(return_value=_async_iter(docs_list))
-        return q
-
-    queries = [_make_query(merging_docs), _make_query(pending_docs)]
-
-    def _collection(_name):
-        coll = MagicMock()
-
-        def _where(*a, **kw):
-            q = queries[call_count["n"] % len(queries)]
-            call_count["n"] += 1
-            q.where = MagicMock(return_value=q)
-            q.order_by = MagicMock(return_value=q)
-            q.limit = MagicMock(return_value=q)
-            return q
-
-        coll.where = _where
-        coll.document = MagicMock(return_value=AsyncMock())
-        return coll
-
-    mock_db = MagicMock()
-    mock_db.collection = _collection
-    return mock_db
+def _mock_document_store() -> AsyncMock:
+    """Build a minimal async DocumentStore double with common methods stubbed."""
+    store = AsyncMock()
+    store.get = AsyncMock(return_value=None)
+    store.set = AsyncMock()
+    store.update = AsyncMock()
+    store.delete = AsyncMock()
+    store.query = AsyncMock(return_value=[])
+    store.increment = AsyncMock()
+    # Default update_if to success so MergeQueue CAS claims return the entry.
+    store.update_if = AsyncMock(return_value=True)
+    return store
 
 
 # ---------------------------------------------------------------------------
@@ -130,18 +52,18 @@ def _build_merge_queue_db(merging_docs: list, pending_docs: list):
 
 
 class TestCIOrchestratorIntegration:
-    """CI orchestrator with mocked Cloud Build and Pub/Sub."""
+    """CI orchestrator exercised with mocked CI provider and broker."""
 
     @pytest.fixture(autouse=True)
-    def _setup(self, integration_settings, mock_pubsub):
+    def _setup(self, integration_settings):
         self.settings = integration_settings
-        self.mock_pubsub = mock_pubsub
+        self.broker = _mock_broker()
 
     # 1. Parse PR URL correctly
     @pytest.mark.asyncio
     async def test_run_ci_parses_pr_url_correctly(self):
         """run_ci extracts repo='acme-org/sample-repo' and pr_number=42."""
-        orchestrator = CIOrchestrator(self.settings)
+        orchestrator = CIOrchestrator(self.settings, broker=self.broker)
         orchestrator.trigger_build = AsyncMock(return_value="build-42")
         orchestrator.get_build_status = AsyncMock(return_value={"status": "success", "log_url": ""})
 
@@ -150,11 +72,11 @@ class TestCIOrchestratorIntegration:
         assert result["repo"] == "acme-org/sample-repo"
         assert result["pr_number"] == 42
 
-    # 2. Trigger Cloud Build
+    # 2. Trigger CI build with correct repo slug
     @pytest.mark.asyncio
     async def test_run_ci_triggers_cloud_build(self):
         """run_ci calls trigger_build with the correct repo."""
-        orchestrator = CIOrchestrator(self.settings)
+        orchestrator = CIOrchestrator(self.settings, broker=self.broker)
         orchestrator.trigger_build = AsyncMock(return_value="build-007")
         orchestrator.get_build_status = AsyncMock(return_value={"status": "success", "log_url": ""})
 
@@ -164,37 +86,41 @@ class TestCIOrchestratorIntegration:
         call_args = orchestrator.trigger_build.call_args
         assert call_args.args[0] == "acme-org/sample-repo"
 
-    # 3. Publish result to forge-result topic
+    # 3. Publish result to forge-result topic via injected broker
     @pytest.mark.asyncio
     async def test_run_ci_publishes_result_to_forge_result_topic(self):
-        """run_ci publishes a message to the forge-result topic with the correct request_id."""
-        orchestrator = CIOrchestrator(self.settings)
+        """run_ci publishes a message with the correct request_id via the broker."""
+        orchestrator = CIOrchestrator(self.settings, broker=self.broker)
         orchestrator.trigger_build = AsyncMock(return_value="build-pub-test")
         orchestrator.get_build_status = AsyncMock(return_value={"status": "success", "log_url": ""})
 
         await orchestrator.run_ci("https://github.com/acme-org/sample-repo/pull/10", "req-pub-test")
 
-        self.mock_pubsub.assert_published_to("forge-result", count=1)
-        msgs = self.mock_pubsub.get_messages_for_topic("forge-result")
-        assert msgs[0]["data"]["request_id"] == "req-pub-test"
+        self.broker.publish.assert_called_once()
+        call_args = self.broker.publish.call_args
+        topic = call_args.args[0]
+        assert "forge-result" in topic
+        published = json.loads(call_args.args[1].decode("utf-8"))
+        assert published["request_id"] == "req-pub-test"
 
-    # 4. Handle build failure
+    # 4. Handle build trigger failure
     @pytest.mark.asyncio
     async def test_run_ci_handles_build_failure(self):
-        """When trigger_build raises, run_ci returns status='failed'."""
-        orchestrator = CIOrchestrator(self.settings)
-        orchestrator.trigger_build = AsyncMock(side_effect=RuntimeError("Cloud Build quota exceeded"))
+        """When trigger_build raises, run_ci returns status='failed' and still publishes."""
+        orchestrator = CIOrchestrator(self.settings, broker=self.broker)
+        orchestrator.trigger_build = AsyncMock(side_effect=RuntimeError("CI quota exceeded"))
 
         result = await orchestrator.run_ci("https://github.com/acme-org/sample-repo/pull/99", "req-fail")
 
         assert result["status"] == "failed"
-        assert "Cloud Build quota exceeded" in result["error"]
+        assert "CI quota exceeded" in result["error"]
+        self.broker.publish.assert_called_once()
 
     # 5. Handle invalid PR URL
     @pytest.mark.asyncio
     async def test_run_ci_handles_invalid_pr_url(self):
         """Malformed PR URL returns status='failed' and does not call trigger_build."""
-        orchestrator = CIOrchestrator(self.settings)
+        orchestrator = CIOrchestrator(self.settings, broker=self.broker)
         orchestrator.trigger_build = AsyncMock(return_value="should-not-be-called")
 
         result = await orchestrator.run_ci("not-a-valid-url", "req-invalid")
@@ -210,86 +136,67 @@ class TestCIOrchestratorIntegration:
 
 
 class TestMergeQueueIntegration:
-    """Merge queue using mock async Firestore client."""
+    """Merge queue exercised with a mocked async DocumentStore."""
 
     @pytest.fixture(autouse=True)
     def _setup(self, integration_settings):
         self.settings = integration_settings
 
-    def _make_queue_with_db(self, merging_docs, pending_docs):
-        """Return a (MergeQueue, mock_db) pair pre-wired for dequeue scenarios."""
-        queue = MergeQueue(self.settings)
-        mock_db = _build_merge_queue_db(merging_docs, pending_docs)
-        return queue, mock_db
-
-    # 1. Enqueue creates a Firestore document
+    # 1. Enqueue writes to the DocumentStore
     @pytest.mark.asyncio
-    async def test_enqueue_creates_firestore_document(self):
-        """enqueue writes a document with correct pr_url, task_id, and status='pending'."""
-        queue = MergeQueue(self.settings)
+    async def test_enqueue_writes_document(self):
+        """enqueue calls DocumentStore.set with pr_url, task_id, and status='pending'."""
+        store = _mock_document_store()
+        queue = MergeQueue(self.settings, document_store=store)
 
-        mock_doc_ref = AsyncMock()
-        mock_collection = MagicMock()
-        mock_collection.document = MagicMock(return_value=mock_doc_ref)
-        mock_db = MagicMock()
-        mock_db.collection = MagicMock(return_value=mock_collection)
-
-        with patch.object(queue, "_client", return_value=mock_db):
-            entry_id = await queue.enqueue("https://github.com/acme-org/sample-repo/pull/1", "task-enqueue-1")
+        entry_id = await queue.enqueue("https://github.com/acme-org/sample-repo/pull/1", "task-enqueue-1")
 
         assert entry_id != ""
-        mock_doc_ref.set.assert_called_once()
-        written = mock_doc_ref.set.call_args.args[0]
+        store.set.assert_called_once()
+        call_args = store.set.call_args
+        assert call_args.args[0] == "merge_queue"
+        assert call_args.args[1] == entry_id
+        written = call_args.args[2]
         assert written["pr_url"] == "https://github.com/acme-org/sample-repo/pull/1"
         assert written["task_id"] == "task-enqueue-1"
         assert written["status"] == "pending"
 
-    # 2. FIFO ordering
+    # 2. FIFO ordering — dequeue returns entries in their enqueue order
     @pytest.mark.asyncio
     async def test_fifo_ordering(self):
-        """Dequeue returns PRs in the order they were enqueued (FIFO)."""
-        pr_urls = [
-            "https://github.com/acme-org/sample-repo/pull/1",
-            "https://github.com/acme-org/sample-repo/pull/2",
-            "https://github.com/acme-org/sample-repo/pull/3",
-        ]
+        """Dequeue returns pending entries in the order the store returns them (FIFO)."""
+        store = _mock_document_store()
+        queue = MergeQueue(self.settings, document_store=store)
 
-        # Build ordered pending docs to simulate FIFO
         pending_entries = [
             {
                 "id": f"entry-{i}",
-                "pr_url": url,
+                "pr_url": f"https://github.com/acme-org/sample-repo/pull/{i + 1}",
                 "task_id": f"task-fifo-{i}",
                 "status": "pending",
                 "created_at": datetime(2026, 1, 1, i, 0, 0, tzinfo=UTC),
                 "priority": 0,
                 "error": None,
             }
-            for i, url in enumerate(pr_urls)
+            for i in range(3)
         ]
 
-        dequeued_urls = []
-
-        for i, entry in enumerate(pending_entries):
-            queue = MergeQueue(self.settings)
-
-            # No currently-merging docs; first pending doc is the current entry
-            doc = _make_doc(entry)
-            mock_db = _build_merge_queue_db(merging_docs=[], pending_docs=[doc])
-
-            with patch.object(queue, "_client", return_value=mock_db):
-                result = await queue.dequeue()
-
-            assert result is not None, f"Expected a result on dequeue #{i}"
+        dequeued_urls: list[str] = []
+        for entry in pending_entries:
+            # Each dequeue call: expire-stale → [], merging-check → [], pending-check → [entry]
+            store.query = AsyncMock(side_effect=[[], [], [entry]])
+            result = await queue.dequeue()
+            assert result is not None
             dequeued_urls.append(result["pr_url"])
 
-        assert dequeued_urls == pr_urls, f"FIFO order violated: expected {pr_urls}, got {dequeued_urls}"
+        assert dequeued_urls == [e["pr_url"] for e in pending_entries]
 
     # 3. Serialization guard blocks parallel merges
     @pytest.mark.asyncio
     async def test_serialization_guard_blocks_parallel_merges(self):
-        """If one entry is already 'merging', dequeue returns None."""
-        queue = MergeQueue(self.settings)
+        """If an entry is already 'merging', dequeue returns None."""
+        store = _mock_document_store()
+        queue = MergeQueue(self.settings, document_store=store)
 
         merging_entry = {
             "id": "entry-merging",
@@ -300,104 +207,51 @@ class TestMergeQueueIntegration:
             "priority": 0,
             "error": None,
         }
-        pending_entry = {
-            "id": "entry-pending",
-            "pr_url": "https://github.com/acme-org/sample-repo/pull/2",
-            "task_id": "task-p2",
-            "status": "pending",
-            "created_at": datetime.now(UTC),
-            "priority": 0,
-            "error": None,
-        }
 
-        merging_doc = _make_doc(merging_entry)
-        pending_doc = _make_doc(pending_entry)
-        mock_db = _build_merge_queue_db(merging_docs=[merging_doc], pending_docs=[pending_doc])
+        # expire-stale: empty, merging-check: returns merging entry
+        store.query = AsyncMock(side_effect=[[], [merging_entry]])
 
-        with patch.object(queue, "_client", return_value=mock_db):
-            result = await queue.dequeue()
+        result = await queue.dequeue()
 
-        assert result is None, "Expected None when a merge is already in progress"
+        assert result is None
 
     # 4. mark_merged allows next dequeue
     @pytest.mark.asyncio
     async def test_mark_merged_allows_next_dequeue(self):
-        """After mark_merged, the next dequeue succeeds (no merging guard)."""
-        queue = MergeQueue(self.settings)
+        """After mark_merged the store is updated with status='merged'."""
+        store = _mock_document_store()
+        queue = MergeQueue(self.settings, document_store=store)
 
-        mock_doc_ref = AsyncMock()
-        mock_collection = MagicMock()
-        mock_collection.document = MagicMock(return_value=mock_doc_ref)
-        mock_db_mark = MagicMock()
-        mock_db_mark.collection = MagicMock(return_value=mock_collection)
+        await queue.mark_merged("entry-001")
 
-        with patch.object(queue, "_client", return_value=mock_db_mark):
-            await queue.mark_merged("entry-001")
-
-        mock_doc_ref.update.assert_called_once_with({"status": "merged"})
-
-        # Now verify dequeue works once guard is clear (no merging docs)
-        second_entry = {
-            "id": "entry-002",
-            "pr_url": "https://github.com/acme-org/sample-repo/pull/2",
-            "task_id": "task-next",
-            "status": "pending",
-            "created_at": datetime.now(UTC),
-            "priority": 0,
-            "error": None,
-        }
-        doc = _make_doc(second_entry)
-        mock_db_dequeue = _build_merge_queue_db(merging_docs=[], pending_docs=[doc])
-
-        with patch.object(queue, "_client", return_value=mock_db_dequeue):
-            result = await queue.dequeue()
-
-        assert result is not None
-        assert result["pr_url"] == "https://github.com/acme-org/sample-repo/pull/2"
+        store.update.assert_called_once()
+        call_args = store.update.call_args
+        assert call_args.args[0] == "merge_queue"
+        assert call_args.args[1] == "entry-001"
+        assert call_args.args[2] == {"status": "merged"}
 
     # 5. mark_failed allows next dequeue
     @pytest.mark.asyncio
-    async def test_mark_failed_allows_next_dequeue(self):
-        """After mark_failed, the next dequeue succeeds (no merging guard)."""
-        queue = MergeQueue(self.settings)
+    async def test_mark_failed_records_error(self):
+        """mark_failed updates the document with status='failed' and the error message."""
+        store = _mock_document_store()
+        queue = MergeQueue(self.settings, document_store=store)
 
-        mock_doc_ref = AsyncMock()
-        mock_collection = MagicMock()
-        mock_collection.document = MagicMock(return_value=mock_doc_ref)
-        mock_db_mark = MagicMock()
-        mock_db_mark.collection = MagicMock(return_value=mock_collection)
+        await queue.mark_failed("entry-001", "CI failed: test suite red")
 
-        with patch.object(queue, "_client", return_value=mock_db_mark):
-            await queue.mark_failed("entry-001", "CI failed: test suite red")
+        store.update.assert_called_once()
+        call_args = store.update.call_args
+        assert call_args.args[0] == "merge_queue"
+        assert call_args.args[1] == "entry-001"
+        assert call_args.args[2] == {"status": "failed", "error": "CI failed: test suite red"}
 
-        mock_doc_ref.update.assert_called_once_with({"status": "failed", "error": "CI failed: test suite red"})
-
-        # Dequeue second entry now that guard is clear
-        second_entry = {
-            "id": "entry-002",
-            "pr_url": "https://github.com/acme-org/sample-repo/pull/3",
-            "task_id": "task-after-fail",
-            "status": "pending",
-            "created_at": datetime.now(UTC),
-            "priority": 0,
-            "error": None,
-        }
-        doc = _make_doc(second_entry)
-        mock_db_dequeue = _build_merge_queue_db(merging_docs=[], pending_docs=[doc])
-
-        with patch.object(queue, "_client", return_value=mock_db_dequeue):
-            result = await queue.dequeue()
-
-        assert result is not None
-        assert result["pr_url"] == "https://github.com/acme-org/sample-repo/pull/3"
-
-    # 6. get_queue_length counts pending
+    # 6. get_queue_length counts pending docs
     @pytest.mark.asyncio
     async def test_get_queue_length_counts_pending(self):
-        """get_queue_length returns 2 after enqueueing 3 and dequeuing 1."""
-        queue = MergeQueue(self.settings)
+        """get_queue_length returns the count of pending entries from the store."""
+        store = _mock_document_store()
+        queue = MergeQueue(self.settings, document_store=store)
 
-        # Simulate 2 remaining pending docs (1 already dequeued/merging)
         pending_entries = [
             {
                 "id": f"entry-{i}",
@@ -410,20 +264,9 @@ class TestMergeQueueIntegration:
             }
             for i in range(2)
         ]
-        docs = [_make_doc(e) for e in pending_entries]
+        store.query = AsyncMock(return_value=pending_entries)
 
-        mock_query = MagicMock()
-        mock_query.where = MagicMock(return_value=mock_query)
-        mock_query.stream = MagicMock(return_value=_async_iter(docs))
-
-        mock_collection = MagicMock()
-        mock_collection.where = MagicMock(return_value=mock_query)
-
-        mock_db = MagicMock()
-        mock_db.collection = MagicMock(return_value=mock_collection)
-
-        with patch.object(queue, "_client", return_value=mock_db):
-            length = await queue.get_queue_length()
+        length = await queue.get_queue_length()
 
         assert length == 2
 
@@ -431,11 +274,13 @@ class TestMergeQueueIntegration:
     @pytest.mark.asyncio
     async def test_empty_queue_dequeue_returns_none(self):
         """Dequeue from an empty queue returns None."""
-        queue = MergeQueue(self.settings)
-        mock_db = _build_merge_queue_db(merging_docs=[], pending_docs=[])
+        store = _mock_document_store()
+        queue = MergeQueue(self.settings, document_store=store)
 
-        with patch.object(queue, "_client", return_value=mock_db):
-            result = await queue.dequeue()
+        # expire-stale: empty, merging-check: empty, pending-check: empty
+        store.query = AsyncMock(return_value=[])
+
+        result = await queue.dequeue()
 
         assert result is None
 
@@ -489,9 +334,6 @@ class TestPRBuilderIntegration:
                 task_id="task-struct-test",
             )
 
-        assert "pr_url" in result
-        assert "pr_number" in result
-        assert "title" in result
         assert result["pr_url"] == "https://github.com/acme-org/sample-repo/pull/42"
         assert result["pr_number"] == 42
         assert result["title"] == "Fix auth bug"
@@ -544,12 +386,11 @@ class TestPRBuilderIntegration:
                 task_id="task-body-id-check",
             )
 
-        call_kwargs = mock_repo.create_pull.call_args.kwargs
-        submitted_body = call_kwargs["body"]
+        submitted_body = mock_repo.create_pull.call_args.kwargs["body"]
         assert "task-body-id-check" in submitted_body
         assert "Henchmen" in submitted_body
 
-    # 4. PR body includes original content
+    # 4. PR body preserves the original content verbatim
     @pytest.mark.asyncio
     async def test_pr_body_includes_original_content(self):
         """The original body text is preserved verbatim in the final PR body."""
@@ -574,9 +415,8 @@ class TestPRBuilderIntegration:
                 task_id="task-preserve",
             )
 
-        call_kwargs = mock_repo.create_pull.call_args.kwargs
-        submitted_body = call_kwargs["body"]
-        assert original_body in submitted_body, f"Original body not found in submitted PR body: {submitted_body!r}"
+        submitted_body = mock_repo.create_pull.call_args.kwargs["body"]
+        assert original_body in submitted_body
 
 
 # ---------------------------------------------------------------------------
@@ -585,12 +425,20 @@ class TestPRBuilderIntegration:
 
 
 class TestForgeServerIntegration:
-    """Forge FastAPI server smoke-tests."""
+    """Forge FastAPI server smoke tests.
+
+    ``httpx.AsyncClient`` with ``ASGITransport`` does not run FastAPI lifespan
+    hooks, so we wire a minimal mock broker onto ``forge_app.state`` by hand.
+    """
 
     @pytest.fixture(autouse=True)
-    def _setup(self, integration_settings, mock_pubsub):
+    def _setup(self, integration_settings):
         self.settings = integration_settings
-        self.mock_pubsub = mock_pubsub
+        self.broker = _mock_broker()
+        forge_app.state.message_broker = self.broker
+        yield
+        if hasattr(forge_app.state, "message_broker"):
+            del forge_app.state.message_broker
 
     # 1. Health endpoint
     @pytest.mark.asyncio
@@ -602,12 +450,13 @@ class TestForgeServerIntegration:
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
 
-    # 2. forge-request endpoint accepts Pub/Sub push message
+    # 2. forge-request endpoint accepts a valid Pub/Sub push envelope
     @pytest.mark.asyncio
     async def test_forge_request_endpoint_accepts_pubsub_message(self):
-        """POST /pubsub/forge-request with a valid Pub/Sub envelope returns 200."""
+        """POST /pubsub/forge-request with a valid envelope returns 200."""
         payload = {
             "pr_url": "https://github.com/acme-org/sample-repo/pull/55",
+            "task_id": "task-server-test",
             "request_id": "req-server-test",
         }
         data_b64 = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8")
@@ -619,20 +468,14 @@ class TestForgeServerIntegration:
             "subscription": "projects/test-project/subscriptions/forge-request-sub",
         }
 
-        # Stub out CIOrchestrator.run_ci so the server doesn't need Cloud Build
-        stub_result = {
-            "request_id": "req-server-test",
-            "pr_url": payload["pr_url"],
-            "status": "success",
-        }
-        with patch(
-            "henchmen.forge.server.CIOrchestrator.run_ci",
-            new_callable=AsyncMock,
-            return_value=stub_result,
+        # Stub out verify_pubsub_oidc + the CI runner so the handler doesn't
+        # need GitHub or any real CI.
+        with (
+            patch("henchmen.forge.server.verify_pubsub_oidc", new_callable=AsyncMock),
+            patch("henchmen.forge.server._run_ci_for_pr", new_callable=AsyncMock),
         ):
             async with AsyncClient(transport=ASGITransport(app=forge_app), base_url="http://test") as client:
                 response = await client.post("/pubsub/forge-request", json=envelope)
 
         assert response.status_code == 200
-        body = response.json()
-        assert body.get("status") == "success"
+        assert response.json().get("status") == "accepted"

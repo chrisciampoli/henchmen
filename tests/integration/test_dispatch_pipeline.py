@@ -7,6 +7,10 @@ Uses mock GCP infrastructure from tests/integration/conftest.py.
 All tests target the repo ``acme-org/sample-repo``.
 """
 
+import json
+from typing import Any
+from unittest.mock import AsyncMock
+
 import pytest
 from httpx import AsyncClient
 
@@ -15,6 +19,33 @@ from henchmen.dispatch.normalizer import TaskNormalizer
 from tests.integration.conftest import IntegrationAssertions, MockPubSubPublisher
 
 TASK_INTAKE_TOPIC = "task-intake"
+
+
+class _MockBroker:
+    """Minimal MessageBroker double that records publish calls.
+
+    Mirrors the embedded ``_MockBroker`` used by the ``dispatch_client``
+    fixture in ``conftest.py``. Tests that exercise ``publish_task``
+    directly pass an instance of this class so the code path no longer
+    has to reach into the provider registry.
+    """
+
+    def __init__(self) -> None:
+        self.published: list[dict[str, Any]] = []
+        self.publish = AsyncMock(side_effect=self._record)
+
+    async def _record(self, topic: str, data: bytes, **attributes: Any) -> str:
+        self.published.append(
+            {
+                "topic": topic,
+                "data": json.loads(data.decode("utf-8")) if data else None,
+                "attributes": attributes,
+            }
+        )
+        return "mock-msg-id"
+
+    def messages_for(self, topic_fragment: str) -> list[dict[str, Any]]:
+        return [m for m in self.published if topic_fragment in m["topic"]]
 
 
 # ---------------------------------------------------------------------------
@@ -390,22 +421,20 @@ class TestJiraDispatchPipeline:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason=(
-        "Quarantined: publish_task routes through the MessageBroker provider, "
-        "which the mock_pubsub fixture no longer intercepts (patches "
-        "google.cloud.pubsub_v1.PublisherClient, bypassed by the abstraction). "
-        "TODO: inject a mock broker via the provider registry fixture."
-    )
-)
 class TestDispatchNormalizerIntegration:
-    """Tests the normalizer directly: from_<source>() + publish_task()."""
+    """Tests the normalizer directly: ``from_<source>() + publish_task()``.
+
+    ``publish_task`` accepts an explicit ``broker`` argument, so these
+    tests inject a :class:`_MockBroker` rather than patching the
+    provider registry. Assertions target the broker's recorded publish
+    calls.
+    """
 
     @pytest.fixture(autouse=True)
-    def _setup(self, integration_settings, mock_pubsub):
-        self.mock_pubsub = mock_pubsub
+    def _setup(self, integration_settings):
         self.normalizer = TaskNormalizer()
         self.settings = get_settings()
+        self.broker = _MockBroker()
 
     @pytest.mark.asyncio
     async def test_normalize_and_publish_cli(
@@ -413,12 +442,13 @@ class TestDispatchNormalizerIntegration:
         cli_task_data: dict,
         assertions: IntegrationAssertions,
     ):
-        """from_cli + publish_task writes a valid HenchmenTask to Pub/Sub."""
+        """from_cli + publish_task writes a valid HenchmenTask to the broker."""
         task = self.normalizer.from_cli(cli_task_data)
-        await self.normalizer.publish_task(task, self.settings)
+        await self.normalizer.publish_task(task, self.settings, broker=self.broker)
 
-        self.mock_pubsub.assert_published_to(TASK_INTAKE_TOPIC, count=1)
-        task_data = _get_first_message(self.mock_pubsub)
+        msgs = self.broker.messages_for(TASK_INTAKE_TOPIC)
+        assert len(msgs) == 1
+        task_data = msgs[0]["data"]
         assertions.assert_valid_henchmen_task(task_data)
         assert task_data["source"] == "cli"
 
@@ -428,12 +458,13 @@ class TestDispatchNormalizerIntegration:
         slack_event_data: dict,
         assertions: IntegrationAssertions,
     ):
-        """from_slack + publish_task writes a valid HenchmenTask to Pub/Sub."""
+        """from_slack + publish_task writes a valid HenchmenTask to the broker."""
         task = self.normalizer.from_slack(slack_event_data)
-        await self.normalizer.publish_task(task, self.settings)
+        await self.normalizer.publish_task(task, self.settings, broker=self.broker)
 
-        self.mock_pubsub.assert_published_to(TASK_INTAKE_TOPIC, count=1)
-        task_data = _get_first_message(self.mock_pubsub)
+        msgs = self.broker.messages_for(TASK_INTAKE_TOPIC)
+        assert len(msgs) == 1
+        task_data = msgs[0]["data"]
         assertions.assert_valid_henchmen_task(task_data)
         assert task_data["source"] == "slack"
 
@@ -443,12 +474,13 @@ class TestDispatchNormalizerIntegration:
         github_issue_event: dict,
         assertions: IntegrationAssertions,
     ):
-        """from_github (issue) + publish_task writes a valid HenchmenTask to Pub/Sub."""
+        """from_github (issue) + publish_task writes a valid HenchmenTask to the broker."""
         task = self.normalizer.from_github(github_issue_event)
-        await self.normalizer.publish_task(task, self.settings)
+        await self.normalizer.publish_task(task, self.settings, broker=self.broker)
 
-        self.mock_pubsub.assert_published_to(TASK_INTAKE_TOPIC, count=1)
-        task_data = _get_first_message(self.mock_pubsub)
+        msgs = self.broker.messages_for(TASK_INTAKE_TOPIC)
+        assert len(msgs) == 1
+        task_data = msgs[0]["data"]
         assertions.assert_valid_henchmen_task(task_data)
         assert task_data["source"] == "github"
         assert task_data["context"]["repo"] == "acme-org/sample-repo"
@@ -459,12 +491,13 @@ class TestDispatchNormalizerIntegration:
         github_pr_comment_event: dict,
         assertions: IntegrationAssertions,
     ):
-        """from_github (PR comment) + publish_task writes a valid HenchmenTask to Pub/Sub."""
+        """from_github (PR comment) + publish_task writes a valid HenchmenTask to the broker."""
         task = self.normalizer.from_github(github_pr_comment_event)
-        await self.normalizer.publish_task(task, self.settings)
+        await self.normalizer.publish_task(task, self.settings, broker=self.broker)
 
-        self.mock_pubsub.assert_published_to(TASK_INTAKE_TOPIC, count=1)
-        task_data = _get_first_message(self.mock_pubsub)
+        msgs = self.broker.messages_for(TASK_INTAKE_TOPIC)
+        assert len(msgs) == 1
+        task_data = msgs[0]["data"]
         assertions.assert_valid_henchmen_task(task_data)
         assert task_data["source"] == "github"
         assert task_data["context"]["branch"] == "feature/auth-update"
@@ -475,12 +508,13 @@ class TestDispatchNormalizerIntegration:
         jira_webhook_data: dict,
         assertions: IntegrationAssertions,
     ):
-        """from_jira + publish_task writes a valid HenchmenTask to Pub/Sub."""
+        """from_jira + publish_task writes a valid HenchmenTask to the broker."""
         task = self.normalizer.from_jira(jira_webhook_data)
-        await self.normalizer.publish_task(task, self.settings)
+        await self.normalizer.publish_task(task, self.settings, broker=self.broker)
 
-        self.mock_pubsub.assert_published_to(TASK_INTAKE_TOPIC, count=1)
-        task_data = _get_first_message(self.mock_pubsub)
+        msgs = self.broker.messages_for(TASK_INTAKE_TOPIC)
+        assert len(msgs) == 1
+        task_data = msgs[0]["data"]
         assertions.assert_valid_henchmen_task(task_data)
         assert task_data["source"] == "jira"
 

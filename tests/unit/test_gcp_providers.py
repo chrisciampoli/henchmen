@@ -122,6 +122,130 @@ class TestFirestoreDocumentStore:
             await store.delete("tasks", "doc-1")
             mock_client.collection.return_value.document.return_value.delete.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_increment_uses_firestore_increment_transform(self, mock_settings):
+        with patch("henchmen.providers.gcp.firestore.firestore") as mock_fs:
+            mock_client = MagicMock()
+            mock_fs.AsyncClient.return_value = mock_client
+
+            # Sentinel objects so we can identify the Increment wrapper.
+            mock_fs.Increment.side_effect = lambda v: ("INCREMENT", v)
+
+            mock_doc_ref = MagicMock()
+            mock_doc_ref.update = AsyncMock()
+            mock_client.collection.return_value.document.return_value = mock_doc_ref
+
+            from henchmen.providers.gcp.firestore import FirestoreDocumentStore
+
+            store = FirestoreDocumentStore(mock_settings)
+            await store.increment("tasks", "doc-1", {"total_input_tokens": 10, "estimated_cost_usd": 0.5})
+
+            mock_doc_ref.update.assert_awaited_once()
+            payload = mock_doc_ref.update.call_args.args[0]
+            assert payload == {
+                "total_input_tokens": ("INCREMENT", 10),
+                "estimated_cost_usd": ("INCREMENT", 0.5),
+            }
+
+    @pytest.mark.asyncio
+    async def test_update_if_success_commits_in_transaction(self, mock_settings):
+        """update_if returns True when the expected value matches under a transaction."""
+        with patch("henchmen.providers.gcp.firestore.firestore") as mock_fs:
+            mock_client = MagicMock()
+            mock_fs.AsyncClient.return_value = mock_client
+
+            mock_doc_ref = MagicMock()
+            mock_client.collection.return_value.document.return_value = mock_doc_ref
+
+            # Snapshot read inside the transaction returns status == "pending"
+            mock_snapshot = MagicMock()
+            mock_snapshot.exists = True
+            mock_snapshot.to_dict.return_value = {"status": "pending"}
+
+            # Emulate the async-transactional decorator used by google-cloud-firestore:
+            # the wrapped function is awaited with a transaction object as the first arg.
+            def async_transactional_decorator(func):
+                async def wrapper(transaction, *args, **kwargs):
+                    return await func(transaction, *args, **kwargs)
+
+                return wrapper
+
+            mock_fs.async_transactional.side_effect = async_transactional_decorator
+            mock_transaction = MagicMock()
+            mock_transaction.update = MagicMock()
+            mock_client.transaction.return_value = mock_transaction
+            mock_doc_ref.get = AsyncMock(return_value=mock_snapshot)
+
+            from henchmen.providers.gcp.firestore import FirestoreDocumentStore
+
+            store = FirestoreDocumentStore(mock_settings)
+            ok = await store.update_if("queue", "e1", "status", "pending", {"status": "merging"})
+            assert ok is True
+            mock_transaction.update.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_update_if_rejects_when_field_mismatch(self, mock_settings):
+        with patch("henchmen.providers.gcp.firestore.firestore") as mock_fs:
+            mock_client = MagicMock()
+            mock_fs.AsyncClient.return_value = mock_client
+
+            mock_doc_ref = MagicMock()
+            mock_client.collection.return_value.document.return_value = mock_doc_ref
+
+            mock_snapshot = MagicMock()
+            mock_snapshot.exists = True
+            mock_snapshot.to_dict.return_value = {"status": "merging"}
+
+            def async_transactional_decorator(func):
+                async def wrapper(transaction, *args, **kwargs):
+                    return await func(transaction, *args, **kwargs)
+
+                return wrapper
+
+            mock_fs.async_transactional.side_effect = async_transactional_decorator
+            mock_transaction = MagicMock()
+            mock_transaction.update = MagicMock()
+            mock_client.transaction.return_value = mock_transaction
+            mock_doc_ref.get = AsyncMock(return_value=mock_snapshot)
+
+            from henchmen.providers.gcp.firestore import FirestoreDocumentStore
+
+            store = FirestoreDocumentStore(mock_settings)
+            ok = await store.update_if("queue", "e1", "status", "pending", {"status": "merged"})
+            assert ok is False
+            mock_transaction.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_if_returns_false_when_doc_missing(self, mock_settings):
+        with patch("henchmen.providers.gcp.firestore.firestore") as mock_fs:
+            mock_client = MagicMock()
+            mock_fs.AsyncClient.return_value = mock_client
+
+            mock_doc_ref = MagicMock()
+            mock_client.collection.return_value.document.return_value = mock_doc_ref
+
+            mock_snapshot = MagicMock()
+            mock_snapshot.exists = False
+            mock_snapshot.to_dict.return_value = None
+
+            def async_transactional_decorator(func):
+                async def wrapper(transaction, *args, **kwargs):
+                    return await func(transaction, *args, **kwargs)
+
+                return wrapper
+
+            mock_fs.async_transactional.side_effect = async_transactional_decorator
+            mock_transaction = MagicMock()
+            mock_transaction.update = MagicMock()
+            mock_client.transaction.return_value = mock_transaction
+            mock_doc_ref.get = AsyncMock(return_value=mock_snapshot)
+
+            from henchmen.providers.gcp.firestore import FirestoreDocumentStore
+
+            store = FirestoreDocumentStore(mock_settings)
+            ok = await store.update_if("queue", "ghost", "status", "pending", {"status": "merging"})
+            assert ok is False
+
 
 class TestGCSObjectStore:
     @pytest.mark.asyncio

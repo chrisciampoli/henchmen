@@ -11,8 +11,8 @@ output "dashboard_id" {
 output "alert_policy_ids" {
   description = "Map of alert policy name to resource name"
   value = {
-    lair_timeout     = google_monitoring_alert_policy.lair_timeout.name
-    dead_letter      = google_monitoring_alert_policy.dead_letter_depth.name
-    ci_failure_rate  = google_monitoring_alert_policy.ci_failure_rate.name
+    lair_timeout    = google_monitoring_alert_policy.lair_timeout.name
+    dead_letter     = google_monitoring_alert_policy.dead_letter_depth.name
+    ci_failure_rate = google_monitoring_alert_policy.ci_failure_rate.name
   }
 }

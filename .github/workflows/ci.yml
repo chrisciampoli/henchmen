@@ -93,3 +93,66 @@ jobs:
           HENCHMEN_GCP_PROJECT_ID: test-project
           HENCHMEN_ENVIRONMENT: dev
         run: pytest tests/integration/ -v --tb=short
+
+  docker-compose-smoke:
+    name: docker-compose smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Create minimal .env.local
+        run: |
+          cat > .env.local <<'EOF'
+          HENCHMEN_PROVIDER=local
+          HENCHMEN_ENVIRONMENT=dev
+          HENCHMEN_GCP_PROJECT_ID=test-project
+          HENCHMEN_LLM_OLLAMA_SKIP_PROBE=1
+          EOF
+
+      # The real `ollama` image is ~2GB and would bloat CI. The compose
+      # file depends on Ollama being healthy, so stub it out with a
+      # tiny HTTP server that returns 200 on any path. This verifies
+      # the rest of the stack can start, wire env vars, and hit its
+      # health endpoints without pulling the full model server.
+      - name: Stub Ollama image (tiny HTTP 200 responder)
+        run: |
+          mkdir -p ci/stub-ollama
+          cat > ci/stub-ollama/Dockerfile <<'EOF'
+          FROM python:3.12-alpine
+          RUN printf 'from http.server import BaseHTTPRequestHandler, HTTPServer\nclass H(BaseHTTPRequestHandler):\n    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"[]")\n    def do_POST(self): self.send_response(200); self.end_headers(); self.wfile.write(b"{}")\n    def log_message(self, *a): pass\nHTTPServer(("0.0.0.0", 11434), H).serve_forever()\n' > /srv.py
+          EXPOSE 11434
+          CMD ["python", "/srv.py"]
+          EOF
+          docker build -t ollama/ollama:0.4.6 ci/stub-ollama
+
+      - name: docker compose up -d
+        run: docker compose up -d --build
+
+      - name: Wait for services to become healthy
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 120))
+          while [ $SECONDS -lt $deadline ]; do
+            state=$(docker compose ps --format '{{.Service}} {{.Status}}')
+            echo "[smoke] $state"
+            if ! echo "$state" | grep -E '(starting|unhealthy)'; then
+              if echo "$state" | grep -q 'healthy'; then
+                echo "[smoke] all services report healthy"
+                exit 0
+              fi
+            fi
+            sleep 5
+          done
+          echo "[smoke] timed out waiting for healthy status"
+          docker compose ps
+          docker compose logs --tail=50
+          exit 1
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --tail=200
+
+      - name: docker compose down
+        if: always()
+        run: docker compose down --volumes --remove-orphans

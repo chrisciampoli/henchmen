@@ -42,21 +42,25 @@ def _remove_aws_modules():
 
 
 def _mock_settings(**overrides):
-    """TODO(R9): replace with the shared ``mock_settings`` fixture from
-    ``tests/conftest.py``. Requires threading ``monkeypatch.setenv`` for
-    all AWS-specific fields used here.
+    """Build a real ``Settings`` instance with AWS-provider overrides.
+
+    Seeds the required ``HENCHMEN_GCP_PROJECT_ID`` env var (AWS fields
+    have sensible defaults on the real Settings class), then applies
+    per-call overrides via ``model_copy``.
     """
-    s = MagicMock()
-    s.aws_region = "us-east-1"
-    s.aws_account_id = "123456789012"
-    s.aws_resource_prefix = "henchmen"
-    s.aws_dynamodb_table = "henchmen"
-    s.aws_ecs_cluster = "henchmen"
-    s.aws_ecs_subnets = "subnet-aaa,subnet-bbb"
-    s.aws_ecs_security_groups = "sg-xxx"
-    for k, v in overrides.items():
-        setattr(s, k, v)
-    return s
+    import os
+
+    from henchmen.config.settings import get_settings
+
+    os.environ.setdefault("HENCHMEN_GCP_PROJECT_ID", "test-project")
+    get_settings.cache_clear()
+    base_overrides = {
+        "aws_account_id": "123456789012",
+        "aws_ecs_subnets": "subnet-aaa,subnet-bbb",
+        "aws_ecs_security_groups": "sg-xxx",
+    }
+    base_overrides.update(overrides)
+    return get_settings().model_copy(update=base_overrides)
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +339,181 @@ class TestDynamoDBDocumentStore:
         results = await store.query("tasks", limit=3)
 
         assert len(results) == 3
+
+    @pytest.mark.asyncio
+    async def test_increment_calls_update_item_with_add_expression(self):
+        mock_table = MagicMock()
+        captured: dict = {}
+
+        def capture_update(**kwargs):
+            captured.update(kwargs)
+            return {}
+
+        mock_table.update_item.side_effect = capture_update
+        store = self._make_store(mock_table)
+        await store.increment("tasks", "t-1", {"tokens": 50, "cost": 0.25})
+
+        assert captured["Key"] == {"pk": "tasks", "sk": "t-1"}
+        # Both fields should appear in the UpdateExpression's ADD clause
+        update_expr = captured["UpdateExpression"]
+        assert update_expr.startswith("ADD ")
+        # ExpressionAttributeNames keeps us safe against reserved words
+        name_map = captured["ExpressionAttributeNames"]
+        value_map = captured["ExpressionAttributeValues"]
+        # Two fields -> two placeholders each
+        assert len(name_map) == 2
+        assert len(value_map) == 2
+        # The value placeholders should contain the numeric deltas
+        assert set(value_map.values()) == {50, 0.25}
+
+    @pytest.mark.asyncio
+    async def test_update_if_calls_update_item_with_condition(self):
+        mock_table = MagicMock()
+        captured: dict = {}
+
+        def capture_update(**kwargs):
+            captured.update(kwargs)
+            return {}
+
+        mock_table.update_item.side_effect = capture_update
+        store = self._make_store(mock_table)
+        ok = await store.update_if("queue", "e1", "status", "pending", {"status": "merging"})
+
+        assert ok is True
+        assert captured["Key"] == {"pk": "queue", "sk": "e1"}
+        # ConditionExpression should reference the expected field
+        cond = captured["ConditionExpression"]
+        assert "status" in cond or "#" in cond
+
+    @pytest.mark.asyncio
+    async def test_update_if_returns_false_on_conditional_check_failed(self):
+        class _ClientError(Exception):
+            def __init__(self):
+                self.response = {"Error": {"Code": "ConditionalCheckFailedException"}}
+
+        # Install the botocore exceptions module so the provider can catch it.
+        mock_botocore_exceptions = MagicMock()
+        mock_botocore_exceptions.ClientError = _ClientError
+        sys.modules["botocore"] = MagicMock()
+        sys.modules["botocore.exceptions"] = mock_botocore_exceptions
+
+        mock_table = MagicMock()
+        mock_table.update_item.side_effect = _ClientError()
+        store = self._make_store(mock_table)
+
+        ok = await store.update_if("queue", "e1", "status", "pending", {"status": "merging"})
+        assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# SQS DLQ pull (backing for SNSMessageBroker.pull_dlq)
+# ---------------------------------------------------------------------------
+
+
+class TestSQSDlqPull:
+    def setup_method(self):
+        _remove_aws_modules()
+        self._boto3 = _install_boto3_stub()
+
+    def teardown_method(self):
+        _remove_aws_modules()
+        sys.modules.pop("boto3", None)
+
+    def _make_broker(self, sqs_mock: MagicMock, sns_mock: MagicMock | None = None):
+        """Build an SNSMessageBroker where boto3.client('sqs') returns sqs_mock."""
+        sns = sns_mock if sns_mock is not None else MagicMock()
+
+        def fake_client(service_name: str, region_name: str | None = None):
+            if service_name == "sns":
+                return sns
+            if service_name == "sqs":
+                return sqs_mock
+            return MagicMock()
+
+        self._boto3.client.side_effect = fake_client
+
+        from henchmen.providers.aws.sns import SNSMessageBroker
+
+        return SNSMessageBroker(_mock_settings())
+
+    @pytest.mark.asyncio
+    async def test_pull_dlq_happy_path_returns_gcp_shape_and_acks(self):
+        sqs_client = MagicMock()
+        sqs_client.get_queue_url.return_value = {
+            "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/henchmen-dev-dead-letter",
+        }
+        sqs_client.receive_message.return_value = {
+            "Messages": [
+                {
+                    "MessageId": "m-1",
+                    "ReceiptHandle": "r-1",
+                    "Body": json.dumps({"task_id": "t-1"}),
+                    "MessageAttributes": {"source": {"StringValue": "cli", "DataType": "String"}},
+                },
+                {
+                    "MessageId": "m-2",
+                    "ReceiptHandle": "r-2",
+                    "Body": json.dumps({"task_id": "t-2"}),
+                    "MessageAttributes": {},
+                },
+                {
+                    "MessageId": "m-3",
+                    "ReceiptHandle": "r-3",
+                    "Body": json.dumps({"task_id": "t-3"}),
+                },
+            ]
+        }
+        sqs_client.delete_message_batch.return_value = {"Successful": [{"Id": "0"}, {"Id": "1"}, {"Id": "2"}]}
+
+        broker = self._make_broker(sqs_client)
+        messages = await broker.pull_dlq("henchmen-dev-dead-letter", max_messages=10)
+
+        assert len(messages) == 3
+        # Shape: {data, message_id, attributes}
+        for msg in messages:
+            assert set(msg.keys()) >= {"data", "message_id", "attributes"}
+        assert messages[0]["message_id"] == "m-1"
+        assert messages[0]["attributes"]["source"] == "cli"
+        # Second message has empty attributes dict, not None
+        assert messages[1]["attributes"] == {}
+        # Delete should be called to ack the batch
+        sqs_client.delete_message_batch.assert_called_once()
+        delete_kwargs = sqs_client.delete_message_batch.call_args.kwargs
+        # All three receipt handles present
+        handles = {entry["ReceiptHandle"] for entry in delete_kwargs["Entries"]}
+        assert handles == {"r-1", "r-2", "r-3"}
+
+    @pytest.mark.asyncio
+    async def test_pull_dlq_empty_queue_returns_empty_list(self):
+        sqs_client = MagicMock()
+        sqs_client.get_queue_url.return_value = {
+            "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/henchmen-dev-dead-letter",
+        }
+        sqs_client.receive_message.return_value = {}  # No 'Messages' key at all
+
+        broker = self._make_broker(sqs_client)
+        messages = await broker.pull_dlq("henchmen-dev-dead-letter", max_messages=10)
+
+        assert messages == []
+        sqs_client.delete_message_batch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pull_dlq_queue_not_found_raises_runtime_error(self):
+        class _QueueMissingError(Exception):
+            def __init__(self):
+                self.response = {"Error": {"Code": "AWS.SimpleQueueService.NonExistentQueue"}}
+
+        mock_botocore_exceptions = MagicMock()
+        mock_botocore_exceptions.ClientError = _QueueMissingError
+        sys.modules["botocore"] = MagicMock()
+        sys.modules["botocore.exceptions"] = mock_botocore_exceptions
+
+        sqs_client = MagicMock()
+        sqs_client.get_queue_url.side_effect = _QueueMissingError()
+
+        broker = self._make_broker(sqs_client)
+        with pytest.raises(RuntimeError, match="does not exist|not found"):
+            await broker.pull_dlq("missing-queue", max_messages=10)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,5 @@
+{
+  "title": "Extract validate_email into its own helper",
+  "description": "order_service.py has an inline email-validation block inside create_order. Extract that logic into a new top-level function called `validate_email(email: str) -> bool` and call it from create_order. Update the existing tests so that create_order's behaviour is unchanged AND add a direct call site for validate_email (the test stub already imports it).",
+  "scheme": "feature_standard"
+}

@@ -100,28 +100,27 @@ def _branching_scheme() -> SchemeGraph:
 
 
 def _mock_settings():
-    """TODO(R9): replace with the shared ``mock_settings`` fixture from
-    ``tests/conftest.py``. This helper uses a ``MagicMock`` rather than the
-    real ``Settings`` class because several tests in this module inject
-    lair / vertex / pubsub fields that would otherwise need to be set via
-    ``monkeypatch.setenv``. Threading the fixture through every test would
-    be a larger refactor than fits in a single R9 session.
+    """Build a real ``Settings`` instance with test-safe defaults.
+
+    The real Settings class already provides sensible defaults for
+    lair/vertex/pubsub fields (see ``Settings.model_post_init`` and the
+    field defaults), so we only need to seed the required
+    ``HENCHMEN_GCP_PROJECT_ID`` env var and disable Vertex AI evaluation
+    so tests don't try to hit the real service.
     """
-    settings = MagicMock()
-    settings.gcp_project_id = "test-project"
-    settings.gcp_region = "us-central1"
-    settings.environment = MagicMock()
-    settings.environment.value = "dev"
-    settings.vertex_ai_model_complex = "gemini-2.5-pro"
-    settings.vertex_ai_model_light = "gemini-2.5-flash"
-    settings.lair_default_cpu = "2"
-    settings.lair_default_memory = "4Gi"
-    settings.lair_default_timeout = 1800
-    settings.pubsub_topic_forge_request = "henchmen-forge-request"
-    settings.gcs_bucket_dossier = ""
-    # Disable Vertex AI evaluation so tests don't try to hit the real service.
-    settings.vertex_ai_evaluation_enabled = False
-    return settings
+    import os
+
+    from henchmen.config.settings import get_settings
+
+    os.environ.setdefault("HENCHMEN_GCP_PROJECT_ID", "test-project")
+    get_settings.cache_clear()
+    return get_settings().model_copy(
+        update={
+            "vertex_ai_evaluation_enabled": False,
+            "lair_default_cpu": "2",
+            "lair_default_memory": "4Gi",
+        }
+    )
 
 
 # ===========================================================================

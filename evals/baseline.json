@@ -1,22 +1,60 @@
 {
-  "version": 1,
-  "last_updated": "2026-04-09",
+  "version": 2,
+  "last_updated": "2026-04-10",
+  "schema": "This file is a STUB. Each provider entry contains a `how_to_populate` field with the exact command to run on your own hardware/account. After running, the harness writes the populated entry back in place. Only update via `henchmen eval --provider <name> --write-baseline` or via .github/workflows/evals.yml — do not hand-edit scores. See evals/README.md for the methodology.",
+  "fixtures": [
+    "bugfix_off_by_one",
+    "bugfix_null_check",
+    "feature_add_logging",
+    "bugfix_import_error",
+    "feature_cli_flag",
+    "refactor_extract_function"
+  ],
   "providers": {
     "openai": {
       "aggregate_score": null,
-      "note": "baseline not yet populated - run `henchmen eval --provider openai --write-baseline`"
+      "fixtures": null,
+      "model_tier": null,
+      "runs": 0,
+      "last_run": null,
+      "how_to_populate": "HENCHMEN_OPENAI_API_KEY=sk-... henchmen eval --provider openai --all --write-baseline",
+      "notes": "Stub — populate via the command above or via the evals.yml workflow_dispatch."
     },
     "anthropic": {
       "aggregate_score": null,
-      "note": "baseline not yet populated - run `henchmen eval --provider anthropic --write-baseline`"
+      "fixtures": null,
+      "model_tier": null,
+      "runs": 0,
+      "last_run": null,
+      "how_to_populate": "HENCHMEN_ANTHROPIC_API_KEY=sk-ant-... henchmen eval --provider anthropic --all --write-baseline",
+      "notes": "Stub — populate via the command above or via the evals.yml workflow_dispatch."
     },
     "vertex": {
       "aggregate_score": null,
-      "note": "baseline not yet populated - run `henchmen eval --provider vertex --write-baseline`"
+      "fixtures": null,
+      "model_tier": null,
+      "runs": 0,
+      "last_run": null,
+      "how_to_populate": "gcloud auth application-default login && HENCHMEN_GCP_PROJECT_ID=my-proj henchmen eval --provider vertex --all --write-baseline",
+      "notes": "Stub — populate via the command above. Requires a GCP project with Vertex AI enabled."
     },
     "ollama": {
       "aggregate_score": null,
-      "note": "baseline not yet populated - run `henchmen eval --provider ollama --write-baseline`"
+      "fixtures": null,
+      "model_tier": null,
+      "runs": 0,
+      "last_run": null,
+      "how_to_populate": "ollama serve & ollama pull qwen2.5-coder:14b && HENCHMEN_LLM_OLLAMA_MODEL=qwen2.5-coder:14b henchmen eval --provider ollama --all --write-baseline",
+      "notes": "Stub — populate via the command above. Requires a local Ollama server with a tool-calling-capable model (qwen2.5-coder:7b+, deepseek-r1:8b+, or llama3.1:8b+)."
+    },
+    "bedrock": {
+      "aggregate_score": null,
+      "fixtures": null,
+      "model_tier": null,
+      "runs": 0,
+      "last_run": null,
+      "how_to_populate": "AWS_PROFILE=henchmen henchmen eval --provider bedrock --all --write-baseline",
+      "notes": "Stub — populate via the command above. Requires AWS credentials with access to Bedrock invoke."
     }
   }
 }

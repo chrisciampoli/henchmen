@@ -29,6 +29,11 @@ def main() -> None:
     build_parser = subparsers.add_parser("build-operative", help="Build the local operative Docker image")
     build_parser.add_argument("--no-cache", action="store_true", help="Build without Docker cache")
 
+    subparsers.add_parser(
+        "doctor",
+        help="Diagnose the local environment (Docker, git, LLM credentials, operative image, ...)",
+    )
+
     eval_parser = subparsers.add_parser("eval", help="Run the offline evaluation harness")
     eval_parser.add_argument(
         "--provider",
@@ -69,6 +74,10 @@ def main() -> None:
         _build_operative(args)
     elif args.command == "eval":
         _eval(args)
+    elif args.command == "doctor":
+        from henchmen.cli import doctor
+
+        sys.exit(doctor.run_doctor_cli())
     else:
         parser.print_help()
         sys.exit(1)

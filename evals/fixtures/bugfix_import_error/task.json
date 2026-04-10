@@ -1,0 +1,5 @@
+{
+  "title": "Fix the ImportError in date_helpers.py",
+  "description": "date_helpers.py uses `timedelta` but never imports it. Add the missing import so the module loads cleanly and the test passes.",
+  "scheme": "bugfix_standard"
+}

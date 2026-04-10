@@ -45,9 +45,14 @@ class OllamaProvider:
     def __init__(self, settings: Settings) -> None:
         self._base_url = getattr(settings, "llm_ollama_base_url", "http://localhost:11434")
         self._default_model = getattr(settings, "llm_ollama_model", "llama3.2")
+        self._skip_probe = bool(getattr(settings, "llm_ollama_skip_probe", False))
         self._client = httpx.AsyncClient(base_url=self._base_url, timeout=300.0)
         # Track which tier flattens we've already warned about to avoid log noise.
         self._warned_tiers: set[str] = set()
+        # C3 capability probe state: None → not probed, "ok" → probed OK,
+        # "skipped" → short-circuited via llm_ollama_skip_probe, "failed"
+        # → the probe detected the model cannot emit tool calls.
+        self._tool_probe_state: str | None = None
 
     def resolve_tier(self, tier: str) -> str:
         """Map any model tier or non-local model name to the configured Ollama model.
@@ -109,6 +114,17 @@ class OllamaProvider:
         system_prompt: str | None = None,
     ) -> LLMResponse:
         """Send a chat completion request to the Ollama API."""
+        # C3: up-front tool-calling capability probe. The very first call
+        # that passes any tools triggers a lightweight canary request to
+        # verify the model can emit tool_calls. A failing probe raises a
+        # clear RuntimeError rather than letting the real operative loop
+        # silently fall back to text-only output.
+        if tools and self._tool_probe_state is None:
+            if self._skip_probe:
+                self._tool_probe_state = "skipped"
+            else:
+                await self._probe_tool_calling(model)
+
         ollama_messages: list[dict[str, Any]] = []
         if system_prompt:
             ollama_messages.append({"role": "system", "content": system_prompt})
@@ -156,6 +172,57 @@ class OllamaProvider:
             model=model,
             finish_reason="tool_use" if tool_calls else "stop",
         )
+
+    async def _probe_tool_calling(self, model: str) -> None:
+        """Issue a canary request with a trivial tool to verify tool-calling support.
+
+        Sets ``self._tool_probe_state`` to ``"ok"`` on success or raises a
+        ``RuntimeError`` with a clear upgrade hint on failure. Called at
+        most once per provider instance, on the first ``generate`` call
+        that passes any tools.
+        """
+        canary_payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Call the probe tool with no arguments."}],
+            "stream": False,
+            "options": {"temperature": 0.0, "num_predict": 64},
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "probe",
+                        "description": "Canary tool for capability detection — call with no arguments.",
+                        "parameters": {"type": "object", "properties": {}, "required": []},
+                    },
+                }
+            ],
+        }
+        try:
+            response = await self._client.post("/api/chat", json=canary_payload)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:  # pragma: no cover — network failure wrapped below
+            self._tool_probe_state = "failed"
+            raise RuntimeError(
+                f"Ollama capability probe failed for model '{model}': {exc}. "
+                "Verify that an Ollama server is running at the configured base URL "
+                "(HENCHMEN_LLM_OLLAMA_BASE_URL). Set HENCHMEN_LLM_OLLAMA_SKIP_PROBE=1 "
+                "to bypass the probe if you're running with mocked providers."
+            ) from exc
+
+        message = data.get("message", {}) or {}
+        if not message.get("tool_calls"):
+            self._tool_probe_state = "failed"
+            raise RuntimeError(
+                f"Ollama model '{model}' does not support native tool calling — "
+                "the capability probe returned no tool_calls. Switch to a "
+                "tool-calling-capable model such as qwen2.5-coder:7b, "
+                "deepseek-r1:8b, or llama3.3. You can override the default model "
+                "via HENCHMEN_LLM_OLLAMA_MODEL. If you're intentionally running "
+                "without real tool calling (e.g. in tests), set "
+                "HENCHMEN_LLM_OLLAMA_SKIP_PROBE=1 to bypass this check."
+            )
+        self._tool_probe_state = "ok"
 
     @staticmethod
     def _convert_tool(tool: ToolDefinition) -> dict[str, Any]:

@@ -1,0 +1,7 @@
+{
+  "must_contain_file_change": ["order_service.py"],
+  "must_fix_tests": true,
+  "expected_substrings_in_changed_code": ["def validate_email"],
+  "test_runner": "pytest",
+  "test_command": ["pytest", "-q", "."]
+}

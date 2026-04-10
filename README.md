@@ -20,6 +20,27 @@ Henchmen receives tasks from **Slack, GitHub, Jira, and CLI**, dispatches AI cod
 
 ---
 
+## Verified today
+
+A real-looking AI agent factory is easy to claim, hard to prove. Here are
+the concrete artifacts you can inspect right now to evaluate Henchmen
+without deploying anything:
+
+- **Green CI** — [![CI](https://github.com/chrisciampoli/henchmen/actions/workflows/ci.yml/badge.svg)](https://github.com/chrisciampoli/henchmen/actions/workflows/ci.yml) All 5 jobs (lint, typecheck, unit, integration, compose smoke) pass on every commit to `main`. 887 tests, 0 skipped.
+- **Expert-panel review** — [`docs/superpowers/reviews/`](docs/superpowers/reviews/) contains the full 8-expert OSS readiness review (82 findings, all closed) that produced this release.
+- **Deploy-on-your-own-GCP walkthrough** — [`docs/deploy-gcp.md`](docs/deploy-gcp.md) is a 30-minute linear walkthrough from `gcloud auth login` to a live stack processing CLI tasks.
+- **Reproducible BYO-LLM parity** — [`evals/baseline.json`](evals/baseline.json) is a structured stub with per-provider populate commands. [`.github/workflows/evals.yml`](.github/workflows/evals.yml) is a `workflow_dispatch` workflow that runs the eval harness against one provider and opens a PR with the updated baseline.
+- **Supply-chain integrity** — all 4 Dockerfiles pin base images to sha256 digests; the [release workflow](.github/workflows/release.yml) builds and publishes release artifacts to GHCR with signed provenance (SLSA L1).
+- **Self-diagnosis** — `henchmen doctor` runs a local self-check (Docker, git, LLM credentials, operative image, Python version) before you spin anything up.
+- **Metrics sample** — [`docs/images/metrics-sample.txt`](docs/images/metrics-sample.txt) shows the Prometheus-format output the observability stack produces when the eval harness runs against three fixtures.
+
+The maintainer has executed the deploy-gcp walkthrough end-to-end
+against a real GCP project. The eval baseline is intentionally left as
+a stub — each contributor runs the harness on their own hardware /
+account and opens a PR with their numbers via the evals workflow.
+
+---
+
 ## Prerequisites
 
 | Requirement | Why |
@@ -127,21 +148,32 @@ graph LR
 
 Henchmen is built on 6 provider interfaces. Swap any layer independently.
 
-| Interface | GCP | AWS | Local | OpenAI | Anthropic |
+| Interface | GCP (supported) | Local (supported) | AWS (experimental) | OpenAI | Anthropic |
 |---|:---:|:---:|:---:|:---:|:---:|
-| **MessageBroker** | Pub/Sub | SNS | in-memory | -- | -- |
-| **DocumentStore** | Firestore | DynamoDB | SQLite | -- | -- |
-| **ObjectStore** | GCS | S3 | filesystem | -- | -- |
-| **ContainerOrchestrator** | Cloud Run Jobs | ECS Fargate | Docker | -- | -- |
-| **LLMProvider** | Vertex AI (Gemini) | Bedrock | Ollama | OpenAI API | Anthropic API |
-| **CIProvider** | Cloud Build | CodeBuild | shell | -- | -- |
+| **MessageBroker** | Pub/Sub | in-memory | SNS + SQS | -- | -- |
+| **DocumentStore** | Firestore | SQLite | DynamoDB | -- | -- |
+| **ObjectStore** | GCS | filesystem | S3 | -- | -- |
+| **ContainerOrchestrator** | Cloud Run Jobs | Docker | ECS Fargate | -- | -- |
+| **LLMProvider** | Vertex AI (Gemini) | Ollama | Bedrock | OpenAI API | Anthropic API |
+| **CIProvider** | Cloud Build | shell | CodeBuild | -- | -- |
+
+**Supported providers** (GCP, Local) have end-to-end walkthroughs, full
+integration coverage, and an exercised release path. See
+[`docs/deploy-gcp.md`](docs/deploy-gcp.md) for the GCP self-host guide.
+
+**Experimental providers** (AWS) ship with unit tests for every
+interface but have not yet been exercised end-to-end by the maintainer.
+They are kept alive for community contributions — if you want to run
+Henchmen on AWS, start a thread in
+[GitHub Discussions](https://github.com/chrisciampoli/henchmen/discussions)
+and the maintainer will pair with you on a first-run walkthrough.
 
 Set your provider:
 
 ```bash
 HENCHMEN_PROVIDER=local    # Local Docker + Ollama (default for dev)
-HENCHMEN_PROVIDER=gcp      # Google Cloud Platform
-HENCHMEN_PROVIDER=aws      # Amazon Web Services
+HENCHMEN_PROVIDER=gcp      # Google Cloud Platform — see docs/deploy-gcp.md
+HENCHMEN_PROVIDER=aws      # AWS (experimental — community supported)
 ```
 
 Override individual services:
@@ -295,9 +327,59 @@ The operative container calls Ollama at `http://host.docker.internal:11434`. Mak
 Add your user to the `docker` group: `sudo usermod -aG docker $USER`, then log out and back in.
 
 **PR was opened but CI steps were skipped**
-Expected in local mode. The `run_tests` handler inside Mastermind is hardcoded for JS/TS monorepos and skips gracefully when the target repo doesn't match. Forge runs real CI on the created PR via the full pipeline; local mode short-circuits this to let you see the PR faster.
+Expected in local mode. Mastermind detects the target repo's stack and runs the appropriate test/lint commands locally, but Forge runs the authoritative CI on the created PR via the full pipeline. Local mode short-circuits this to let you see the PR faster.
 
 See [docs/troubleshooting.md](docs/troubleshooting.md) for the full 15-scenario guide.
+
+---
+
+## Supported Languages
+
+Henchmen detects the target repository's stack at runtime via manifest
+files and runs the appropriate lint / test commands. The following
+stacks are detected and supported out of the box:
+
+| Stack        | Detected by                             | Test command                         | Lint command             |
+|--------------|-----------------------------------------|--------------------------------------|--------------------------|
+| Python       | `pyproject.toml`, `setup.py`, `requirements.txt` | `python -m pytest`          | `python -m ruff check`   |
+| Node (pnpm)  | `pnpm-lock.yaml` (+ `turbo.json` for monorepos) | `pnpm run test`             | `pnpm run lint`          |
+| Node (npm)   | `package.json` (no pnpm lockfile)       | `npm test`                           | `eslint` on changed files |
+| Go           | `go.mod`                                | `go test ./...`                      | `go vet ./...`           |
+| Rust         | `Cargo.toml`                            | `cargo test`                         | `cargo clippy`           |
+| Java (Maven) | `pom.xml`                               | `mvn test`                           | `mvn verify -DskipTests` |
+| Java (Gradle)| `build.gradle` or `build.gradle.kts`    | `./gradlew test`                     | `./gradlew check -x test`|
+
+If your project uses something else, the run_tests handler falls back
+gracefully with a "stack not detected" skip rather than failing. See
+`src/henchmen/utils/stack_detector.py` for the detection logic and add
+a new stack via a pull request.
+
+---
+
+## Reproducibility: verify BYO-LLM parity yourself
+
+Henchmen supports 5 LLM providers (Vertex AI Gemini, AWS Bedrock,
+OpenAI, Anthropic, and Ollama). To measure how close your chosen
+provider gets to the Gemini 2.5 Pro baseline on your own hardware /
+account, run the eval harness:
+
+```bash
+# Run a single fixture against the provider of your choice.
+henchmen eval --provider openai --fixture bugfix_off_by_one
+
+# Run the whole fixture set (3 fixtures by default — add your own in
+# evals/fixtures/).
+henchmen eval --provider ollama --all
+```
+
+Results go to `evals/baseline.json`. A stub file ships in the repo with
+a `"how to populate me"` hint next to every provider entry. If you want
+to publish your numbers, open a PR updating the stub with your results.
+
+The [`.github/workflows/evals.yml`](.github/workflows/evals.yml)
+workflow is `workflow_dispatch`-triggered so you can run it against
+your own GitHub Actions runner with your own secrets — it opens a PR
+updating `evals/baseline.json` for review.
 
 ---
 

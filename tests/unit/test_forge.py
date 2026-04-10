@@ -12,18 +12,14 @@ from henchmen.providers.interfaces.ci_provider import CIResult, CIStatus
 # ---------------------------------------------------------------------------
 
 
-def _mock_settings():
-    """TODO(R9): replace with the shared ``mock_settings`` fixture from
-    ``tests/conftest.py``. Requires updating the ``pubsub_topic_forge_result``
-    assertion below — the real Settings class computes topic names with an
-    environment prefix (``henchmen-dev-forge-result``), whereas this helper
-    returns a raw ``henchmen-forge-result``.
+@pytest.fixture
+def forge_settings(mock_settings):
+    """Project-wide ``mock_settings`` re-exported as ``forge_settings``.
+
+    Kept as a distinct fixture so that test code reads as ``settings = forge_settings``
+    without confusion when someone later adds forge-specific overrides here.
     """
-    s = MagicMock()
-    s.gcp_project_id = "test-project"
-    s.pubsub_topic_forge_result = "henchmen-forge-result"
-    s.firestore_database = "(default)"
-    return s
+    return mock_settings
 
 
 def _mock_broker():
@@ -48,6 +44,9 @@ def _mock_document_store():
     store.update = AsyncMock()
     store.delete = AsyncMock()
     store.query = AsyncMock(return_value=[])
+    # D1/D2: new CAS + atomic increment primitives default to success
+    store.update_if = AsyncMock(return_value=True)
+    store.increment = AsyncMock()
     return store
 
 
@@ -58,10 +57,10 @@ def _mock_document_store():
 
 class TestCIOrchestratorTriggerBuild:
     @pytest.mark.asyncio
-    async def test_trigger_build_calls_ci_provider(self):
+    async def test_trigger_build_calls_ci_provider(self, forge_settings):
         from henchmen.forge.ci_orchestrator import CIOrchestrator
 
-        settings = _mock_settings()
+        settings = forge_settings
         ci_provider = _mock_ci_provider()
         orchestrator = CIOrchestrator(settings, ci_provider=ci_provider)
 
@@ -74,10 +73,10 @@ class TestCIOrchestratorTriggerBuild:
         assert call_kwargs["branch"] == "feature-x"
 
     @pytest.mark.asyncio
-    async def test_trigger_build_includes_pr_branch(self):
+    async def test_trigger_build_includes_pr_branch(self, forge_settings):
         from henchmen.forge.ci_orchestrator import CIOrchestrator
 
-        settings = _mock_settings()
+        settings = forge_settings
         ci_provider = _mock_ci_provider()
         orchestrator = CIOrchestrator(settings, ci_provider=ci_provider)
 
@@ -90,10 +89,10 @@ class TestCIOrchestratorTriggerBuild:
 
 class TestCIOrchestratorPublishResult:
     @pytest.mark.asyncio
-    async def test_publishes_to_correct_topic(self):
+    async def test_publishes_to_correct_topic(self, forge_settings):
         from henchmen.forge.ci_orchestrator import CIOrchestrator
 
-        settings = _mock_settings()
+        settings = forge_settings
         broker = _mock_broker()
         orchestrator = CIOrchestrator(settings, broker=broker)
 
@@ -103,7 +102,8 @@ class TestCIOrchestratorPublishResult:
         broker.publish.assert_called_once()
         call_args = broker.publish.call_args
         topic = call_args.args[0]
-        assert topic == "henchmen-forge-result"
+        # Real Settings class applies the env prefix — dev default
+        assert topic == "henchmen-dev-forge-result"
 
         data_bytes = call_args.args[1]
         published = json.loads(data_bytes.decode("utf-8"))
@@ -111,10 +111,10 @@ class TestCIOrchestratorPublishResult:
         assert published["request_id"] == "req-1"
 
     @pytest.mark.asyncio
-    async def test_publishes_with_request_id_attribute(self):
+    async def test_publishes_with_request_id_attribute(self, forge_settings):
         from henchmen.forge.ci_orchestrator import CIOrchestrator
 
-        settings = _mock_settings()
+        settings = forge_settings
         broker = _mock_broker()
         orchestrator = CIOrchestrator(settings, broker=broker)
 
@@ -124,10 +124,10 @@ class TestCIOrchestratorPublishResult:
         assert call_kwargs.get("request_id") == "req-42"
 
     @pytest.mark.asyncio
-    async def test_run_ci_publishes_result_on_success(self):
+    async def test_run_ci_publishes_result_on_success(self, forge_settings):
         from henchmen.forge.ci_orchestrator import CIOrchestrator
 
-        settings = _mock_settings()
+        settings = forge_settings
         ci_provider = _mock_ci_provider()
         broker = _mock_broker()
         orchestrator = CIOrchestrator(settings, ci_provider=ci_provider, broker=broker)
@@ -139,10 +139,10 @@ class TestCIOrchestratorPublishResult:
         assert result["build_id"] == "build-abc-123"
 
     @pytest.mark.asyncio
-    async def test_run_ci_fails_on_invalid_url(self):
+    async def test_run_ci_fails_on_invalid_url(self, forge_settings):
         from henchmen.forge.ci_orchestrator import CIOrchestrator
 
-        settings = _mock_settings()
+        settings = forge_settings
         broker = _mock_broker()
         orchestrator = CIOrchestrator(settings, broker=broker)
 
@@ -160,10 +160,10 @@ class TestCIOrchestratorPublishResult:
 
 class TestMergeQueueEnqueue:
     @pytest.mark.asyncio
-    async def test_enqueue_writes_to_document_store(self):
+    async def test_enqueue_writes_to_document_store(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = _mock_settings()
+        settings = forge_settings
         store = _mock_document_store()
         queue = MergeQueue(settings, document_store=store)
 
@@ -182,10 +182,10 @@ class TestMergeQueueEnqueue:
         assert written["status"] == "pending"
 
     @pytest.mark.asyncio
-    async def test_enqueue_returns_unique_ids(self):
+    async def test_enqueue_returns_unique_ids(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = _mock_settings()
+        settings = forge_settings
         store = _mock_document_store()
         queue = MergeQueue(settings, document_store=store)
 
@@ -197,10 +197,10 @@ class TestMergeQueueEnqueue:
 
 class TestMergeQueueDequeue:
     @pytest.mark.asyncio
-    async def test_dequeue_returns_none_when_merge_in_progress(self):
+    async def test_dequeue_returns_none_when_merge_in_progress(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = _mock_settings()
+        settings = forge_settings
         store = _mock_document_store()
         queue = MergeQueue(settings, document_store=store)
 
@@ -223,10 +223,10 @@ class TestMergeQueueDequeue:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_dequeue_returns_none_when_queue_empty(self):
+    async def test_dequeue_returns_none_when_queue_empty(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = _mock_settings()
+        settings = forge_settings
         store = _mock_document_store()
         queue = MergeQueue(settings, document_store=store)
 
@@ -238,10 +238,11 @@ class TestMergeQueueDequeue:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_dequeue_claims_pending_entry(self):
+    async def test_dequeue_claims_pending_entry_via_update_if(self, forge_settings):
+        """Happy path: pending entry found, CAS succeeds, entry returned with status=merging."""
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = _mock_settings()
+        settings = forge_settings
         store = _mock_document_store()
         queue = MergeQueue(settings, document_store=store)
 
@@ -257,25 +258,62 @@ class TestMergeQueueDequeue:
 
         # expire stale: empty, merging check: empty, pending check: one result
         store.query = AsyncMock(side_effect=[[], [], [pending_entry]])
+        store.update_if = AsyncMock(return_value=True)
 
         result = await queue.dequeue()
 
         assert result is not None
         assert result["id"] == "e-pending"
         assert result["status"] == "merging"
-        store.update.assert_called_once()
-        update_args = store.update.call_args.args
-        assert update_args[0] == "merge_queue"
-        assert update_args[1] == "e-pending"
-        assert update_args[2]["status"] == "merging"
+
+        # dequeue must use update_if (CAS) — NOT a plain update — so two racing
+        # Forge replicas can't both claim the same entry.
+        store.update_if.assert_called_once()
+        call = store.update_if.call_args
+        # signature: update_if(collection, doc_id, expected_field, expected_value, new_values)
+        assert call.args[0] == "merge_queue"
+        assert call.args[1] == "e-pending"
+        assert call.args[2] == "status"
+        assert call.args[3] == "pending"
+        new_values = call.args[4]
+        assert new_values["status"] == "merging"
+
+    @pytest.mark.asyncio
+    async def test_dequeue_returns_none_when_cas_conflict_loses(self, forge_settings):
+        """Conflict path: another replica claimed the entry first, update_if returns False."""
+        from henchmen.forge.merge_queue import MergeQueue
+
+        settings = forge_settings
+        store = _mock_document_store()
+        queue = MergeQueue(settings, document_store=store)
+
+        pending_entry = {
+            "id": "e-contested",
+            "pr_url": "https://github.com/acme/repo/pull/6",
+            "task_id": "t6",
+            "status": "pending",
+            "created_at": None,
+            "priority": 0,
+            "error": None,
+        }
+        # expire stale: empty, merging check: empty, pending check: one result
+        store.query = AsyncMock(side_effect=[[], [], [pending_entry]])
+        # Another worker won the CAS first — we lose.
+        store.update_if = AsyncMock(return_value=False)
+
+        result = await queue.dequeue()
+
+        assert result is None
+        # No plain update fallback — the CAS must be the only claim attempt.
+        store.update.assert_not_called()
 
 
 class TestMergeQueueMarkMergedAndFailed:
     @pytest.mark.asyncio
-    async def test_mark_merged_updates_status(self):
+    async def test_mark_merged_updates_status(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = _mock_settings()
+        settings = forge_settings
         store = _mock_document_store()
         queue = MergeQueue(settings, document_store=store)
 
@@ -284,10 +322,10 @@ class TestMergeQueueMarkMergedAndFailed:
         store.update.assert_called_once_with("merge_queue", "entry-001", {"status": "merged"})
 
     @pytest.mark.asyncio
-    async def test_mark_failed_updates_status_and_error(self):
+    async def test_mark_failed_updates_status_and_error(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = _mock_settings()
+        settings = forge_settings
         store = _mock_document_store()
         queue = MergeQueue(settings, document_store=store)
 
@@ -300,10 +338,10 @@ class TestMergeQueueMarkMergedAndFailed:
 
 class TestMergeQueueGetQueue:
     @pytest.mark.asyncio
-    async def test_get_queue_length_counts_pending(self):
+    async def test_get_queue_length_counts_pending(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = _mock_settings()
+        settings = forge_settings
         store = _mock_document_store()
         queue = MergeQueue(settings, document_store=store)
 
@@ -320,10 +358,10 @@ class TestMergeQueueGetQueue:
         )
 
     @pytest.mark.asyncio
-    async def test_get_queue_returns_all_entries(self):
+    async def test_get_queue_returns_all_entries(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = _mock_settings()
+        settings = forge_settings
         store = _mock_document_store()
         queue = MergeQueue(settings, document_store=store)
 
@@ -343,10 +381,10 @@ class TestMergeQueueGetQueue:
 
 class TestPRBuilderCreatePR:
     @pytest.mark.asyncio
-    async def test_create_pr_with_correct_labels(self):
+    async def test_create_pr_with_correct_labels(self, forge_settings):
         from henchmen.forge.pr_builder import PRBuilder
 
-        settings = _mock_settings()
+        settings = forge_settings
         builder = PRBuilder(settings)
         builder._get_token = MagicMock(return_value="fake-token")
 
@@ -376,10 +414,10 @@ class TestPRBuilderCreatePR:
         mock_pr.add_to_labels.assert_called_once_with("henchmen-operative")
 
     @pytest.mark.asyncio
-    async def test_create_pr_passes_correct_args(self):
+    async def test_create_pr_passes_correct_args(self, forge_settings):
         from henchmen.forge.pr_builder import PRBuilder
 
-        settings = _mock_settings()
+        settings = forge_settings
         builder = PRBuilder(settings)
         builder._get_token = MagicMock(return_value="fake-token")
 
@@ -413,29 +451,29 @@ class TestPRBuilderCreatePR:
 
 
 class TestPRBuilderBuildBody:
-    def test_build_body_includes_task_id(self):
+    def test_build_body_includes_task_id(self, forge_settings):
         from henchmen.forge.pr_builder import PRBuilder
 
-        settings = _mock_settings()
+        settings = forge_settings
         builder = PRBuilder(settings)
 
         body = builder._build_body("My description", "task-42")
         assert "task-42" in body
         assert "My description" in body
 
-    def test_build_body_includes_henchmen_attribution(self):
+    def test_build_body_includes_henchmen_attribution(self, forge_settings):
         from henchmen.forge.pr_builder import PRBuilder
 
-        settings = _mock_settings()
+        settings = forge_settings
         builder = PRBuilder(settings)
 
         body = builder._build_body("Desc", "task-1")
         assert "Henchmen" in body
 
-    def test_build_body_appends_to_original(self):
+    def test_build_body_appends_to_original(self, forge_settings):
         from henchmen.forge.pr_builder import PRBuilder
 
-        settings = _mock_settings()
+        settings = forge_settings
         builder = PRBuilder(settings)
 
         body = builder._build_body("Original body content", "task-5")

@@ -1,0 +1,5 @@
+{
+  "title": "Add a --verbose flag to the greeter CLI",
+  "description": "The greeter.py script already uses argparse and accepts a --name argument. Add a --verbose/-v flag that, when set, prints the greeting twice. Update the tests so that `test_verbose_prints_greeting_twice` passes.",
+  "scheme": "feature_standard"
+}

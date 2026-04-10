@@ -1,0 +1,7 @@
+{
+  "must_contain_file_change": ["date_helpers.py"],
+  "must_fix_tests": true,
+  "expected_substrings_in_changed_code": ["timedelta"],
+  "test_runner": "pytest",
+  "test_command": ["pytest", "-q", "."]
+}

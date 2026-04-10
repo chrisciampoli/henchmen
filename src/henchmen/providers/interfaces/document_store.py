@@ -37,3 +37,39 @@ class DocumentStore(Protocol):
         Operators: ==, !=, <, <=, >, >=, in, not-in, array-contains.
         """
         ...
+
+    async def increment(
+        self,
+        collection: str,
+        document_id: str,
+        field_deltas: dict[str, int | float],
+    ) -> None:
+        """Atomically add ``delta`` to each field in ``field_deltas``.
+
+        Missing fields or missing documents are treated as zero — the field
+        is created and set to the delta. Intended for counters and cost
+        accumulators where a read-modify-write loop would race under
+        concurrent writers. Providers use native atomic primitives
+        (Firestore ``Increment`` transforms, DynamoDB ``ADD`` update
+        expressions, SQLite per-doc locks).
+        """
+        ...
+
+    async def update_if(
+        self,
+        collection: str,
+        document_id: str,
+        expected_field: str,
+        expected_value: Any,
+        new_values: dict[str, Any],
+    ) -> bool:
+        """Conditionally update ``new_values`` if ``expected_field`` equals ``expected_value``.
+
+        Returns ``True`` on a successful compare-and-swap, ``False`` if the
+        precondition failed or the document does not exist. Intended for
+        single-writer claim operations (e.g. FIFO merge queue dequeue)
+        where two replicas may otherwise race and both claim the same
+        entry. Providers use native primitives (Firestore transactions,
+        DynamoDB ``ConditionExpression``, SQLite per-doc locks).
+        """
+        ...

@@ -33,7 +33,7 @@ resource "google_cloud_run_v2_service" "mastermind" {
   project  = var.project_id
 
   template {
-    timeout = "3600s"
+    timeout         = "3600s"
     service_account = var.service_account_emails["mastermind"]
 
     vpc_access {
@@ -54,11 +54,21 @@ resource "google_cloud_run_v2_service" "mastermind" {
 
       env {
         name = "SLACK_BOT_TOKEN"
-        value_source { secret_key_ref { secret = "henchmen-${var.environment}-slack-bot-token"; version = "latest" } }
+        value_source {
+          secret_key_ref {
+            secret  = "henchmen-${var.environment}-slack-bot-token"
+            version = "latest"
+          }
+        }
       }
       env {
         name = "GITHUB_TOKEN"
-        value_source { secret_key_ref { secret = "henchmen-${var.environment}-github-token"; version = "latest" } }
+        value_source {
+          secret_key_ref {
+            secret  = "henchmen-${var.environment}-github-token"
+            version = "latest"
+          }
+        }
       }
       # PINECONE_API_KEY removed — migrated to Vector Search 2.0 (GCP-native auth)
 
@@ -154,15 +164,30 @@ resource "google_cloud_run_v2_service" "dispatch" {
 
       env {
         name = "SLACK_BOT_TOKEN"
-        value_source { secret_key_ref { secret = "henchmen-${var.environment}-slack-bot-token"; version = "latest" } }
+        value_source {
+          secret_key_ref {
+            secret  = "henchmen-${var.environment}-slack-bot-token"
+            version = "latest"
+          }
+        }
       }
       env {
         name = "SLACK_SIGNING_SECRET"
-        value_source { secret_key_ref { secret = "henchmen-${var.environment}-slack-signing-secret"; version = "latest" } }
+        value_source {
+          secret_key_ref {
+            secret  = "henchmen-${var.environment}-slack-signing-secret"
+            version = "latest"
+          }
+        }
       }
       env {
         name = "SLACK_APP_TOKEN"
-        value_source { secret_key_ref { secret = "henchmen-${var.environment}-slack-app-token"; version = "latest" } }
+        value_source {
+          secret_key_ref {
+            secret  = "henchmen-${var.environment}-slack-app-token"
+            version = "latest"
+          }
+        }
       }
 
       resources {
@@ -212,7 +237,12 @@ resource "google_cloud_run_v2_service" "forge" {
 
       env {
         name = "GITHUB_TOKEN"
-        value_source { secret_key_ref { secret = "henchmen-${var.environment}-github-token"; version = "latest" } }
+        value_source {
+          secret_key_ref {
+            secret  = "henchmen-${var.environment}-github-token"
+            version = "latest"
+          }
+        }
       }
 
       resources {

@@ -15,18 +15,25 @@ from henchmen.providers.interfaces.container_orchestrator import JobStatus
 
 
 def _mock_settings(**overrides):
-    """TODO(R9): replace with the shared ``mock_settings`` fixture from
-    ``tests/conftest.py``. Needs plumbing via ``monkeypatch.setenv`` for the
-    Ollama-specific fields.
+    """Build a real ``Settings`` instance with test-safe defaults.
+
+    Seeds ``os.environ`` for the ``HENCHMEN_GCP_PROJECT_ID`` required
+    field (Ollama fields already have sensible defaults on the real
+    Settings class) and applies per-call overrides via Pydantic
+    ``model_copy``. The autouse ``_isolate_settings`` fixture clears
+    ``get_settings`` between tests so each call rebuilds a fresh
+    instance.
     """
-    s = MagicMock()
-    s.environment = MagicMock()
-    s.environment.value = "dev"
-    s.llm_ollama_base_url = "http://localhost:11434"
-    s.llm_ollama_model = "llama3.2"
-    for k, v in overrides.items():
-        setattr(s, k, v)
-    return s
+    import os
+
+    from henchmen.config.settings import get_settings
+
+    os.environ.setdefault("HENCHMEN_GCP_PROJECT_ID", "test-project")
+    get_settings.cache_clear()
+    settings = get_settings()
+    if overrides:
+        settings = settings.model_copy(update=overrides)
+    return settings
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +252,108 @@ class TestSQLiteDocumentStore:
         doc = await store.get("tasks", "t-1")
         assert doc is not None
         assert doc["status"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_increment_creates_field_when_missing(self, tmp_path):
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "test.db"))
+        await store.set("tasks", "t-1", {"status": "pending"})
+        await store.increment("tasks", "t-1", {"counter": 3})
+        doc = await store.get("tasks", "t-1")
+        assert doc is not None
+        assert doc["counter"] == 3
+        assert doc["status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_increment_adds_to_existing_value(self, tmp_path):
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "test.db"))
+        await store.set("tasks", "t-1", {"tokens": 100, "cost": 1.5})
+        await store.increment("tasks", "t-1", {"tokens": 50, "cost": 0.25})
+        doc = await store.get("tasks", "t-1")
+        assert doc is not None
+        assert doc["tokens"] == 150
+        assert doc["cost"] == pytest.approx(1.75)
+
+    @pytest.mark.asyncio
+    async def test_increment_creates_document_when_missing(self, tmp_path):
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "test.db"))
+        await store.increment("tasks", "fresh", {"n": 5})
+        doc = await store.get("tasks", "fresh")
+        assert doc is not None
+        assert doc["n"] == 5
+
+    @pytest.mark.asyncio
+    async def test_increment_concurrent_updates_are_serialized(self, tmp_path):
+        import asyncio
+
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "test.db"))
+        await store.set("tasks", "t-1", {"counter": 0})
+
+        # Fire 20 concurrent +1 increments; the per-doc lock must serialize them.
+        await asyncio.gather(*[store.increment("tasks", "t-1", {"counter": 1}) for _ in range(20)])
+
+        doc = await store.get("tasks", "t-1")
+        assert doc is not None
+        assert doc["counter"] == 20
+
+    @pytest.mark.asyncio
+    async def test_update_if_matches_precondition(self, tmp_path):
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "test.db"))
+        await store.set("queue", "e1", {"status": "pending", "owner": None})
+        ok = await store.update_if("queue", "e1", "status", "pending", {"status": "merging", "owner": "worker-1"})
+        assert ok is True
+        doc = await store.get("queue", "e1")
+        assert doc is not None
+        assert doc["status"] == "merging"
+        assert doc["owner"] == "worker-1"
+
+    @pytest.mark.asyncio
+    async def test_update_if_rejects_wrong_expected_value(self, tmp_path):
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "test.db"))
+        await store.set("queue", "e1", {"status": "merging"})
+        ok = await store.update_if("queue", "e1", "status", "pending", {"status": "merged"})
+        assert ok is False
+        doc = await store.get("queue", "e1")
+        assert doc is not None
+        assert doc["status"] == "merging"
+
+    @pytest.mark.asyncio
+    async def test_update_if_returns_false_when_missing(self, tmp_path):
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "test.db"))
+        ok = await store.update_if("queue", "ghost", "status", "pending", {"status": "merging"})
+        assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_update_if_concurrent_only_one_wins(self, tmp_path):
+        import asyncio
+
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "test.db"))
+        await store.set("queue", "e1", {"status": "pending"})
+
+        results = await asyncio.gather(
+            *[
+                store.update_if("queue", "e1", "status", "pending", {"status": "merging", "claimed_by": f"w-{i}"})
+                for i in range(10)
+            ]
+        )
+        # Exactly one caller must win the CAS; the rest must see the precondition fail.
+        assert sum(1 for r in results if r is True) == 1
+        assert sum(1 for r in results if r is False) == 9
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +607,205 @@ class TestOllamaProvider:
             )
 
         assert captured_payload["messages"][0] == {"role": "system", "content": "You are helpful."}
+
+
+class TestOllamaCapabilityProbe:
+    """C3: up-front tool-calling capability probe.
+
+    The first time ``generate`` is called with a non-empty ``tools``
+    argument, the provider issues a trivial canary call. If the model
+    does not return a ``tool_calls`` field, the provider raises a
+    clear error identifying the model instead of silently flattening
+    to text-only output halfway through a real operative run.
+
+    ``HENCHMEN_OLLAMA_SKIP_PROBE=1`` short-circuits the probe so
+    CI / test doubles with mocked httpx don't get blocked.
+    """
+
+    def _make_provider(self, **settings_overrides):
+        from henchmen.providers.local.ollama import OllamaProvider
+
+        settings = _mock_settings(**settings_overrides)
+        return OllamaProvider(settings)
+
+    @pytest.mark.asyncio
+    async def test_probe_runs_once_and_succeeds_when_model_returns_tool_calls(self):
+        """A capable model returns tool_calls on the canary — probe is recorded as OK."""
+        from henchmen.models.llm import Message, MessageRole, ToolDefinition, ToolParameter
+
+        provider = self._make_provider()
+
+        # Every real httpx post() returns a response with non-empty tool_calls.
+        async def mock_post(path, json=None):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "probe", "arguments": {}}}],
+                },
+                "prompt_eval_count": 1,
+                "eval_count": 1,
+            }
+            return resp
+
+        probe_tool = ToolDefinition(
+            name="probe",
+            description="canary",
+            parameters=[ToolParameter(name="x", type="string", description="x", required=False)],
+        )
+
+        with patch.object(provider._client, "post", side_effect=mock_post):
+            result = await provider.generate(
+                messages=[Message(role=MessageRole.USER, content="Hi")],
+                model="llama3.2",
+                tools=[probe_tool],
+            )
+
+        assert len(result.tool_calls) == 1
+        # Probe state flag is set so future calls don't re-probe.
+        assert provider._tool_probe_state == "ok"
+
+    @pytest.mark.asyncio
+    async def test_probe_raises_when_model_lacks_tool_calling(self):
+        """A model that returns no tool_calls on the canary raises a RuntimeError."""
+        from henchmen.models.llm import Message, MessageRole, ToolDefinition, ToolParameter
+
+        provider = self._make_provider()
+
+        async def mock_post(path, json=None):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {
+                "message": {"role": "assistant", "content": "I cannot call tools", "tool_calls": []},
+                "prompt_eval_count": 1,
+                "eval_count": 4,
+            }
+            return resp
+
+        probe_tool = ToolDefinition(
+            name="probe",
+            description="canary",
+            parameters=[ToolParameter(name="x", type="string", description="x", required=False)],
+        )
+
+        with (
+            patch.object(provider._client, "post", side_effect=mock_post),
+            pytest.raises(RuntimeError, match="does not support native tool calling"),
+        ):
+            await provider.generate(
+                messages=[Message(role=MessageRole.USER, content="Hi")],
+                model="llama3.2",
+                tools=[probe_tool],
+            )
+
+    @pytest.mark.asyncio
+    async def test_probe_skipped_when_setting_is_true(self):
+        """HENCHMEN_OLLAMA_SKIP_PROBE=True short-circuits the probe."""
+        from henchmen.models.llm import Message, MessageRole, ToolDefinition, ToolParameter
+
+        provider = self._make_provider(llm_ollama_skip_probe=True)
+
+        async def mock_post(path, json=None):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {
+                "message": {"role": "assistant", "content": "", "tool_calls": []},
+                "prompt_eval_count": 1,
+                "eval_count": 1,
+            }
+            return resp
+
+        probe_tool = ToolDefinition(
+            name="probe",
+            description="canary",
+            parameters=[ToolParameter(name="x", type="string", description="x", required=False)],
+        )
+
+        with patch.object(provider._client, "post", side_effect=mock_post):
+            # Should NOT raise — probe is skipped.
+            result = await provider.generate(
+                messages=[Message(role=MessageRole.USER, content="Hi")],
+                model="llama3.2",
+                tools=[probe_tool],
+            )
+
+        assert result.tool_calls == []
+        assert provider._tool_probe_state == "skipped"
+
+    @pytest.mark.asyncio
+    async def test_probe_not_repeated_on_second_generate_call(self):
+        """After the first successful probe, subsequent calls do NOT re-probe."""
+        from henchmen.models.llm import Message, MessageRole, ToolDefinition, ToolParameter
+
+        provider = self._make_provider()
+
+        call_count = {"n": 0}
+
+        async def mock_post(path, json=None):
+            call_count["n"] += 1
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "probe", "arguments": {}}}],
+                },
+                "prompt_eval_count": 1,
+                "eval_count": 1,
+            }
+            return resp
+
+        probe_tool = ToolDefinition(
+            name="probe",
+            description="canary",
+            parameters=[ToolParameter(name="x", type="string", description="x", required=False)],
+        )
+
+        with patch.object(provider._client, "post", side_effect=mock_post):
+            await provider.generate(
+                messages=[Message(role=MessageRole.USER, content="First")],
+                model="llama3.2",
+                tools=[probe_tool],
+            )
+            await provider.generate(
+                messages=[Message(role=MessageRole.USER, content="Second")],
+                model="llama3.2",
+                tools=[probe_tool],
+            )
+
+        # First generate: 1 probe + 1 real = 2 calls. Second generate:
+        # 0 probes + 1 real = 1 call. Total = 3.
+        assert call_count["n"] == 3
+
+    @pytest.mark.asyncio
+    async def test_probe_not_triggered_without_tools(self):
+        """Calls that pass no tools never trigger the probe."""
+        from henchmen.models.llm import Message, MessageRole
+
+        provider = self._make_provider()
+
+        async def mock_post(path, json=None):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {
+                "message": {"role": "assistant", "content": "hi", "tool_calls": []},
+                "prompt_eval_count": 1,
+                "eval_count": 1,
+            }
+            return resp
+
+        with patch.object(provider._client, "post", side_effect=mock_post):
+            await provider.generate(
+                messages=[Message(role=MessageRole.USER, content="Hi")],
+                model="llama3.2",
+                tools=None,
+            )
+
+        # No probe triggered — state stays as the initial None.
+        assert provider._tool_probe_state is None
 
 
 # ---------------------------------------------------------------------------

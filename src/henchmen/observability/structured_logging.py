@@ -4,6 +4,17 @@ Emits JSON-structured log entries compatible with Cloud Logging's structured
 payload format.  When running on Cloud Run, these are automatically ingested
 and can drive log-based metrics and alerting policies in Cloud Monitoring.
 
+.. note::
+   This module intentionally uses ``print(..., file=sys.stdout, flush=True)``
+   rather than the ``logging`` module. Cloud Logging parses JSON directly
+   from stdout lines emitted by Cloud Run containers; routing through
+   ``logging`` would either wrap the JSON in Python's default formatter
+   (breaking the structured payload) or require disabling the root
+   logger's handlers, which has its own side-effects for third-party
+   libraries. Keeping a single raw ``print`` here is the minimum-impact
+   way to preserve the structured payload contract. Do not replace this
+   with ``logger.info(...)`` — it will break metrics ingestion.
+
 Usage:
     from henchmen.observability.structured_logging import emit_metric
 
