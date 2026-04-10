@@ -1,0 +1,15 @@
+title = "Henchmen gitleaks config"
+
+[allowlist]
+description = "Test fixtures and example values"
+paths = [
+    '''tests/''',
+    '''\.env\.example$''',
+    '''evals/''',
+]
+regexTarget = "line"
+regexes = [
+    '''test-project''',
+    '''local-dev''',
+    '''fake-.*-key''',
+]

@@ -8,9 +8,12 @@ google-cloud-storage>=2.18.2
 google-cloud-run>=0.10.12
 google-cloud-secret-manager>=2.21.1
 google-cloud-logging>=3.11.3
-google-cloud-aiplatform
-vertexai
-google-adk
+# google-cloud-aiplatform / vertexai / google-adk version-lock each other
+# internally with == pins. Floor + major-ceiling lets Dependabot upgrade
+# within the 1.x line. See commits ddf1daa..08ed41e for history.
+google-cloud-aiplatform>=1.88.0,<2
+vertexai>=1.88.0,<2
+google-adk>=1.87.0,<2
 mcp>=1.0.0
 httpx>=0.27.2
 PyGithub>=2.4.0

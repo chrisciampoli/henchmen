@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     )
 
     # GCP core
-    gcp_project_id: str = Field(..., description="GCP project ID")
+    gcp_project_id: str = Field(default="", description="GCP project ID (required for provider=gcp)")
     gcp_region: str = Field(default="us-central1", description="GCP region")
     environment: Environment = Field(default=Environment.DEV, description="Deployment environment")
 
@@ -49,7 +49,14 @@ class Settings(BaseSettings):
     pubsub_topic_ci_failure: str = Field(default="")
 
     def model_post_init(self, __context: object) -> None:
-        """Set environment-prefixed defaults for Pub/Sub topics."""
+        """Set environment-prefixed defaults for Pub/Sub topics and validate provider requirements."""
+        if self.provider == "gcp" and not self.gcp_project_id:
+            msg = (
+                "HENCHMEN_GCP_PROJECT_ID is required when HENCHMEN_PROVIDER=gcp. "
+                "Set it in your .env.local or environment."
+            )
+            raise ValueError(msg)
+
         env = self.environment.value
         defaults = {
             "pubsub_topic_task_intake": f"henchmen-{env}-task-intake",
@@ -234,4 +241,4 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     """Return the cached application Settings singleton."""
-    return Settings()  # type: ignore[call-arg]  # pydantic-settings fills from env vars
+    return Settings()

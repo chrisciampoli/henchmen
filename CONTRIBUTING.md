@@ -15,7 +15,13 @@ Thank you for your interest in contributing. This guide covers everything you ne
    pip install -e ".[dev]"
    ```
 
-3. Verify the setup:
+3. (Optional) Install pre-commit hooks for secret scanning and auto-formatting:
+   ```bash
+   pip install pre-commit
+   pre-commit install
+   ```
+
+4. Verify the setup:
    ```bash
    pytest tests/unit/ -q
    ```

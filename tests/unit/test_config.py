@@ -40,10 +40,11 @@ class TestSettingsEnvPrefix:
         assert settings.gcp_region == "europe-west1"
         assert settings.environment == Environment.STAGING
 
-    def test_gcp_project_id_is_required(self, monkeypatch: pytest.MonkeyPatch):
+    def test_gcp_project_id_required_when_provider_is_gcp(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "gcp")
         monkeypatch.delenv("HENCHMEN_GCP_PROJECT_ID", raising=False)
 
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError, match="HENCHMEN_GCP_PROJECT_ID is required"):
             Settings()
 
     def test_case_insensitive_env_prefix(self, monkeypatch: pytest.MonkeyPatch):
@@ -212,6 +213,32 @@ class TestGetSettingsSingleton:
         s2 = get_settings()
         # After cache_clear, a new instance is created
         assert s1 is not s2
+
+
+# ---------------------------------------------------------------------------
+# Extra fields are ignored (SettingsConfigDict extra="ignore")
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Local-mode portability (gcp_project_id optional when provider != gcp)
+# ---------------------------------------------------------------------------
+
+
+class TestSettingsLocalMode:
+    def test_local_mode_no_gcp_project(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        monkeypatch.delenv("HENCHMEN_GCP_PROJECT_ID", raising=False)
+
+        s = Settings()
+        assert s.gcp_project_id == ""
+
+    def test_gcp_mode_requires_gcp_project(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "gcp")
+        monkeypatch.delenv("HENCHMEN_GCP_PROJECT_ID", raising=False)
+
+        with pytest.raises(ValueError, match="HENCHMEN_GCP_PROJECT_ID is required"):
+            Settings()
 
 
 # ---------------------------------------------------------------------------

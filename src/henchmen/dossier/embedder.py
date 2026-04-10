@@ -5,6 +5,10 @@ Pre-chunks code with our AST-aware chunker, then uploads each chunk as a
 separate RAG file to preserve symbol boundaries.
 
 Commit tracking metadata is stored via DocumentStore.
+
+NOTE: This module is tightly coupled to Vertex AI RAG Engine. Abstracting
+behind a generic RAG provider interface is tracked as a roadmap item.
+See https://github.com/chrisciampoli/henchmen/issues — search "RAG provider".
 """
 
 from __future__ import annotations
@@ -59,7 +63,7 @@ def chunk_record_id(repo: str, file_path: str, start_line: int, end_line: int) -
 
 def _init_vertex(project_id: str, region: str) -> None:
     """Initialize Vertex AI SDK."""
-    import vertexai  # TODO: Abstract RAG provider
+    import vertexai
 
     vertexai.init(project=project_id, location=region)
 
@@ -82,7 +86,7 @@ async def get_or_create_corpus(
         return ""
 
     def _do() -> str:
-        from vertexai import rag  # TODO: Abstract RAG provider
+        from vertexai import rag
 
         _init_vertex(project_id, region)
 
@@ -155,7 +159,7 @@ async def upsert_chunks(
         )
 
     def _upload_batch(batch: list[CodeChunk]) -> int:
-        from vertexai import rag  # TODO: Abstract RAG provider
+        from vertexai import rag
 
         _init_vertex(project_id, region)
         uploaded = 0
@@ -181,7 +185,7 @@ async def upsert_chunks(
                 tmp.write(content)
                 tmp_path = tmp.name
             try:
-                rag.upload_file(  # TODO: Abstract RAG provider
+                rag.upload_file(
                     corpus_name=corpus_name,
                     path=tmp_path,
                     display_name=display_name,
@@ -264,7 +268,7 @@ async def delete_file_chunks(
     file_path_set = set(file_paths)
 
     def _delete() -> int:
-        from vertexai import rag  # TODO: Abstract RAG provider
+        from vertexai import rag
 
         _init_vertex(project_id, region)
         deleted = 0
@@ -276,7 +280,7 @@ async def delete_file_chunks(
                 file_path = parts[2]
                 if file_repo == repo and file_path in file_path_set:
                     try:
-                        rag.delete_file(name=rag_file.name)  # TODO: Abstract RAG provider
+                        rag.delete_file(name=rag_file.name)
                         deleted += 1
                     except Exception as exc:
                         logger.warning("Failed to delete RAG file %s: %s", rag_file.name, exc)
@@ -328,11 +332,11 @@ async def query_similar_chunks(
             return []
 
     def _query() -> list[SemanticChunk]:
-        from vertexai import rag  # TODO: Abstract RAG provider
+        from vertexai import rag
 
         _init_vertex(project_id, region)
 
-        response = rag.retrieval_query(  # TODO: Abstract RAG provider
+        response = rag.retrieval_query(
             text=query_text,
             rag_resources=[rag.RagResource(rag_corpus=corpus_name)],
             rag_retrieval_config=rag.RagRetrievalConfig(top_k=top_k),
