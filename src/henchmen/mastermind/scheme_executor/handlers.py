@@ -9,6 +9,7 @@ The ``executor`` parameter provides access to settings, node_results, etc.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import shutil
@@ -429,48 +430,46 @@ async def _run_lint_check(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-        else:
-            return await asyncio.create_subprocess_exec(
-                "pnpm",
-                "run",
-                "lint",
-                cwd=workspace,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-    else:
-        # Single-package: lint only changed files
-        changed_proc = await asyncio.create_subprocess_exec(
-            "git",
-            "diff",
-            "--name-only",
-            "origin/main",
-            "--diff-filter=ACMR",
-            "--",
-            "*.ts",
-            "*.tsx",
-            "*.js",
-            "*.jsx",
-            "*.py",
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        changed_out, _ = await changed_proc.communicate()
-        changed_files = [f.strip() for f in changed_out.decode().strip().split("\n") if f.strip()]
-
-        if not changed_files:
-            return None
-
         return await asyncio.create_subprocess_exec(
-            "npx",
-            "eslint",
-            *changed_files,
-            "--max-warnings=0",
+            "pnpm",
+            "run",
+            "lint",
             cwd=workspace,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+    # Single-package: lint only changed files
+    changed_proc = await asyncio.create_subprocess_exec(
+        "git",
+        "diff",
+        "--name-only",
+        "origin/main",
+        "--diff-filter=ACMR",
+        "--",
+        "*.ts",
+        "*.tsx",
+        "*.js",
+        "*.jsx",
+        "*.py",
+        cwd=workspace,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    changed_out, _ = await changed_proc.communicate()
+    changed_files = [f.strip() for f in changed_out.decode().strip().split("\n") if f.strip()]
+
+    if not changed_files:
+        return None
+
+    return await asyncio.create_subprocess_exec(
+        "npx",
+        "eslint",
+        *changed_files,
+        "--max-warnings=0",
+        cwd=workspace,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -640,11 +639,9 @@ async def handle_create_pr(
             base=task.context.branch or "main",
         )
 
-        # Add label
-        try:
+        # Add label (may not exist yet)
+        with contextlib.suppress(Exception):
             pr.add_to_labels("henchmen-operative")
-        except Exception:
-            pass  # Label may not exist yet
 
         pr_url = pr.html_url
         logger.info("[CREATE_PR] PR created: %s", pr_url)

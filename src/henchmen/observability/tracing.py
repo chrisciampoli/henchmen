@@ -21,6 +21,7 @@ Usage:
     extract_trace_context(attrs)    # Restore on receive
 """
 
+import contextlib
 import logging
 from typing import Any
 
@@ -138,10 +139,8 @@ def shutdown_tracing() -> None:
     """Flush and shut down the tracer provider."""
     global _tracer_provider
     if _tracer_provider is not None:
-        try:
+        with contextlib.suppress(Exception):
             _tracer_provider.shutdown()
-        except Exception:
-            pass
         _tracer_provider = None
 
 

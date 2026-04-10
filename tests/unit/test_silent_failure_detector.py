@@ -69,16 +69,7 @@ class TestSilentFailureDetector:
 
     def test_noop_change_detected_when_added_equals_removed(self):
         """A diff that only reorders identical lines is flagged as a noop."""
-        diff = (
-            "diff --git a/foo.py b/foo.py\n"
-            "--- a/foo.py\n"
-            "+++ b/foo.py\n"
-            "@@\n"
-            "-line_a\n"
-            "-line_b\n"
-            "+line_b\n"
-            "+line_a\n"
-        )
+        diff = "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n@@\n-line_a\n-line_b\n+line_b\n+line_a\n"
         detector = SilentFailureDetector()
         findings = detector.scan_diff(diff)
 

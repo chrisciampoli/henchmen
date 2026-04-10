@@ -152,10 +152,7 @@ def should_skip_file(rel_path: str, file_size: int = 0) -> bool:
         return True
 
     # Check allowed extensions (reject if not in the allow-list)
-    if ext not in ALLOWED_EXTENSIONS:
-        return True
-
-    return False
+    return ext not in ALLOWED_EXTENSIONS
 
 
 # ---------------------------------------------------------------------------
@@ -379,10 +376,9 @@ def chunk_file(file_path: str, content: str) -> list[CodeChunk]:
 
     if ext == ".py":
         return _chunk_python(file_path, content)
-    elif ext in {".ts", ".tsx", ".js", ".jsx"}:
+    if ext in {".ts", ".tsx", ".js", ".jsx"}:
         return _chunk_typescript(file_path, content)
-    else:
-        return _chunk_fixed_size(file_path, content)
+    return _chunk_fixed_size(file_path, content)
 
 
 def chunk_files(files: dict[str, str]) -> list[CodeChunk]:

@@ -124,10 +124,8 @@ async def git_commit(message: str, files: list[str] | str | None = None, working
     if isinstance(files, str):
         try:
             parsed = _json.loads(files)
-            if isinstance(parsed, list):
-                file_list = [str(f) for f in parsed]
-            else:
-                file_list = [files]  # Single filename as string
+            # Single filename as string, or list of names already.
+            file_list = [str(f) for f in parsed] if isinstance(parsed, list) else [files]
         except _json.JSONDecodeError:
             # Space-separated or single file
             file_list = files.split() if " " in files else [files]
@@ -214,7 +212,7 @@ async def git_force_push(branch: str | None = None, working_dir: str = "") -> di
             ),
             "success": False,
         }
-    if _branch_is_protected(branch):
+    if _branch_is_protected(branch) or branch is None:
         return {
             "error": (
                 f"refusing to force-push to protected branch '{branch or 'HEAD'}'. "
@@ -227,8 +225,7 @@ async def git_force_push(branch: str | None = None, working_dir: str = "") -> di
     except PermissionError as exc:
         return {"error": f"access denied: {exc}", "success": False}
     # Use --force-with-lease to avoid clobbering concurrent pushes.
-    args = ["push", "--force-with-lease", "origin", branch]
-    return await _run_git(*args, working_dir=safe_working_dir)
+    return await _run_git("push", "--force-with-lease", "origin", branch, working_dir=safe_working_dir)
 
 
 @tool(

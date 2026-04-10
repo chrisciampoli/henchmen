@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -30,10 +31,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     def _sigterm_handler() -> None:
         logger.info("[forge] SIGTERM received, initiating graceful shutdown")
 
-    try:
+    # Windows does not support add_signal_handler.
+    with contextlib.suppress(NotImplementedError):
         loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)
-    except NotImplementedError:
-        pass  # Windows doesn't support add_signal_handler
 
     from henchmen.observability.tracing import init_tracing, instrument_fastapi, shutdown_tracing
     from henchmen.providers.registry import ProviderRegistry
@@ -133,7 +133,8 @@ async def _publish_ci_failure(pr_url: str, task_id: str, request_id: str, reason
         "status": "failed",
         "reason": reason,
     }
-    await broker.publish("forge-result", payload, attributes={"request_id": request_id})
+    data = json.dumps(payload).encode("utf-8")
+    await broker.publish("forge-result", data, request_id=request_id)
 
 
 async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:

@@ -71,7 +71,7 @@ class SchemeGraph:
         # Cycles involving at least one conditional edge are "controlled loops" (e.g. verify→implement
         # retry loops) and are allowed. The SchemeExecutor's retry limit prevents infinite execution.
         white, gray, black = 0, 1, 2
-        color: dict[str, int] = {nid: white for nid in self._node_map}
+        color: dict[str, int] = dict.fromkeys(self._node_map, white)
 
         def dfs_has_unconditional_cycle(node_id: str) -> bool:
             color[node_id] = gray
@@ -88,10 +88,9 @@ class SchemeGraph:
             return False
 
         for node_id in self._node_map:
-            if color[node_id] == white:
-                if dfs_has_unconditional_cycle(node_id):
-                    errors.append("Cycle detected in scheme graph")
-                    break
+            if color[node_id] == white and dfs_has_unconditional_cycle(node_id):
+                errors.append("Cycle detected in scheme graph")
+                break
 
         # Check all nodes are reachable from the root (only if exactly one root)
         if len(root_nodes) == 1:

@@ -7,13 +7,14 @@ endpoints invoked by Cloud Scheduler.
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import re
 import signal
 import traceback
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -116,11 +117,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("[mastermind] SIGTERM received, initiating graceful shutdown")
         _shutdown_event.set()
 
-    try:
+    # Windows does not support add_signal_handler.
+    with contextlib.suppress(NotImplementedError):
         loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)
-    except NotImplementedError:
-        # Windows doesn't support add_signal_handler
-        pass
 
     logger.info("[mastermind] Service started")
     yield
@@ -223,6 +222,11 @@ async def _check_message_dedup(message_id: str, dedup_key: str | None = None) ->
 
     Returns True if the message should be treated as a duplicate (skipped).
     """
+    # Short-circuit: if neither key is provided, there is nothing to check.
+    # This also keeps the helper testable without constructing a full agent.
+    if not message_id and not dedup_key:
+        return False
+
     agent = get_agent()
     store = agent.tracker._store
     now = datetime.now(UTC)
@@ -275,15 +279,10 @@ async def _check_message_dedup(message_id: str, dedup_key: str | None = None) ->
         return False
 
     # Application-level dedup key takes precedence because it is deterministic.
-    if dedup_key:
-        if await _check_or_claim(dedup_key):
-            return True
+    if dedup_key and await _check_or_claim(dedup_key):
+        return True
 
-    if message_id:
-        if await _check_or_claim(message_id):
-            return True
-
-    return False
+    return bool(message_id and await _check_or_claim(message_id))
 
 
 async def _mark_message_done(message_id: str, dedup_key: str | None = None) -> None:
@@ -387,10 +386,8 @@ async def task_intake_handler(request: Request) -> dict[str, Any]:
             tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
             logger.error("[MASTERMIND] Resume FAILED for %s: %s", resume_task_id, exc)
             logger.error("[MASTERMIND] Traceback: %s", tb[:1000])
-            try:
+            with suppress(Exception):
                 await agent.tracker.mark_escalated(resume_task_id, reason=f"Resume failed: {exc}")
-            except Exception:
-                pass
             # E2: do NOT mark as done — leave the in_flight marker so Pub/Sub
             # can retry and the stale TTL reclaim path handles it.
             raise HTTPException(status_code=500, detail=f"Resume failed: {exc}") from exc
@@ -415,10 +412,8 @@ async def task_intake_handler(request: Request) -> dict[str, Any]:
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         logger.error("[MASTERMIND] Task FAILED for %s: %s", task.id, exc)
         logger.error("[MASTERMIND] Traceback: %s", tb[:1000])
-        try:
+        with suppress(Exception):
             await agent.tracker.mark_escalated(task.id, reason=f"Unhandled error: {exc}")
-        except Exception:
-            pass
         # E2: do NOT mark as done — leave the in_flight marker so Pub/Sub
         # can retry and the stale TTL reclaim path handles it.
         raise HTTPException(status_code=500, detail=f"Task processing failed: {exc}") from exc
@@ -493,9 +488,8 @@ def _format_ci_result_message(pr_number: int, ci_passed: bool, failed_checks: li
     """Format a CI result message for Slack."""
     if ci_passed:
         return f"CI result for PR #{pr_number}: All checks passed"
-    else:
-        checks = ", ".join(failed_checks) if failed_checks else "unknown checks"
-        return f"CI result for PR #{pr_number}: FAILED ({checks})"
+    checks = ", ".join(failed_checks) if failed_checks else "unknown checks"
+    return f"CI result for PR #{pr_number}: FAILED ({checks})"
 
 
 async def _notify_slack(task: HenchmenTask, result: dict[str, Any]) -> None:

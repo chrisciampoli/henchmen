@@ -268,8 +268,7 @@ class TestDevModeFixNodeBehavior:
         mock_settings = MagicMock()
         mock_settings.environment = MagicMock()
         mock_settings.environment.value = "dev"
-        executor = SchemeExecutor(mock_graph, mock_lair, mock_settings)
-        return executor
+        return SchemeExecutor(mock_graph, mock_lair, mock_settings)
 
     def _make_node(self, node_id: str) -> Any:
         from henchmen.models.scheme import NodeType, SchemeNode

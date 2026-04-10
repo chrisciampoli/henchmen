@@ -101,9 +101,7 @@ class LairManager:
             "REPO_URL": task.context.repo,
             # Fix/retry nodes must clone the feature branch (not main)
             # so they can see and push to the operative's prior work.
-            "BRANCH": (
-                task.branch_name if node.id in ("fix_lint", "fix_tests") else (task.context.branch or "main")
-            ),
+            "BRANCH": (task.branch_name if node.id in ("fix_lint", "fix_tests") else (task.context.branch or "main")),
             "TASK_TITLE": task.title[:200],
             "TASK_DESCRIPTION": task.description[:500],
             "HENCHMEN_GCP_PROJECT_ID": self.settings.gcp_project_id,

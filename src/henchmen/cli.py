@@ -171,13 +171,15 @@ def _eval(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
-def _print_fixture_result(result: "FixtureResult") -> None:
+def _print_fixture_result(result: FixtureResult) -> None:
     s = result.score
     tests = "n/a" if s.tests_pass is None else ("pass" if s.tests_pass else "fail")
     print(f"Fixture:   {result.fixture_id}")
     print(f"Provider:  {result.provider}  model={result.model_tier}")
-    print(f"Score:     {s.overall_score:.2f}  (diff_nonempty={s.diff_non_empty}, "
-          f"files={s.touched_expected_files}, tests={tests}, substrings={s.contains_expected_substrings})")
+    print(
+        f"Score:     {s.overall_score:.2f}  (diff_nonempty={s.diff_non_empty}, "
+        f"files={s.touched_expected_files}, tests={tests}, substrings={s.contains_expected_substrings})"
+    )
     print(
         f"Wall:      {result.wall_clock_seconds:.2f}s  "
         f"tokens={result.total_input_tokens}/{result.total_output_tokens}  "
@@ -187,7 +189,7 @@ def _print_fixture_result(result: "FixtureResult") -> None:
         print(f"ERROR:     {result.error}")
 
 
-def _print_eval_report(report: "EvalReport") -> None:
+def _print_eval_report(report: EvalReport) -> None:
     print("=" * 60)
     print(f"Eval report: provider={report.provider}  aggregate={report.aggregate_score:.3f}")
     print(f"Commit: {report.commit_sha or 'unknown'}  at {report.timestamp.isoformat()}")
@@ -196,12 +198,14 @@ def _print_eval_report(report: "EvalReport") -> None:
         s = r.score
         tests = "-" if s.tests_pass is None else ("P" if s.tests_pass else "F")
         flag = " ERR" if r.error else ""
-        print(f"  {r.fixture_id:32s}  score={s.overall_score:.2f}  tests={tests}  "
-              f"{r.wall_clock_seconds:5.2f}s  ${r.estimated_cost_usd:.4f}{flag}")
+        print(
+            f"  {r.fixture_id:32s}  score={s.overall_score:.2f}  tests={tests}  "
+            f"{r.wall_clock_seconds:5.2f}s  ${r.estimated_cost_usd:.4f}{flag}"
+        )
     print("=" * 60)
 
 
-def _write_baseline(path: "Path", provider: str, report: "EvalReport") -> None:
+def _write_baseline(path: Path, provider: str, report: EvalReport) -> None:
     import json
     from datetime import date
     from typing import Any
@@ -222,7 +226,7 @@ def _write_baseline(path: "Path", provider: str, report: "EvalReport") -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _compare_baseline(path: "Path", provider: str, report: "EvalReport") -> int:
+def _compare_baseline(path: Path, provider: str, report: EvalReport) -> int:
     import json
 
     if not path.is_file():
@@ -235,12 +239,13 @@ def _compare_baseline(path: "Path", provider: str, report: "EvalReport") -> int:
         print(f"No baseline for provider {provider!r} — run --write-baseline first.")
         return 0
     delta = report.aggregate_score - float(baseline_score)
-    print(f"Baseline comparison: current={report.aggregate_score:.3f}  "
-          f"baseline={float(baseline_score):.3f}  delta={delta:+.3f}")
+    print(
+        f"Baseline comparison: current={report.aggregate_score:.3f}  "
+        f"baseline={float(baseline_score):.3f}  delta={delta:+.3f}"
+    )
     if delta < -_BASELINE_REGRESSION_THRESHOLD:
         print(
-            f"REGRESSION: aggregate dropped by {abs(delta):.3f} "
-            f"(> {_BASELINE_REGRESSION_THRESHOLD:.2f}) — failing.",
+            f"REGRESSION: aggregate dropped by {abs(delta):.3f} (> {_BASELINE_REGRESSION_THRESHOLD:.2f}) — failing.",
             file=sys.stderr,
         )
         return 1

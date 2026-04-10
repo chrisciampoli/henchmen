@@ -21,6 +21,14 @@ def _mock_settings(**overrides):
     s = MagicMock()
     s.openai_api_key = "sk-test-openai"
     s.anthropic_api_key = "sk-ant-test"
+    # L10 fix: providers read tier defaults from Settings. Mirror the
+    # real Settings defaults so tests pin the expected behaviour.
+    s.openai_model_complex = "gpt-4.1"
+    s.openai_model_light = "gpt-4.1-mini"
+    s.openai_model_reasoning = "o3"
+    s.anthropic_model_complex = "claude-sonnet-4-6-20250514"
+    s.anthropic_model_light = "claude-haiku-4-5-20251001"
+    s.anthropic_model_reasoning = "claude-opus-4-6-20250514"
     for k, v in overrides.items():
         setattr(s, k, v)
     return s
@@ -59,11 +67,13 @@ class TestOpenAIProvider:
         assert provider.resolve_tier("gpt-custom") == "gpt-custom"
 
     def test_supported_models(self):
+        # L10 fix: supported_models now returns the three configured tier
+        # models (from Settings), deduped. It no longer includes hard-coded
+        # extras like gpt-4o.
         provider = self._make_provider()
         models = provider.supported_models()
         assert "gpt-4.1" in models
         assert "gpt-4.1-mini" in models
-        assert "gpt-4o" in models
         assert "o3" in models
 
     @pytest.mark.asyncio

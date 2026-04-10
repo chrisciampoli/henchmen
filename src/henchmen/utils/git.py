@@ -32,10 +32,7 @@ async def clone_repo(
         RuntimeError: If the ``git clone`` process returns a non-zero exit code.
             The error message is sanitised to avoid leaking the token.
     """
-    if token:
-        clone_url = f"https://x-access-token:{token}@github.com/{repo}.git"
-    else:
-        clone_url = f"https://github.com/{repo}.git"
+    clone_url = f"https://x-access-token:{token}@github.com/{repo}.git" if token else f"https://github.com/{repo}.git"
 
     cmd: list[str] = ["git", "clone"]
     if depth is not None:

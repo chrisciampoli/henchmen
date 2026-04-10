@@ -82,8 +82,7 @@ def count_tokens(
 
                 future = asyncio.run_coroutine_threadsafe(provider.count_tokens(text, model_name), loop)
                 return int(future.result(timeout=10))
-            else:
-                return int(loop.run_until_complete(provider.count_tokens(text, model_name)))
+            return int(loop.run_until_complete(provider.count_tokens(text, model_name)))
         except Exception as exc:
             logger.debug("Provider token counting failed, using fallback: %s", exc)
             return len(text) // 4

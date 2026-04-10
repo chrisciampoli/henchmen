@@ -119,6 +119,8 @@ def _mock_settings():
     settings.lair_default_timeout = 1800
     settings.pubsub_topic_forge_request = "henchmen-forge-request"
     settings.gcs_bucket_dossier = ""
+    # Disable Vertex AI evaluation so tests don't try to hit the real service.
+    settings.vertex_ai_evaluation_enabled = False
     return settings
 
 
@@ -511,9 +513,15 @@ class TestMastermindHandleTask:
         SchemeRegistry.clear()
 
     @pytest.mark.asyncio
+    @patch("henchmen.mastermind.scheme_executor.executor.SchemeExecutor.execute", new_callable=AsyncMock)
     @patch("henchmen.mastermind.agent.DossierBuilder")
-    async def test_handle_task_full_lifecycle(self, mock_builder_cls):
-        """Full lifecycle: task -> scheme_selected -> ... -> completed or escalated."""
+    async def test_handle_task_full_lifecycle(self, mock_builder_cls, mock_executor_execute):
+        """Full lifecycle: task -> scheme_selected -> ... -> completed.
+
+        The SchemeExecutor.execute call is stubbed to return a canned success
+        result so the test focuses on handle_task's orchestration, not the
+        downstream handler chain (which has its own dedicated tests).
+        """
         settings = _mock_settings()
         agent = MastermindAgent(settings=settings)
 
@@ -533,12 +541,27 @@ class TestMastermindHandleTask:
             status=OperativeStatus.COMPLETED,
             summary="Fix done",
             confidence_score=0.95,
+            files_changed=["src/example.py"],
             started_at=datetime.now(UTC),
             completed_at=datetime.now(UTC),
         )
 
-        # Mock _run_ci to return passed
-        agent._run_ci = AsyncMock(return_value={"status": "passed"})
+        # Canned success report from the scheme executor so we test
+        # handle_task, not the full DAG walk (which is covered by
+        # integration tests).
+        mock_executor_execute.return_value = {
+            "final_status": "completed",
+            "nodes_executed": [
+                "create_branch",
+                "prefetch_context",
+                "implement_fix",
+                "verify_changes",
+                "run_lint",
+                "run_tests",
+                "create_pr",
+            ],
+            "pr_url": "https://github.com/example/repo/pull/1",
+        }
 
         task = _make_task()
         result = await agent.handle_task(task)

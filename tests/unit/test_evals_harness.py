@@ -19,7 +19,6 @@ from evals.harness import (
 )
 from henchmen.models.llm import LLMResponse, Message, TokenUsage, ToolDefinition
 
-
 # ---------------------------------------------------------------------------
 # Pydantic model serialization
 # ---------------------------------------------------------------------------
@@ -92,9 +91,7 @@ def _init_fake_fixture(tmp_path: Path, diff_patterns: dict) -> tuple[Path, Path]
         json.dumps({"title": "t", "description": "d", "scheme": "bugfix_standard"}),
         encoding="utf-8",
     )
-    (fixture / "expected" / "diff_patterns.json").write_text(
-        json.dumps(diff_patterns), encoding="utf-8"
-    )
+    (fixture / "expected" / "diff_patterns.json").write_text(json.dumps(diff_patterns), encoding="utf-8")
     (fixture / "repo" / "sample.py").write_text("def f():\n    return 1\n", encoding="utf-8")
 
     workspace = tmp_path / "ws"

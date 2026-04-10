@@ -69,8 +69,7 @@ async def file_edit(path: str, old_text: str, new_text: str) -> dict[str, Any]:
             s = s.replace("\u201c", '"').replace("\u201d", '"')  # smart double quotes
             s = s.replace("\u2018", "'").replace("\u2019", "'")  # smart single quotes
             s = s.replace("\u2026", "...")  # ellipsis
-            s = s.replace("\u00a0", " ")  # non-breaking space
-            return s
+            return s.replace("\u00a0", " ")  # non-breaking space
 
         norm_original = normalize(original)
         norm_old = normalize(old_text)

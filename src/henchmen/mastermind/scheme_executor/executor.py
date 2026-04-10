@@ -25,9 +25,7 @@ _DEFAULT_COST_CEILING_USD = 2.0
 class SchemeExecutor:
     """Walks a Scheme DAG, dispatching deterministic and agentic nodes."""
 
-    def __init__(
-        self, scheme_graph: SchemeGraph, lair_manager: LairManager, settings: "Settings", tracker: Any = None
-    ):
+    def __init__(self, scheme_graph: SchemeGraph, lair_manager: LairManager, settings: "Settings", tracker: Any = None):
         self.scheme_graph = scheme_graph
         self.lair_manager = lair_manager
         self.settings = settings
@@ -110,11 +108,10 @@ class SchemeExecutor:
             condition = result.get("condition")  # "pass", "fail", or None
             next_nodes = self.scheme_graph.get_next_nodes(current_node.id, condition)
 
-            if not next_nodes:
-                # If a condition was returned but no matching conditional edge exists,
-                # try unconditional edges as a fallback
-                if condition is not None:
-                    next_nodes = self.scheme_graph.get_next_nodes(current_node.id, None)
+            # If a condition was returned but no matching conditional edge
+            # exists, try unconditional edges as a fallback.
+            if not next_nodes and condition is not None:
+                next_nodes = self.scheme_graph.get_next_nodes(current_node.id, None)
 
             if not next_nodes:
                 # Dead-end with a "fail" condition means unhandled failure — escalate
@@ -135,8 +132,7 @@ class SchemeExecutor:
         """Execute a single scheme node."""
         if node.node_type == NodeType.DETERMINISTIC:
             return await self._execute_deterministic(node, task, dossier)
-        else:
-            return await self._execute_agentic(node, task, dossier)
+        return await self._execute_agentic(node, task, dossier)
 
     async def _execute_deterministic(self, node: SchemeNode, task: HenchmenTask, dossier: Dossier) -> dict[str, Any]:
         """Execute a deterministic node (lint, test, branch, PR creation)."""
@@ -242,8 +238,7 @@ class SchemeExecutor:
 
             if report.status == OperativeStatus.COMPLETED:
                 return {"condition": "pass", "report": report.model_dump(), "lair_id": lair_id}
-            else:
-                return {"condition": "fail", "report": report.model_dump(), "lair_id": lair_id}
+            return {"condition": "fail", "report": report.model_dump(), "lair_id": lair_id}
         except Exception as exc:
             logger.error("[SCHEME] Lair provisioning failed for node %s: %s", node.id, exc)
 
@@ -266,17 +261,16 @@ class SchemeExecutor:
                     "dev_mode": True,
                     "message": f"Agentic node '{node.name}' simulated (lair unavailable): {exc}",
                 }
-            else:
-                logger.error(
-                    "Lair provisioning failed for node %s (task %s): %s — failing node",
-                    node.id,
-                    task.id,
-                    exc,
-                )
-                return {
-                    "condition": "fail",
-                    "message": f"Agentic node '{node.name}' failed (lair unavailable): {exc}",
-                }
+            logger.error(
+                "Lair provisioning failed for node %s (task %s): %s — failing node",
+                node.id,
+                task.id,
+                exc,
+            )
+            return {
+                "condition": "fail",
+                "message": f"Agentic node '{node.name}' failed (lair unavailable): {exc}",
+            }
 
     async def _maybe_evaluate(self, task: HenchmenTask, node: SchemeNode, report: Any) -> None:
         """Run post-operative evaluation if enabled in settings."""
@@ -320,7 +314,7 @@ class SchemeExecutor:
         # Find PR URL if one was created
         pr_url = None
         escalated = False
-        for node_id, result in self.node_results.items():
+        for _node_id, result in self.node_results.items():
             if result.get("pr_url"):
                 pr_url = result["pr_url"]
             if result.get("escalated"):
