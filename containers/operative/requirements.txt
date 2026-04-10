@@ -1,10 +1,10 @@
 google-cloud-pubsub==2.26.1
 google-cloud-storage==2.18.2
 google-cloud-logging==3.11.3
-google-cloud-aiplatform>=1.87.0
-vertexai>=1.87.0
-google-genai>=0.3.0
-google-adk>=0.1.0
+google-cloud-aiplatform
+vertexai
+google-genai
+google-adk
 mcp==1.0.0
 pydantic==2.9.2
 pydantic-settings==2.6.1
