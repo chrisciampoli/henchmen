@@ -100,7 +100,10 @@ class VertexAIProvider:
         )
         response = await self._client.aio.models.generate_content(
             model=model,
-            contents=contents,  # type: ignore[arg-type]  # google-genai expects a covariant Sequence
+            # google-genai's `contents` accepts a covariant Sequence; some
+            # versions tighten the union enough that mypy is happy with our
+            # list[Content], so we tag both arg-type and unused-ignore.
+            contents=contents,  # type: ignore[arg-type, unused-ignore]
             config=config,
         )
 

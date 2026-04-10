@@ -955,7 +955,9 @@ class OperativeAgent:
 
             response = client.models.generate_content(
                 model=model_name,
-                contents=contents,  # type: ignore[arg-type]  # google-genai expects a covariant Sequence
+                # google-genai version-dependent: some versions accept
+                # list[Content], some require a covariant Sequence.
+                contents=contents,  # type: ignore[arg-type, unused-ignore]
                 config=config,
             )
 
@@ -1010,7 +1012,7 @@ class OperativeAgent:
                     async def _retry_call() -> Any:
                         return client.models.generate_content(
                             model=model_name,
-                            contents=contents,  # type: ignore[arg-type]  # covariant-Sequence mismatch
+                            contents=contents,  # type: ignore[arg-type, unused-ignore]
                             config=config,
                         )
 

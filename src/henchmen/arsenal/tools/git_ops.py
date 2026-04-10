@@ -114,10 +114,19 @@ async def git_commit(message: str, files: list[str] | str | None = None, working
     """
     import json as _json
 
+    from henchmen.arsenal._workspace import get_workspace_root
+
     try:
         safe_working_dir = _resolve_working_dir(working_dir)
     except PermissionError as exc:
         return {"error": f"access denied: {exc}", "success": False}
+
+    # When the caller did not supply a working_dir, default to the workspace
+    # root rather than the test runner's cwd. This makes git_commit
+    # consistent regardless of where the operative happens to be invoked
+    # from and avoids accidentally writing into the host repository.
+    if not safe_working_dir:
+        safe_working_dir = get_workspace_root()
 
     # Normalize files: models sometimes pass a JSON string instead of a list
     file_list: list[str] | None = None
@@ -135,7 +144,7 @@ async def git_commit(message: str, files: list[str] | str | None = None, working
     if file_list:
         # Resolve each path against the workspace and bail out if any escape.
         cleaned: list[str] = []
-        base_dir = safe_working_dir or os.getcwd()
+        base_dir = safe_working_dir
         for f in file_list:
             # Resolve absolute against workspace, relative against working_dir.
             if os.path.isabs(f):
