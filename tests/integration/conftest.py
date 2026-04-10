@@ -362,6 +362,25 @@ def test_workspace(tmp_path):
 
     subprocess.run(["git", "init"], cwd=workspace, capture_output=True)
     subprocess.run(["git", "checkout", "-b", "main"], cwd=workspace, capture_output=True)
+    # Set per-workspace user.name/user.email so subsequent git commands made
+    # by Arsenal tools (which inherit only os.environ) can commit even when
+    # the host runner has no global git config (e.g. fresh GitHub Actions VM).
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=workspace,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=workspace,
+        capture_output=True,
+    )
+    # Suppress GPG signing requests on hosts that have commit.gpgsign=true.
+    subprocess.run(
+        ["git", "config", "commit.gpgsign", "false"],
+        cwd=workspace,
+        capture_output=True,
+    )
 
     (workspace / "src").mkdir()
     (workspace / "src" / "auth.py").write_text(
