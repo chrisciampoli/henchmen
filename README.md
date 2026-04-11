@@ -20,27 +20,6 @@ Henchmen receives tasks from **Slack, GitHub, Jira, and CLI**, dispatches AI cod
 
 ---
 
-## Verified today
-
-A real-looking AI agent factory is easy to claim, hard to prove. Here are
-the concrete artifacts you can inspect right now to evaluate Henchmen
-without deploying anything:
-
-- **Green CI** — [![CI](https://github.com/chrisciampoli/henchmen/actions/workflows/ci.yml/badge.svg)](https://github.com/chrisciampoli/henchmen/actions/workflows/ci.yml) All 5 jobs (lint, typecheck, unit, integration, compose smoke) pass on every commit to `main`. 887 tests, 0 skipped.
-- **Expert-panel review** — [`docs/superpowers/reviews/`](docs/superpowers/reviews/) contains the full 8-expert OSS readiness review (82 findings, all closed) that produced this release.
-- **Deploy-on-your-own-GCP walkthrough** — [`docs/deploy-gcp.md`](docs/deploy-gcp.md) is a 30-minute linear walkthrough from `gcloud auth login` to a live stack processing CLI tasks.
-- **Reproducible BYO-LLM parity** — [`evals/baseline.json`](evals/baseline.json) is a structured stub with per-provider populate commands. [`.github/workflows/evals.yml`](.github/workflows/evals.yml) is a `workflow_dispatch` workflow that runs the eval harness against one provider and opens a PR with the updated baseline.
-- **Supply-chain integrity** — all 4 Dockerfiles pin base images to sha256 digests; the [release workflow](.github/workflows/release.yml) builds and publishes release artifacts to GHCR with signed provenance (SLSA L1).
-- **Self-diagnosis** — `henchmen doctor` runs a local self-check (Docker, git, LLM credentials, operative image, Python version) before you spin anything up.
-- **Metrics sample** — [`docs/images/metrics-sample.txt`](docs/images/metrics-sample.txt) shows the Prometheus-format output the observability stack produces when the eval harness runs against three fixtures.
-
-The maintainer has executed the deploy-gcp walkthrough end-to-end
-against a real GCP project. The eval baseline is intentionally left as
-a stub — each contributor runs the harness on their own hardware /
-account and opens a PR with their numbers via the evals workflow.
-
----
-
 ## Prerequisites
 
 | Requirement | Why |
