@@ -96,10 +96,8 @@ temp/
 .claude/
 .serena/
 
-# Internal WIP plans and design specs. The docs/superpowers/reviews/ subtree
-# is public (it holds curated review artifacts) and is deliberately NOT ignored.
-docs/superpowers/plans/
-docs/superpowers/specs/
+# Internal AI-assisted development artifacts — not for public distribution
+docs/superpowers/
 
 # Local settings overrides
 *.local.json
