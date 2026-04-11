@@ -12,6 +12,22 @@ from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
+# Module-level singleton for single-process mode. When set, all calls to
+# InMemoryMessageBroker() return this instance so Dispatch, Mastermind,
+# and Forge share the same broker (and its forward map).
+_shared_instance: InMemoryMessageBroker | None = None
+
+
+def set_shared_broker(broker: InMemoryMessageBroker) -> None:
+    """Designate *broker* as the process-wide singleton."""
+    global _shared_instance
+    _shared_instance = broker
+
+
+def get_shared_broker() -> InMemoryMessageBroker | None:
+    """Return the shared broker, or None if not in singleton mode."""
+    return _shared_instance
+
 
 class InMemoryMessageBroker:
     """MessageBroker backed by in-process async queues.
@@ -20,7 +36,15 @@ class InMemoryMessageBroker:
     delivery when running all services in a single process.
     """
 
+    def __new__(cls) -> InMemoryMessageBroker:
+        if _shared_instance is not None:
+            return _shared_instance
+        return super().__new__(cls)
+
     def __init__(self) -> None:
+        if hasattr(self, "_initialized"):
+            return
+        self._initialized = True
         self._messages: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._subscribers: dict[str, list[Callable[..., Any]]] = defaultdict(list)
         self._forward_map: dict[str, str] = {}
@@ -80,7 +104,7 @@ class InMemoryMessageBroker:
         }
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.post(url, json=envelope, timeout=30)
+                resp = await client.post(url, json=envelope, timeout=1800)
                 logger.debug("Forwarded %s to %s (status=%d)", msg_id, url, resp.status_code)
         except Exception as exc:
             logger.warning("HTTP forward failed for %s -> %s: %s", msg_id, url, exc)

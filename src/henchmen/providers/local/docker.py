@@ -22,6 +22,7 @@ class DockerOrchestrator:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._processes: dict[str, asyncio.subprocess.Process] = {}
+        self._drain_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def run_job(
         self,
@@ -37,6 +38,8 @@ class DockerOrchestrator:
         """Launch a Docker container. Returns the container execution ID."""
         exec_id = f"docker-{uuid4().hex[:8]}"
         cmd = ["docker", "run", "--rm", "--name", exec_id]
+        # Allow container to reach host services (Ollama, Henchmen server)
+        cmd.extend(["--add-host=host.docker.internal:host-gateway"])
         for k, v in env_vars.items():
             cmd.extend(["-e", f"{k}={v}"])
         mem = memory.lower().replace("gi", "g").replace("mi", "m")
@@ -49,6 +52,19 @@ class DockerOrchestrator:
             stderr=asyncio.subprocess.STDOUT,
         )
         self._processes[exec_id] = process
+
+        # Drain stdout in the background so the pipe buffer never fills up
+        # (a full pipe would block the Docker CLI and hang the container).
+        async def _drain(proc: asyncio.subprocess.Process, eid: str) -> None:
+            if proc.stdout is None:
+                return
+            async for line in proc.stdout:
+                text = line.decode(errors="replace").rstrip()
+                if text:
+                    logger.info("[operative:%s] %s", eid[:12], text)
+
+        task = asyncio.create_task(_drain(process, exec_id))
+        self._drain_tasks[exec_id] = task
         return exec_id
 
     async def get_status(self, execution_id: str) -> JobResult:

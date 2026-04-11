@@ -114,6 +114,10 @@ class OllamaProvider:
         system_prompt: str | None = None,
     ) -> LLMResponse:
         """Send a chat completion request to the Ollama API."""
+        # Always resolve cloud model names to the local Ollama model.
+        # Scheme nodes reference "gemini-2.5-pro" etc. which Ollama doesn't have.
+        model = self.resolve_tier(model)
+
         # C3: up-front tool-calling capability probe. The very first call
         # that passes any tools triggers a lightweight canary request to
         # verify the model can emit tool_calls. A failing probe raises a

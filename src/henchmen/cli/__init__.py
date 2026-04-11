@@ -274,14 +274,67 @@ def _serve(args: argparse.Namespace) -> None:
     logger = logging.getLogger("henchmen")
     logger.info("Starting Henchmen in single-process mode (provider=local)")
 
+    # Create a shared InMemoryMessageBroker so all mounted services publish
+    # and consume from the same instance. The forward map simulates Pub/Sub
+    # push subscriptions by HTTP-POSTing envelopes between services.
+    from henchmen.config.settings import get_settings
+    from henchmen.providers.local.memory import InMemoryMessageBroker, set_shared_broker
+
+    shared_broker = InMemoryMessageBroker()
+    settings = get_settings()
+    env = settings.environment.value
+    base = f"http://localhost:{args.port}"
+    shared_broker.set_forward_map(
+        {
+            f"henchmen-{env}-task-intake": f"{base}/mastermind/pubsub/task-intake",
+            f"henchmen-{env}-operative-complete": f"{base}/mastermind/pubsub/operative-complete",
+            f"henchmen-{env}-forge-request": f"{base}/forge/pubsub/forge-request",
+            f"henchmen-{env}-forge-result": f"{base}/mastermind/pubsub/forge-result",
+            f"henchmen-{env}-ci-failure": f"{base}/mastermind/pubsub/ci-failure",
+        }
+    )
+    set_shared_broker(shared_broker)
+    logger.info("Shared broker configured with forward map for %d topics", len(shared_broker._forward_map))
+
+    from collections.abc import AsyncIterator
+    from contextlib import asynccontextmanager
+
     from fastapi import FastAPI
 
-    app = FastAPI(title="Henchmen (Local Dev)", version="0.1.0")
+    from henchmen.providers.registry import ProviderRegistry
+
+    registry = ProviderRegistry(settings)
 
     from henchmen.dispatch.server import app as dispatch_app
     from henchmen.forge.server import app as forge_app
     from henchmen.mastermind.server import app as mastermind_app
 
+    # Pre-initialize sub-app state that would normally be set by their
+    # lifespans. Mounted sub-app lifespans may not run in all Starlette
+    # versions, so we inject the shared providers directly.
+    dispatch_app.state.message_broker = shared_broker
+
+    mastermind_app.state.message_broker = shared_broker
+    mastermind_app.state.document_store = registry.get_document_store()
+    mastermind_app.state.container_orchestrator = registry.get_container_orchestrator()
+
+    forge_app.state.message_broker = shared_broker
+    forge_app.state.ci_provider = registry.get_ci_provider()
+    forge_app.state.document_store = registry.get_document_store()
+
+    # Also eagerly initialize the Mastermind agent singleton so the
+    # Pub/Sub handlers find it immediately (they call get_agent()).
+    from henchmen.mastermind.server import get_agent  # noqa: E402
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # Warm up the MastermindAgent singleton
+        get_agent()
+        logger.info("All services initialized")
+        yield
+        logger.info("Shutting down")
+
+    app = FastAPI(title="Henchmen (Local Dev)", version="0.1.0", lifespan=lifespan)
     app.mount("/dispatch", dispatch_app)
     app.mount("/mastermind", mastermind_app)
     app.mount("/forge", forge_app)

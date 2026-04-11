@@ -91,8 +91,9 @@ class LairManager:
         self, task: HenchmenTask, node: SchemeNode, lair_id: str, scheme_id: str = ""
     ) -> dict[str, str]:
         """Build plain environment variable dict for the operative container."""
-        # Scale up resources for long-running nodes
-        return {
+        import os
+
+        env = {
             "TASK_ID": task.id,
             "NODE_ID": node.id,
             "SCHEME_ID": scheme_id,
@@ -109,8 +110,42 @@ class LairManager:
             "HENCHMEN_GCP_REGION": self.settings.gcp_region,
         }
 
+        # Local mode: pass LLM config and GitHub token as plain env vars.
+        # In GCP mode these come from Secret Manager and Vertex AI settings.
+        if self.settings.provider == "local":
+            llm_provider = self.settings.llm_provider or "local"
+            env.update(
+                {
+                    "HENCHMEN_PROVIDER": "local",
+                    "HENCHMEN_LLM_PROVIDER": llm_provider,
+                    "HENCHMEN_GIT_AUTHOR_NAME": self.settings.git_author_name,
+                    "HENCHMEN_GIT_AUTHOR_EMAIL": self.settings.git_author_email,
+                }
+            )
+            # Ollama: rewrite URL so the container can reach the host
+            if llm_provider == "local":
+                ollama_url = self.settings.llm_ollama_base_url
+                # Inside Docker, localhost is the container — use host.docker.internal
+                ollama_url = ollama_url.replace("localhost", "host.docker.internal")
+                ollama_url = ollama_url.replace("127.0.0.1", "host.docker.internal")
+                env["HENCHMEN_LLM_OLLAMA_BASE_URL"] = ollama_url
+                env["HENCHMEN_LLM_OLLAMA_MODEL"] = self.settings.llm_ollama_model
+            elif llm_provider == "openai":
+                env["HENCHMEN_OPENAI_API_KEY"] = self.settings.openai_api_key
+            elif llm_provider == "anthropic":
+                env["HENCHMEN_ANTHROPIC_API_KEY"] = self.settings.anthropic_api_key
+
+            # GitHub token from environment (not Secret Manager in local mode)
+            github_token = os.environ.get("GITHUB_TOKEN", "")
+            if github_token:
+                env["GITHUB_TOKEN"] = github_token
+
+        return env
+
     def _build_image(self) -> str:
         """Build the operative container image URI."""
+        if self.settings.provider == "local":
+            return "henchmen-operative:local"
         return (
             f"{self.settings.gcp_region}-docker.pkg.dev/"
             f"{self.settings.gcp_project_id}/"
@@ -136,15 +171,19 @@ class LairManager:
 
         image = self._build_image()
         env_vars = self._build_env_vars(task, node, lair_id, scheme_id)
-        service_account = f"sa-dev-operative@{self.settings.gcp_project_id}.iam.gserviceaccount.com"
 
-        # Secret references passed as {env_var_name: secret_resource_name}
-        secrets = {
-            "GITHUB_TOKEN": (
-                f"projects/{self.settings.gcp_project_id}/secrets/"
-                f"henchmen-{self.settings.environment.value}-github-token"
-            ),
-        }
+        # Local mode: GITHUB_TOKEN is already in env_vars (plain), no Secret Manager.
+        if self.settings.provider == "local":
+            service_account = None
+            secrets = None
+        else:
+            service_account = f"sa-dev-operative@{self.settings.gcp_project_id}.iam.gserviceaccount.com"
+            secrets = {
+                "GITHUB_TOKEN": (
+                    f"projects/{self.settings.gcp_project_id}/secrets/"
+                    f"henchmen-{self.settings.environment.value}-github-token"
+                ),
+            }
 
         logger.info("[LAIR] Creating lair %s for task %s node %s", lair_id, task.id, node.id)
 
