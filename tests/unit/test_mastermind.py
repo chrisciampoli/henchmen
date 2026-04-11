@@ -116,6 +116,7 @@ def _mock_settings():
     get_settings.cache_clear()
     return get_settings().model_copy(
         update={
+            "provider": "gcp",
             "vertex_ai_evaluation_enabled": False,
             "lair_default_cpu": "2",
             "lair_default_memory": "4Gi",
