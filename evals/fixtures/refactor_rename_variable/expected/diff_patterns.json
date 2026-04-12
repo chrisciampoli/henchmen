@@ -1,0 +1,10 @@
+{
+  "must_contain_file_change": ["inventory.py"],
+  "must_fix_tests": true,
+  "expected_substrings_in_changed_code": ["items:"],
+  "test_runner": "pytest",
+  "test_command": ["pytest", "-q", "."],
+  "expected_diff_lines": 20,
+  "max_expected_steps": 3,
+  "max_expected_tokens": 5000
+}

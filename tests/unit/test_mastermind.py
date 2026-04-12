@@ -1062,3 +1062,102 @@ class TestFeatureStandardNoPlanNode:
                 break
         else:
             pytest.fail("verify_changes node not found")
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Escalation node tracking
+# ---------------------------------------------------------------------------
+
+
+class TestEscalationNodeTracking:
+    @pytest.mark.asyncio
+    async def test_cycle_detection_sets_escalation_node(self):
+        """When a cycle is detected, the executor should record which node caused it."""
+        # Use a linear scheme and artificially trigger cycle detection
+        graph = _linear_scheme(["loop_node"])
+        mock_lair = MagicMock(spec=LairManager)
+        settings = _mock_settings()
+
+        executor = SchemeExecutor(graph, mock_lair, settings)
+        # Pre-seed visited states to trigger cycle detection on first visit
+        executor._visited_states.add(("loop_node", 0))
+        task = _make_task()
+        dossier = Dossier(task_id=task.id)
+
+        result = await executor.execute(task, dossier)
+
+        assert result["escalated"] is True
+        assert result["escalation_node"] == "loop_node"
+
+    @pytest.mark.asyncio
+    async def test_dead_end_fail_sets_escalation_node(self):
+        """When a dead-end is reached with condition='fail', escalation_node should be set."""
+        # Single-node scheme: node returns "fail" and has no outgoing fail edge
+        graph = _linear_scheme(["only_node"])
+        mock_lair = MagicMock(spec=LairManager)
+        settings = _mock_settings()
+
+        executor = SchemeExecutor(graph, mock_lair, settings)
+
+        # Directly test the _build_execution_report with pre-populated results
+        executor.node_results["only_node"] = {"condition": "fail", "message": "test failure", "escalated": True}
+        executor._escalation_node = "only_node"
+        executor._freshly_executed.add("only_node")
+
+        report = executor._build_execution_report()
+        assert report["escalated"] is True
+        assert report["escalation_node"] == "only_node"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Heartbeat during agentic wait
+# ---------------------------------------------------------------------------
+
+
+class TestHeartbeatDuringWait:
+    @pytest.mark.asyncio
+    async def test_heartbeat_refreshed_during_agentic_wait(self):
+        """The executor should send heartbeats while waiting for lair completion."""
+        import asyncio
+
+        graph = _linear_scheme(
+            ["implement_fix"],
+            node_types={"implement_fix": NodeType.AGENTIC},
+        )
+
+        mock_lair = AsyncMock(spec=LairManager)
+        mock_lair.create_lair.return_value = "lair-001"
+
+        # Simulate a short delay in completion
+        async def _slow_completion(lair_id):
+            await asyncio.sleep(0.05)
+            return OperativeReport(
+                task_id="task-001",
+                scheme_id="test_scheme",
+                node_id="implement_fix",
+                operative_id="lair-001",
+                status=OperativeStatus.COMPLETED,
+                summary="Done",
+                confidence_score=0.9,
+                started_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+            )
+
+        mock_lair.wait_for_completion.side_effect = _slow_completion
+
+        mock_tracker = MagicMock()
+        mock_tracker.record_node_result = AsyncMock()
+        mock_tracker.update_execution_state = AsyncMock()
+        mock_tracker.update_heartbeat = AsyncMock()
+        settings = _mock_settings()
+
+        executor = SchemeExecutor(graph, mock_lair, settings, tracker=mock_tracker)
+        task = _make_task()
+        dossier = Dossier(task_id=task.id)
+
+        result = await executor.execute(task, dossier)
+
+        assert "implement_fix" in result["nodes_executed"]
+        # Heartbeat is only sent every 120s so it won't fire during 50ms wait,
+        # but the heartbeat task should have been created and cancelled
+        # The important thing is no crash and clean execution

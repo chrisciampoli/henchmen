@@ -1,0 +1,10 @@
+{
+  "must_contain_file_change": ["math_utils.py"],
+  "must_fix_tests": true,
+  "expected_substrings_in_changed_code": ["return result"],
+  "test_runner": "pytest",
+  "test_command": ["pytest", "-q", "."],
+  "expected_diff_lines": 6,
+  "max_expected_steps": 2,
+  "max_expected_tokens": 3000
+}

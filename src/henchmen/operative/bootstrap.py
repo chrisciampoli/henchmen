@@ -303,6 +303,9 @@ async def run_operative() -> None:
         tool_calls_count=telemetry.get("tool_calls_count", 0),
         tool_calls_detail=telemetry.get("tool_calls_detail", {}),
         wall_clock_seconds=wall_clock_seconds,
+        steps_used=telemetry.get("steps_used", 0),
+        context_tokens_at_start=telemetry.get("context_tokens_at_start", 0),
+        context_tokens_at_end=telemetry.get("context_tokens_at_end", 0),
     )
 
     # Persist a partial INTERRUPTED record to the cross-instance document
@@ -362,8 +365,11 @@ async def _build_file_context(workspace_dir: str, task_title: str, task_descript
     """Walk the workspace, pick the most relevant files, and return their contents as context.
 
     Uses TaskAnalyzer results (from the dossier) when available to boost scores
-    for mentioned files and keyword-matching files.
+    for mentioned files and keyword-matching files. File selection is delegated
+    to ``FileScorer`` which uses a context-window budget instead of a hard file
+    count limit.
     """
+    from henchmen.dossier.file_scorer import FileScorer
     from henchmen.dossier.task_analyzer import TaskAnalyzer
 
     # 0. Try to read task analysis from dossier (avoids re-running analyzer)
@@ -391,76 +397,30 @@ async def _build_file_context(workspace_dir: str, task_title: str, task_descript
 
     all_files.sort()
 
-    # 2. Score files for relevance
-    combined_text = f"{task_title} {task_description}".lower()
-    # Extract potential file names / stems from task text
-    mentioned_patterns: list[str] = re.findall(r"[\w\-]+\.[\w]+", combined_text)
-    keywords = set(re.findall(r"[a-z]{3,}", combined_text))
+    # 2. Score files using FileScorer (replaces inline scoring logic)
+    scorer = FileScorer()
+    scored = scorer.score_files(
+        all_files=all_files,
+        task_title=task_title,
+        task_description=task_description,
+        mentioned_files=analysis_mentioned_lower,
+        rag_file_paths=rag_file_paths,
+        analysis_keywords=analysis_keywords,
+        max_context_chars=_MAX_CONTEXT_CHARS,
+    )
 
-    scored: list[tuple[float, str]] = []
-    for rel in all_files:
-        score = 0.0
-        basename = os.path.basename(rel).lower()
-        rel_lower = rel.lower()
+    # For test_fix tasks, boost test files (task-type-specific logic stays here)
+    if analysis.task_type == "test_fix":
+        boosted: list[tuple[float, str]] = []
+        for score, rel in scored:
+            basename = os.path.basename(rel).lower()
+            if "test" in basename or "spec" in basename or "test" in rel.lower():
+                score += 8
+            boosted.append((score, rel))
+        boosted.sort(key=lambda t: (-t[0], t[1]))
+        scored = boosted
 
-        # HIGH PRIORITY: Exact match with files mentioned in task analysis
-        if basename in analysis_mentioned_lower or rel_lower in analysis_mentioned_lower:
-            score += 50
-        # Partial match with analysis mentioned files
-        for mentioned in analysis_mentioned_lower:
-            if mentioned in rel_lower:
-                score += 25
-                break
-
-        # Exact file name match from task text
-        for pat in mentioned_patterns:
-            if pat.lower() == basename:
-                score += 10
-            elif pat.lower() in rel_lower:
-                score += 5
-
-        # Top-level config / readme
-        if os.path.basename(rel) in _TOP_LEVEL_FILES and "/" not in rel:
-            score += 3
-
-        # README.md anywhere
-        if basename == "readme.md":
-            score += 4
-
-        # Keyword overlap with path components (both original and analysis keywords)
-        path_parts = set(re.findall(r"[a-z]{3,}", rel_lower))
-        overlap = keywords & path_parts
-        score += len(overlap) * 0.5
-        # Analysis keywords get additional weight
-        analysis_overlap = analysis_keywords & path_parts
-        score += len(analysis_overlap) * 1.0
-
-        # Boost files that appear in RAG semantic search results
-        if rel_lower in rag_file_paths or basename in rag_file_paths:
-            score += 30
-
-        # Boost files in the same directory as mentioned files
-        rel_dir = os.path.dirname(rel_lower)
-        if rel_dir:
-            for mentioned in analysis_mentioned_lower:
-                mentioned_dir = os.path.dirname(mentioned.lower())
-                if mentioned_dir and rel_dir == mentioned_dir:
-                    score += 15
-                    break
-
-        # For test_fix tasks, boost test files
-        if analysis.task_type == "test_fix" and ("test" in basename or "spec" in basename or "test" in rel_lower):
-            score += 8
-
-        # Prefer source files
-        if rel.endswith((".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java")):
-            score += 0.5
-
-        scored.append((score, rel))
-
-    # Sort descending by score, take top N
-    scored.sort(key=lambda t: (-t[0], t[1]))
-    selected = [rel for _score, rel in scored[:_MAX_FILES]]
+    selected = [rel for _score, rel in scored]
 
     # 3. Read file contents
     file_sections: list[str] = []

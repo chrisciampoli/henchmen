@@ -1,0 +1,5 @@
+{
+  "title": "Fix TypeError in format_price",
+  "description": "The format_price function crashes with a TypeError when passed an integer instead of a float. It calls .2f formatting on the value but first attempts string concatenation. Fix the type handling so both int and float inputs produce a correctly formatted price string, and the tests pass.",
+  "scheme": "bugfix_standard"
+}

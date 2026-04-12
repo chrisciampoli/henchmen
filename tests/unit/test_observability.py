@@ -1060,3 +1060,168 @@ class TestPRDedup:
         assert result["pr_url"] == "https://github.com/org/repo/pull/100"
         assert result["pr_number"] == 100
         mock_repo.create_pull.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: New observability fields
+# ---------------------------------------------------------------------------
+
+
+class TestRecordNodeResultNewFields:
+    """Test that record_node_result persists steps_used, context_tokens_at_start/end."""
+
+    def _make_tracker(self, store: MagicMock | None = None):
+        from henchmen.observability.tracker import TaskTracker
+
+        settings = _mock_settings()
+        mock_store = store or _make_mock_store()
+        return TaskTracker(settings, document_store=mock_store)
+
+    @pytest.mark.asyncio
+    async def test_record_node_result_includes_steps_and_context_tokens(self):
+        store = _make_mock_store()
+        store.get = AsyncMock(return_value={})
+        tracker = self._make_tracker(store)
+        report = _make_report(
+            steps_used=25,
+            context_tokens_at_start=5000,
+            context_tokens_at_end=12000,
+        )
+        await tracker.record_node_result("test-task", "implement_fix", report)
+        _coll, _id, update_data = store.update.call_args[0]
+        node_data = update_data["node_metrics"]["implement_fix"]
+        assert node_data["steps_used"] == 25
+        assert node_data["context_tokens_at_start"] == 5000
+        assert node_data["context_tokens_at_end"] == 12000
+
+
+class TestRecordRagChunks:
+    def _make_tracker(self, store: MagicMock | None = None):
+        from henchmen.observability.tracker import TaskTracker
+
+        settings = _mock_settings()
+        mock_store = store or _make_mock_store()
+        return TaskTracker(settings, document_store=mock_store)
+
+    @pytest.mark.asyncio
+    async def test_record_rag_chunks(self):
+        store = _make_mock_store()
+        tracker = self._make_tracker(store)
+        await tracker.record_rag_chunks("task-1", 15)
+        store.increment.assert_called_once()
+        _coll, _id, deltas = store.increment.call_args.args
+        assert deltas == {"rag_chunks_retrieved": 15}
+
+    @pytest.mark.asyncio
+    async def test_record_rag_chunks_swallows_errors(self):
+        store = _make_mock_store()
+        store.increment = AsyncMock(side_effect=Exception("Store down"))
+        tracker = self._make_tracker(store)
+        await tracker.record_rag_chunks("task-1", 10)  # Should not raise
+
+
+class TestCleanupExpiredTasks:
+    def _make_tracker(self, store: MagicMock | None = None):
+        from henchmen.observability.tracker import TaskTracker
+
+        settings = _mock_settings()
+        mock_store = store or _make_mock_store()
+        return TaskTracker(settings, document_store=mock_store)
+
+    @pytest.mark.asyncio
+    async def test_cleanup_expired_deletes_old_docs(self):
+        store = _make_mock_store()
+        store.query = AsyncMock(
+            return_value=[
+                {"task_id": "t1"},
+                {"task_id": "t2"},
+            ]
+        )
+        tracker = self._make_tracker(store)
+        deleted = await tracker.cleanup_expired()
+        assert deleted == 2
+        assert store.delete.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cleanup_expired_returns_zero_on_empty(self):
+        store = _make_mock_store()
+        store.query = AsyncMock(return_value=[])
+        tracker = self._make_tracker(store)
+        deleted = await tracker.cleanup_expired()
+        assert deleted == 0
+
+    @pytest.mark.asyncio
+    async def test_cleanup_expired_swallows_errors(self):
+        store = _make_mock_store()
+        store.query = AsyncMock(side_effect=Exception("Store down"))
+        tracker = self._make_tracker(store)
+        deleted = await tracker.cleanup_expired()
+        assert deleted == 0
+
+
+class TestCleanupProcessedMessages:
+    def _make_tracker(self, store: MagicMock | None = None):
+        from henchmen.observability.tracker import TaskTracker
+
+        settings = _mock_settings()
+        mock_store = store or _make_mock_store()
+        return TaskTracker(settings, document_store=mock_store)
+
+    @pytest.mark.asyncio
+    async def test_cleanup_processed_messages(self):
+        store = _make_mock_store()
+        store.query = AsyncMock(
+            return_value=[
+                {"key": "msg-1", "processed_at": "2026-01-01T00:00:00+00:00"},
+                {"key": "msg-2", "processed_at": "2026-01-01T00:00:00+00:00"},
+                {"key": "msg-3", "processed_at": "2026-01-01T00:00:00+00:00"},
+            ]
+        )
+        tracker = self._make_tracker(store)
+        deleted = await tracker.cleanup_processed_messages()
+        assert deleted == 3
+        assert store.delete.call_count == 3
+
+
+class TestMarkEscalatedWithNode:
+    def _make_tracker(self, store: MagicMock | None = None):
+        from henchmen.observability.tracker import TaskTracker
+
+        settings = _mock_settings()
+        mock_store = store or _make_mock_store()
+        return TaskTracker(settings, document_store=mock_store)
+
+    @pytest.mark.asyncio
+    async def test_mark_escalated_with_node(self):
+        store = _make_mock_store()
+        tracker = self._make_tracker(store)
+        await tracker.mark_escalated("task-1", reason="cycle", escalation_node="implement_fix")
+        _coll, _id, data = store.update.call_args[0]
+        assert data["escalation_node"] == "implement_fix"
+        assert data["escalation_reason"] == "cycle"
+
+    @pytest.mark.asyncio
+    async def test_mark_escalated_without_node_omits_field(self):
+        store = _make_mock_store()
+        tracker = self._make_tracker(store)
+        await tracker.mark_escalated("task-1", reason="timeout")
+        _coll, _id, data = store.update.call_args[0]
+        assert "escalation_node" not in data
+
+
+class TestUpdateHeartbeat:
+    def _make_tracker(self, store: MagicMock | None = None):
+        from henchmen.observability.tracker import TaskTracker
+
+        settings = _mock_settings()
+        mock_store = store or _make_mock_store()
+        return TaskTracker(settings, document_store=mock_store)
+
+    @pytest.mark.asyncio
+    async def test_update_heartbeat(self):
+        store = _make_mock_store()
+        tracker = self._make_tracker(store)
+        await tracker.update_heartbeat("task-1")
+        store.update.assert_called_once()
+        _coll, _id, data = store.update.call_args[0]
+        assert "last_heartbeat" in data

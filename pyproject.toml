@@ -113,6 +113,7 @@ dev = [
     "pytest-randomly",
     "ruff",
     "mypy",
+    "aiosqlite",
 ]
 # Full stack + dev tooling. Needed to run the integration test suite because
 # tests/integration/conftest.py imports google.cloud.{pubsub_v1,firestore,storage}
@@ -159,6 +160,8 @@ ignore = []
 "src/henchmen/mastermind/agent.py" = ["ASYNC109"]
 # Tests get a relaxed ruleset — assert-raises-Exception, print-for-debug,
 # and blocking-IO-in-async-tests are all idiomatic.
+# Eval harness uses blocking subprocess.run and print() for user-facing output.
+"evals/**/*.py" = ["T201", "ASYNC230", "ASYNC240"]
 "tests/**/*.py" = ["T201", "B017", "ASYNC230", "ASYNC240", "ASYNC221", "SIM105"]
 
 [tool.pytest.ini_options]

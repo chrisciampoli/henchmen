@@ -69,3 +69,6 @@ class OperativeReport(StrictBase):
     tool_calls_count: int = Field(default=0, description="Total tool calls made")
     tool_calls_detail: dict[str, int] = Field(default_factory=dict, description="Tool call counts by tool name")
     wall_clock_seconds: float = Field(default=0.0, description="Total execution time in seconds")
+    steps_used: int = Field(default=0, description="Number of agentic steps taken during execution")
+    context_tokens_at_start: int = Field(default=0, description="Input tokens on the first model call")
+    context_tokens_at_end: int = Field(default=0, description="Input tokens on the last model call")

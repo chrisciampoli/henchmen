@@ -174,6 +174,7 @@ class TaskTracker:
                 "last_heartbeat": now,
                 "recovery_attempts": 0,
                 "escalation_reason": None,
+                "escalation_node": None,
             }
             await self._store.set(_COLLECTION, task.id, doc)
             logger.info("Started tracking task %s", task.id)
@@ -206,6 +207,9 @@ class TaskTracker:
                 "model_name": model_name,
                 "status": report.status.value,
                 "confidence_score": report.confidence_score,
+                "steps_used": report.steps_used,
+                "context_tokens_at_start": report.context_tokens_at_start,
+                "context_tokens_at_end": report.context_tokens_at_end,
             }
 
             # 1) Atomic counter increments — safe under cross-process concurrency.
@@ -250,6 +254,14 @@ class TaskTracker:
             logger.info("Recorded node %s for task %s (cost=$%.3f)", node_id, task_id, cost)
         except Exception as exc:
             logger.warning("Failed to record node %s for task %s: %s", node_id, task_id, exc)
+
+    async def record_rag_chunks(self, task_id: str, count: int) -> None:
+        """Atomically set the number of RAG chunks retrieved for a task."""
+        try:
+            await self._store.increment(_COLLECTION, task_id, {"rag_chunks_retrieved": count})
+            logger.info("Recorded %d RAG chunks for task %s", count, task_id)
+        except Exception as exc:
+            logger.warning("Failed to record RAG chunks for task %s: %s", task_id, exc)
 
     async def record_ci_result(self, task_id: str, ci_passed: bool) -> None:
         """Update CI pass/fail status."""
@@ -305,6 +317,17 @@ class TaskTracker:
         except Exception as exc:
             logger.warning("Failed to checkpoint task %s: %s", task_id, exc)
 
+    async def update_heartbeat(self, task_id: str) -> None:
+        """Refresh the heartbeat timestamp for a running task."""
+        try:
+            await self._store.update(
+                _COLLECTION,
+                task_id,
+                {"last_heartbeat": datetime.now(UTC)},
+            )
+        except Exception as exc:
+            logger.debug("Heartbeat update failed (non-fatal): %s", exc)
+
     async def mark_stalled(self, task_id: str) -> None:
         """Mark a task as stalled (heartbeat expired)."""
         try:
@@ -313,18 +336,21 @@ class TaskTracker:
         except Exception as exc:
             logger.warning("Failed to mark task %s as stalled: %s", task_id, exc)
 
-    async def mark_escalated(self, task_id: str, reason: str = "") -> None:
+    async def mark_escalated(self, task_id: str, reason: str = "", escalation_node: str | None = None) -> None:
         """Mark a task as escalated (unrecoverable)."""
         try:
+            update_data: dict[str, Any] = {
+                "execution_state": "escalated",
+                "final_status": "escalated",
+                "escalation_reason": reason,
+                "completed_at": datetime.now(UTC),
+            }
+            if escalation_node is not None:
+                update_data["escalation_node"] = escalation_node
             await self._store.update(
                 _COLLECTION,
                 task_id,
-                {
-                    "execution_state": "escalated",
-                    "final_status": "escalated",
-                    "escalation_reason": reason,
-                    "completed_at": datetime.now(UTC),
-                },
+                update_data,
             )
             logger.info("Escalated task %s: %s", task_id, reason)
         except Exception as exc:
@@ -437,6 +463,56 @@ class TaskTracker:
             logger.info("Cleared ci_fix_in_progress for task %s", task_id)
         except Exception as exc:
             logger.warning("Failed to clear ci_fix_in_progress for task %s: %s", task_id, exc)
+
+    async def cleanup_expired(self, batch_size: int = 100) -> int:
+        """Delete task execution documents past their expires_at TTL.
+
+        Returns the number of documents deleted.
+        """
+        try:
+            now = datetime.now(UTC)
+            expired = await self._store.query(
+                _COLLECTION,
+                filters=[("expires_at", "<", now)],
+                limit=batch_size,
+            )
+            deleted = 0
+            for doc in expired:
+                task_id = doc.get("task_id", "")
+                if task_id:
+                    await self._store.delete(_COLLECTION, task_id)
+                    deleted += 1
+            if deleted:
+                logger.info("Cleaned up %d expired task documents", deleted)
+            return deleted
+        except Exception as exc:
+            logger.warning("Failed to cleanup expired tasks: %s", exc)
+            return 0
+
+    async def cleanup_processed_messages(self, retention_days: int = 7, batch_size: int = 200) -> int:
+        """Delete processed message dedup records older than retention_days.
+
+        Returns the number of documents deleted.
+        """
+        try:
+            cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+            old_messages = await self._store.query(
+                "processed_messages",
+                filters=[("processed_at", "<", cutoff.isoformat())],
+                limit=batch_size,
+            )
+            deleted = 0
+            for doc in old_messages:
+                key = doc.get("key", "")
+                if key:
+                    await self._store.delete("processed_messages", key)
+                    deleted += 1
+            if deleted:
+                logger.info("Cleaned up %d old processed messages", deleted)
+            return deleted
+        except Exception as exc:
+            logger.warning("Failed to cleanup processed messages: %s", exc)
+            return 0
 
     async def get_task_by_id_prefix(self, task_id_prefix: str) -> dict[str, Any] | None:
         """Find a task whose ID starts with the given prefix.

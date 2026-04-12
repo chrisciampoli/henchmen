@@ -1,0 +1,5 @@
+{
+  "title": "Rename 'lst' to 'items' throughout inventory.py",
+  "description": "The inventory.py module uses the variable name 'lst' which is unclear. Rename every occurrence of 'lst' to 'items' in the module (parameter names, local variables, docstrings). The tests reference the public API by keyword argument, so they must also be updated. All tests must continue to pass after the rename.",
+  "scheme": "feature_standard"
+}

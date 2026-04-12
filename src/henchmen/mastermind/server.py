@@ -826,6 +826,9 @@ async def check_dlq_handler() -> dict[str, Any]:
 
 @app.post("/api/v1/cleanup")
 async def cleanup_handler() -> dict[str, Any]:
-    """Cleanup stale tasks (called by Cloud Scheduler)."""
-    logger.info("Running stale task cleanup")
-    return {"status": "ok", "cleaned": 0}
+    """Cleanup expired task docs and stale dedup records (called by Cloud Scheduler)."""
+    agent = get_agent()
+    expired = await agent.tracker.cleanup_expired()
+    messages = await agent.tracker.cleanup_processed_messages()
+    logger.info("Cleanup complete: %d expired tasks, %d processed messages", expired, messages)
+    return {"status": "ok", "expired_cleaned": expired, "messages_cleaned": messages}

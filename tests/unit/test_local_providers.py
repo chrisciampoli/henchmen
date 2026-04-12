@@ -464,7 +464,7 @@ class TestOllamaProvider:
     def test_supported_models_returns_default(self):
         from henchmen.providers.local.ollama import OllamaProvider
 
-        provider = OllamaProvider(_mock_settings())
+        provider = OllamaProvider(_mock_settings(llm_ollama_model="llama3.2"))
         models = provider.supported_models()
         assert models == ["llama3.2"]
 
@@ -478,21 +478,21 @@ class TestOllamaProvider:
         from henchmen.models.llm import ModelTier
         from henchmen.providers.local.ollama import OllamaProvider
 
-        provider = OllamaProvider(_mock_settings())
+        provider = OllamaProvider(_mock_settings(llm_ollama_model="llama3.2"))
         assert provider.resolve_tier(ModelTier.COMPLEX) == "llama3.2"
 
     def test_resolve_tier_light(self):
         from henchmen.models.llm import ModelTier
         from henchmen.providers.local.ollama import OllamaProvider
 
-        provider = OllamaProvider(_mock_settings())
+        provider = OllamaProvider(_mock_settings(llm_ollama_model="llama3.2"))
         assert provider.resolve_tier(ModelTier.LIGHT) == "llama3.2"
 
     def test_resolve_tier_reasoning(self):
         from henchmen.models.llm import ModelTier
         from henchmen.providers.local.ollama import OllamaProvider
 
-        provider = OllamaProvider(_mock_settings())
+        provider = OllamaProvider(_mock_settings(llm_ollama_model="llama3.2"))
         assert provider.resolve_tier(ModelTier.REASONING) == "llama3.2"
 
     def test_resolve_tier_passthrough_unknown(self):

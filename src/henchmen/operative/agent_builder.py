@@ -11,7 +11,8 @@ from typing import TYPE_CHECKING, Any
 from henchmen.config.settings import Settings
 from henchmen.models.llm import LLMResponse, Message, MessageRole, ToolCall, ToolDefinition, ToolParameter
 from henchmen.models.operative import OperativeConfig
-from henchmen.operative.failure_classifier import classify_tool_failure
+from henchmen.operative.failure_classifier import classify_tool_failure, get_recovery_strategy
+from henchmen.operative.nudge_detector import NudgeDetector
 from henchmen.providers.interfaces import LLMProvider
 
 if TYPE_CHECKING:
@@ -371,6 +372,9 @@ class OperativeAgent:
         consecutive_failure_count: int = 0
         failure_abort_reason: str | None = None
 
+        # Centralized nudge detector
+        nudge_detector = NudgeDetector(max_steps=self.max_steps)
+
         while True:
             # Graceful shutdown: if SIGTERM was received, stop the loop so the
             # caller can write a partial INTERRUPTED report before SIGKILL.
@@ -402,23 +406,17 @@ class OperativeAgent:
                 )
                 break
 
-            # Phase-aware nudge: if we've been only reading for too long, push to edit
-            # Use a threshold that scales with max_steps (min 3 consecutive read-only steps)
-            nudge_threshold = max(3, self.max_steps // 8)
-            if not has_edited and read_only_steps >= nudge_threshold and self.step_count >= nudge_threshold:
-                remaining = self.max_steps - self.step_count
-                self.messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"You have spent {self.step_count} steps reading files. "
-                            f"You have {remaining} steps remaining. "
-                            f"STOP READING. Based on what you've learned, make the code change NOW "
-                            f"using file_edit or file_write, then call git_commit. Do not read any more files."
-                        ),
-                    }
+            # Centralized stuck detection via NudgeDetector
+            stuck_state = nudge_detector.check_stuck(self.step_count)
+            if stuck_state is not None:
+                nudge_msg = nudge_detector.get_nudge_message(stuck_state, self.step_count)
+                self.messages.append({"role": "user", "content": nudge_msg})
+                logger.info(
+                    "[OPERATIVE] Nudge at step %d: %s",
+                    self.step_count,
+                    stuck_state.value,
                 )
-                logger.info("[OPERATIVE] Phase nudge at step %d: pushing model to edit", self.step_count)
+                guardrails._nudge_count += 1
                 read_only_steps = 0  # reset so we don't spam
 
             # Pre-model hook
@@ -457,7 +455,7 @@ class OperativeAgent:
 
                 consecutive_text_only += 1
                 total_text_only += 1
-                remaining = self.max_steps - self.step_count
+                nudge_detector.record_text_only_response()
 
                 logger.info(
                     "[OPERATIVE] Text-only response at step %d (consecutive=%d, total=%d)",
@@ -474,35 +472,19 @@ class OperativeAgent:
                     )
                     break
 
-                # Escalating nudge based on state
-                if has_edited and consecutive_text_only >= 2:
-                    nudge = (
-                        "FINAL WARNING: You have returned text without calling any tool "
-                        f"{consecutive_text_only} times in a row. "
-                        "Your ONLY option right now is to call git_commit(message, files). "
-                        "Do NOT return text. Do NOT explain. Call git_commit NOW."
-                    )
-                elif has_edited:
-                    nudge = (
-                        f"You've edited files but haven't committed. "
-                        f"Call git_commit(message, files) NOW. You have {remaining} steps left. "
-                        f"Do NOT return text — call git_commit."
-                    )
-                elif self.step_count >= 5:
-                    nudge = (
-                        f"URGENT: You have used {self.step_count} of {self.max_steps} steps "
-                        f"without making any code changes. "
-                        f"You have {remaining} steps left. Make the change NOW with file_edit "
-                        f"or file_write, then git_commit. "
-                        f"Do NOT return text. Call a tool."
-                    )
+                # Use NudgeDetector for text-only nudges
+                text_stuck = nudge_detector.check_stuck(self.step_count)
+                if text_stuck is not None:
+                    nudge = nudge_detector.get_nudge_message(text_stuck, self.step_count)
                 else:
+                    remaining = self.max_steps - self.step_count
                     nudge = (
                         f"You have {remaining} steps remaining. "
                         f"Use file_edit or file_write to make the code change, then call git_commit. "
                         f"Do not analyze — call a tool."
                     )
                 self.messages.append({"role": "user", "content": nudge})
+                guardrails._nudge_count += 1
                 read_only_steps = 0
                 continue
 
@@ -535,11 +517,20 @@ class OperativeAgent:
                     if classification != "none":
                         step_had_failure = True
                         step_failure_class = classification
+                        nudge_detector.record_tool_call(tool_name, success=False)
                         logger.info(
                             "[agent] Tool %s failed with classification=%s",
                             tool_name,
                             classification,
                         )
+                        # Inject recovery strategy as guidance
+                        recovery = get_recovery_strategy(classification)
+                        if recovery:
+                            raw_str_with_recovery = json.dumps(raw)
+                            if len(raw_str_with_recovery) < _MAX_TOOL_RESULT_CHARS - 500:
+                                raw["_recovery_hint"] = recovery
+                    else:
+                        nudge_detector.record_tool_call(tool_name, success=True)
 
                     # Track lint results for the pre-commit gate
                     if tool_name == "run_lint":
@@ -607,24 +598,20 @@ class OperativeAgent:
                     consecutive_failure_count = 1
 
                 if consecutive_failure_count >= 3:
-                    if step_failure_class == "environmental":
+                    recovery = get_recovery_strategy(step_failure_class)
+                    if step_failure_class in ("approach_wrong", "environmental"):
                         failure_abort_reason = (
-                            "Three consecutive environmental tool failures "
-                            "(missing dependency, permission, or disk issue). "
-                            "Escalating — the environment appears broken."
+                            f"Three consecutive {step_failure_class} failures. "
+                            "Escalating — the environment or approach is broken."
                         )
-                    elif step_failure_class == "transient":
+                    elif step_failure_class in ("tool_error", "transient"):
                         failure_abort_reason = (
-                            "Three consecutive transient tool failures. "
+                            f"Three consecutive {step_failure_class} failures. "
                             "Backing off and escalating — downstream services "
                             "may be unhealthy."
                         )
                     else:
-                        failure_abort_reason = (
-                            "Three consecutive semantic tool failures. "
-                            "The current strategy is not working; stopping "
-                            "the loop so the model can be redirected."
-                        )
+                        failure_abort_reason = f"Three consecutive {step_failure_class} failures. {recovery}"
                     logger.warning("[agent] %s", failure_abort_reason)
                     self._blocked_reason = failure_abort_reason
                     break
@@ -1277,6 +1264,12 @@ async def build_operative_agent(
         if file_context:
             dossier_context = file_context + "\n\n" + dossier_context
 
+    # Inject detected conventions into the system instruction so generated
+    # code matches the target project's existing style
+    conventions_prompt = _extract_conventions_prompt(workspace_dir)
+    if conventions_prompt:
+        instruction = instruction + "\n\n" + conventions_prompt
+
     return OperativeAgent(
         config=config,
         node=node,
@@ -1302,6 +1295,7 @@ async def _fetch_arsenal_tools(
 
     # Import tool modules to trigger @tool decorator registration
     import henchmen.arsenal.tools.code_intel  # noqa: F401
+    import henchmen.arsenal.tools.context  # noqa: F401
     import henchmen.arsenal.tools.git_ops  # noqa: F401
     import henchmen.arsenal.tools.test_runner  # noqa: F401
     from henchmen.arsenal.registry import ToolRegistry
@@ -1387,6 +1381,37 @@ def _extract_task_type_from_dossier(workspace_dir: str) -> str | None:
         return task_analysis.get("task_type")
 
     return None
+
+
+def _extract_conventions_prompt(workspace_dir: str) -> str:
+    """Read conventions from the dossier JSON and format as a system prompt section.
+
+    Falls back to live detection from the workspace if the dossier has no
+    conventions (e.g. older dossiers built before this feature).
+    """
+    from henchmen.dossier.convention_detector import RepoConventions, conventions_to_prompt, detect_conventions
+
+    # Try reading from dossier first
+    dossier_path = os.path.join(workspace_dir, ".henchmen", "dossier", "dossier.json")
+    if os.path.exists(dossier_path):
+        try:
+            with open(dossier_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            conventions_data = data.get("conventions")
+            if isinstance(conventions_data, dict):
+                conventions = RepoConventions(**conventions_data)
+                prompt = conventions_to_prompt(conventions)
+                if prompt:
+                    return prompt
+        except Exception:
+            pass
+
+    # Fallback: detect from workspace
+    try:
+        conventions = detect_conventions(workspace_dir)
+        return conventions_to_prompt(conventions)
+    except Exception:
+        return ""
 
 
 def _extract_code_search_context(workspace_dir: str) -> str:

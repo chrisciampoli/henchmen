@@ -6,6 +6,7 @@ Importing this package registers all tool modules with the ToolRegistry.
 from henchmen.arsenal.tools import (
     code_edit,
     code_intel,
+    context,
     git_ops,
     github,
     jira,
@@ -16,6 +17,7 @@ from henchmen.arsenal.tools import (
 __all__ = [
     "code_edit",
     "code_intel",
+    "context",
     "git_ops",
     "github",
     "jira",

@@ -35,36 +35,50 @@ def main() -> None:
     )
 
     eval_parser = subparsers.add_parser("eval", help="Run the offline evaluation harness")
-    eval_parser.add_argument(
+    eval_subparsers = eval_parser.add_subparsers(dest="eval_command")
+
+    # --- henchmen eval run ---
+    eval_run_parser = eval_subparsers.add_parser("run", help="Run eval fixtures and save results to SQLite")
+    eval_run_parser.add_argument(
         "--provider",
         required=True,
         help="LLM provider to evaluate (openai, anthropic, vertex, ollama, local)",
     )
-    eval_parser.add_argument(
+    eval_run_parser.add_argument(
         "--fixture",
         default=None,
         help="Run a single fixture by directory name (default: run all fixtures)",
     )
-    eval_parser.add_argument(
+    eval_run_parser.add_argument(
         "--fixtures-dir",
         default="evals/fixtures",
         help="Path to the fixtures directory (default: evals/fixtures)",
     )
-    eval_parser.add_argument(
+    eval_run_parser.add_argument(
         "--baseline-path",
         default="evals/baseline.json",
         help="Path to baseline.json (default: evals/baseline.json)",
     )
-    eval_parser.add_argument(
+    eval_run_parser.add_argument(
         "--write-baseline",
         action="store_true",
         help="Overwrite the baseline for this provider with the current run",
     )
-    eval_parser.add_argument(
+    eval_run_parser.add_argument(
         "--compare-baseline",
         action="store_true",
         help="Compare current run to baseline; exit non-zero on >5%% regression",
     )
+
+    # --- henchmen eval compare ---
+    eval_compare_parser = eval_subparsers.add_parser("compare", help="Compare two eval runs dimension-by-dimension")
+    eval_compare_parser.add_argument("run_a", help="First run ID")
+    eval_compare_parser.add_argument("run_b", help="Second run ID")
+
+    # --- henchmen eval history ---
+    eval_history_parser = eval_subparsers.add_parser("history", help="Show past eval runs")
+    eval_history_parser.add_argument("--provider", default=None, help="Filter by provider")
+    eval_history_parser.add_argument("--limit", type=int, default=20, help="Max runs to show")
 
     args = parser.parse_args()
 
@@ -73,7 +87,7 @@ def main() -> None:
     elif args.command == "build-operative":
         _build_operative(args)
     elif args.command == "eval":
-        _eval(args)
+        _dispatch_eval(args, eval_parser)
     elif args.command == "doctor":
         from henchmen.cli import doctor
 
@@ -122,10 +136,30 @@ def _build_operative(args: argparse.Namespace) -> None:
 _BASELINE_REGRESSION_THRESHOLD = 0.05
 
 
-def _eval(args: argparse.Namespace) -> None:
+def _dispatch_eval(args: argparse.Namespace, eval_parser: argparse.ArgumentParser) -> None:
+    """Route eval sub-subcommands to their handlers."""
+    cmd = getattr(args, "eval_command", None)
+    if cmd == "run":
+        _eval_run(args)
+    elif cmd == "compare":
+        _eval_compare(args)
+    elif cmd == "history":
+        _eval_history(args)
+    else:
+        # Backward compat: bare `henchmen eval --provider X` (no subcommand)
+        # still works if --provider was passed directly on the eval parser.
+        if getattr(args, "provider", None):
+            _eval_run(args)
+        else:
+            eval_parser.print_help()
+            sys.exit(1)
+
+
+def _eval_run(args: argparse.Namespace) -> None:
     """Run the offline evaluation harness for a given LLM provider."""
     import asyncio
     from pathlib import Path
+    from uuid import uuid4
 
     from henchmen.config.settings import get_settings
 
@@ -159,12 +193,21 @@ def _eval(args: argparse.Namespace) -> None:
             sys.exit(2)
         result = asyncio.run(run_fixture(target, llm_provider, settings=settings))
         _print_fixture_result(result)
+
+        # Save single-fixture run to SQLite.
+        _save_single_fixture_run(result, args.provider, str(uuid4()))
+
         if result.error:
             sys.exit(1)
         return
 
     report = asyncio.run(run_all_fixtures(fixtures_dir, llm_provider, settings=settings))
     _print_eval_report(report)
+
+    # Save full run to SQLite history.
+    run_id = str(uuid4())
+    _save_report_to_storage(report, run_id)
+    print(f"Run saved: {run_id}")
 
     if args.write_baseline:
         _write_baseline(baseline_path, args.provider, report)
@@ -178,6 +221,111 @@ def _eval(args: argparse.Namespace) -> None:
     # Default: fail if any fixture errored.
     if any(r.error for r in report.results):
         sys.exit(1)
+
+
+def _save_report_to_storage(report: EvalReport, run_id: str) -> None:
+    """Persist an EvalReport to the SQLite history store."""
+    import asyncio
+
+    from evals.storage import EvalRun, FixtureResultRow, save_run
+
+    fixture_rows: list[FixtureResultRow] = []
+    for r in report.results:
+        dims = r.score.dimensions
+        fixture_rows.append(
+            FixtureResultRow(
+                fixture_id=r.fixture_id,
+                correctness=dims.correctness if dims else 0.0,
+                precision=dims.precision if dims else 0.0,
+                conventions=dims.conventions if dims else 0.0,
+                efficiency=dims.efficiency if dims else 0.0,
+                completion=dims.completion if dims else 0.0,
+                wall_clock=r.wall_clock_seconds,
+                tokens=r.total_input_tokens + r.total_output_tokens,
+                cost=r.estimated_cost_usd,
+            )
+        )
+
+    eval_run = EvalRun(
+        id=run_id,
+        provider=report.provider,
+        commit_sha=report.commit_sha,
+        timestamp=report.timestamp.isoformat(),
+        aggregate_score=report.aggregate_score,
+        fixture_results=fixture_rows,
+    )
+    asyncio.run(save_run(eval_run))
+
+
+def _save_single_fixture_run(result: FixtureResult, provider: str, run_id: str) -> None:
+    """Persist a single-fixture result to the SQLite history store."""
+    import asyncio
+
+    from evals.storage import EvalRun, FixtureResultRow, save_run
+
+    dims = result.score.dimensions
+    row = FixtureResultRow(
+        fixture_id=result.fixture_id,
+        correctness=dims.correctness if dims else 0.0,
+        precision=dims.precision if dims else 0.0,
+        conventions=dims.conventions if dims else 0.0,
+        efficiency=dims.efficiency if dims else 0.0,
+        completion=dims.completion if dims else 0.0,
+        wall_clock=result.wall_clock_seconds,
+        tokens=result.total_input_tokens + result.total_output_tokens,
+        cost=result.estimated_cost_usd,
+    )
+    eval_run = EvalRun(
+        id=run_id,
+        provider=provider,
+        aggregate_score=result.score.overall_score,
+        fixture_results=[row],
+    )
+    asyncio.run(save_run(eval_run))
+
+
+def _eval_compare(args: argparse.Namespace) -> None:
+    """Compare two eval runs dimension-by-dimension."""
+    import asyncio
+
+    from evals.storage import compare_runs
+
+    logging.basicConfig(level=logging.INFO)
+
+    try:
+        comparison = asyncio.run(compare_runs(args.run_a, args.run_b))
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    print(f"Comparing runs: {comparison.run_a_id} vs {comparison.run_b_id}")
+    print(
+        f"Aggregate:  {comparison.run_a_aggregate:.4f} -> {comparison.run_b_aggregate:.4f}  "
+        f"delta={comparison.aggregate_delta:+.4f}"
+    )
+    print("-" * 60)
+    for d in comparison.dimension_deltas:
+        print(f"  {d.dimension:14s}  {d.run_a_avg:.4f} -> {d.run_b_avg:.4f}  delta={d.delta:+.4f}")
+
+
+def _eval_history(args: argparse.Namespace) -> None:
+    """Show past eval runs from SQLite history."""
+    import asyncio
+
+    from evals.storage import list_runs
+
+    logging.basicConfig(level=logging.INFO)
+
+    runs = asyncio.run(list_runs(provider=args.provider, limit=args.limit))
+
+    if not runs:
+        print("No eval runs found.")
+        return
+
+    print(f"{'ID':36s}  {'Provider':12s}  {'Score':6s}  {'Fixtures':8s}  {'Timestamp'}")
+    print("-" * 90)
+    for r in runs:
+        print(f"{r.id:36s}  {r.provider:12s}  {r.aggregate_score:.4f}  {r.fixture_count:8d}  {r.timestamp}")
 
 
 def _print_fixture_result(result: FixtureResult) -> None:

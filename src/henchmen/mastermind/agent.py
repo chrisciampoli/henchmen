@@ -148,6 +148,14 @@ class MastermindAgent:
             final_status = result.get("final_status", "completed")
             await self.tracker.finalize_task(task.id, final_status, pr_url_final, pr_number)
 
+            # Record escalation node if the task was escalated
+            if final_status == "escalated" and result.get("escalation_node"):
+                await self.tracker.mark_escalated(
+                    task.id,
+                    reason=f"Escalated at node: {result['escalation_node']}",
+                    escalation_node=result["escalation_node"],
+                )
+
             # Log to Vertex AI Experiments if enabled
             try:
                 from henchmen.observability.experiments import maybe_log_experiment
@@ -437,6 +445,7 @@ class MastermindAgent:
         semantic_chunks = await self._fetch_semantic_chunks(task)
         if semantic_chunks:
             dossier.semantic_code_chunks = semantic_chunks
+            await self.tracker.record_rag_chunks(task.id, len(semantic_chunks))
 
         # Also try to build via DossierBuilder for rules/PRs
         try:

@@ -1,5 +1,7 @@
 """SchemeExecutor - walks a Scheme DAG and dispatches nodes."""
 
+import asyncio
+import contextlib
 import logging
 import os
 from typing import TYPE_CHECKING, Any
@@ -35,6 +37,7 @@ class SchemeExecutor:
         self._max_node_retries = 2  # Max times a single node can be re-executed
         self._freshly_executed: set[str] = set()  # nodes executed in this session (excludes checkpoint-restored)
         self._visited_states: set[tuple[str, int]] = set()  # (node_id, retry_count) for cycle detection
+        self._escalation_node: str | None = None  # node that caused escalation
 
     async def execute(self, task: HenchmenTask, dossier: Dossier) -> dict[str, Any]:
         """Execute the scheme from root to completion.
@@ -61,6 +64,7 @@ class SchemeExecutor:
                     node_key,
                     exec_count,
                 )
+                self._escalation_node = node_key
                 self.node_results[node_key] = {
                     "condition": None,
                     "message": f"Cycle detected at {node_key} — escalating",
@@ -121,6 +125,7 @@ class SchemeExecutor:
                         current_node.id,
                         task.id,
                     )
+                    self._escalation_node = current_node.id
                     self.node_results[current_node.id]["escalated"] = True
                 break  # Terminal node reached
 
@@ -171,6 +176,16 @@ class SchemeExecutor:
                 output_tokens = report_data.get("total_output_tokens", 0)
                 total += estimate_cost(model_name, input_tokens, output_tokens)
         return total
+
+    async def _heartbeat_during_wait(self, task_id: str, interval: int = 120) -> None:
+        """Send periodic heartbeats while waiting for an operative to complete."""
+        while True:
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+            if self.tracker:
+                await self.tracker.update_heartbeat(task_id)
 
     async def _execute_agentic(self, node: SchemeNode, task: HenchmenTask, dossier: Dossier) -> dict[str, Any]:
         """Execute an agentic node by provisioning a Lair and running an Operative.
@@ -227,7 +242,20 @@ class SchemeExecutor:
                 enriched_task, node, scheme_id=self.scheme_graph.definition.id
             )
             logger.info("[SCHEME] Lair %s created, waiting for completion...", lair_id)
-            report = await self.lair_manager.wait_for_completion(lair_id)
+
+            # Run heartbeat concurrently with wait_for_completion
+            heartbeat_task: asyncio.Task[None] | None = None
+            try:
+                heartbeat_task = asyncio.create_task(
+                    self._heartbeat_during_wait(task.id),
+                    name=f"executor-heartbeat-{task.id[:8]}",
+                )
+                report = await self.lair_manager.wait_for_completion(lair_id)
+            finally:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await heartbeat_task
             logger.info("[SCHEME] Lair %s completed with status: %s", lair_id, report.status)
 
             if self.tracker:
@@ -331,6 +359,7 @@ class SchemeExecutor:
             "final_status": final_status,
             "pr_url": pr_url,
             "escalated": escalated,
+            "escalation_node": self._escalation_node,
             "node_results": self.node_results,
             "nodes_executed": list(self._freshly_executed),
         }

@@ -1,0 +1,5 @@
+{
+  "title": "Add missing return statement in find_max",
+  "description": "The find_max function computes the maximum value in a list but never returns it. The variable is assigned correctly but the function falls off the end returning None. Add the missing return statement so the tests pass.",
+  "scheme": "bugfix_standard"
+}

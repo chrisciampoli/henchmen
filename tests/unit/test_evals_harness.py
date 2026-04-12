@@ -11,9 +11,12 @@ from pathlib import Path
 import pytest
 
 from evals.harness import (
+    DimensionScores,
     EvalReport,
+    FixtureMeta,
     FixtureResult,
     FixtureScore,
+    compute_dimensions,
     run_fixture,
     score_result,
 )
@@ -232,3 +235,174 @@ async def test_run_fixture_with_mock_provider_produces_zero_score(tmp_path: Path
     assert result.total_input_tokens >= 10
     assert result.total_output_tokens >= 5
     assert result.error is None
+
+
+# ---------------------------------------------------------------------------
+# DimensionScores
+# ---------------------------------------------------------------------------
+
+
+class TestDimensionScores:
+    """Tests for the five-dimensional scoring model."""
+
+    def test_dimension_scores_weighted_calculation(self) -> None:
+        """Verify the weighted composite respects the 40/20/15/15/10 split."""
+        dims = DimensionScores(
+            correctness=1.0,
+            precision=1.0,
+            conventions=1.0,
+            efficiency=1.0,
+            completion=1.0,
+        )
+        assert dims.compute_weighted_score() == pytest.approx(1.0)
+
+    def test_dimension_scores_partial(self) -> None:
+        dims = DimensionScores(
+            correctness=0.5,
+            precision=0.5,
+            conventions=0.5,
+            efficiency=0.5,
+            completion=0.5,
+        )
+        assert dims.compute_weighted_score() == pytest.approx(0.5)
+
+    def test_dimension_scores_zero(self) -> None:
+        dims = DimensionScores()
+        assert dims.compute_weighted_score() == pytest.approx(0.0)
+
+    def test_dimension_scores_weights_sum_to_one(self) -> None:
+        """Guard against typos in the weight dict."""
+        total = sum(DimensionScores._WEIGHTS.values())
+        assert total == pytest.approx(1.0)
+
+    def test_dimension_scores_correctness_only(self) -> None:
+        """Correctness at 40% weight, rest zero."""
+        dims = DimensionScores(correctness=1.0)
+        assert dims.compute_weighted_score() == pytest.approx(0.4)
+
+    def test_dimension_scores_backward_compat(self) -> None:
+        """Existing FixtureScore still works without dimensions (None default)."""
+        score = FixtureScore(
+            fixture_id="legacy",
+            diff_non_empty=True,
+            touched_expected_files=True,
+            tests_pass=True,
+            contains_expected_substrings=True,
+            overall_score=1.0,
+        )
+        assert score.dimensions is None
+        data = score.model_dump()
+        assert data["dimensions"] is None
+        restored = FixtureScore.model_validate(data)
+        assert restored.dimensions is None
+        assert restored.overall_score == 1.0
+
+
+class TestComputeDimensions:
+    """Tests for the compute_dimensions() orchestrator."""
+
+    def test_perfect_run(self, tmp_path: Path) -> None:
+        """All signals positive with no budgets set should score high."""
+        meta = FixtureMeta()
+        dims = compute_dimensions(
+            tests_pass=True,
+            touched_expected_files=True,
+            contains_expected_substrings=True,
+            changed_files=["sample.py"],
+            expected_files=["sample.py"],
+            diff_line_count=5,
+            workspace=tmp_path,
+            steps=2,
+            total_tokens=1000,
+            wall_clock=1.5,
+            meta=meta,
+            error=None,
+            finished=True,
+        )
+        assert dims.correctness == pytest.approx(1.0)
+        assert dims.precision == pytest.approx(1.0)
+        assert dims.completion == pytest.approx(1.0)
+        assert dims.efficiency == pytest.approx(1.0)  # No budget = 1.0
+        assert dims.compute_weighted_score() == pytest.approx(1.0)
+
+    def test_error_run(self, tmp_path: Path) -> None:
+        """An error should zero out completion."""
+        meta = FixtureMeta()
+        dims = compute_dimensions(
+            tests_pass=False,
+            touched_expected_files=False,
+            contains_expected_substrings=False,
+            changed_files=[],
+            expected_files=["sample.py"],
+            diff_line_count=0,
+            workspace=tmp_path,
+            steps=1,
+            total_tokens=100,
+            wall_clock=0.5,
+            meta=meta,
+            error="RuntimeError: boom",
+            finished=False,
+        )
+        assert dims.completion == pytest.approx(0.0)
+        assert dims.correctness == pytest.approx(0.0)
+        assert dims.precision == pytest.approx(0.0)
+
+    def test_efficiency_with_budget(self, tmp_path: Path) -> None:
+        """Steps at budget should score 1.0, at 2x budget should score 0.0."""
+        meta = FixtureMeta(max_expected_steps=3, max_expected_tokens=1000)
+
+        # Exactly at budget
+        dims = compute_dimensions(
+            tests_pass=True,
+            touched_expected_files=True,
+            contains_expected_substrings=True,
+            changed_files=["f.py"],
+            expected_files=["f.py"],
+            diff_line_count=5,
+            workspace=tmp_path,
+            steps=3,
+            total_tokens=1000,
+            wall_clock=1.0,
+            meta=meta,
+            error=None,
+            finished=True,
+        )
+        assert dims.efficiency == pytest.approx(1.0)
+
+        # At 2x budget — should be 0.0
+        dims_over = compute_dimensions(
+            tests_pass=True,
+            touched_expected_files=True,
+            contains_expected_substrings=True,
+            changed_files=["f.py"],
+            expected_files=["f.py"],
+            diff_line_count=5,
+            workspace=tmp_path,
+            steps=6,
+            total_tokens=2000,
+            wall_clock=2.0,
+            meta=meta,
+            error=None,
+            finished=True,
+        )
+        assert dims_over.efficiency == pytest.approx(0.0)
+
+    def test_precision_penalises_extra_files(self, tmp_path: Path) -> None:
+        """Extra changed files should reduce precision."""
+        meta = FixtureMeta()
+        dims = compute_dimensions(
+            tests_pass=True,
+            touched_expected_files=True,
+            contains_expected_substrings=True,
+            changed_files=["target.py", "extra1.py", "extra2.py"],
+            expected_files=["target.py"],
+            diff_line_count=5,
+            workspace=tmp_path,
+            steps=1,
+            total_tokens=100,
+            wall_clock=0.5,
+            meta=meta,
+            error=None,
+            finished=True,
+        )
+        assert dims.precision < 1.0

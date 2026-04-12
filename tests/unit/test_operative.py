@@ -729,3 +729,171 @@ class TestSecretRedactionFilter:
         record = self._make_record("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef1234")
         f.filter(record)
         assert "***REDACTED***" in str(record.msg)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Context tokens tracking in guardrails
+# ---------------------------------------------------------------------------
+
+
+class TestGuardrailsContextTokenTracking:
+    def test_context_tokens_at_start_set_on_first_response(self):
+        config = _make_config()
+        g = OperativeGuardrails(config, set())
+        g.after_model_response({"content": [], "usage": {"input": 5000, "output": 100}})
+        g.after_model_response({"content": [], "usage": {"input": 8000, "output": 200}})
+        telemetry = g.get_telemetry()
+        assert telemetry["context_tokens_at_start"] == 5000
+        assert telemetry["context_tokens_at_end"] == 8000
+
+    def test_context_tokens_at_start_not_overwritten(self):
+        config = _make_config()
+        g = OperativeGuardrails(config, set())
+        g.after_model_response({"content": [], "usage": {"input": 3000, "output": 50}})
+        g.after_model_response({"content": [], "usage": {"input": 7000, "output": 100}})
+        g.after_model_response({"content": [], "usage": {"input": 12000, "output": 200}})
+        telemetry = g.get_telemetry()
+        assert telemetry["context_tokens_at_start"] == 3000
+        assert telemetry["context_tokens_at_end"] == 12000
+
+    def test_steps_used_in_telemetry(self):
+        config = _make_config()
+        g = OperativeGuardrails(config, set())
+        response = {"content": [], "usage": {"input": 100, "output": 50}}
+        g.after_model_response(response)
+        g.after_model_response(response)
+        g.after_model_response(response)
+        telemetry = g.get_telemetry()
+        assert telemetry["steps_used"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: New OperativeReport fields
+# ---------------------------------------------------------------------------
+
+
+class TestOperativeReportNewFields:
+    def test_steps_used_field(self):
+        report = _make_report(steps_used=25)
+        assert report.steps_used == 25
+
+    def test_context_tokens_fields(self):
+        report = _make_report(context_tokens_at_start=5000, context_tokens_at_end=12000)
+        assert report.context_tokens_at_start == 5000
+        assert report.context_tokens_at_end == 12000
+
+    def test_new_fields_default_to_zero(self):
+        report = _make_report()
+        assert report.steps_used == 0
+        assert report.context_tokens_at_start == 0
+        assert report.context_tokens_at_end == 0
+
+
+# ---------------------------------------------------------------------------
+# Adaptive step budgets
+# ---------------------------------------------------------------------------
+
+
+class TestAdaptiveStepBudgets:
+    def test_step_budget_overrides_max_steps(self):
+        from henchmen.models.scheme import StepBudget
+
+        config = _make_config()
+        budget = StepBudget(base_steps=10, max_steps=20, extension_steps=5, max_extensions=2)
+        g = OperativeGuardrails(config, set(), max_steps=50, step_budget=budget)
+        assert g._effective_max_steps == 10  # base_steps, not max_steps
+
+    def test_grant_extension_increases_effective_max(self):
+        from henchmen.models.scheme import StepBudget
+
+        config = _make_config()
+        budget = StepBudget(base_steps=10, max_steps=25, extension_steps=5, max_extensions=2)
+        g = OperativeGuardrails(config, set(), step_budget=budget)
+        assert g._effective_max_steps == 10
+        assert g.grant_extension() is True
+        assert g._effective_max_steps == 15
+        assert g.grant_extension() is True
+        assert g._effective_max_steps == 20
+        # Third extension should fail
+        assert g.grant_extension() is False
+        assert g._effective_max_steps == 20
+
+    def test_grant_extension_capped_at_max(self):
+        from henchmen.models.scheme import StepBudget
+
+        config = _make_config()
+        budget = StepBudget(base_steps=10, max_steps=12, extension_steps=5, max_extensions=3)
+        g = OperativeGuardrails(config, set(), step_budget=budget)
+        g.grant_extension()
+        assert g._effective_max_steps == 12  # capped at max_steps
+
+    def test_no_budget_means_no_extension(self):
+        config = _make_config()
+        g = OperativeGuardrails(config, set(), max_steps=20)
+        assert g.grant_extension() is False
+
+    def test_check_step_limit_uses_effective_max(self):
+        from henchmen.models.scheme import StepBudget
+
+        config = _make_config()
+        budget = StepBudget(base_steps=3, max_steps=10, extension_steps=3, max_extensions=1)
+        g = OperativeGuardrails(config, set(), step_budget=budget)
+        response = {"content": [], "usage": {"input": 10, "output": 5}}
+        g.after_model_response(response)
+        g.after_model_response(response)
+        assert g.check_step_limit() is False
+        g.after_model_response(response)
+        assert g.check_step_limit() is True
+        # Grant extension
+        g.grant_extension()
+        assert g.check_step_limit() is False  # Now have 6 effective max
+
+
+# ---------------------------------------------------------------------------
+# Enhanced failure classification
+# ---------------------------------------------------------------------------
+
+
+class TestEnhancedFailureClassification:
+    def test_test_failure_detected(self):
+        from henchmen.operative.failure_classifier import classify_tool_failure
+
+        result = {"error": "3 tests failed, 2 passed", "tool_name": "run_tests"}
+        assert classify_tool_failure(result) == "test_failure"
+
+    def test_lint_error_detected(self):
+        from henchmen.operative.failure_classifier import classify_tool_failure
+
+        result = {"error": "ruff: 5 errors found", "tool_name": "run_lint"}
+        assert classify_tool_failure(result) == "lint_error"
+
+    def test_context_missing_detected(self):
+        from henchmen.operative.failure_classifier import classify_tool_failure
+
+        result = {"error": "file not found: src/missing.py"}
+        assert classify_tool_failure(result) == "context_missing"
+
+    def test_tool_error_detected(self):
+        from henchmen.operative.failure_classifier import classify_tool_failure
+
+        result = {"error": "rate limit exceeded, try again later"}
+        assert classify_tool_failure(result) == "tool_error"
+
+    def test_approach_wrong_for_environmental(self):
+        from henchmen.operative.failure_classifier import classify_tool_failure
+
+        result = {"error": "permission denied: /etc/shadow"}
+        assert classify_tool_failure(result) == "approach_wrong"
+
+    def test_recovery_strategy_exists(self):
+        from henchmen.operative.failure_classifier import get_recovery_strategy
+
+        for cls in ["tool_error", "test_failure", "lint_error", "context_missing", "approach_wrong"]:
+            strategy = get_recovery_strategy(cls)
+            assert strategy, f"No strategy for {cls}"
+
+    def test_none_for_no_error(self):
+        from henchmen.operative.failure_classifier import classify_tool_failure
+
+        assert classify_tool_failure({"result": "ok"}) == "none"
+        assert classify_tool_failure("string") == "none"

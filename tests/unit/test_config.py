@@ -81,12 +81,14 @@ class TestSettingsDefaults:
 
     def test_github_default_org(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("HENCHMEN_GCP_PROJECT_ID", "test-project")
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_ORG", "")
 
         settings = Settings()
         assert settings.github_default_org == ""
 
     def test_github_default_repo(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("HENCHMEN_GCP_PROJECT_ID", "test-project")
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "")
 
         settings = Settings()
         assert settings.github_default_repo == ""

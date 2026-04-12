@@ -1,0 +1,5 @@
+{
+  "title": "Add a /status endpoint to the health service",
+  "description": "The health_service.py module has a /health endpoint that returns {\"status\": \"ok\"}. Add a new /status endpoint that returns {\"status\": \"ok\", \"version\": \"1.0.0\", \"uptime_seconds\": <integer>} where uptime_seconds is the number of seconds since the module was imported. Use the `time` module. Update the test file so that test_status_endpoint passes.",
+  "scheme": "feature_standard"
+}

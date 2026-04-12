@@ -9,6 +9,7 @@ import tempfile
 import httpx
 
 from henchmen.config.settings import Settings
+from henchmen.dossier.convention_detector import RepoConventions, detect_conventions
 from henchmen.dossier.rules import RuleFileLoader
 from henchmen.models.dossier import CodeSearchResult, Dossier, RelatedIssue, RelatedPR, RuleFile
 from henchmen.models.scheme import DossierRequirement
@@ -68,6 +69,10 @@ class DossierBuilder:
         elif requirement.code_search_symbols and local_mode:
             logger.info("Skipping code_search in local mode; grep-based context only.")
 
+        # Detect project conventions (runs in its own shallow clone if rules
+        # were not already fetched; lightweight — only reads config files)
+        dossier.conventions = await self._detect_conventions(task)
+
         # Serialize and upload to GCS
         dossier.artifact_uri = await self._upload_artifact(dossier)
         return dossier
@@ -75,6 +80,40 @@ class DossierBuilder:
     # ------------------------------------------------------------------
     # Private fetch methods
     # ------------------------------------------------------------------
+
+    async def _detect_conventions(self, task: HenchmenTask) -> RepoConventions | None:
+        """Detect project conventions from a shallow clone of the repo.
+
+        Uses the same clone-and-scan pattern as ``_fetch_rule_files``. Returns
+        ``None`` on any failure so the dossier pipeline is never blocked.
+        """
+        repo = task.context.repo
+        if not repo:
+            return None
+
+        github_token = _get_github_token(self.settings)
+        branch = task.context.branch or "main"
+
+        tmp_dir = tempfile.mkdtemp(prefix="henchmen-conventions-")
+        try:
+            try:
+                await clone_repo(
+                    repo,
+                    branch,
+                    tmp_dir,
+                    token=github_token or None,
+                    depth=1,
+                )
+            except RuntimeError as exc:
+                logger.warning("Failed to clone repo for convention detection: %s", exc)
+                return None
+
+            return detect_conventions(tmp_dir)
+        except Exception as exc:
+            logger.warning("Convention detection failed: %s", exc)
+            return None
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     async def _fetch_relevant_files(self, task: HenchmenTask) -> list[str]:
         """Identify file paths relevant to the task from context."""

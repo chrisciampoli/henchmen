@@ -38,7 +38,9 @@ FEATURE_STANDARD = SchemeDefinition(
             id="implement_feature",
             name="Implement Feature",
             node_type=NodeType.AGENTIC,
-            arsenal_requirement=ArsenalRequirement(tool_sets=["code_intel", "code_edit", "git_ops", "test_runner"]),
+            arsenal_requirement=ArsenalRequirement(
+                tool_sets=["code_intel", "code_edit", "git_ops", "test_runner", "context"]
+            ),
             dossier_requirement=DossierRequirement(
                 fetch_files=True,
                 fetch_rules=True,

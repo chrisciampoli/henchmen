@@ -1,0 +1,5 @@
+{
+  "title": "Add input validation to register_user",
+  "description": "The register_user function in user_service.py currently accepts any input without validation. Add validation so that: (1) username must be 3-20 characters and alphanumeric, (2) age must be between 0 and 150. Raise ValueError with a descriptive message on invalid input. The test file already has tests for these validations.",
+  "scheme": "feature_standard"
+}

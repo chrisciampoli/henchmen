@@ -8,7 +8,6 @@ The existing ``create_order`` behaviour must continue to work.
 from __future__ import annotations
 
 import pytest
-
 from order_service import create_order
 
 

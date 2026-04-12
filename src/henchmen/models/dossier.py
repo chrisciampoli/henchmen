@@ -74,11 +74,16 @@ class Dossier(StrictBase):
         default_factory=list, description="Code chunks retrieved via semantic search, ranked by relevance"
     )
     task_analysis: TaskAnalysis | None = Field(default=None, description="Analyzed task context from TaskAnalyzer")
+    conventions: RepoConventions | None = Field(
+        default=None, description="Detected project conventions (test framework, lint config, naming, etc.)"
+    )
     repo_structure: str = Field(default="", description="Condensed directory tree of the repository")
     artifact_uri: str | None = Field(default=None, description="GCS URI if this dossier has been serialized to storage")
 
 
 # Import here to avoid circular dependency — TaskAnalysis is used in Dossier annotation above
+# RepoConventions is referenced in Dossier via forward annotation — import and rebuild
+from henchmen.dossier.convention_detector import RepoConventions  # noqa: E402, F811
 from henchmen.dossier.task_analyzer import TaskAnalysis  # noqa: E402, F811
 
 Dossier.model_rebuild()

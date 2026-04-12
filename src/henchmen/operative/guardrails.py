@@ -7,6 +7,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from henchmen.models.operative import OperativeConfig
+from henchmen.models.scheme import StepBudget
 
 if TYPE_CHECKING:
     from henchmen.observability.cost_accumulator import TaskCostAccumulator
@@ -39,10 +40,14 @@ class OperativeGuardrails:
         allowed_tools: set[str],
         max_steps: int = 20,
         task_cost_accumulator: "TaskCostAccumulator | None" = None,
+        step_budget: StepBudget | None = None,
     ) -> None:
         self.config = config
         self.allowed_tools = allowed_tools
         self.max_steps = max_steps
+        self._step_budget = step_budget
+        self._extensions_granted: int = 0
+        self._effective_max_steps: int = step_budget.base_steps if step_budget else max_steps
         self.tool_call_count = 0
         self.token_usage: dict[str, int] = {"input": 0, "output": 0, "cached_input": 0}
         self._step_count = 0
@@ -52,6 +57,7 @@ class OperativeGuardrails:
         self._consecutive_blocked: int = 0
         self._estimated_cost_usd: float = 0.0
         self._task_cost_accumulator = task_cost_accumulator
+        self._first_input_tokens: int = 0
         self._start_time: float = time.monotonic()
 
         ceiling_env = os.environ.get("HENCHMEN_OPERATIVE_COST_CEILING_USD", "")
@@ -143,6 +149,8 @@ class OperativeGuardrails:
         self.token_usage["output"] += output_tokens
         self.token_usage["cached_input"] = self.token_usage.get("cached_input", 0) + cached_input_tokens
         self._last_input_tokens = input_tokens  # Track last context size
+        if self._first_input_tokens == 0 and input_tokens > 0:
+            self._first_input_tokens = input_tokens
         self._step_count += 1
 
         # Update running cost estimate. Pass cached_input_tokens so tracker.estimate_cost
@@ -252,8 +260,27 @@ class OperativeGuardrails:
     # ------------------------------------------------------------------
 
     def check_step_limit(self) -> bool:
-        """Return True if the step limit has been reached."""
-        return self._step_count >= self.max_steps
+        """Return True if the effective step limit has been reached."""
+        return self._step_count >= self._effective_max_steps
+
+    def grant_extension(self) -> bool:
+        """Grant a step budget extension if allowed. Returns True if granted."""
+        if self._step_budget is None:
+            return False
+        if self._extensions_granted >= self._step_budget.max_extensions:
+            return False
+        self._extensions_granted += 1
+        self._effective_max_steps = min(
+            self._effective_max_steps + self._step_budget.extension_steps,
+            self._step_budget.max_steps,
+        )
+        logger.info(
+            "[guardrails] Extension #%d granted: effective_max=%d (task=%s)",
+            self._extensions_granted,
+            self._effective_max_steps,
+            self.config.task_id,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Cost ceiling check
@@ -329,6 +356,7 @@ class OperativeGuardrails:
             "wall_clock_seconds": 0,  # set by caller
             "steps_used": self._step_count,
             "nudges_sent": self._nudge_count,
+            "context_tokens_at_start": self._first_input_tokens,
             "context_tokens_at_end": self._last_input_tokens,
         }
 
