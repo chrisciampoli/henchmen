@@ -490,14 +490,35 @@ async def initialize_workspace(
         # Use deeper clone for feature branches so we have origin/main for diffing
         depth = 50 if branch.startswith("henchmen/") else 1
         logger.info("Cloning repo %s (branch: %s, depth: %s)", repo_url, branch, depth)
-        await clone_repo(
-            repo_slug,
-            branch,
-            workspace,
-            token=github_token or None,
-            depth=depth,
-            single_branch=False,
-        )
+        try:
+            await clone_repo(
+                repo_slug,
+                branch,
+                workspace,
+                token=github_token or None,
+                depth=depth,
+                single_branch=False,
+            )
+        except RuntimeError:
+            if branch != "main":
+                # Branch doesn't exist on remote — fall back to main.
+                # This happens when the task specifies a feature branch name
+                # that hasn't been created yet; the operative will create its
+                # own henchmen/<task_id> branch from main anyway.
+                logger.warning(
+                    "Branch %s not found on remote, falling back to main",
+                    branch,
+                )
+                await clone_repo(
+                    repo_slug,
+                    "main",
+                    workspace,
+                    token=github_token or None,
+                    depth=depth,
+                    single_branch=False,
+                )
+            else:
+                raise
     else:
         logger.warning("No REPO_URL set; workspace will be empty")
 

@@ -78,7 +78,8 @@ Ask the user ONE question at a time to gather the following information:
 3. Title: a short, descriptive title for the task
 4. Description: a detailed description of what needs to be done
 5. Priority: critical, high, normal (default), or low
-6. Branch: target branch (default: main)
+6. Branch: the BASE branch to work from (default: main). This is NOT a feature \
+branch name — Henchmen creates its own feature branch automatically.
 
 When you have enough information to build the task, emit a structured block \
 in EXACTLY this format (do NOT use markdown fences around it):
@@ -88,7 +89,7 @@ type: <bugfix|feature|refactor>
 title: <short title>
 description: <detailed description>
 repo: <owner/repo>
-branch: <branch name>
+branch: <base branch, almost always "main">
 priority: <critical|high|normal|low>
 ===END===
 
@@ -97,7 +98,8 @@ Rules:
 - Ask one question at a time — don't overwhelm the user.
 - Use the defaults above when the user doesn't specify values.
 - Only emit the ===TASK=== block when you have at least a title and description.
-- Never emit the block inside markdown code fences."""
+- Never emit the block inside markdown code fences.
+- The branch field must be an EXISTING branch (usually "main"). Never invent feature branch names."""
 
 
 def _check_ollama(base_url: str, model: str) -> str | None:
