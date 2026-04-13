@@ -34,6 +34,8 @@ def main() -> None:
         help="Diagnose the local environment (Docker, git, LLM credentials, operative image, ...)",
     )
 
+    subparsers.add_parser("chat", help="Interactive task builder (powered by local LLM)")
+
     eval_parser = subparsers.add_parser("eval", help="Run the offline evaluation harness")
     eval_subparsers = eval_parser.add_subparsers(dest="eval_command")
 
@@ -92,6 +94,10 @@ def main() -> None:
         from henchmen.cli import doctor
 
         sys.exit(doctor.run_doctor_cli())
+    elif args.command == "chat":
+        from henchmen.cli import chat
+
+        sys.exit(chat.run_chat_cli())
     else:
         parser.print_help()
         sys.exit(1)
