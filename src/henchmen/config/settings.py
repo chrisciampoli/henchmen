@@ -97,6 +97,7 @@ class Settings(BaseSettings):
         default="", description="Secret Manager resource name for GitHub App private key"
     )
     github_webhook_secret: str = Field(default="", description="GitHub webhook secret")
+    github_token: str = Field(default="", description="GitHub personal access token for operative clone/push")
     github_default_org: str = Field(default="", description="Default GitHub organization")
     github_default_repo: str = Field(default="", description="Default target repo for tasks")
 

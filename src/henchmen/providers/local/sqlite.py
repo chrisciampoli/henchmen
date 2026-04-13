@@ -5,7 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
+
+
+def _json_default(obj: object) -> str:
+    """Handle non-serializable types (datetime, timedelta) for json.dumps."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -51,7 +60,7 @@ class SQLiteDocumentStore:
         clean = {k: v for k, v in data.items() if k != "_id"}
         self._conn.execute(
             f"INSERT OR REPLACE INTO [{collection}] (id, data) VALUES (?, ?)",
-            (document_id, json.dumps(clean)),
+            (document_id, json.dumps(clean, default=_json_default)),
         )
         self._conn.commit()
 

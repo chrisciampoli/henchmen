@@ -314,25 +314,18 @@ class MastermindAgent:
         """Select appropriate scheme based on task content.
 
         Uses keyword matching for now; can be upgraded to LLM-based selection.
+
+        Priority order: feature > bugfix > goal_decomposition > default.
+        Feature and bugfix keywords are checked against title + description.
+        Goal keywords are checked against **title only** to avoid false
+        positives from incidental words in long descriptions/specs.
         """
-        title_lower = (task.title + " " + task.description).lower()
+        title_lower = task.title.lower()
+        full_text = (task.title + " " + task.description).lower()
 
-        # Check for goal-level tasks that need decomposition
-        goal_keywords = [
-            "improve",
-            "optimize",
-            "refactor all",
-            "fix all",
-            "update all",
-            "increase coverage",
-            "reduce",
-            "clean up all",
-            "migrate",
-        ]
-        if any(kw in title_lower for kw in goal_keywords):
-            return "goal_decomposition"
-
-        # Check feature keywords FIRST — "fix" is too broad and would match feature tasks
+        # Check feature keywords FIRST — these are the strongest signal.
+        # A task that says "build" or "create" is implementation work even
+        # if the description happens to mention "improve" or "optimize".
         feature_keywords = [
             "feature",
             "implement",
@@ -348,11 +341,31 @@ class MastermindAgent:
             "scaffold",
             "portal",
             "dashboard",
+            "homepage",
         ]
-        if any(kw in title_lower for kw in feature_keywords):
+        if any(kw in full_text for kw in feature_keywords):
             return "feature_standard"
-        if any(kw in title_lower for kw in ["bug", "fix", "error", "crash", "broken"]):
+
+        # Check bugfix keywords
+        if any(kw in full_text for kw in ["bug", "fix", "error", "crash", "broken"]):
             return "bugfix_standard"
+
+        # Check for goal-level tasks that need decomposition.
+        # Only match on TITLE to avoid false positives from long descriptions
+        # that incidentally contain words like "improve" or "reduce".
+        goal_keywords = [
+            "improve",
+            "optimize",
+            "refactor all",
+            "fix all",
+            "update all",
+            "increase coverage",
+            "reduce",
+            "clean up all",
+            "migrate",
+        ]
+        if any(kw in title_lower for kw in goal_keywords):
+            return "goal_decomposition"
 
         # Default to bugfix
         return "bugfix_standard"

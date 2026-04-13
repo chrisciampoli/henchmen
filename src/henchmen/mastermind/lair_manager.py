@@ -135,8 +135,8 @@ class LairManager:
             elif llm_provider == "anthropic":
                 env["HENCHMEN_ANTHROPIC_API_KEY"] = self.settings.anthropic_api_key
 
-            # GitHub token from environment (not Secret Manager in local mode)
-            github_token = os.environ.get("GITHUB_TOKEN", "")
+            # GitHub token: prefer settings (reads .env.local), fall back to os.environ
+            github_token = self.settings.github_token or os.environ.get("GITHUB_TOKEN", "")
             if github_token:
                 env["GITHUB_TOKEN"] = github_token
 
