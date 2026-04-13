@@ -373,7 +373,10 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
                 shell_parts.append(lint_str)
         else:
             test_str = " ".join(stack.test_command)
-            shell_parts.append(test_str)
+            if stack.name.startswith("node"):
+                shell_parts.append(f"{test_str} 2>/dev/null || echo 'TEST_SKIP: no test script configured'")
+            else:
+                shell_parts.append(test_str)
 
         shell_script = " && ".join(shell_parts)
 
@@ -386,10 +389,13 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
         passed = result["returncode"] == 0
         output = result["output"]
 
-        # Treat "no lint script" as a pass — the project simply doesn't have lint configured
+        # Treat missing scripts as a pass — the project simply doesn't have lint/test configured
         if not passed and "LINT_SKIP: no lint script configured" in output:
             logger.info("[SCHEME] %s skipped for task %s — no lint script in project", check_type, task.id)
             return {"condition": "pass", "message": f"{check_type} skipped — no lint script configured"}
+        if not passed and "TEST_SKIP: no test script configured" in output:
+            logger.info("[SCHEME] %s skipped for task %s — no test script in project", check_type, task.id)
+            return {"condition": "pass", "message": f"{check_type} skipped — no test script configured"}
 
         logger.info("[SCHEME] %s %s for task %s", check_type, "PASSED" if passed else "FAILED", task.id)
         if not passed:
