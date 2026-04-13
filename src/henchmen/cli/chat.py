@@ -18,7 +18,7 @@ import httpx
 
 from henchmen.config.settings import Settings, get_settings
 
-_TASK_PATTERN = re.compile(r"===TASK===\s*\n(.*?)\n===END===", re.DOTALL)
+_TASK_PATTERN = re.compile(r"={2,}TASK={2,}\s*\n(.*?)\n={2,}END={2,}", re.DOTALL)
 _CHAT_TEMPERATURE = 0.7
 _LOCAL_DISPATCH_URL = "http://localhost:8000/dispatch/api/v1/tasks"
 _LOCAL_DISPATCH_TIMEOUT = 5.0
