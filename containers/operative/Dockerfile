@@ -13,7 +13,7 @@ COPY pyproject.toml .
 RUN pip install --no-cache-dir --prefix=/install -e ".[local]"
 
 # --- Node.js builder stage ---
-FROM node:20.18-slim@sha256:ffc11dbf16dd0abcbb7b837410601b4d5592db2d03741e13a4a5336ab74d7ccb AS node-builder
+FROM node:25.9-slim@sha256:435f3537a088a01fd208bb629a4b69c28d85deb9a60af8a710cafc3befd6e3be AS node-builder
 
 # Install pnpm globally and verify
 RUN npm install -g pnpm@9 && pnpm --version
