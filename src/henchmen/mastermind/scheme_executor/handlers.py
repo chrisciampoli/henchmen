@@ -416,7 +416,8 @@ async def _run_in_docker(workspace: str, shell_script: str, settings: Any) -> di
     """
     # Convert Windows paths to Docker-compatible format
     docker_workspace = workspace.replace("\\", "/")
-    image = f"henchmen-operative:{settings.lair_operative_image_tag}"
+    tag = "local" if settings.provider == "local" else settings.lair_operative_image_tag
+    image = f"henchmen-operative:{tag}"
 
     cmd = [
         "docker",

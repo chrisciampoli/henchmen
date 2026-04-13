@@ -104,35 +104,85 @@ class AnthropicProvider:
                 continue
             if msg.role == MessageRole.TOOL:
                 # Anthropic expects tool results as role=user with tool_result content blocks
-                ant_messages.append({
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": msg.tool_call_id or "unknown",
-                            "content": msg.content,
-                        }
-                    ],
-                })
+                ant_messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": msg.tool_call_id or "unknown",
+                                "content": msg.content,
+                            }
+                        ],
+                    }
+                )
             elif msg.role == MessageRole.ASSISTANT and msg.tool_calls:
                 # Assistant messages with tool calls need content blocks
                 content_blocks: list[dict[str, object]] = []
                 if msg.content:
                     content_blocks.append({"type": "text", "text": msg.content})
                 for tc in msg.tool_calls:
-                    content_blocks.append({
-                        "type": "tool_use",
-                        "id": tc.id,
-                        "name": tc.name,
-                        "input": tc.arguments,
-                    })
+                    content_blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.name,
+                            "input": tc.arguments,
+                        }
+                    )
                 ant_messages.append({"role": "assistant", "content": content_blocks})
             else:
                 ant_messages.append({"role": msg.role.value, "content": msg.content})
 
+        # Anthropic requires every tool_result to have a corresponding tool_use
+        # in the immediately preceding assistant message. Context window trimming
+        # can orphan tool_results by dropping their parent assistant message.
+        # Collect all tool_use IDs and strip orphaned tool_results.
+        tool_use_ids: set[str] = set()
+        for m in ant_messages:
+            content = m.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_use_ids.add(str(block.get("id", "")))
+
+        cleaned: list[dict[str, object]] = []
+        for m in ant_messages:
+            content = m.get("content")
+            if isinstance(content, list):
+                filtered = [
+                    b
+                    for b in content
+                    if not (
+                        isinstance(b, dict)
+                        and b.get("type") == "tool_result"
+                        and str(b.get("tool_use_id", "")) not in tool_use_ids
+                    )
+                ]
+                if not filtered:
+                    continue  # Drop entirely empty messages
+                m = {**m, "content": filtered}
+            cleaned.append(m)
+
+        # Anthropic requires alternating user/assistant roles. Merge consecutive same-role.
+        merged: list[dict[str, object]] = []
+        for m in cleaned:
+            if merged and merged[-1].get("role") == m.get("role"):
+                prev_content = merged[-1].get("content")
+                curr_content = m.get("content")
+                # Merge text content
+                if isinstance(prev_content, str) and isinstance(curr_content, str):
+                    merged[-1] = {**merged[-1], "content": f"{prev_content}\n{curr_content}"}
+                elif isinstance(prev_content, list) and isinstance(curr_content, list):
+                    merged[-1] = {**merged[-1], "content": prev_content + curr_content}
+                else:
+                    merged.append(m)
+            else:
+                merged.append(m)
+
         kwargs: dict[str, object] = {
             "model": model,
-            "messages": ant_messages,
+            "messages": merged,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
