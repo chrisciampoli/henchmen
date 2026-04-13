@@ -13,6 +13,7 @@ from henchmen.cli.chat import (
     _check_ollama,
     _dispatch_task,
     _parse_task_block,
+    _read_multiline_input,
 )
 from henchmen.config.settings import Settings
 
@@ -185,7 +186,7 @@ async def test_dispatch_task_local_down_falls_back(mock_settings: Settings) -> N
 
 
 @pytest.mark.asyncio
-async def test_call_ollama_returns_content() -> None:
+async def test_call_ollama_returns_content_no_stream() -> None:
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_resp.json.return_value = {"message": {"content": "Hello! What task?"}}
@@ -197,9 +198,18 @@ async def test_call_ollama_returns_content() -> None:
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
     with patch("henchmen.cli.chat.httpx.AsyncClient", return_value=mock_client):
-        result = await _call_ollama("http://localhost:11434", "llama3.2", [])
+        result = await _call_ollama("http://localhost:11434", "llama3.2", [], stream_to_stdout=False)
 
     assert result == "Hello! What task?"
+
+
+# --- _read_multiline_input ---
+
+
+def test_read_multiline_input_single_line() -> None:
+    with patch("builtins.input", return_value="hello world"):
+        result = _read_multiline_input("> ")
+    assert result == "hello world"
 
 
 # --- run_chat_cli full flow ---
@@ -213,13 +223,6 @@ async def test_chat_loop_full_flow(mock_settings: Settings) -> None:
     # Mock _check_ollama to pass
     # Mock input() to return a sequence of user inputs
     # Mock _call_ollama to return responses
-    user_inputs = iter(
-        [
-            "Fix the login bug in the auth module",  # User describes task
-            "y",  # Confirm dispatch
-        ]
-    )
-
     llm_response = """\
 Got it! Here's your task:
 
@@ -237,7 +240,11 @@ priority: normal
         patch("henchmen.cli.chat._check_ollama", return_value=None),
         patch("henchmen.cli.chat._call_ollama", AsyncMock(return_value=llm_response)),
         patch("henchmen.cli.chat._dispatch_task", AsyncMock(return_value={"method": "local", "result": {"ok": True}})),
-        patch("builtins.input", side_effect=lambda prompt="": next(user_inputs)),
+        patch(
+            "henchmen.cli.chat._read_multiline_input",
+            side_effect=["Fix the login bug in the auth module"],
+        ),
+        patch("builtins.input", return_value="y"),  # confirm dispatch
         patch("builtins.print"),
     ):
         exit_code = await _chat_loop()
@@ -266,7 +273,7 @@ async def test_chat_loop_quit(mock_settings: Settings) -> None:
 
     with (
         patch("henchmen.cli.chat._check_ollama", return_value=None),
-        patch("builtins.input", side_effect=["quit"]),
+        patch("henchmen.cli.chat._read_multiline_input", side_effect=["quit"]),
         patch("builtins.print"),
     ):
         exit_code = await _chat_loop()

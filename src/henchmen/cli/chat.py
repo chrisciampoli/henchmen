@@ -8,7 +8,9 @@ pre-loads defaults (repo, org, env) so the user doesn't repeat themselves.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+import select
 import sys
 from typing import Any
 
@@ -20,6 +22,39 @@ _TASK_PATTERN = re.compile(r"===TASK===\s*\n(.*?)\n===END===", re.DOTALL)
 _CHAT_TEMPERATURE = 0.7
 _LOCAL_DISPATCH_URL = "http://localhost:8000/dispatch/api/v1/tasks"
 _LOCAL_DISPATCH_TIMEOUT = 5.0
+
+
+def _read_multiline_input(prompt: str = "> ") -> str:
+    """Read user input, collecting all pasted lines into a single string.
+
+    Python's ``input()`` only reads one line. When users paste multi-line
+    text, the remaining lines sit in the stdin buffer. This function drains
+    that buffer so pastes are captured in full.
+    """
+    first_line = input(prompt)  # noqa: ASYNC250
+    lines = [first_line]
+
+    # Drain any remaining lines in the stdin buffer (from a paste).
+    # Windows: use msvcrt.kbhit(). Unix/macOS: use select().
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            while msvcrt.kbhit():
+                extra = sys.stdin.readline()
+                if not extra:
+                    break
+                lines.append(extra.rstrip("\n"))
+        else:
+            while select.select([sys.stdin], [], [], 0.0)[0]:
+                extra = sys.stdin.readline()
+                if not extra:
+                    break
+                lines.append(extra.rstrip("\n"))
+    except Exception:
+        pass  # If buffer drain fails, we still have the first line
+
+    return "\n".join(lines)
 
 
 def _build_system_prompt(settings: Settings) -> str:
@@ -132,6 +167,7 @@ def _print_welcome(settings: Settings, model: str) -> None:
     print(f"  Env:     {env}")
     print()
     print("Describe what you need done, and I'll help you build a task.")
+    print("Paste multi-line specs directly -- all lines will be captured.")
     print("Type 'quit' to exit, '/help' for commands.")
     print()
 
@@ -162,20 +198,48 @@ async def _call_ollama(
     base_url: str,
     model: str,
     messages: list[dict[str, str]],
+    *,
+    stream_to_stdout: bool = True,
 ) -> str:
-    """Send a chat request to Ollama and return the response content."""
-    payload = {
+    """Send a chat request to Ollama and return the response content.
+
+    When *stream_to_stdout* is True (the default), tokens are printed to
+    stdout as they arrive so the user sees the LLM "thinking" in real time.
+    """
+    payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "stream": False,
+        "stream": stream_to_stdout,
         "options": {"temperature": _CHAT_TEMPERATURE},
     }
-    async with httpx.AsyncClient(base_url=base_url, timeout=120.0) as client:
-        resp = await client.post("/api/chat", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        content: str = data.get("message", {}).get("content", "")
-        return content
+    async with httpx.AsyncClient(base_url=base_url, timeout=300.0) as client:
+        if not stream_to_stdout:
+            resp = await client.post("/api/chat", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            content: str = data.get("message", {}).get("content", "")
+            return content
+
+        # Streaming mode: print tokens as they arrive
+        collected: list[str] = []
+        print()  # blank line before response
+        async with client.stream("POST", "/api/chat", json=payload) as resp:
+            resp.raise_for_status()
+            async for raw_line in resp.aiter_lines():
+                if not raw_line.strip():
+                    continue
+                try:
+                    chunk = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                token = chunk.get("message", {}).get("content", "")
+                if token:
+                    print(token, end="", flush=True)
+                    collected.append(token)
+                if chunk.get("done", False):
+                    break
+        print("\n")  # newline after streamed response
+        return "".join(collected)
 
 
 async def _dispatch_task(task_data: dict[str, str], settings: Settings) -> dict[str, Any]:
@@ -270,35 +334,42 @@ async def _chat_loop() -> int:
 
     while True:
         try:
-            user_input = input("> ").strip()  # noqa: ASYNC250
+            user_input = _read_multiline_input("> ")
         except (KeyboardInterrupt, EOFError):
             print("\nChat ended.")
             return 0
 
+        user_input = user_input.strip()
         if not user_input:
             continue
 
-        # REPL commands
-        if user_input.lower() in ("quit", "exit"):
-            print("Chat ended.")
-            return 0
+        # REPL commands (only check single-line inputs)
+        if "\n" not in user_input:
+            if user_input.lower() in ("quit", "exit"):
+                print("Chat ended.")
+                return 0
 
-        if user_input == "/help":
-            _print_help()
-            continue
+            if user_input == "/help":
+                _print_help()
+                continue
 
-        if user_input == "/reset":
-            ollama_messages = [{"role": "system", "content": system_prompt}]
-            last_extracted = {}
-            print("Conversation reset. Start describing your task.")
-            continue
+            if user_input == "/reset":
+                ollama_messages = [{"role": "system", "content": system_prompt}]
+                last_extracted = {}
+                print("Conversation reset. Start describing your task.")
+                continue
 
-        if user_input == "/status":
-            if last_extracted:
-                _print_task_preview(last_extracted)
-            else:
-                print("No task fields collected yet.")
-            continue
+            if user_input == "/status":
+                if last_extracted:
+                    _print_task_preview(last_extracted)
+                else:
+                    print("No task fields collected yet.")
+                continue
+
+        # Show line count for multi-line pastes so user knows it was captured
+        line_count = user_input.count("\n") + 1
+        if line_count > 1:
+            print(f"(received {line_count} lines)")
 
         # Add user message and call LLM
         ollama_messages.append({"role": "user", "content": user_input})
@@ -312,27 +383,20 @@ async def _chat_loop() -> int:
             continue
 
         if not response.strip():
-            print("(empty response — try rephrasing)")
+            print("(empty response -- try rephrasing)")
             ollama_messages.pop()
             continue
 
         # Add assistant response to history
         ollama_messages.append({"role": "assistant", "content": response})
 
-        # Check for task block
+        # Check for task block (streaming already printed the text)
         task_data = _parse_task_block(response)
         if task_data:
             last_extracted = task_data
-            # Print the conversational part (before the block) if any
-            pre_block = response[: response.index("===TASK===")].strip()
-            if pre_block:
-                print(f"\n{pre_block}")
-
             dispatched = await _confirm_and_dispatch(task_data, settings)
             if dispatched:
                 return 0
-        else:
-            print(f"\n{response}\n")
 
     return 0  # pragma: no cover
 
