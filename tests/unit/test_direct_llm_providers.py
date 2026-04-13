@@ -269,7 +269,7 @@ class TestAnthropicProvider:
 
     def test_resolve_tier_complex(self):
         provider = self._make_provider()
-        assert provider.resolve_tier(ModelTier.COMPLEX) == "claude-sonnet-4-6-20250514"
+        assert provider.resolve_tier(ModelTier.COMPLEX) == "claude-sonnet-4-20250514"
 
     def test_resolve_tier_light(self):
         provider = self._make_provider()
@@ -277,7 +277,7 @@ class TestAnthropicProvider:
 
     def test_resolve_tier_reasoning(self):
         provider = self._make_provider()
-        assert provider.resolve_tier(ModelTier.REASONING) == "claude-opus-4-6-20250514"
+        assert provider.resolve_tier(ModelTier.REASONING) == "claude-opus-4-20250514"
 
     def test_resolve_tier_passthrough_unknown(self):
         provider = self._make_provider()
@@ -286,8 +286,8 @@ class TestAnthropicProvider:
     def test_supported_models(self):
         provider = self._make_provider()
         models = provider.supported_models()
-        assert "claude-sonnet-4-6-20250514" in models
-        assert "claude-opus-4-6-20250514" in models
+        assert "claude-sonnet-4-20250514" in models
+        assert "claude-opus-4-20250514" in models
         assert "claude-haiku-4-5-20251001" in models
 
     @pytest.mark.asyncio
@@ -300,10 +300,10 @@ class TestAnthropicProvider:
         provider._client.messages = MagicMock()
         provider._client.messages.count_tokens = AsyncMock(return_value=mock_result)
 
-        count = await provider.count_tokens("hello world", "claude-sonnet-4-6-20250514")
+        count = await provider.count_tokens("hello world", "claude-sonnet-4-20250514")
         assert count == 7
         provider._client.messages.count_tokens.assert_called_once_with(
-            model="claude-sonnet-4-6-20250514",
+            model="claude-sonnet-4-20250514",
             messages=[{"role": "user", "content": "hello world"}],
         )
 
@@ -331,11 +331,11 @@ class TestAnthropicProvider:
 
         result = await provider.generate(
             messages=[Message(role=MessageRole.USER, content="Hi")],
-            model="claude-sonnet-4-6-20250514",
+            model="claude-sonnet-4-20250514",
         )
 
         assert result.content == "Hello from Anthropic!"
-        assert result.model == "claude-sonnet-4-6-20250514"
+        assert result.model == "claude-sonnet-4-20250514"
         assert result.finish_reason == "end_turn"
         assert result.usage.input_tokens == 10
         assert result.usage.output_tokens == 6
@@ -371,7 +371,7 @@ class TestAnthropicProvider:
 
         await provider.generate(
             messages=[Message(role=MessageRole.USER, content="Go")],
-            model="claude-sonnet-4-6-20250514",
+            model="claude-sonnet-4-20250514",
             system_prompt="You are a helpful assistant.",
         )
 
@@ -410,7 +410,7 @@ class TestAnthropicProvider:
                 Message(role=MessageRole.SYSTEM, content="Ignored system msg"),
                 Message(role=MessageRole.USER, content="User message"),
             ],
-            model="claude-sonnet-4-6-20250514",
+            model="claude-sonnet-4-20250514",
         )
 
         roles = [m["role"] for m in captured_kwargs["messages"]]
@@ -443,7 +443,7 @@ class TestAnthropicProvider:
 
         result = await provider.generate(
             messages=[Message(role=MessageRole.USER, content="Look up anthropic")],
-            model="claude-sonnet-4-6-20250514",
+            model="claude-sonnet-4-20250514",
         )
 
         assert result.finish_reason == "tool_use"

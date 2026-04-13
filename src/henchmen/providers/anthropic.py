@@ -102,7 +102,33 @@ class AnthropicProvider:
         for msg in messages:
             if msg.role == MessageRole.SYSTEM:
                 continue
-            ant_messages.append({"role": msg.role.value, "content": msg.content})
+            if msg.role == MessageRole.TOOL:
+                # Anthropic expects tool results as role=user with tool_result content blocks
+                ant_messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": msg.tool_call_id or "unknown",
+                            "content": msg.content,
+                        }
+                    ],
+                })
+            elif msg.role == MessageRole.ASSISTANT and msg.tool_calls:
+                # Assistant messages with tool calls need content blocks
+                content_blocks: list[dict[str, object]] = []
+                if msg.content:
+                    content_blocks.append({"type": "text", "text": msg.content})
+                for tc in msg.tool_calls:
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": tc.arguments,
+                    })
+                ant_messages.append({"role": "assistant", "content": content_blocks})
+            else:
+                ant_messages.append({"role": msg.role.value, "content": msg.content})
 
         kwargs: dict[str, object] = {
             "model": model,
