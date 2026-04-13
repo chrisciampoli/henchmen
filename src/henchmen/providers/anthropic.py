@@ -42,8 +42,26 @@ class AnthropicProvider:
         )
 
     def resolve_tier(self, tier: str) -> str:
-        """Map a model tier to the default Anthropic model for that tier."""
-        return self._tier_defaults.get(tier, tier)
+        """Map a model tier or cloud model name to an Anthropic model.
+
+        Scheme nodes reference cloud model names like ``gemini-2.5-pro``
+        which don't exist in the Anthropic API. Remap any non-Anthropic
+        model name to the COMPLEX tier default (Claude Sonnet).
+        """
+        # Direct tier match (e.g. "default/complex")
+        if tier in self._tier_defaults:
+            return self._tier_defaults[tier]
+        # Already an Anthropic model name
+        if tier.startswith("claude"):
+            return tier
+        # Non-Anthropic model name (gemini-*, gpt-*, etc.) → remap to COMPLEX
+        default = self._tier_defaults.get(ModelTier.COMPLEX, "claude-sonnet-4-6-20250514")
+        logger.warning(
+            "[anthropic] Remapping non-Anthropic model '%s' -> '%s'",
+            tier,
+            default,
+        )
+        return default
 
     def supported_models(self) -> list[str]:
         """Return the list of supported Anthropic model identifiers."""
