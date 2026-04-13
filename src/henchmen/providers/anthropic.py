@@ -97,6 +97,7 @@ class AnthropicProvider:
         system_prompt: str | None = None,
     ) -> LLMResponse:
         """Send a messages request to the Anthropic API."""
+        model = self.resolve_tier(model)
         ant_messages: list[dict[str, object]] = []
         for msg in messages:
             if msg.role == MessageRole.SYSTEM:
