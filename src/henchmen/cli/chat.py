@@ -316,7 +316,7 @@ async def _confirm_and_dispatch(task_data: dict[str, str], settings: Settings) -
 async def _chat_loop() -> int:
     """Async REPL loop. Returns exit code."""
     settings = get_settings()
-    model = settings.llm_ollama_model
+    model = settings.llm_ollama_chat_model or settings.llm_ollama_model
     base_url = settings.llm_ollama_base_url
 
     # Pre-flight check

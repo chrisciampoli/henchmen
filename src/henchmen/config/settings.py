@@ -191,6 +191,9 @@ class Settings(BaseSettings):
     # Ollama (local LLM)
     llm_ollama_base_url: str = Field(default="http://localhost:11434", description="Ollama server URL")
     llm_ollama_model: str = Field(default="llama3.2", description="Default Ollama model")
+    llm_ollama_chat_model: str = Field(
+        default="", description="Ollama model for henchmen chat (falls back to llm_ollama_model)"
+    )
     llm_ollama_skip_probe: bool = Field(
         default=False,
         description=(

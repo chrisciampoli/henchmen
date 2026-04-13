@@ -10,7 +10,7 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 COPY src/ ./src/
 COPY pyproject.toml .
-RUN pip install --no-cache-dir --prefix=/install -e .
+RUN pip install --no-cache-dir --prefix=/install -e ".[local]"
 
 # --- Node.js builder stage ---
 FROM node:20.18-slim@sha256:ffc11dbf16dd0abcbb7b837410601b4d5592db2d03741e13a4a5336ab74d7ccb AS node-builder
