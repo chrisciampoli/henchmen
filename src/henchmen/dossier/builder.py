@@ -315,7 +315,5 @@ class DossierBuilder:
 
 
 def _get_github_token(settings: Settings) -> str:
-    """Return a plain GitHub token from settings (for unauthenticated fallback)."""
-    # In production this would be fetched from Secret Manager.
-    # Here we accept an optional plain env var for testing convenience.
-    return os.environ.get("GITHUB_TOKEN", "")
+    """Return a plain GitHub token, preferring settings over env var."""
+    return settings.github_token or os.environ.get("GITHUB_TOKEN", "")

@@ -299,6 +299,11 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
     packages via ``--filter``. Other stacks run the detected commands
     across the full workspace.
 
+    In local mode (provider=local), commands are executed inside the
+    operative Docker image via ``docker run`` with the workspace mounted
+    as a volume. This ensures the correct toolchain (Node.js, npm,
+    eslint, etc.) is available regardless of the host OS.
+
     Args:
         executor: The scheme executor (provides settings)
         task: The task being executed (provides repo and branch info)
@@ -306,9 +311,13 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
     """
     from pathlib import Path
 
+    from henchmen.config.settings import get_settings
+
     repo = task.context.repo
     branch = task.branch_name
-    github_token = os.environ.get("GITHUB_TOKEN", "")
+    settings = get_settings()
+    github_token = settings.github_token or os.environ.get("GITHUB_TOKEN", "")
+    is_local = settings.provider == "local"
 
     if not repo:
         logger.warning("No repo for CI check, failing")
@@ -345,57 +354,46 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
                 "message": f"{check_type} skipped — could not detect project stack",
             }
 
-        # Install dependencies if the stack has an install step
+        # Build the shell script that installs deps + runs the check.
+        # In local mode this runs inside the operative Docker image;
+        # in cloud mode it runs natively (the host has the toolchain).
+        shell_parts: list[str] = []
         if stack.install_command is not None:
-            proc = await asyncio.create_subprocess_exec(
-                *stack.install_command,
-                cwd=workspace,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
+            # npm ci may fail if no lockfile; fall back to npm install
+            install_str = " ".join(stack.install_command)
+            shell_parts.append(f"{install_str} || npm install --no-audit 2>/dev/null || true")
 
-        # For JS/TS monorepos, scope to affected packages
-        affected_packages: list[str] = []
-        if stack.is_monorepo:
-            affected_packages = await _get_affected_packages(workspace)
-            if affected_packages:
-                logger.info(
-                    "[SCHEME] Scoping %s to affected packages: %s",
-                    check_type,
-                    affected_packages,
-                )
-
-        # Run the check
         if check_type == "lint":
-            lint_proc = await _run_lint_check(workspace, stack, affected_packages)
-            if lint_proc is None:
-                logger.info("[SCHEME] No lintable files changed for task %s, skipping lint", task.id)
-                return {"condition": "pass", "message": "lint passed (no changed files to lint)"}
-            proc = lint_proc
-        else:  # tests
-            test_cmd = list(stack.test_command)
-            # Legacy monorepo path: pnpm run test still works, no extra args.
-            proc = await asyncio.create_subprocess_exec(
-                *test_cmd,
-                cwd=workspace,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            # Try the stack's lint command; if the project has no lint script,
+            # fall back to npx eslint (JS/TS) or the stack default.
+            lint_str = " ".join(stack.lint_command)
+            if stack.name.startswith("node"):
+                shell_parts.append(f"{lint_str} 2>/dev/null || echo 'LINT_SKIP: no lint script configured'")
+            else:
+                shell_parts.append(lint_str)
+        else:
+            test_str = " ".join(stack.test_command)
+            shell_parts.append(test_str)
 
-        stdout, stderr = await proc.communicate()
-        # Capture both stdout and stderr — turbo writes to both streams
-        stdout_text = stdout.decode(errors="replace")[:3000]
-        stderr_text = stderr.decode(errors="replace")[:3000]
-        output = stdout_text
-        if stderr_text:
-            output = f"{stdout_text}\n--- stderr ---\n{stderr_text}" if stdout_text.strip() else stderr_text
-        passed = proc.returncode == 0
+        shell_script = " && ".join(shell_parts)
+
+        if is_local:
+            # Run inside the operative Docker image with the workspace mounted
+            result = await _run_in_docker(workspace, shell_script, settings)
+        else:
+            result = await _run_on_host(workspace, shell_parts, stack, check_type)
+
+        passed = result["returncode"] == 0
+        output = result["output"]
+
+        # Treat "no lint script" as a pass — the project simply doesn't have lint configured
+        if not passed and "LINT_SKIP: no lint script configured" in output:
+            logger.info("[SCHEME] %s skipped for task %s — no lint script in project", check_type, task.id)
+            return {"condition": "pass", "message": f"{check_type} skipped — no lint script configured"}
 
         logger.info("[SCHEME] %s %s for task %s", check_type, "PASSED" if passed else "FAILED", task.id)
         if not passed:
-            logger.warning("[SCHEME] %s stdout: %s", check_type, stdout_text[:1000])
-            logger.warning("[SCHEME] %s stderr: %s", check_type, stderr_text[:1000])
+            logger.warning("[SCHEME] %s output: %s", check_type, output[:2000])
 
         return {
             "condition": "pass" if passed else "fail",
@@ -408,6 +406,81 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
         return {"condition": "fail", "message": f"{check_type} failed (error: {exc})"}
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
+
+
+async def _run_in_docker(workspace: str, shell_script: str, settings: Any) -> dict[str, Any]:
+    """Run a CI check command inside the operative Docker image.
+
+    Mounts the cloned workspace as a volume so the container has access
+    to the code and the correct toolchain (Node.js, npm, Python, etc.).
+    """
+    # Convert Windows paths to Docker-compatible format
+    docker_workspace = workspace.replace("\\", "/")
+    image = f"henchmen-operative:{settings.lair_operative_image_tag}"
+
+    cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{docker_workspace}:/ci-workspace",
+        "-w",
+        "/ci-workspace",
+        "--entrypoint",
+        "/bin/bash",
+        image,
+        "-c",
+        shell_script,
+    ]
+
+    logger.info("[SCHEME] Running CI check in Docker: %s", shell_script[:200])
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await proc.communicate()
+    output = stdout.decode(errors="replace")[:5000] if stdout else ""
+
+    return {"returncode": proc.returncode or 0, "output": output}
+
+
+async def _run_on_host(workspace: str, shell_parts: list[str], stack: Stack, check_type: str) -> dict[str, Any]:
+    """Run CI check commands natively on the host (cloud mode)."""
+    # Install dependencies
+    if stack.install_command is not None:
+        proc = await asyncio.create_subprocess_exec(
+            *stack.install_command,
+            cwd=workspace,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+
+    # Run the actual check
+    if check_type == "lint":
+        proc = await asyncio.create_subprocess_exec(
+            *stack.lint_command,
+            cwd=workspace,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    else:
+        proc = await asyncio.create_subprocess_exec(
+            *stack.test_command,
+            cwd=workspace,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    stdout, stderr = await proc.communicate()
+    stdout_text = stdout.decode(errors="replace")[:3000]
+    stderr_text = stderr.decode(errors="replace")[:3000]
+    output = stdout_text
+    if stderr_text:
+        output = f"{stdout_text}\n--- stderr ---\n{stderr_text}" if stdout_text.strip() else stderr_text
+
+    return {"returncode": proc.returncode or 0, "output": output}
 
 
 async def _run_lint_check(

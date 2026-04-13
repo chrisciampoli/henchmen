@@ -391,7 +391,7 @@ class MastermindAgent:
 
         # Pre-fetch file tree from GitHub so the operative knows the codebase structure
         repo = task.context.repo
-        github_token = os.environ.get("GITHUB_TOKEN", "")
+        github_token = self.settings.github_token or os.environ.get("GITHUB_TOKEN", "")
         if repo and github_token:
             try:
                 from github import Github
