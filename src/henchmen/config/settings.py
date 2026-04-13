@@ -223,7 +223,7 @@ class Settings(BaseSettings):
 
     # Anthropic model tier mapping (L10 fix — avoid hard-coded model names in providers)
     anthropic_model_complex: str = Field(
-        default="claude-sonnet-4-6-20250514",
+        default="claude-sonnet-4-20250514",
         description="Anthropic model used for the COMPLEX tier",
     )
     anthropic_model_light: str = Field(
@@ -231,7 +231,7 @@ class Settings(BaseSettings):
         description="Anthropic model used for the LIGHT tier",
     )
     anthropic_model_reasoning: str = Field(
-        default="claude-opus-4-6-20250514",
+        default="claude-opus-4-20250514",
         description="Anthropic model used for the REASONING tier",
     )
 
