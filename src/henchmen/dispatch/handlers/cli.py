@@ -176,7 +176,7 @@ async def run_embedding_pipeline(
 
         # Upsert to RAG Engine (handles embedding automatically)
         logger.info("[EMBED] Upserting %d chunks to RAG Engine...", len(all_chunks))
-        count = await upsert_chunks(
+        result = await upsert_chunks(
             chunks=all_chunks,
             repo=repo,
             commit_sha=head_sha,
@@ -185,11 +185,24 @@ async def run_embedding_pipeline(
             region=region,
         )
 
-        # Update last indexed commit
+        # Fail closed: advancing the last-indexed commit after a partial or
+        # skipped upsert permanently strands the chunks that did not make it,
+        # because the next incremental run only diffs from this commit.
+        if not result.ok:
+            reason = result.skipped_reason or f"{result.failed} of {len(all_chunks)} chunks failed to upload"
+            logger.error("[EMBED] Not advancing last-indexed commit for %s@%s: %s", repo, head_sha[:8], reason)
+            return {
+                "status": "failed",
+                "error": reason,
+                "chunks_upserted": result.uploaded,
+                "chunks_failed": result.failed,
+                "commit_sha": head_sha,
+            }
+
         await set_last_indexed_commit(repo, head_sha, project_id=project_id)
 
-        logger.info("[EMBED] Completed: %d chunks upserted for %s@%s", count, repo, head_sha[:8])
-        return {"status": "completed", "chunks_upserted": count, "commit_sha": head_sha}
+        logger.info("[EMBED] Completed: %d chunks upserted for %s@%s", result.uploaded, repo, head_sha[:8])
+        return {"status": "completed", "chunks_upserted": result.uploaded, "commit_sha": head_sha}
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

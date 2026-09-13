@@ -955,16 +955,18 @@
         <div class="terminal-body">
           <div class="t-comment"># Clone and install</div>
           <div class="t-cmd">git clone https://github.com/chrisciampoli/henchmen &amp;&amp; cd henchmen</div>
-          <div class="t-cmd">pip install -e ".[dev]"</div>
+          <div class="t-cmd">pip install -e ".[local,dev]"</div>
           <div class="t-blank"></div>
-          <div class="t-comment"># Configure &#8212; set your GitHub token and LLM choice</div>
-          <div class="t-cmd">cp .env.example .env.local</div>
-          <div class="t-cmd">$EDITOR .env.local</div>
+          <div class="t-comment"># Configure &#8212; the wizard writes .env.local for you</div>
+          <div class="t-cmd">henchmen init</div>
           <div class="t-blank"></div>
-          <div class="t-comment"># .env.local (minimum required)</div>
-          <div class="t-out">GITHUB_TOKEN=ghp_your_token_here</div>
-          <div class="t-out">HENCHMEN_LLM_PROVIDER=openai          <span style="color:var(--muted)"># or: anthropic, local (Ollama)</span></div>
-          <div class="t-out">HENCHMEN_OPENAI_API_KEY=sk-...        <span style="color:var(--muted)"># for OpenAI</span></div>
+          <div class="t-out">Deployment mode?            <span style="color:var(--muted)">local / gcp / aws</span></div>
+          <div class="t-out">LLM provider?               <span style="color:var(--muted)">anthropic / openai / ollama / vertex / bedrock</span></div>
+          <div class="t-success">&#10003; Anthropic API key: valid (14 models available)</div>
+          <div class="t-success">&#10003; GitHub token: authenticated as your-user</div>
+          <div class="t-success">&#10003; GitHub repository: push access OK (default branch: main)</div>
+          <div class="t-out">Channel for Henchmen to join?  <span style="color:var(--muted)">#engineering  #henchmen</span></div>
+          <div class="t-success">&#10003; Wrote .env.local</div>
         </div>
       </div>
 
@@ -976,13 +978,15 @@
           <span class="terminal-title">bash &#8212; step 2: start the server</span>
         </div>
         <div class="terminal-body">
+          <div class="t-comment"># Verify the setup, then build the operative image once (~3 min)</div>
+          <div class="t-cmd">henchmen doctor</div>
+          <div class="t-cmd">henchmen build-operative</div>
+          <div class="t-blank"></div>
           <div class="t-cmd">henchmen serve</div>
           <div class="t-blank"></div>
           <div class="t-success">&#10003; Starting Henchmen in single-process mode (provider=local)</div>
-          <div class="t-success">&#10003; HTTP forwarding configured for 4 topics</div>
-          <div class="t-success">&#10003; Uvicorn running on http://0.0.0.0:8000</div>
-          <div class="t-blank"></div>
-          <div class="t-comment"># First run auto-builds the operative Docker image (~2 min)</div>
+          <div class="t-success">&#10003; Shared broker configured for 5 topics</div>
+          <div class="t-success">&#10003; Uvicorn running on http://127.0.0.1:8000</div>
         </div>
       </div>
 
@@ -1020,16 +1024,15 @@
     <div class="integrations-grid">
       <div class="integration-card reveal">
         <span class="integration-icon">&#128025;</span>
-        <h3>GitHub App</h3>
-        <p>Required for the full PR workflow. Henchmen creates branches, pushes commits, and opens pull requests.</p>
+        <h3>GitHub</h3>
+        <p>Required for the full PR workflow. Henchmen creates branches, pushes commits, and opens pull requests with a classic personal access token.</p>
         <ul class="step-list">
-          <li>Create a GitHub App with Contents + PR permissions</li>
-          <li>Install on your target repository</li>
-          <li>Download the private key (.pem file)</li>
+          <li>Create a classic PAT with the <code>repo</code> scope</li>
+          <li>Use an account that can push to the target repo</li>
+          <li><code>henchmen doctor</code> verifies push access for you</li>
         </ul>
         <div class="env-block">
-          <span class="env-key">HENCHMEN_GITHUB_APP_ID</span>=<span class="env-val">123456</span><br/>
-          <span class="env-key">HENCHMEN_GITHUB_APP_PRIVATE_KEY_SECRET</span>=<span class="env-val">/path/to/key.pem</span><br/>
+          <span class="env-key">HENCHMEN_GITHUB_TOKEN</span>=<span class="env-val">ghp_...</span><br/>
           <span class="env-key">HENCHMEN_GITHUB_DEFAULT_REPO</span>=<span class="env-val">your-org/your-repo</span>
         </div>
       </div>
@@ -1040,13 +1043,15 @@
         <p>@mention the bot in any channel to create a task. Thread context is automatically included for richer descriptions.</p>
         <ul class="step-list">
           <li>Create a Slack App with Socket Mode enabled</li>
-          <li>Add bot scopes: app_mentions:read, chat:write</li>
+          <li>Bot scopes: app_mentions:read, chat:write, channels:history, channels:read, channels:join, groups:read</li>
           <li>Subscribe to the app_mention event</li>
+          <li><code>henchmen init</code> lists your channels and joins the one you pick</li>
         </ul>
         <div class="env-block">
-          <span class="env-key">HENCHMEN_SLACK_BOT_TOKEN_SECRET</span>=<span class="env-val">xoxb-...</span><br/>
-          <span class="env-key">HENCHMEN_SLACK_APP_TOKEN_SECRET</span>=<span class="env-val">xapp-...</span><br/>
-          <span class="env-key">HENCHMEN_SLACK_SIGNING_SECRET</span>=<span class="env-val">your-secret</span>
+          <span class="env-key">HENCHMEN_SLACK_BOT_TOKEN</span>=<span class="env-val">xoxb-...</span><br/>
+          <span class="env-key">HENCHMEN_SLACK_APP_TOKEN</span>=<span class="env-val">xapp-...</span><br/>
+          <span class="env-key">HENCHMEN_SLACK_SIGNING_SECRET</span>=<span class="env-val">your-secret</span><br/>
+          <span class="env-key">HENCHMEN_SLACK_NOTIFICATION_CHANNEL</span>=<span class="env-val">C0123ABCD</span>
         </div>
       </div>
 
@@ -1061,7 +1066,8 @@
         </ul>
         <div class="env-block">
           <span class="env-key">HENCHMEN_JIRA_BASE_URL</span>=<span class="env-val">https://your-org.atlassian.net</span><br/>
-          <span class="env-key">HENCHMEN_JIRA_API_TOKEN_SECRET</span>=<span class="env-val">your-token</span><br/>
+          <span class="env-key">HENCHMEN_JIRA_EMAIL</span>=<span class="env-val">svc@your-org.com</span><br/>
+          <span class="env-key">HENCHMEN_JIRA_API_TOKEN</span>=<span class="env-val">your-token</span><br/>
           <span class="env-key">HENCHMEN_JIRA_PROJECT_KEY</span>=<span class="env-val">PROJ</span>
         </div>
       </div>
