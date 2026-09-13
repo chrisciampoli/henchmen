@@ -37,7 +37,7 @@ import subprocess
 import tempfile
 import time
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic import BaseModel, Field
@@ -620,19 +620,34 @@ async def _run_agent_loop(
     )
 
 
+def _is_rooted_on_any_platform(rel: str) -> bool:
+    """True if ``rel`` is anchored to a root or drive under POSIX *or* Windows rules.
+
+    Checked against both flavours deliberately. ``C:\\Windows\\x``,
+    ``\\rooted\\x``, ``\\\\server\\share\\x`` and the drive-relative ``D:x``
+    escape the workspace on Windows but are ordinary relative names on Linux,
+    where the join would quietly create a directory called ``C:``. A path the
+    model meant as absolute is never a filename we want either way, so it is
+    refused on every platform and the eval harness behaves the same on both.
+    """
+    windows = PureWindowsPath(rel)
+    return bool(PurePosixPath(rel).is_absolute() or windows.is_absolute() or windows.drive or windows.root)
+
+
 def _apply_patch(workspace: Path, arguments: dict[str, Any]) -> None:
     """Write ``arguments['contents']`` to ``arguments['path']`` inside the workspace.
 
-    The path comes straight from model output, so containment is verified on
-    the *resolved* path rather than with string heuristics: ``is_absolute()``
-    alone misses Windows drive-relative (``D:foo``), drive-less rooted
-    (``\\foo``) and UNC (``\\\\server\\share``) forms, all of which escape a
-    ``workspace / rel`` join.
+    The path comes straight from model output, so it is refused if it is
+    anchored under either platform's rules, and the *resolved* path is then
+    checked for containment to catch ``..`` traversal.
     """
     rel = str(arguments.get("path", "")).strip()
     contents = arguments.get("contents", "")
     if not rel:
         logger.warning("Refusing empty apply_patch path")
+        return
+    if _is_rooted_on_any_platform(rel):
+        logger.warning("Refusing absolute or drive-anchored apply_patch path: %r", rel)
         return
     try:
         root = workspace.resolve()
