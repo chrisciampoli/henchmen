@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import shlex
 from typing import TYPE_CHECKING, Any
 
 import yaml
@@ -11,6 +13,9 @@ from henchmen.providers.interfaces.ci_provider import CIResult, CIStatus
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
+
+# CodeBuild rejects timeoutInMinutesOverride below 5 with a ValidationException.
+_MIN_TIMEOUT_MINUTES = 5
 
 _STATUS_MAP: dict[str, CIStatus] = {
     "SUCCEEDED": CIStatus.SUCCESS,
@@ -24,15 +29,16 @@ _STATUS_MAP: dict[str, CIStatus] = {
 
 
 def _build_buildspec(repo_url: str, branch: str, commands: list[str]) -> str:
-    """Generate a CodeBuild buildspec YAML string."""
+    """Generate a CodeBuild buildspec YAML string.
+
+    ``branch`` and ``repo_url`` originate from task metadata, so they are
+    shell-quoted before being interpolated into the clone command.
+    """
+    clone = f"git clone --branch {shlex.quote(branch)} -- {shlex.quote(repo_url)} ."
     spec = {
         "version": "0.2",
         "phases": {
-            "install": {
-                "commands": [
-                    f"git clone -b {branch} {repo_url} .",
-                ]
-            },
+            "install": {"commands": [clone]},
             "build": {
                 "commands": commands,
             },
@@ -44,13 +50,11 @@ def _build_buildspec(repo_url: str, branch: str, commands: list[str]) -> str:
 class CodeBuildCIProvider:
     """CIProvider backed by AWS CodeBuild."""
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(self, settings: Settings) -> None:
         import boto3
 
-        region = getattr(settings, "aws_region", "us-east-1") if settings else "us-east-1"
-        prefix = getattr(settings, "aws_resource_prefix", "henchmen") if settings else "henchmen"
-        self._project_name = f"{prefix}-ci"
-        self._client: Any = boto3.client("codebuild", region_name=region)
+        self._project_name = f"{settings.aws_resource_prefix}-ci"
+        self._client: Any = boto3.client("codebuild", region_name=settings.aws_region)
 
     async def trigger_build(
         self,
@@ -59,13 +63,18 @@ class CodeBuildCIProvider:
         commands: list[str],
         timeout_seconds: int = 600,
     ) -> str:
-        """Start a CodeBuild build with an inline buildspec. Returns build ID."""
+        """Start a CodeBuild build with an inline buildspec. Returns build ID.
+
+        Returns as soon as the build is queued — poll :meth:`get_status` until
+        a terminal ``CIStatus``.
+        """
         buildspec = _build_buildspec(repo_url, branch, commands)
+        timeout_minutes = max(_MIN_TIMEOUT_MINUTES, math.ceil(timeout_seconds / 60))
         response = await asyncio.to_thread(
             self._client.start_build,
             projectName=self._project_name,
             buildspecOverride=buildspec,
-            timeoutInMinutesOverride=max(1, timeout_seconds // 60),
+            timeoutInMinutesOverride=timeout_minutes,
         )
         return str(response["build"]["id"])
 
@@ -84,7 +93,9 @@ class CodeBuildCIProvider:
             )
         build = builds[0]
         build_status: str = build.get("buildStatus", "IN_PROGRESS")
-        status = _STATUS_MAP.get(build_status, CIStatus.PENDING)
+        # Unrecognised statuses fail closed: a PENDING reading would make
+        # callers poll for ever instead of surfacing the problem.
+        status = _STATUS_MAP.get(build_status, CIStatus.FAILURE)
 
         logs_url: str | None = None
         logs_info = build.get("logs", {})
@@ -116,7 +127,11 @@ class CodeBuildCIProvider:
         )
 
     async def get_logs(self, build_id: str) -> str:
-        """Return the CloudWatch logs URL for a CodeBuild build."""
+        """Return the CloudWatch logs URL for a CodeBuild build.
+
+        CodeBuild keeps log text in CloudWatch, so this is a URL rather than
+        log content (see the CIProvider docstring for the contract).
+        """
         result = await self.get_status(build_id)
         return result.logs_url or f"https://console.aws.amazon.com/codesuite/codebuild/builds/{build_id}/view/new"
 

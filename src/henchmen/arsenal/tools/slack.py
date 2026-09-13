@@ -1,19 +1,25 @@
-"""Slack tools - post messages, thread replies, file uploads."""
+"""Slack tools - post messages, thread replies, file uploads.
+
+The bot token comes from :class:`~henchmen.config.settings.Settings`, which
+accepts both ``HENCHMEN_SLACK_BOT_TOKEN`` and the bare ``SLACK_BOT_TOKEN``
+that a Cloud Run secret mount injects.
+"""
 
 import asyncio
-import os
 from typing import Any
 
 from henchmen.arsenal.registry import tool
 
 
 def _get_slack_client() -> Any:
-    """Return an authenticated Slack WebClient using SLACK_BOT_TOKEN env var."""
+    """Return an authenticated Slack WebClient using the configured bot token."""
     from slack_sdk import WebClient
 
-    token = os.environ.get("SLACK_BOT_TOKEN", "")
+    from henchmen.config.settings import get_settings
+
+    token = get_settings().slack_bot_token
     if not token:
-        raise ValueError("SLACK_BOT_TOKEN environment variable is not set")
+        raise ValueError("No Slack bot token configured (set HENCHMEN_SLACK_BOT_TOKEN)")
     return WebClient(token=token)
 
 

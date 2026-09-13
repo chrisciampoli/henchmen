@@ -1,4 +1,13 @@
-"""SnapshotCache – ObjectStore-based repository snapshot cache for fast workspace setup."""
+"""SnapshotCache – ObjectStore-based repository snapshot cache for fast workspace setup.
+
+Status: the read side (:meth:`SnapshotCache.get_snapshot` /
+:meth:`SnapshotCache.restore_snapshot`) is wired into
+``henchmen.operative.bootstrap``; the write side
+(:meth:`SnapshotCache.save_snapshot`) has no caller yet, so the cache is
+always cold in production. Populating it requires bootstrap to call
+``save_snapshot`` after a fresh clone (passing the cloned HEAD sha) and to
+``git fetch``/``reset`` after a restore.
+"""
 
 import asyncio
 import hashlib
@@ -34,13 +43,17 @@ class SnapshotCache:
             self._object_store = ProviderRegistry(self.settings).get_object_store()
         return self._object_store
 
-    async def get_snapshot(self, repo_url: str, branch: str = "main") -> str | None:
-        """Return the GCS URI of a cached snapshot, or None if not cached."""
+    async def get_snapshot(self, repo_url: str, branch: str = "main", commit_sha: str = "") -> str | None:
+        """Return the URI of a cached snapshot, or None if not cached.
+
+        ``commit_sha`` is part of the cache key: without it a restored
+        workspace would be pinned forever to whatever tree was first saved.
+        """
         bucket = self.settings.gcs_bucket_snapshots
         if not bucket:
             return None
 
-        key = self._snapshot_key(repo_url, branch)
+        key = self._snapshot_key(repo_url, branch, commit_sha)
         blob_name = f"{_SNAPSHOT_PREFIX}{key}{_SNAPSHOT_SUFFIX}"
 
         try:
@@ -54,16 +67,21 @@ class SnapshotCache:
 
         return None
 
-    async def save_snapshot(self, workspace_dir: str, repo_url: str, branch: str = "main") -> str:
+    async def save_snapshot(
+        self, workspace_dir: str, repo_url: str, branch: str = "main", commit_sha: str = ""
+    ) -> str | None:
         """Create a tarball of the workspace and upload it via ObjectStore.
 
-        Returns the GCS URI of the uploaded snapshot.
+        Returns the URI of the uploaded snapshot, or ``None`` when no snapshot
+        bucket is configured (mirroring :meth:`get_snapshot`, which also
+        degrades to "no cache" rather than raising).
         """
         bucket = self.settings.gcs_bucket_snapshots
         if not bucket:
-            raise ValueError("gcs_bucket_snapshots is not configured")
+            logger.info("No snapshot bucket configured (HENCHMEN_GCS_BUCKET_SNAPSHOTS); skipping snapshot save")
+            return None
 
-        key = self._snapshot_key(repo_url, branch)
+        key = self._snapshot_key(repo_url, branch, commit_sha)
         blob_name = f"{_SNAPSHOT_PREFIX}{key}{_SNAPSHOT_SUFFIX}"
 
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
@@ -108,9 +126,9 @@ class SnapshotCache:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
-    def _snapshot_key(self, repo_url: str, branch: str) -> str:
-        """Generate a deterministic cache key from repo URL and branch."""
-        raw = f"{repo_url}#{branch}"
+    def _snapshot_key(self, repo_url: str, branch: str, commit_sha: str = "") -> str:
+        """Generate a deterministic cache key from repo URL, branch and commit."""
+        raw = f"{repo_url}#{branch}#{commit_sha}"
         return hashlib.sha256(raw.encode()).hexdigest()[:40]
 
 
@@ -126,6 +144,11 @@ def _create_tarball(source_dir: str, dest_path: str) -> None:
 
 
 def _extract_tarball(tarball_path: str, dest_dir: str) -> None:
-    """Extract a .tar.gz archive into dest_dir."""
+    """Extract a .tar.gz archive into dest_dir.
+
+    ``filter="data"`` rejects members with absolute paths, ``..`` components,
+    links escaping the destination and special files — without it a crafted
+    snapshot could overwrite files anywhere in the operative container.
+    """
     with tarfile.open(tarball_path, "r:gz") as tar:
-        tar.extractall(dest_dir)
+        tar.extractall(dest_dir, filter="data")

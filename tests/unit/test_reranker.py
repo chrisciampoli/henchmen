@@ -1,6 +1,7 @@
 """Unit tests for the dossier reranker module."""
 
-from unittest.mock import AsyncMock, MagicMock
+import inspect
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -11,6 +12,14 @@ from henchmen.dossier.reranker import (
     _parse_rerank_response,
     rerank_chunks,
 )
+from henchmen.models.llm import LLMResponse
+from henchmen.providers.interfaces.llm_provider import LLMProvider
+
+
+def _response(content: str) -> LLMResponse:
+    """A real LLMResponse — a MagicMock would accept any attribute."""
+    return LLMResponse(content=content, model="test-model", finish_reason="stop")
+
 
 # ---------------------------------------------------------------------------
 # _build_chunk_summaries
@@ -118,20 +127,18 @@ class TestFallbackSort:
 
 class TestRerankChunks:
     @pytest.mark.asyncio
-    async def test_successful_reranking(self):
+    async def test_successful_reranking(self, mock_settings):
         chunks = [
             {"file_path": "auth.py", "content": "def login(): pass", "relevance_score": 0.5},
             {"file_path": "utils.py", "content": "def helper(): pass", "relevance_score": 0.8},
             {"file_path": "config.py", "content": "DEBUG = True", "relevance_score": 0.3},
         ]
 
-        mock_response = MagicMock()
-        mock_response.text = '[{"index": 2, "score": 0.95}, {"index": 0, "score": 0.7}, {"index": 1, "score": 0.2}]'
-
+        scores = '[{"index": 2, "score": 0.95}, {"index": 0, "score": 0.7}, {"index": 1, "score": 0.2}]'
         mock_provider = AsyncMock()
-        mock_provider.generate = AsyncMock(return_value=mock_response)
+        mock_provider.generate = AsyncMock(return_value=_response(scores))
 
-        result = await rerank_chunks(chunks, "Fix the login bug", mock_provider, top_k=2)
+        result = await rerank_chunks(chunks, "Fix the login bug", mock_provider, top_k=2, settings=mock_settings)
 
         assert len(result) == 2
         assert result[0].file_path == "config.py"
@@ -139,7 +146,39 @@ class TestRerankChunks:
         assert result[1].file_path == "auth.py"
 
     @pytest.mark.asyncio
-    async def test_falls_back_on_llm_failure(self):
+    async def test_generate_is_called_with_interface_kwargs(self, mock_settings):
+        """The old code passed system_instruction=, which every provider rejects."""
+        mock_provider = AsyncMock()
+        mock_provider.generate = AsyncMock(return_value=_response('[{"index": 0, "score": 0.9}]'))
+
+        await rerank_chunks(
+            [{"file_path": "a.py", "content": "x", "relevance_score": 0.1}],
+            "task",
+            mock_provider,
+            settings=mock_settings,
+        )
+
+        kwargs = mock_provider.generate.await_args.kwargs
+        allowed = set(inspect.signature(LLMProvider.generate).parameters) - {"self"}
+        assert set(kwargs) <= allowed
+        assert kwargs["system_prompt"]
+
+    @pytest.mark.asyncio
+    async def test_model_defaults_to_configured_light_tier(self, mock_settings):
+        """No hardcoded model names (CLAUDE.md)."""
+        mock_provider = AsyncMock()
+        mock_provider.generate = AsyncMock(return_value=_response("[]"))
+
+        await rerank_chunks([{"file_path": "a.py", "content": "x"}], "task", mock_provider, settings=mock_settings)
+
+        from henchmen.models.llm import ModelTier
+        from henchmen.providers.tiers import resolve_model_name
+
+        expected = resolve_model_name(mock_settings, ModelTier.LIGHT.value)
+        assert mock_provider.generate.await_args.kwargs["model"] == expected
+
+    @pytest.mark.asyncio
+    async def test_falls_back_on_llm_failure(self, mock_settings):
         chunks = [
             {"file_path": "a.py", "content": "aaa", "relevance_score": 0.3},
             {"file_path": "b.py", "content": "bbb", "relevance_score": 0.9},
@@ -148,7 +187,7 @@ class TestRerankChunks:
         mock_provider = AsyncMock()
         mock_provider.generate = AsyncMock(side_effect=RuntimeError("LLM unavailable"))
 
-        result = await rerank_chunks(chunks, "some task", mock_provider, top_k=2)
+        result = await rerank_chunks(chunks, "some task", mock_provider, top_k=2, settings=mock_settings)
 
         # Should fall back to original order by relevance_score
         assert len(result) == 2
@@ -156,18 +195,15 @@ class TestRerankChunks:
         assert result[0].relevance_score == 0.9
 
     @pytest.mark.asyncio
-    async def test_falls_back_on_malformed_response(self):
+    async def test_falls_back_on_malformed_response(self, mock_settings):
         chunks = [
             {"file_path": "x.py", "content": "xxx", "relevance_score": 0.5},
         ]
 
-        mock_response = MagicMock()
-        mock_response.text = "this is not valid JSON at all"
-
         mock_provider = AsyncMock()
-        mock_provider.generate = AsyncMock(return_value=mock_response)
+        mock_provider.generate = AsyncMock(return_value=_response("this is not valid JSON at all"))
 
-        result = await rerank_chunks(chunks, "task", mock_provider, top_k=5)
+        result = await rerank_chunks(chunks, "task", mock_provider, top_k=5, settings=mock_settings)
 
         # Should fall back to original order
         assert len(result) == 1

@@ -1,10 +1,13 @@
-"""LairManager - creates and monitors Cloud Run Jobs (Lairs) for Operative execution."""
+"""LairManager - creates and monitors container jobs (Lairs) for Operative execution."""
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
+from henchmen.models.llm import ModelTier
 from henchmen.models.operative import OperativeReport, OperativeStatus
 from henchmen.models.scheme import SchemeNode
 from henchmen.models.task import HenchmenTask
@@ -13,6 +16,7 @@ from henchmen.providers.interfaces.document_store import DocumentStore
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
+    from henchmen.models.dossier import Dossier
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +24,31 @@ logger = logging.getLogger(__name__)
 _MAX_ENTRIES = 500
 _ENTRY_TTL = timedelta(hours=2)
 
+# Nodes that continue work on the operative's own feature branch rather than
+# starting from the task's base branch.
+_BRANCH_CONTINUATION_NODES = frozenset({"fix_lint", "fix_tests", "ci_fix"})
+
+# Environment values are capped only to stay clear of the per-container
+# environment size limits (Cloud Run: 32 KiB across all variables; `docker run
+# -e` is bounded by the OS argument limit). Multi-kilobyte values are fine on
+# both, and the fix nodes rely on the full lint/test output being present.
+_MAX_TASK_DESCRIPTION_CHARS = 16_000
+_MAX_TASK_TITLE_CHARS = 200
+
+# Extra time allowed on top of the node timeout before the wait gives up: the
+# container still has to start, upload its report and be observed as finished.
+_WAIT_GRACE_SECONDS = 300
+
+
+def _parse_iso(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
 
 class LairManager:
-    """Creates and monitors Cloud Run Jobs (Lairs) for Operative execution."""
+    """Creates and monitors container jobs (Lairs) for Operative execution."""
 
     def __init__(
         self,
@@ -88,57 +114,64 @@ class LairManager:
             logger.info("[lair-cleanup] Evicted %d entries from received_reports", excess)
 
     def _build_env_vars(
-        self, task: HenchmenTask, node: SchemeNode, lair_id: str, scheme_id: str = ""
+        self,
+        task: HenchmenTask,
+        node: SchemeNode,
+        lair_id: str,
+        scheme_id: str = "",
+        dossier: "Dossier | None" = None,
     ) -> dict[str, str]:
-        """Build plain environment variable dict for the operative container."""
-        import os
+        """Build the environment variable dict for the operative container.
 
-        env = {
-            "TASK_ID": task.id,
-            "NODE_ID": node.id,
-            "SCHEME_ID": scheme_id,
-            "LAIR_ID": lair_id,
-            "MODEL_NAME": node.model_name or self.settings.vertex_ai_model_complex,
-            "REPO_URL": task.context.repo,
-            # Fix/retry nodes must clone the feature branch (not main)
-            # so they can see and push to the operative's prior work.
-            "BRANCH": (task.branch_name if node.id in ("fix_lint", "fix_tests") else (task.context.branch or "main")),
-            "TASK_TITLE": task.title[:200],
-            "TASK_DESCRIPTION": task.description[:500],
-            "HENCHMEN_GCP_PROJECT_ID": self.settings.gcp_project_id,
-            "HENCHMEN_ENVIRONMENT": self.settings.environment.value,
-            "HENCHMEN_GCP_REGION": self.settings.gcp_region,
-        }
+        Configuration travels as ``HENCHMEN_*`` variables produced by
+        :meth:`Settings.operative_env`, so an operator override in
+        ``.env.local`` (model tiers, token budgets, cost ceilings) reaches the
+        container instead of silently falling back to the in-container
+        defaults. On top of that sits the per-execution runtime contract
+        (``TASK_ID``, ``NODE_ID``, ...), which is deliberately unprefixed
+        because it is input, not configuration.
+        """
+        is_local = self.settings.provider == "local"
+        env = self.settings.operative_env(include_secrets=is_local)
 
-        # Local mode: pass LLM config and GitHub token as plain env vars.
-        # In GCP mode these come from Secret Manager and Vertex AI settings.
-        if self.settings.provider == "local":
-            llm_provider = self.settings.llm_provider or "local"
-            env.update(
-                {
-                    "HENCHMEN_PROVIDER": "local",
-                    "HENCHMEN_LLM_PROVIDER": llm_provider,
-                    "HENCHMEN_GIT_AUTHOR_NAME": self.settings.git_author_name,
-                    "HENCHMEN_GIT_AUTHOR_EMAIL": self.settings.git_author_email,
-                }
-            )
-            # Ollama: rewrite URL so the container can reach the host
-            if llm_provider == "local":
-                ollama_url = self.settings.llm_ollama_base_url
+        env.update(
+            {
+                "TASK_ID": task.id,
+                "NODE_ID": node.id,
+                "SCHEME_ID": scheme_id,
+                "LAIR_ID": lair_id,
+                # Tier names resolve per provider inside the operative; a
+                # concrete model name here would pin every provider to Gemini.
+                "MODEL_NAME": node.model_name or ModelTier.COMPLEX.value,
+                "REPO_URL": task.context.repo,
+                # Fix/retry nodes must clone the feature branch (not the base
+                # branch) so they can see and push to the operative's prior work.
+                "BRANCH": (
+                    task.branch_name if node.id in _BRANCH_CONTINUATION_NODES else (task.context.branch or "main")
+                ),
+                "TASK_TITLE": task.title[:_MAX_TASK_TITLE_CHARS],
+                "TASK_DESCRIPTION": task.description[:_MAX_TASK_DESCRIPTION_CHARS],
+            }
+        )
+
+        # The dossier is delivered out-of-band through the object store; only
+        # advertise it once it has actually been serialized.
+        artifact_uri = getattr(dossier, "artifact_uri", "") or ""
+        if artifact_uri:
+            env["DOSSIER_URI"] = artifact_uri
+
+        if is_local:
+            # The container talks back to the host `henchmen serve` process.
+            env["HENCHMEN_LOCAL_FORWARD_BASE_URL"] = self.settings.local_forward_base
+            ollama_url = env.get("HENCHMEN_LLM_OLLAMA_BASE_URL", "")
+            if ollama_url:
                 # Inside Docker, localhost is the container — use host.docker.internal
-                ollama_url = ollama_url.replace("localhost", "host.docker.internal")
-                ollama_url = ollama_url.replace("127.0.0.1", "host.docker.internal")
+                for host in ("localhost", "127.0.0.1"):
+                    ollama_url = ollama_url.replace(host, "host.docker.internal")
                 env["HENCHMEN_LLM_OLLAMA_BASE_URL"] = ollama_url
-                env["HENCHMEN_LLM_OLLAMA_MODEL"] = self.settings.llm_ollama_model
-            elif llm_provider == "openai":
-                env["HENCHMEN_OPENAI_API_KEY"] = self.settings.openai_api_key
-            elif llm_provider == "anthropic":
-                env["HENCHMEN_ANTHROPIC_API_KEY"] = self.settings.anthropic_api_key
-
-            # GitHub token: prefer settings (reads .env.local), fall back to os.environ
-            github_token = self.settings.github_token or os.environ.get("GITHUB_TOKEN", "")
-            if github_token:
-                env["GITHUB_TOKEN"] = github_token
+            # Also expose the bare name for tooling (git, gh) that reads it directly.
+            if self.settings.github_token:
+                env["GITHUB_TOKEN"] = self.settings.github_token
 
         return env
 
@@ -153,37 +186,60 @@ class LairManager:
             f"operative:{self.settings.lair_operative_image_tag}"
         )
 
-    async def create_lair(self, task: HenchmenTask, node: SchemeNode, scheme_id: str = "") -> str:
+    async def _discard_stale_report(self, task_id: str, node_id: str) -> None:
+        """Drop any report left over from a previous execution of this task/node.
+
+        Without this, a re-execution (CI-fix loop, watchdog resume) consumes the
+        *previous* attempt's report on its first poll and reports success before
+        the new operative has done anything.
+        """
+        key = f"{task_id}:{node_id}"
+        self._received_reports.pop(key, None)
+        self._pending_reports.pop(key, None)
+        try:
+            await self._get_store().delete("operative_reports", key)
+        except Exception as exc:
+            logger.warning("Could not clear stale operative report for %s: %s", key, exc)
+
+    async def create_lair(
+        self,
+        task: HenchmenTask,
+        node: SchemeNode,
+        scheme_id: str = "",
+        dossier: "Dossier | None" = None,
+    ) -> str:
         """Create and launch a container job for an operative. Returns lair_id."""
         self._cleanup_stale_entries()
 
-        # Cloud Run Job IDs: lowercase, digits, hyphens only, max 63 chars, must start with letter
-        raw_id = f"lair-{task.id[:8]}-{node.id}"
-        lair_id = raw_id.replace("_", "-").lower()[:63]
+        # Container job IDs: lowercase, digits, hyphens only, max 63 chars,
+        # must start with a letter. The random suffix keeps a re-execution of
+        # the same task/node (CI-fix loop, resume) from colliding with the
+        # job resource created by the previous attempt.
+        base_id = f"lair-{task.id[:8]}-{node.id}".replace("_", "-").lower()[:56]
+        lair_id = f"{base_id}-{uuid4().hex[:6]}"
 
-        # Scale up resources for long-running nodes
-        if node.timeout_seconds > 300:
-            cpu = "4"
-            memory = "8Gi"
-        else:
-            cpu = self.settings.lair_default_cpu
-            memory = self.settings.lair_default_memory
+        cpu = self.settings.lair_default_cpu
+        memory = self.settings.lair_default_memory
+        timeout_seconds = node.timeout_seconds or self.settings.lair_default_timeout
 
         image = self._build_image()
-        env_vars = self._build_env_vars(task, node, lair_id, scheme_id)
+        env_vars = self._build_env_vars(task, node, lair_id, scheme_id, dossier=dossier)
 
-        # Local mode: GITHUB_TOKEN is already in env_vars (plain), no Secret Manager.
-        if self.settings.provider == "local":
-            service_account = None
-            secrets = None
-        else:
-            service_account = f"sa-dev-operative@{self.settings.gcp_project_id}.iam.gserviceaccount.com"
-            secrets = {
+        # Local and AWS modes carry credentials in plain env vars; only Cloud Run
+        # Jobs take a service account and Secret Manager references.
+        if self.settings.provider == "gcp":
+            service_account: str | None = self.settings.lair_service_account_email
+            secrets: dict[str, str] | None = {
                 "GITHUB_TOKEN": (
                     f"projects/{self.settings.gcp_project_id}/secrets/"
                     f"henchmen-{self.settings.environment.value}-github-token"
                 ),
             }
+        else:
+            service_account = None
+            secrets = None
+
+        await self._discard_stale_report(task.id, node.id)
 
         logger.info("[LAIR] Creating lair %s for task %s node %s", lair_id, task.id, node.id)
 
@@ -194,7 +250,7 @@ class LairManager:
             env_vars=env_vars,
             cpu=cpu,
             memory=memory,
-            timeout_seconds=node.timeout_seconds,
+            timeout_seconds=timeout_seconds,
             service_account=service_account,
             secrets=secrets,
         )
@@ -205,6 +261,7 @@ class LairManager:
             "execution_id": exec_id,
             "task_id": task.id,
             "node_id": node.id,
+            "timeout_seconds": timeout_seconds,
             "created_at": datetime.now(UTC).isoformat(),
         }
 
@@ -230,30 +287,99 @@ class LairManager:
         else:
             logger.info("Operative report received for %s (no waiter yet, stored for pickup)", key)
 
-    async def _check_store_report(self, task_id: str, node_id: str) -> OperativeReport | None:
-        """Check DocumentStore for an operative report (cross-instance coordination)."""
+    async def _check_store_report(
+        self, task_id: str, node_id: str, not_before: datetime | None = None
+    ) -> OperativeReport | None:
+        """Check DocumentStore for an operative report (cross-instance coordination).
+
+        Reports older than *not_before* belong to an earlier execution of the
+        same node and are ignored rather than consumed.
+        """
+        key = f"{task_id}:{node_id}"
         try:
             store = self._get_store()
-            key = f"{task_id}:{node_id}"
             data = await store.get("operative_reports", key)
-            if data is not None:
-                return OperativeReport.model_validate(data)
+            if data is None:
+                return None
+            report = OperativeReport.model_validate(data)
         except Exception as exc:
-            logger.warning("DocumentStore report check failed for %s:%s: %s", task_id, node_id, exc)
-        return None
+            logger.warning("DocumentStore report check failed for %s: %s", key, exc)
+            return None
 
-    async def wait_for_completion(self, lair_id: str, poll_interval: int = 10) -> OperativeReport:
+        if not_before is not None:
+            stamp = report.completed_at or report.started_at
+            if stamp is not None and stamp < not_before:
+                logger.warning("Ignoring stale operative report for %s (finished %s)", key, stamp.isoformat())
+                return None
+
+        # Consume it so a later execution of the same node cannot pick it up.
+        try:
+            await self._get_store().delete("operative_reports", key)
+        except Exception as exc:
+            logger.warning("Could not delete consumed operative report %s: %s", key, exc)
+        return report
+
+    def _fabricate_report(
+        self,
+        lair_id: str,
+        task_id: str,
+        node_id: str,
+        status: OperativeStatus,
+        summary: str,
+    ) -> OperativeReport:
+        """Build a synthetic report for a lair that never delivered one.
+
+        Never COMPLETED: without a report there is no evidence the work was
+        done or verified, and CLAUDE.md's fail-closed rule forbids promoting an
+        unverified run to success.
+        """
+        now = datetime.now(UTC)
+        return OperativeReport(
+            task_id=task_id,
+            scheme_id="",
+            node_id=node_id,
+            operative_id=lair_id,
+            status=status,
+            summary=summary,
+            confidence_score=0.0,
+            started_at=now,
+            completed_at=now,
+            error=summary,
+        )
+
+    async def wait_for_completion(
+        self,
+        lair_id: str,
+        poll_interval: int = 10,
+        timeout_seconds: int | None = None,
+    ) -> OperativeReport:
         """Wait for the operative's real report via in-memory event, DocumentStore, or orchestrator polling.
 
         Three-tier approach for cross-instance reliability:
         1. In-memory event (same-instance fast path — Pub/Sub handler sets it directly)
         2. DocumentStore poll (cross-instance — operative_complete_handler writes report there)
         3. ContainerOrchestrator status (last resort — detects completion even if Pub/Sub lost)
+
+        The wait is bounded by *timeout_seconds* (default: the node timeout
+        recorded at ``create_lair`` plus a start-up/report grace period); on
+        expiry the lair is cancelled and a TIMED_OUT report is returned.
         """
-        lair_info = self._active_lairs.get(lair_id, {})
-        task_id = lair_info.get("task_id", "")
-        node_id = lair_info.get("node_id", "")
+        lair_info = self._active_lairs.get(lair_id)
+        if not lair_info:
+            logger.error("[LAIR] wait_for_completion called for unknown lair %s", lair_id)
+            return self._fabricate_report(
+                lair_id, "", "", OperativeStatus.FAILED, f"Unknown lair {lair_id} — no execution to wait for"
+            )
+
+        task_id = str(lair_info.get("task_id", ""))
+        node_id = str(lair_info.get("node_id", ""))
         key = f"{task_id}:{node_id}"
+        created_at = _parse_iso(str(lair_info.get("created_at", "")))
+
+        if timeout_seconds is None:
+            timeout_seconds = int(lair_info.get("timeout_seconds", self.settings.lair_default_timeout))
+            timeout_seconds += _WAIT_GRACE_SECONDS
+        deadline = time.monotonic() + timeout_seconds
 
         # Check if report already arrived in-memory (Pub/Sub can be faster than our polling setup)
         if key in self._received_reports:
@@ -265,8 +391,9 @@ class LairManager:
         event = asyncio.Event()
         self._pending_reports[key] = event
 
-        execution_id = lair_info.get("execution_id", "")
+        execution_id = str(lair_info.get("execution_id", ""))
         final_job_result = None
+        timed_out = False
 
         # Poll: in-memory event, DocumentStore, and orchestrator status
         while True:
@@ -275,7 +402,7 @@ class LairManager:
                 break
 
             # Tier 2: Check DocumentStore (cross-instance)
-            store_report = await self._check_store_report(task_id, node_id)
+            store_report = await self._check_store_report(task_id, node_id, not_before=created_at)
             if store_report is not None:
                 self._pending_reports.pop(key, None)
                 logger.info("Retrieved operative report from DocumentStore for %s", key)
@@ -289,7 +416,7 @@ class LairManager:
                     if job_result.status not in (JobStatus.PROVISIONING, JobStatus.RUNNING):
                         final_job_result = job_result
                         # Execution finished — check store one more time, then wait briefly for in-memory
-                        store_report = await self._check_store_report(task_id, node_id)
+                        store_report = await self._check_store_report(task_id, node_id, not_before=created_at)
                         if store_report is not None:
                             self._pending_reports.pop(key, None)
                             return store_report
@@ -301,6 +428,12 @@ class LairManager:
                 except Exception as exc:
                     logger.warning("Failed to poll execution %s: %s", execution_id, exc)
 
+            if time.monotonic() >= deadline:
+                logger.error("[LAIR] Wait for %s exceeded %ds — cancelling lair", key, timeout_seconds)
+                timed_out = True
+                await self.cancel_lair(lair_id)
+                break
+
             await asyncio.sleep(poll_interval)
 
         # Use real report if available from any source
@@ -310,28 +443,20 @@ class LairManager:
             return report
 
         # Final store check
-        store_report = await self._check_store_report(task_id, node_id)
+        store_report = await self._check_store_report(task_id, node_id, not_before=created_at)
         if store_report is not None:
             self._pending_reports.pop(key, None)
             return store_report
 
-        # Fallback: fabricate report from orchestrator status
+        # Fallback: fabricate a non-success report from the orchestrator status.
         self._pending_reports.pop(key, None)
-        succeeded = final_job_result is not None and final_job_result.status == JobStatus.COMPLETED
-        status = OperativeStatus.COMPLETED if succeeded else OperativeStatus.FAILED
-        logger.warning("Using fabricated report for %s (report not received from any source)", key)
+        job_status = final_job_result.status if final_job_result is not None else None
+        is_timeout = timed_out or job_status == JobStatus.TIMED_OUT
+        status = OperativeStatus.TIMED_OUT if is_timeout else OperativeStatus.FAILED
+        summary = f"Lair {lair_id} produced no report (job status: {job_status.value if job_status else 'unknown'})"
+        logger.warning("[LAIR] %s — treating node as %s", summary, status.value)
 
-        return OperativeReport(
-            task_id=task_id,
-            scheme_id="",
-            node_id=node_id,
-            operative_id=lair_id,
-            status=status,
-            summary=f"Lair {lair_id} finished with status {status.value}",
-            confidence_score=1.0 if succeeded else 0.0,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-        )
+        return self._fabricate_report(lair_id, task_id, node_id, status, summary)
 
     async def cancel_lair(self, lair_id: str) -> None:
         """Cancel a running Lair."""
@@ -347,15 +472,3 @@ class LairManager:
             logger.info("Cancelled lair %s", lair_id)
         except Exception as exc:
             logger.error("Failed to cancel lair %s: %s", lair_id, exc)
-
-    async def get_lair_status(self, lair_id: str) -> dict[str, Any]:
-        """Get current status of a Lair."""
-        lair_info = self._active_lairs.get(lair_id)
-        if not lair_info:
-            return {"status": "unknown", "lair_id": lair_id}
-
-        return {
-            "status": "active",
-            "lair_id": lair_id,
-            **lair_info,
-        }

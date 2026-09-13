@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -11,6 +13,29 @@ if TYPE_CHECKING:
 
 
 _RESERVED_ATTRS = {"pk", "sk", "data"}
+
+_SUPPORTED_OPERATORS = frozenset({"==", "!=", "<", "<=", ">", ">=", "in", "not-in", "array-contains"})
+
+
+def _to_dynamo(value: Any) -> Any:
+    """Convert a Python value into something boto3 can serialize.
+
+    boto3's ``TypeSerializer`` rejects ``float`` ("Float types are not
+    supported. Use Decimal types instead.") and ``datetime`` outright, so
+    floats become ``Decimal`` and datetimes become ISO-8601 strings — the
+    same representation the SQLite provider writes.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _to_dynamo(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_to_dynamo(v) for v in value]
+    return value
 
 
 def _decimal_to_native(value: Any) -> Any:
@@ -59,9 +84,9 @@ class DynamoDBDocumentStore:
     def __init__(self, settings: Settings) -> None:
         import boto3
 
-        region = getattr(settings, "aws_region", "us-east-1")
-        table_name = getattr(settings, "aws_dynamodb_table", "henchmen")
-        self._table: Any = boto3.resource("dynamodb", region_name=region).Table(table_name)
+        self._table: Any = boto3.resource("dynamodb", region_name=settings.aws_region).Table(
+            settings.aws_dynamodb_table
+        )
 
     async def get(self, collection: str, document_id: str) -> dict[str, Any] | None:
         """Fetch a document by ID. Returns None if not found.
@@ -104,15 +129,34 @@ class DynamoDBDocumentStore:
             # so CAS preconditions and atomic counters can target them.
             # None is omitted because DynamoDB rejects null attribute values.
             if isinstance(value, int | float | str | bool) and value is not None:
-                item[key] = value
+                item[key] = _to_dynamo(value)
         await asyncio.to_thread(self._table.put_item, Item=item)
 
     async def update(self, collection: str, document_id: str, data: dict[str, Any]) -> None:
-        """Partially update fields on an existing document (merge)."""
-        existing = await self.get(collection, document_id) or {}
-        existing.pop("_id", None)
-        existing.update({k: v for k, v in data.items() if k != "_id"})
-        await self.set(collection, document_id, existing)
+        """Partially update fields on a document, creating it when missing.
+
+        Implemented as a single ``UpdateExpression`` over the supplied fields
+        only. The previous read-modify-write (get + full ``put_item``) raced
+        with ``increment``: an atomic counter bumped between the read and the
+        write was silently rolled back to its stale value.
+        """
+        fields = {k: v for k, v in data.items() if k != "_id" and k not in _RESERVED_ATTRS}
+        if not fields:
+            return
+        name_map: dict[str, str] = {}
+        value_map: dict[str, Any] = {}
+        set_parts: list[str] = []
+        for idx, (field, value) in enumerate(fields.items()):
+            name_map[f"#u{idx}"] = field
+            value_map[f":u{idx}"] = _to_dynamo(value)
+            set_parts.append(f"#u{idx} = :u{idx}")
+        await asyncio.to_thread(
+            self._table.update_item,
+            Key={"pk": collection, "sk": document_id},
+            UpdateExpression="SET " + ", ".join(set_parts),
+            ExpressionAttributeNames=name_map,
+            ExpressionAttributeValues=value_map,
+        )
 
     async def delete(self, collection: str, document_id: str) -> None:
         """Delete a document."""
@@ -129,15 +173,26 @@ class DynamoDBDocumentStore:
         order_direction: str = "ASCENDING",
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Query documents in a collection with optional in-memory filtering."""
+        """Query documents in a collection with optional in-memory filtering.
+
+        DynamoDB Query returns at most 1 MB per call, so every page is
+        followed: without that, filtering/ordering/limit would silently apply
+        to the first page only.
+        """
         from boto3.dynamodb.conditions import Key
 
-        response = await asyncio.to_thread(
-            self._table.query,
-            KeyConditionExpression=Key("pk").eq(collection),
-        )
+        raw_items: list[dict[str, Any]] = []
+        query_kwargs: dict[str, Any] = {"KeyConditionExpression": Key("pk").eq(collection)}
+        while True:
+            response = await asyncio.to_thread(self._table.query, **query_kwargs)
+            raw_items.extend(response.get("Items", []))
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            query_kwargs["ExclusiveStartKey"] = last_key
+
         items: list[dict[str, Any]] = []
-        for item in response.get("Items", []):
+        for item in raw_items:
             raw = item.get("data")
             doc: dict[str, Any] = json.loads(raw) if raw else {}
             # Overlay top-level attributes so atomic counters show through.
@@ -151,6 +206,8 @@ class DynamoDBDocumentStore:
         # In-memory filtering
         if filters:
             for field, op, value in filters:
+                if op not in _SUPPORTED_OPERATORS:
+                    raise ValueError(f"Unsupported query operator: {op!r}")
                 if op == "==":
                     items = [d for d in items if d.get(field) == value]
                 elif op == "!=":
@@ -167,6 +224,8 @@ class DynamoDBDocumentStore:
                     items = [d for d in items if d.get(field) in value]
                 elif op == "not-in":
                     items = [d for d in items if d.get(field) not in value]
+                elif op == "array-contains":
+                    items = [d for d in items if isinstance(d.get(field), list) and value in d[field]]
 
         # In-memory sorting
         if order_by:
@@ -201,7 +260,7 @@ class DynamoDBDocumentStore:
             name_placeholder = f"#f{idx}"
             value_placeholder = f":v{idx}"
             name_map[name_placeholder] = field
-            value_map[value_placeholder] = delta
+            value_map[value_placeholder] = _to_dynamo(delta)
             add_parts.append(f"{name_placeholder} {value_placeholder}")
         update_expression = "ADD " + ", ".join(add_parts)
         await asyncio.to_thread(
@@ -231,13 +290,13 @@ class DynamoDBDocumentStore:
         from botocore.exceptions import ClientError
 
         name_map: dict[str, str] = {"#cond": expected_field}
-        value_map: dict[str, Any] = {":cond": expected_value}
+        value_map: dict[str, Any] = {":cond": _to_dynamo(expected_value)}
         set_parts: list[str] = []
         for idx, (field, value) in enumerate(new_values.items()):
             name_placeholder = f"#v{idx}"
             value_placeholder = f":nv{idx}"
             name_map[name_placeholder] = field
-            value_map[value_placeholder] = value
+            value_map[value_placeholder] = _to_dynamo(value)
             set_parts.append(f"{name_placeholder} = {value_placeholder}")
         update_expression = "SET " + ", ".join(set_parts)
         condition_expression = "#cond = :cond"

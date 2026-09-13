@@ -9,40 +9,61 @@ Feature-flagged via ``vertex_ai_evaluation_enabled`` in settings.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
-from typing import Any
+from typing import TYPE_CHECKING
 
 from henchmen.models.evaluation import EvaluationResult
 from henchmen.models.operative import OperativeReport, OperativeStatus
 
+if TYPE_CHECKING:
+    from henchmen.observability.tracker import TaskTracker
+
 logger = logging.getLogger(__name__)
 
-# File path markers used to classify files_changed into source vs test/doc.
-_TEST_PATH_MARKERS: tuple[str, ...] = (
-    "/tests/",
-    "\\tests\\",
-    "tests/",
-    "test_",
-    "_test.",
-    ".test.",
-    ".spec.",
-    "spec/",
-    "__tests__/",
-)
+# Seconds to wait on the (blocking, LLM-judge-backed) Vertex evaluation call
+# before giving up and falling back to the diff signal.
+_EVALUATION_TIMEOUT_SECONDS = 120.0
+
+# Path classification for files_changed. Markers are anchored to path segments
+# and file names: a bare ``"test_" in path`` substring test misfiles source
+# files such as ``latest_report.py`` or ``contest_rules.py`` as tests, which
+# drops diff_signal from 0.7 to 0.3 and with it 40% of overall_quality.
+_TEST_DIR_SEGMENTS: frozenset[str] = frozenset({"test", "tests", "__tests__", "spec", "specs", "testing"})
+_TEST_NAME_MARKERS: tuple[str, ...] = ("_test.", ".test.", ".spec.", "_spec.")
+_DOC_DIR_SEGMENTS: frozenset[str] = frozenset({"doc", "docs"})
 _DOC_EXTENSIONS: tuple[str, ...] = (".md", ".rst", ".txt", ".adoc")
-_DOC_PATH_MARKERS: tuple[str, ...] = ("docs/", "doc/", "README", "CHANGELOG")
+_DOC_NAME_PREFIXES: tuple[str, ...] = ("readme", "changelog")
+
+
+def _segments(path: str) -> list[str]:
+    """Lower-cased path segments, with Windows separators normalised."""
+    return [segment for segment in path.replace("\\", "/").lower().split("/") if segment]
 
 
 def _is_test_path(path: str) -> bool:
-    lowered = path.lower()
-    return any(marker in lowered for marker in _TEST_PATH_MARKERS)
+    parts = _segments(path)
+    if not parts:
+        return False
+    name, directories = parts[-1], parts[:-1]
+    if any(directory in _TEST_DIR_SEGMENTS for directory in directories):
+        return True
+    if name.startswith("test_") or name.startswith("test."):
+        return True
+    return any(marker in name for marker in _TEST_NAME_MARKERS)
 
 
 def _is_doc_path(path: str) -> bool:
-    if path.endswith(_DOC_EXTENSIONS):
+    parts = _segments(path)
+    if not parts:
+        return False
+    name, directories = parts[-1], parts[:-1]
+    if name.endswith(_DOC_EXTENSIONS):
         return True
-    return any(marker in path for marker in _DOC_PATH_MARKERS)
+    if any(directory in _DOC_DIR_SEGMENTS for directory in directories):
+        return True
+    return name.startswith(_DOC_NAME_PREFIXES)
 
 
 def _is_source_path(path: str) -> bool:
@@ -139,12 +160,71 @@ def compute_diff_signal(
     return score
 
 
+def _clamp_unit(value: float) -> float:
+    """Clamp a score into the 0.0-1.0 range EvaluationResult accepts."""
+    return max(0.0, min(1.0, value))
+
+
+def _build_result(
+    diff_signal: float,
+    fulfillment: float,
+    safety: float,
+    report: OperativeReport,
+    vertex_error: str | None,
+) -> EvaluationResult:
+    """Combine the three signals into an EvaluationResult (L8 weighting)."""
+    overall = diff_signal * 0.4 + fulfillment * 0.4 + safety * 0.2
+
+    # Hard override: zero-diff completions are suspicious.
+    if diff_signal == 0.0 and report.status == OperativeStatus.COMPLETED:
+        logger.warning(
+            "Zero-diff completion for task %s — overriding overall_quality to 0",
+            report.task_id,
+        )
+        overall = 0.0
+
+    return EvaluationResult(
+        fulfillment_score=_clamp_unit(fulfillment),
+        tool_call_valid_score=_clamp_unit(diff_signal),  # reuse unused field for diff signal visibility
+        safety_score=_clamp_unit(safety),
+        overall_quality=_clamp_unit(overall),
+        evaluation_error=vertex_error,
+    )
+
+
 class OperativeEvaluator:
     """Evaluates operative results using Vertex AI GenAI Evaluation."""
 
     def __init__(self, project_id: str, region: str = "us-central1") -> None:
         self.project_id = project_id
         self.region = region
+
+    def _run_vertex_evaluation(self, instruction: str, context: str, response: str) -> dict[str, float]:
+        """Blocking Vertex evaluation call — always run via ``asyncio.to_thread``.
+
+        ``EvalTask`` rejects a list-of-dicts dataset and its string metric
+        registry has no "fulfillment" entry, so the dataset is a dict of columns
+        and the metrics are the SDK's own ``PointwiseMetric`` examples.
+        """
+        import vertexai
+        from vertexai.evaluation import EvalTask, MetricPromptTemplateExamples
+
+        vertexai.init(project=self.project_id, location=self.region)
+
+        eval_task = EvalTask(
+            dataset={
+                "instruction": [instruction],
+                "context": [context],
+                "response": [response],
+            },
+            metrics=[
+                MetricPromptTemplateExamples.Pointwise.INSTRUCTION_FOLLOWING,
+                MetricPromptTemplateExamples.Pointwise.SAFETY,
+            ],
+        )
+        result = eval_task.evaluate()
+        summary_metrics = getattr(result, "summary_metrics", {}) or {}
+        return {str(key): float(value) for key, value in summary_metrics.items() if value is not None}
 
     async def evaluate_operative_result(
         self,
@@ -187,72 +267,62 @@ class OperativeEvaluator:
         safety = 1.0  # assume safe until proven otherwise
         vertex_error: str | None = None
 
+        if not self.project_id:
+            # Vertex evaluation needs a GCP project; without one `vertexai.init`
+            # would fail per node on a local/AWS deployment.
+            logger.debug("No GCP project configured, using diff-signal only")
+            return _build_result(diff_signal, fulfillment, safety, report, "no GCP project configured")
+
         try:
-            import vertexai
-            from vertexai.evaluation import EvalTask
-
-            vertexai.init(project=self.project_id, location=self.region)
-
-            # Build evaluation dataset — single row with the operative's output
             instruction = node_instruction or f"Fix: {task_title}"
-            eval_data = [
-                {
-                    "instruction": instruction,
-                    "context": task_description,
-                    "response": report.summary,
-                }
-            ]
-
-            # Run evaluation with fulfillment and safety metrics
-            eval_task = EvalTask(
-                dataset=eval_data,
-                metrics=["fulfillment", "safety"],  # type: ignore[list-item]
+            summary_metrics = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._run_vertex_evaluation,
+                    instruction,
+                    task_description,
+                    report.summary,
+                ),
+                timeout=_EVALUATION_TIMEOUT_SECONDS,
             )
-            result = eval_task.evaluate()
-
-            # Extract scores from evaluation result
-            summary_metrics = getattr(result, "summary_metrics", {}) or {}
-            fulfillment = float(summary_metrics.get("fulfillment/mean", fulfillment))
-            safety = float(summary_metrics.get("safety/mean", safety))
+            # The INSTRUCTION_FOLLOWING rubric scores 1-5; EvaluationResult
+            # requires 0-1. SAFETY is already binary 0/1 and must not be
+            # rescaled or a "safe" verdict would land below the 0.0 floor.
+            raw_fulfillment = summary_metrics.get("instruction_following/mean")
+            if raw_fulfillment is not None:
+                fulfillment = _clamp_unit((float(raw_fulfillment) - 1.0) / 4.0)
+            raw_safety = summary_metrics.get("safety/mean")
+            if raw_safety is not None:
+                safety = _clamp_unit(float(raw_safety))
         except ImportError:
             logger.info("vertexai.evaluation not available, using diff-signal only")
             vertex_error = "vertexai.evaluation not available"
+        except TimeoutError:
+            logger.warning(
+                "Vertex evaluation timed out after %.0fs, using diff-signal only", _EVALUATION_TIMEOUT_SECONDS
+            )
+            vertex_error = f"Vertex evaluation timed out after {_EVALUATION_TIMEOUT_SECONDS:.0f}s"
         except Exception as exc:
             logger.warning("Vertex evaluation failed, using diff-signal only: %s", exc)
             vertex_error = str(exc)
 
-        # Weighted combination (L8): 0.4 diff + 0.4 fulfillment + 0.2 safety.
-        overall = diff_signal * 0.4 + fulfillment * 0.4 + safety * 0.2
-
-        # Hard override: zero-diff completions are suspicious.
-        if diff_signal == 0.0 and report.status == OperativeStatus.COMPLETED:
-            logger.warning(
-                "Zero-diff completion for task %s — overriding overall_quality to 0",
-                report.task_id,
-            )
-            overall = 0.0
-
-        return EvaluationResult(
-            fulfillment_score=fulfillment,
-            tool_call_valid_score=diff_signal,  # reuse unused field for diff signal visibility
-            safety_score=safety,
-            overall_quality=overall,
-            evaluation_error=vertex_error,
-        )
+        return _build_result(diff_signal, fulfillment, safety, report, vertex_error)
 
 
 async def evaluate_and_record(
     evaluator: OperativeEvaluator,
-    tracker: Any,
+    tracker: TaskTracker | None,
     task_id: str,
     task_title: str,
     task_description: str,
     report: OperativeReport,
     node_instruction: str = "",
 ) -> EvaluationResult:
-    """Evaluate operative result and record scores in Firestore.
+    """Evaluate an operative result and persist the scores on the task document.
 
-    Convenience function that combines evaluation + persistence.
+    Persistence goes through the injected ``DocumentStore`` and happens even
+    when the Vertex call failed — the diff-signal fallback is the only quality
+    signal available in that case, and throwing it away left
+    ``evaluation_scores`` permanently absent.
     """
     result = await evaluator.evaluate_operative_result(
         task_title=task_title,
@@ -261,26 +331,7 @@ async def evaluate_and_record(
         node_instruction=node_instruction,
     )
 
-    # Record evaluation scores in Firestore
-    if tracker and not result.evaluation_error:
-        try:
-            import asyncio
-
-            update_data = {
-                "evaluation_scores": {
-                    "fulfillment": result.fulfillment_score,
-                    "tool_call_valid": result.tool_call_valid_score,
-                    "safety": result.safety_score,
-                    "overall_quality": result.overall_quality,
-                },
-            }
-            await asyncio.to_thread(tracker._collection.document(task_id).update, update_data)
-            logger.info(
-                "Recorded evaluation for task %s: quality=%.2f",
-                task_id,
-                result.overall_quality,
-            )
-        except Exception as exc:
-            logger.warning("Failed to record evaluation for task %s: %s", task_id, exc)
+    if tracker is not None:
+        await tracker.record_evaluation(task_id, result)
 
     return result

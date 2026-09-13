@@ -13,6 +13,7 @@ checkpoint fields written by the executor.
 
 import json
 import logging
+import re
 from typing import Any
 
 from henchmen.config.settings import Settings, get_settings
@@ -20,7 +21,7 @@ from henchmen.dossier.builder import DossierBuilder
 from henchmen.dossier.embedder import query_similar_chunks
 from henchmen.forge.error_extractor import extract_ci_errors, format_errors_for_operative
 from henchmen.mastermind.lair_manager import LairManager
-from henchmen.mastermind.scheme_executor import SchemeExecutor
+from henchmen.mastermind.scheme_executor import SchemeExecutor, validate_deterministic_handlers
 from henchmen.models.dossier import CodeSearchResult, Dossier, RelatedIssue
 from henchmen.models.scheme import NodeType
 from henchmen.models.task import HenchmenTask
@@ -30,13 +31,53 @@ from henchmen.providers.interfaces.document_store import DocumentStore
 from henchmen.providers.interfaces.message_broker import MessageBroker
 from henchmen.schemes.base import SchemeGraph
 from henchmen.schemes.registry import SchemeRegistry
+from henchmen.utils.git import get_github_token
 
 logger = logging.getLogger(__name__)
 
 # Maximum number of in-flight task IDs to retain in the local tracking set.
 # Used only for in-memory dedup hints — authoritative state is in Firestore.
 _MAX_ACTIVE_TASKS = 200
-_MAX_PENDING_CI = 200
+
+# Scheme selection keywords. Matched on word boundaries so "address" does not
+# read as "add", "prefix" as "fix", and "debug" as "bug".
+_FEATURE_KEYWORDS = (
+    "feature",
+    "implement",
+    "build",
+    "create",
+    "add",
+    "new module",
+    "new endpoint",
+    "new page",
+    "new component",
+    "set up",
+    "setup",
+    "scaffold",
+    "portal",
+    "dashboard",
+    "homepage",
+)
+_BUGFIX_KEYWORDS = ("bug", "fix", "error", "crash", "broken")
+# Checked against the title only, and before the single-word lists, so the
+# multi-word goal phrases are reachable at all ("fix all" would otherwise be
+# swallowed by the "fix" bugfix keyword).
+_GOAL_KEYWORDS = (
+    "improve",
+    "optimize",
+    "refactor all",
+    "fix all",
+    "update all",
+    "increase coverage",
+    "reduce",
+    "clean up all",
+    "migrate",
+)
+
+
+def _matches_keyword(text: str, keywords: tuple[str, ...]) -> bool:
+    """True when any keyword appears in *text* as a whole word/phrase."""
+    return any(re.search(rf"\b{re.escape(kw)}\b", text) for kw in keywords)
 
 
 class MastermindAgent:
@@ -60,7 +101,6 @@ class MastermindAgent:
         # Authoritative state lives in Firestore `task_executions/{task_id}`;
         # this set is only a hint for local cleanup and test introspection.
         self._active_tasks: set[str] = set()
-        self._pending_ci: dict[str, dict[str, Any]] = {}  # request_id -> {event, result}
         self.tracker = TaskTracker(self.settings, document_store=document_store)
 
     def _get_broker(self) -> MessageBroker:
@@ -85,14 +125,6 @@ class MastermindAgent:
             for tid in list(self._active_tasks)[:excess]:
                 self._active_tasks.discard(tid)
             logger.info("[cleanup] Evicted %d entries from _active_tasks", excess)
-
-        # Evict resolved (event already set) entries from _pending_ci
-        if len(self._pending_ci) > _MAX_PENDING_CI:
-            resolved = [rid for rid, info in self._pending_ci.items() if info.get("event") and info["event"].is_set()]
-            for rid in resolved:
-                self._pending_ci.pop(rid, None)
-            if resolved:
-                logger.info("[cleanup] Evicted %d resolved entries from _pending_ci", len(resolved))
 
     async def handle_task(self, task: HenchmenTask) -> dict[str, Any]:
         """Process a task through its full lifecycle.
@@ -123,6 +155,16 @@ class MastermindAgent:
                 await self.tracker.finalize_task(task.id, "escalated")
                 return {"status": "escalated", "reason": reason, "task_id": task.id}
 
+            # 2b. Refuse to run a scheme whose deterministic gates have no
+            #     handler — those gates would silently be skipped.
+            handler_problems = validate_deterministic_handlers(scheme_graph)
+            if handler_problems:
+                reason = "; ".join(handler_problems)
+                logger.error("[MASTERMIND] %s", reason)
+                await self.tracker.finalize_task(task.id, "escalated")
+                await self.tracker.mark_escalated(task.id, reason=reason)
+                return {"status": "escalated", "reason": reason, "task_id": task.id}
+
             # 3. Build dossier
             dossier = await self._build_dossier(task, scheme_graph)
 
@@ -148,13 +190,13 @@ class MastermindAgent:
             final_status = result.get("final_status", "completed")
             await self.tracker.finalize_task(task.id, final_status, pr_url_final, pr_number)
 
-            # Record escalation node if the task was escalated
-            if final_status == "escalated" and result.get("escalation_node"):
-                await self.tracker.mark_escalated(
-                    task.id,
-                    reason=f"Escalated at node: {result['escalation_node']}",
-                    escalation_node=result["escalation_node"],
-                )
+            # Record escalation whenever the run escalated — even when no
+            # single node can be named (cost ceiling, dead-end with no node id),
+            # otherwise the task never gets an escalation record.
+            if final_status == "escalated":
+                escalation_node = result.get("escalation_node")
+                reason = f"Escalated at node: {escalation_node}" if escalation_node else "Escalated during execution"
+                await self.tracker.mark_escalated(task.id, reason=reason, escalation_node=escalation_node)
 
             # Log to Vertex AI Experiments if enabled
             try:
@@ -203,6 +245,13 @@ class MastermindAgent:
         if not scheme_graph:
             return {"status": "error", "reason": f"Unknown scheme: {scheme_id}"}
 
+        handler_problems = validate_deterministic_handlers(scheme_graph)
+        if handler_problems:
+            reason = "; ".join(handler_problems)
+            logger.error("[MASTERMIND] %s", reason)
+            await self.tracker.mark_escalated(task_id, reason=reason)
+            return {"status": "escalated", "reason": reason, "task_id": task_id}
+
         # Build dossier (lightweight — context is mostly cached)
         dossier = await self._build_dossier(task, scheme_graph)
 
@@ -243,8 +292,7 @@ class MastermindAgent:
         self, task_id_prefix: str, repo: str, branch: str, check_suite_id: int
     ) -> dict[str, Any]:
         """Handle a CI failure by dispatching a fix operative. Max 2 retries."""
-        import os
-
+        from henchmen.models.operative import OperativeStatus
         from henchmen.models.scheme import ArsenalRequirement, NodeType, SchemeNode
         from henchmen.models.task import HenchmenTask, TaskContext, TaskSource
 
@@ -264,10 +312,12 @@ class MastermindAgent:
         # 3. Max retries
         if ci_fix_attempts >= 2:
             await self.tracker.record_ci_result(task_id, False)
+            reason = "CI still failing after 2 fix attempts"
+            await self.tracker.mark_escalated(task_id, reason=reason)
             return {"status": "escalated", "reason": "max retries (2) reached"}
 
         # 4. Extract errors
-        github_token = os.environ.get("GITHUB_TOKEN", "")
+        github_token = get_github_token()
         errors = await extract_ci_errors(repo, check_suite_id, github_token)
         if not errors:
             return {"status": "skipped", "reason": "no errors found"}
@@ -286,7 +336,7 @@ class MastermindAgent:
             instruction_template=(
                 "You are fixing CI failures on an existing branch. "
                 "Here are the exact errors to fix. Do NOT add features, refactor, or make unrelated changes. "
-                "Fix the errors, commit, and push.\n\n" + error_context
+                "Fix the errors, commit, and push."
             ),
         )
 
@@ -295,19 +345,38 @@ class MastermindAgent:
                 source=TaskSource.GITHUB,
                 source_id=f"ci-fix-{task_id}",
                 title=f"Fix CI failures ({ci_fix_attempts + 1}/2)",
-                description=error_context,
+                # The operative resolves its system instruction from the
+                # registered scheme node, not from the node object built here,
+                # so the per-run error list has to travel in the description.
+                description=(
+                    "Fix the CI failures below on the existing branch. Do NOT add features, "
+                    "refactor, or make unrelated changes. Fix the errors, commit, and push.\n\n"
+                    "--- CI ERRORS (FIX THESE) ---\n" + error_context
+                ),
                 context=TaskContext(repo=repo, branch=branch),
                 created_by="henchmen-ci-loop",
             )
             fix_task.id = task_id
 
             lair_id = await self.lair_manager.create_lair(fix_task, fix_node, scheme_id="bugfix_standard")
-            await self.lair_manager.wait_for_completion(lair_id)
+            report = await self.lair_manager.wait_for_completion(lair_id)
             await self.tracker.clear_ci_fix_in_progress(task_id)
+
+            status = getattr(report, "status", None)
+            if status is not None and status != OperativeStatus.COMPLETED:
+                logger.warning("[CI-LOOP] Fix operative for %s ended as %s", task_id, status)
+                return {
+                    "status": "fix_failed",
+                    "task_id": task_id,
+                    "attempt": ci_fix_attempts + 1,
+                    "lair_id": lair_id,
+                    "reason": getattr(report, "summary", str(status)),
+                }
 
             return {"status": "fix_dispatched", "task_id": task_id, "attempt": ci_fix_attempts + 1, "lair_id": lair_id}
         except Exception as exc:
             await self.tracker.clear_ci_fix_in_progress(task_id)
+            logger.error("[CI-LOOP] Fix dispatch failed for %s: %s", task_id, exc)
             return {"status": "error", "reason": str(exc)}
 
     async def _select_scheme(self, task: HenchmenTask) -> str:
@@ -315,65 +384,34 @@ class MastermindAgent:
 
         Uses keyword matching for now; can be upgraded to LLM-based selection.
 
-        Priority order: feature > bugfix > goal_decomposition > default.
-        Feature and bugfix keywords are checked against title + description.
-        Goal keywords are checked against **title only** to avoid false
-        positives from incidental words in long descriptions/specs.
+        Priority order: goal_decomposition > bugfix > feature > default.
+        Goal keywords are checked against the **title only** (to avoid false
+        positives from incidental words in long descriptions/specs) and first,
+        because phrases like "fix all" and "update all" contain the single-word
+        bugfix/feature keywords and would otherwise be unreachable. Bugfix wins
+        over feature so "Fix crash when adding an item" routes to
+        ``bugfix_standard``, as documented in docs/schemes.md.
+
+        All matches are on word boundaries: "address" is not "add", "prefix" is
+        not "fix", and "debug" is not "bug".
         """
         title_lower = task.title.lower()
         full_text = (task.title + " " + task.description).lower()
 
-        # Check feature keywords FIRST — these are the strongest signal.
-        # A task that says "build" or "create" is implementation work even
-        # if the description happens to mention "improve" or "optimize".
-        feature_keywords = [
-            "feature",
-            "implement",
-            "build",
-            "create",
-            "add",
-            "new module",
-            "new endpoint",
-            "new page",
-            "new component",
-            "set up",
-            "setup",
-            "scaffold",
-            "portal",
-            "dashboard",
-            "homepage",
-        ]
-        if any(kw in full_text for kw in feature_keywords):
-            return "feature_standard"
+        if _matches_keyword(title_lower, _GOAL_KEYWORDS):
+            return "goal_decomposition"
 
-        # Check bugfix keywords
-        if any(kw in full_text for kw in ["bug", "fix", "error", "crash", "broken"]):
+        if _matches_keyword(full_text, _BUGFIX_KEYWORDS):
             return "bugfix_standard"
 
-        # Check for goal-level tasks that need decomposition.
-        # Only match on TITLE to avoid false positives from long descriptions
-        # that incidentally contain words like "improve" or "reduce".
-        goal_keywords = [
-            "improve",
-            "optimize",
-            "refactor all",
-            "fix all",
-            "update all",
-            "increase coverage",
-            "reduce",
-            "clean up all",
-            "migrate",
-        ]
-        if any(kw in title_lower for kw in goal_keywords):
-            return "goal_decomposition"
+        if _matches_keyword(full_text, _FEATURE_KEYWORDS):
+            return "feature_standard"
 
         # Default to bugfix
         return "bugfix_standard"
 
     async def _build_dossier(self, task: HenchmenTask, scheme_graph: SchemeGraph) -> Dossier:
         """Build dossier with repo file tree, task analysis, and relevant context."""
-        import os
-
         from henchmen.dossier.task_analyzer import TaskAnalyzer
 
         dossier = Dossier(task_id=task.id)
@@ -391,14 +429,15 @@ class MastermindAgent:
 
         # Pre-fetch file tree from GitHub so the operative knows the codebase structure
         repo = task.context.repo
-        github_token = self.settings.github_token or os.environ.get("GITHUB_TOKEN", "")
+        github_token = self.settings.github_token
+        base_branch = task.context.branch or "main"
         if repo and github_token:
             try:
                 from github import Github
 
                 g = Github(github_token)
                 github_repo = g.get_repo(repo)
-                tree = github_repo.get_git_tree("main", recursive=True)
+                tree = github_repo.get_git_tree(base_branch, recursive=True)
                 file_paths = [item.path for item in tree.tree if item.type == "blob"]
                 # Only store file paths for scoring in bootstrap — NOT dumped into context.
                 # Was 200, reduced to 0 in dossier context (operative uses tools to explore).
@@ -503,57 +542,3 @@ class MastermindAgent:
         except Exception as exc:
             logger.warning("[DOSSIER] Semantic search failed (non-fatal): %s", exc)
             return []
-
-    async def _run_ci(self, pr_url: str, timeout: int = 600) -> dict[str, Any]:
-        """Trigger CI via Forge and wait for result.
-
-        Publishes a forge-request to the message broker, then waits for the result to arrive
-        via ``notify_forge_result`` (called by the Pub/Sub push handler).
-        """
-        import asyncio
-        import uuid
-
-        request_id = str(uuid.uuid4())
-
-        # Create an event so we can wait for the async result
-        event: asyncio.Event = asyncio.Event()
-        self._pending_ci[request_id] = {"event": event, "result": None}
-
-        broker = self._get_broker()
-        data = json.dumps({"pr_url": pr_url, "action": "run_ci", "request_id": request_id}).encode("utf-8")
-        await broker.publish(self.settings.pubsub_topic_forge_request, data)
-
-        # Wait for the forge-result push handler to call notify_forge_result
-        try:
-            await asyncio.wait_for(event.wait(), timeout=timeout)
-        except TimeoutError:
-            self._pending_ci.pop(request_id, None)
-            return {"status": "failed", "error": "CI timed out"}
-
-        result: dict[str, Any] = self._pending_ci.pop(request_id, {}).get("result", {})
-        return result
-
-    def notify_forge_result(self, request_id: str, result: dict[str, Any]) -> None:
-        """Called by the Pub/Sub handler when a forge-result message arrives."""
-        pending = self._pending_ci.get(request_id)
-        if pending:
-            pending["result"] = result
-            pending["event"].set()
-
-    async def handle_pubsub_message(self, message: dict[str, Any]) -> dict[str, Any]:
-        """Handle incoming Pub/Sub messages (task intake, operative complete, forge result)."""
-        msg_type = message.get("type", "task_intake")
-
-        if msg_type == "task_intake":
-            task = HenchmenTask.model_validate(message.get("data", {}))
-            return await self.handle_task(task)
-        if msg_type == "operative_complete":
-            # Handle operative completion report
-            return {"status": "acknowledged"}
-        if msg_type == "forge_result":
-            data = message.get("data", {})
-            request_id = data.get("request_id", "")
-            self.notify_forge_result(request_id, data)
-            return {"status": "acknowledged"}
-
-        return {"status": "unknown_message_type"}

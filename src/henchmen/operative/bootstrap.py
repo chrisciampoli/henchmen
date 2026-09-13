@@ -7,7 +7,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import re
 import signal
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,13 +16,23 @@ from typing import Any
 import henchmen.schemes.bugfix_standard  # noqa: F401
 import henchmen.schemes.feature_standard  # noqa: F401
 import henchmen.schemes.goal_decomposition  # noqa: F401
+from henchmen.arsenal._workspace import set_workspace_root
 from henchmen.config.settings import Settings, get_settings
+from henchmen.models.llm import ModelTier
 from henchmen.models.operative import OperativeConfig, OperativeReport, OperativeStatus
 from henchmen.operative.agent_builder import build_operative_agent
+from henchmen.operative.git_helpers import (
+    DEFAULT_BASE_BRANCH,
+    detect_base_branch,
+    detect_remote_default_branch,
+    run_git,
+)
 from henchmen.providers.interfaces import MessageBroker, ObjectStore
 from henchmen.providers.interfaces.document_store import DocumentStore
 from henchmen.providers.registry import ProviderRegistry
-from henchmen.utils.git import clone_repo
+from henchmen.providers.tiers import resolve_model_name
+from henchmen.utils.git import build_clone_url, clone_repo
+from henchmen.utils.redaction import install_secret_redaction, redact
 
 logger = logging.getLogger(__name__)
 
@@ -32,23 +41,36 @@ logger = logging.getLogger(__name__)
 _TASK_EXECUTIONS_COLLECTION = "task_executions"
 
 
-class _SecretRedactionFilter(logging.Filter):
-    """Logging filter that redacts known secret token patterns before they reach Cloud Logging."""
+class _RedactingFormatter(logging.Formatter):
+    """Formatter that redacts secrets from the fully rendered line, traceback included.
 
-    _PATTERNS = [
-        re.compile(r"(ghp_[a-zA-Z0-9]{36})"),  # GitHub personal access tokens
-        re.compile(r"(ghs_[a-zA-Z0-9]{36})"),  # GitHub server-to-server tokens
-        re.compile(r"(xoxb-[a-zA-Z0-9-]+)"),  # Slack bot tokens
-        re.compile(r"(sk-[a-zA-Z0-9]{32,})"),  # OpenAI / generic secret keys
-        re.compile(r"(x-access-token:[^@\s]+)"),  # Git clone credential URLs
-    ]
+    The shared record factory (:func:`install_secret_redaction`) covers the
+    message and its ``%``-args; only the traceback appended by
+    ``logger.exception`` is rendered later, so it is redacted here.
+    """
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        msg = str(record.msg)
-        for pattern in self._PATTERNS:
-            msg = pattern.sub("***REDACTED***", msg)
-        record.msg = msg
-        return True
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(super().format(record))
+
+
+def install_log_redaction() -> None:
+    """Install secret redaction for everything this process logs.
+
+    A ``logging.Filter`` on the root *logger* never sees records emitted by
+    ``henchmen.*`` module loggers (they propagate straight to the root
+    *handlers*), which is why redaction is installed at the record factory and
+    on each handler's formatter instead.
+    """
+    install_secret_redaction()
+    for handler in logging.getLogger().handlers:
+        existing = handler.formatter
+        if not isinstance(existing, _RedactingFormatter):
+            handler.setFormatter(
+                _RedactingFormatter(
+                    getattr(existing, "_fmt", None),
+                    getattr(existing, "datefmt", None),
+                )
+            )
 
 
 async def _heartbeat_loop(
@@ -125,14 +147,21 @@ async def run_operative() -> None:
         logger.warning("Document store unavailable (heartbeat/accumulator disabled): %s", exc)
         document_store = None
 
-    # 1. Read config from environment
+    # 1. Read config from environment. MODEL_NAME may be a tier ("default/complex");
+    # resolve it once here so telemetry, the report and the cost gate all carry the
+    # concrete model the provider will actually bill.
+    raw_model_name = os.environ.get("MODEL_NAME") or ModelTier.COMPLEX.value
     config = OperativeConfig(
         task_id=os.environ["TASK_ID"],
         node_id=os.environ["NODE_ID"],
         scheme_id=os.environ["SCHEME_ID"],
-        model_name=os.environ.get("MODEL_NAME", settings.vertex_ai_model_complex),
+        model_name=resolve_model_name(settings, raw_model_name),
     )
-    operative_id = os.environ.get("OPERATIVE_ID", f"op-{config.task_id}-{config.node_id}")
+    # LAIR_ID is what the Mastermind uses for the fallback report, so prefer it
+    # over a synthetic id — one execution must not have two identities.
+    operative_id = (
+        os.environ.get("OPERATIVE_ID") or os.environ.get("LAIR_ID") or f"op-{config.task_id}-{config.node_id}"
+    )
 
     started_at = datetime.now(UTC)
 
@@ -155,20 +184,41 @@ async def run_operative() -> None:
         # (matches the pattern used in mastermind/server.py lifespan).
         logger.debug("add_signal_handler not supported on this platform; SIGTERM handler disabled")
 
-    # 2. INITIALIZE: Clone repo, download dossier, set up workspace
-    workspace_dir = await initialize_workspace(config, settings, object_store=object_store)
+    # 2. INITIALIZE: Clone repo, download dossier, set up workspace.
+    # A clone/checkout failure must still produce a report — otherwise the
+    # Mastermind only learns "the job failed" with no root cause.
+    try:
+        workspace_dir = await initialize_workspace(config, settings, object_store=object_store)
 
-    # 2b. Pre-read files into context so the operative can skip searching
-    file_context = await _build_file_context(
-        workspace_dir,
-        os.environ.get("TASK_TITLE", ""),
-        os.environ.get("TASK_DESCRIPTION", ""),
-    )
-    # Write to a file instead of env var to avoid "Argument list too long" errors
-    file_context_path = os.path.join(workspace_dir, ".henchmen_file_context.txt")
-    with open(file_context_path, "w", encoding="utf-8") as fh:
-        fh.write(file_context)
-    os.environ["FILE_CONTEXT_PATH"] = file_context_path
+        # 2b. Pre-read files into context so the operative can skip searching
+        file_context = await _build_file_context(
+            workspace_dir,
+            os.environ.get("TASK_TITLE", ""),
+            os.environ.get("TASK_DESCRIPTION", ""),
+        )
+        # Write to a file instead of env var to avoid "Argument list too long" errors
+        file_context_path = os.path.join(workspace_dir, ".henchmen_file_context.txt")
+        with open(file_context_path, "w", encoding="utf-8") as fh:
+            fh.write(file_context)
+        os.environ["FILE_CONTEXT_PATH"] = file_context_path
+    except Exception as exc:
+        logger.exception("Workspace initialisation failed")
+        failure_report = OperativeReport(
+            task_id=config.task_id,
+            scheme_id=config.scheme_id,
+            node_id=config.node_id,
+            operative_id=operative_id,
+            status=OperativeStatus.FAILED,
+            summary=f"Workspace initialisation failed: {exc}",
+            confidence_score=0.0,
+            error=str(exc),
+            started_at=started_at,
+            completed_at=datetime.now(UTC),
+            model_name=config.model_name,
+            wall_clock_seconds=(datetime.now(UTC) - started_at).total_seconds(),
+        )
+        await publish_report(failure_report, settings, broker=broker)
+        raise
 
     # ------------------------------------------------------------------
     # Start the heartbeat task. We hold a strong reference so the event
@@ -197,6 +247,7 @@ async def run_operative() -> None:
 
     # 3. EXECUTE: Build and run the agent
     interrupted = False
+    agent = None
     try:
         agent = await build_operative_agent(
             config,
@@ -209,13 +260,12 @@ async def run_operative() -> None:
         result = await agent.run()  # Returns dict with git_diff, summary, files_changed, confidence
 
         # Always check for changes — even if agent didn't report them
-        # (Gemini may have edited files without calling git_commit)
+        # (the model may have edited files without calling git_commit)
         branch_name = config.branch_name
         has_changes = await _check_for_changes(workspace_dir)
         if has_changes:
-            await _create_branch_and_push(workspace_dir, branch_name)
+            await _create_branch_and_push(workspace_dir, branch_name, settings)
             result["branch_pushed"] = branch_name
-            result["files_changed"] = result.get("files_changed") or [branch_name]
             logger.info("Pushed branch %s", branch_name)
         else:
             logger.info("No changes detected in workspace — skipping branch push")
@@ -232,18 +282,24 @@ async def run_operative() -> None:
         else:
             status = OperativeStatus.COMPLETED
     except TimeoutError:
-        result = {"summary": "Operative timed out but may have made changes", "error": "Timeout"}
+        # Timed-out nodes are usually the expensive ones — keep their telemetry
+        # so the task-level cost gate is not under-counted.
+        result = {
+            "summary": "Operative timed out but may have made changes",
+            "error": "Timeout",
+            "telemetry": agent.get_telemetry() if agent is not None else {},
+        }
         status = OperativeStatus.TIMED_OUT
         # Still try to push any changes made before timeout
         try:
             branch_name = config.branch_name
             has_changes = await _check_for_changes(workspace_dir)
             if has_changes:
-                await _create_branch_and_push(workspace_dir, branch_name)
+                await _create_branch_and_push(workspace_dir, branch_name, settings)
                 result["branch_pushed"] = branch_name
                 logger.info("Pushed changes despite timeout (status remains TIMED_OUT)")
         except Exception:
-            pass
+            logger.warning("Could not push changes after timeout", exc_info=True)
     except Exception as e:
         logger.exception("Operative execution failed")
         # If SIGTERM had already fired, classify this as INTERRUPTED rather
@@ -259,16 +315,17 @@ async def run_operative() -> None:
         else:
             result = {"summary": f"Operative failed: {str(e)}", "error": str(e)}
             status = OperativeStatus.FAILED
+        result["telemetry"] = agent.get_telemetry() if agent is not None else {}
         # Still try to push any changes made before failure
         try:
             branch_name = config.branch_name
             has_changes = await _check_for_changes(workspace_dir)
             if has_changes:
-                await _create_branch_and_push(workspace_dir, branch_name)
+                await _create_branch_and_push(workspace_dir, branch_name, settings)
                 result["branch_pushed"] = branch_name
                 logger.info("Pushed changes despite error")
         except Exception:
-            pass
+            logger.warning("Could not push changes after failure", exc_info=True)
     finally:
         # Cancel the heartbeat before we publish — we don't want a post-report
         # heartbeat write racing with TaskTracker.finalize_task.
@@ -295,7 +352,9 @@ async def run_operative() -> None:
         block_reason=result.get("block_reason"),
         started_at=started_at,
         completed_at=completed_at,
-        model_name=config.model_name,
+        # Telemetry carries the concrete model the provider reported; fall back
+        # to the resolved config value when the agent never got to run.
+        model_name=telemetry.get("model_name") or config.model_name,
         total_input_tokens=telemetry.get("total_input_tokens", 0),
         total_output_tokens=telemetry.get("total_output_tokens", 0),
         cached_input_tokens=telemetry.get("cached_input_tokens", 0),
@@ -466,8 +525,14 @@ async def initialize_workspace(
     workspace = f"/workspace/{config.task_id}"
     os.makedirs(workspace, exist_ok=True)
 
+    # Arsenal resolves every tool path against WORKSPACE_DIR. Without this the
+    # root stays /workspace (the parent), so git_commit without an explicit
+    # working_dir runs outside the repository and can never succeed.
+    os.environ["WORKSPACE_DIR"] = workspace
+    set_workspace_root(workspace)
+
     repo_url = os.environ.get("REPO_URL", "")
-    branch = os.environ.get("BRANCH", "main")
+    branch = os.environ.get("BRANCH", "") or DEFAULT_BASE_BRANCH
 
     # Try snapshot cache first
     from henchmen.dossier.cache import SnapshotCache
@@ -500,25 +565,28 @@ async def initialize_workspace(
                 single_branch=False,
             )
         except RuntimeError:
-            if branch != "main":
-                # Branch doesn't exist on remote — fall back to main.
-                # This happens when the task specifies a feature branch name
-                # that hasn't been created yet; the operative will create its
-                # own henchmen/<task_id> branch from main anyway.
-                logger.warning(
-                    "Branch %s not found on remote, falling back to main",
-                    branch,
-                )
-                await clone_repo(
-                    repo_slug,
-                    "main",
-                    workspace,
-                    token=github_token or None,
-                    depth=depth,
-                    single_branch=False,
-                )
-            else:
+            # Branch doesn't exist on remote — fall back to the repository's
+            # own default branch (which is not necessarily "main"). The
+            # operative creates its henchmen/<task_id> branch from there anyway.
+            default_branch = await detect_remote_default_branch(
+                build_clone_url(repo_slug, github_token or None),
+                token=github_token or None,
+            )
+            if default_branch == branch:
                 raise
+            logger.warning(
+                "Branch %s not found on remote, falling back to default branch %s",
+                branch,
+                default_branch,
+            )
+            await clone_repo(
+                repo_slug,
+                default_branch,
+                workspace,
+                token=github_token or None,
+                depth=depth,
+                single_branch=False,
+            )
     else:
         logger.warning("No REPO_URL set; workspace will be empty")
 
@@ -538,6 +606,10 @@ async def initialize_workspace(
         )
         await proc.communicate()
 
+    # Keep henchmen scratch files out of the target repo's tree WITHOUT editing
+    # its tracked .gitignore (that diff would land in every PR).
+    _write_git_exclusions(workspace)
+
     # Create the henchmen feature branch so agent commits land on a branch, not main
     branch_name = config.branch_name
     proc = await asyncio.create_subprocess_exec(
@@ -555,19 +627,44 @@ async def initialize_workspace(
     else:
         logger.warning("Failed to create branch %s, continuing on current branch", branch_name)
 
-    # Fetch origin/main ref so scoped lint/tests can diff against it
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        "fetch",
-        "origin",
-        "main:refs/remotes/origin/main",
-        cwd=workspace,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    await proc.communicate()
+    # Fetch the repository's default branch so scoped lint/tests can diff against it
+    base_branch = await detect_base_branch(workspace)
+    _, stderr_text, rc = await run_git(workspace, "fetch", "origin", f"{base_branch}:refs/remotes/origin/{base_branch}")
+    if rc != 0:
+        logger.error("Could not fetch base branch %s: %s", base_branch, stderr_text[:300])
 
-    # Install project dependencies if package.json exists (Node.js projects need this for type checking)
+    # Install project dependencies so run_tests / run_lint / type_check work.
+    await _install_project_dependencies(workspace)
+
+    # Download dossier artifact if available
+    dossier_uri = os.environ.get("DOSSIER_URI")
+    if dossier_uri:
+        await download_dossier(dossier_uri, workspace, object_store=object_store)
+
+    return workspace
+
+
+def _write_git_exclusions(workspace: str) -> None:
+    """Add henchmen scratch paths to ``.git/info/exclude`` (never the tracked .gitignore)."""
+    exclude_path = os.path.join(workspace, ".git", "info", "exclude")
+    entries = [".henchmen_file_context.txt", ".henchmen/", "node_modules/"]
+    try:
+        os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
+        existing = ""
+        if os.path.exists(exclude_path):
+            with open(exclude_path, encoding="utf-8") as fh:
+                existing = fh.read()
+        missing = [entry for entry in entries if entry not in existing]
+        if missing:
+            with open(exclude_path, "a", encoding="utf-8") as fh:
+                fh.write("\n# Added by Henchmen operative (local only, never committed)\n")
+                fh.write("\n".join(missing) + "\n")
+    except OSError as exc:
+        logger.warning("Could not write git exclusions: %s", exc)
+
+
+async def _install_project_dependencies(workspace: str) -> None:
+    """Install target-repo dependencies (Node and Python). Failures are non-fatal."""
     package_json = os.path.join(workspace, "package.json")
     if os.path.exists(package_json):
         pnpm_lock = os.path.join(workspace, "pnpm-lock.yaml")
@@ -579,51 +676,53 @@ async def initialize_workspace(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        _stdout, stderr = await proc.communicate()
         if proc.returncode == 0:
             logger.info("Node.js dependencies installed successfully")
         else:
             logger.warning("Node.js dependency install failed (non-fatal): %s", stderr.decode()[:500])
 
-    # Download dossier artifact if available
-    dossier_uri = os.environ.get("DOSSIER_URI")
-    if dossier_uri:
-        await download_dossier(dossier_uri, workspace, object_store=object_store)
+    # Python projects: the image ships pytest/ruff/mypy, but the target repo's
+    # own dependencies still have to be installed for its tests to import.
+    requirements = [
+        name for name in ("requirements.txt", "requirements-dev.txt") if os.path.exists(os.path.join(workspace, name))
+    ]
+    pip_commands: list[list[str]] = [["pip", "install", "--user", "-r", name] for name in requirements]
+    if os.path.exists(os.path.join(workspace, "pyproject.toml")) or os.path.exists(os.path.join(workspace, "setup.py")):
+        pip_commands.append(["pip", "install", "--user", "-e", "."])
 
-    return workspace
+    for cmd in pip_commands:
+        logger.info("Installing Python dependencies: %s", " ".join(cmd))
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=workspace,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning("Python dependency install failed (non-fatal): %s", stderr.decode()[:500])
 
 
 async def _check_for_changes(workspace_dir: str) -> bool:
     """Check if the workspace has any uncommitted or committed-but-not-pushed changes."""
     try:
         # Check for uncommitted changes (modified, new, deleted files)
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "status",
-            "--porcelain",
-            cwd=workspace_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        if stdout.strip():
+        porcelain, _, _ = await run_git(workspace_dir, "status", "--porcelain")
+        if porcelain.strip():
             logger.info("[OPERATIVE] Uncommitted changes detected")
             return True
 
-        # Check if current branch has commits ahead of origin/main (agent committed on the branch)
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "rev-list",
-            "--count",
-            "origin/main..HEAD",
-            cwd=workspace_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        count = stdout.decode().strip()
+        # Check if the current branch has commits ahead of the base ref
+        # (the agent committed on the branch). The base branch is NOT always
+        # "main" — a wrong ref made rev-list fail and silently discarded work.
+        base_branch = await detect_base_branch(workspace_dir)
+        count, stderr_text, rc = await run_git(workspace_dir, "rev-list", "--count", f"origin/{base_branch}..HEAD")
+        if rc != 0:
+            logger.error("Could not compare against origin/%s: %s", base_branch, stderr_text[:300])
+            return False
         if count.isdigit() and int(count) > 0:
-            logger.info("[OPERATIVE] Branch has %s commit(s) ahead of origin/main", count)
+            logger.info("[OPERATIVE] Branch has %s commit(s) ahead of origin/%s", count, base_branch)
             return True
 
         return False
@@ -632,44 +731,25 @@ async def _check_for_changes(workspace_dir: str) -> bool:
         return False
 
 
-async def _create_branch_and_push(workspace_dir: str, branch_name: str) -> None:
+async def _create_branch_and_push(workspace_dir: str, branch_name: str, settings: Settings) -> None:
     """Create a git branch, commit any uncommitted changes, and push to origin."""
 
     async def _git(*args: str) -> tuple[str, str, int]:
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            *args,
-            cwd=workspace_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        return stdout.decode().strip(), stderr.decode().strip(), proc.returncode or 0
+        return await run_git(workspace_dir, *args)
 
-    # Configure git user for commits (use env vars set during initialize_workspace)
-    git_email = os.environ.get("HENCHMEN_GIT_AUTHOR_EMAIL", "henchmen-operative@noreply.local")
-    git_name = os.environ.get("HENCHMEN_GIT_AUTHOR_NAME", "Henchmen Operative")
-    await _git("config", "user.email", git_email)
-    await _git("config", "user.name", git_name)
+    # Configure git user for commits from Settings (the same source
+    # ``initialize_workspace`` used for the --global config).
+    await _git("config", "user.email", settings.git_author_email)
+    await _git("config", "user.name", settings.git_author_name)
 
-    # Exclude henchmen temp files from the commit (only add if not already present)
-    gitignore_path = os.path.join(workspace_dir, ".gitignore")
-    existing = ""
-    if os.path.exists(gitignore_path):
-        with open(gitignore_path, encoding="utf-8") as fh:
-            existing = fh.read()
-    if ".henchmen_file_context.txt" not in existing:
-        with open(gitignore_path, "a", encoding="utf-8") as fh:
-            fh.write("\n.henchmen_file_context.txt\n")
+    # Henchmen scratch files are excluded via .git/info/exclude in
+    # initialize_workspace — never by editing the repo's tracked .gitignore.
 
     # Create and checkout branch
-    out, err, rc = await _git("checkout", "-b", branch_name)
+    _out, _err, rc = await _git("checkout", "-b", branch_name)
     if rc != 0:
         # Branch might already exist
         await _git("checkout", branch_name)
-
-    # Stage all changes
-    await _git("add", "-A")
 
     # Stage any uncommitted changes and commit if needed
     await _git("add", "-A")
@@ -694,24 +774,26 @@ async def _create_branch_and_push(workspace_dir: str, branch_name: str) -> None:
 async def download_dossier(uri: str, workspace: str, object_store: ObjectStore | None = None) -> None:
     """Download dossier artifact from object storage to workspace/.henchmen/dossier/
 
-    Supports gs:// (GCS) and s3:// URIs. The object_store provider handles the
-    actual download; if no provider is supplied a direct GCS fallback is used so
-    callers that don't yet pass a provider continue to work.
+    Accepts ``gs://bucket/key``, ``s3://bucket/key`` and provider-relative
+    ``bucket/key`` (what the filesystem object store used in local mode emits).
+    The object_store provider performs the download; if no provider is supplied
+    a direct GCS fallback is used so callers that don't yet pass one still work.
     """
     dest_dir = os.path.join(workspace, ".henchmen", "dossier")
     os.makedirs(dest_dir, exist_ok=True)
     dest_path = os.path.join(dest_dir, "dossier.json")
 
     # Parse the URI into bucket + key regardless of scheme
-    if uri.startswith("gs://"):
-        scheme_len = len("gs://")
-    elif uri.startswith("s3://"):
-        scheme_len = len("s3://")
+    without_prefix = uri
+    for scheme in ("gs://", "s3://", "file://"):
+        if uri.startswith(scheme):
+            without_prefix = uri[len(scheme) :]
+            break
     else:
-        logger.warning("Invalid dossier URI (expected gs:// or s3://): %s", uri)
-        return
+        if "://" in uri:
+            logger.warning("Unsupported dossier URI scheme: %s", uri)
+            return
 
-    without_prefix = uri[scheme_len:]
     parts = without_prefix.split("/", 1)
     if len(parts) != 2:
         logger.warning("Could not parse object storage URI: %s", uri)
@@ -759,7 +841,7 @@ async def publish_report(report: OperativeReport, settings: Settings, broker: Me
 def main() -> None:
     """Entrypoint for the container."""
     logging.basicConfig(level=logging.INFO)
-    logging.getLogger().addFilter(_SecretRedactionFilter())
+    install_log_redaction()
     asyncio.run(run_operative())
 
 

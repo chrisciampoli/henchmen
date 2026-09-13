@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from typing import Any
 
 import httpx
 from pydantic import BaseModel
@@ -31,14 +32,55 @@ class CIError(BaseModel):
 
 _GITHUB_API = "https://api.github.com"
 _FAILING_CONCLUSIONS = {"failure", "timed_out", "cancelled", "action_required"}
+_PER_PAGE = 100
+_MAX_PAGES = 10
+_AUTH_STATUSES = {401, 403, 404}
+
+
+class CIErrorExtractionError(RuntimeError):
+    """Raised when GitHub check-run data could not be retrieved.
+
+    An empty ``[]`` from :func:`extract_ci_errors` means "the suite reported no
+    errors". A failure to *reach* GitHub (bad credentials, rate limit, deleted
+    repo, transport error) must never be squashed into that same empty list, or
+    a token misconfiguration silently disables the whole CI fix loop.
+    """
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _raise_for_status(resp: httpx.Response, what: str) -> None:
+    """Turn a non-2xx GitHub response into an explicit extraction error."""
+    if resp.status_code < 400:
+        return
+    body = (resp.text or "")[:200]
+    if resp.status_code in _AUTH_STATUSES:
+        raise CIErrorExtractionError(
+            f"GitHub denied access while fetching {what} (HTTP {resp.status_code}). "
+            f"Check that the GitHub token is set and has repo scope: {body}",
+            status_code=resp.status_code,
+        )
+    raise CIErrorExtractionError(
+        f"GitHub returned HTTP {resp.status_code} while fetching {what}: {body}",
+        status_code=resp.status_code,
+    )
 
 
 async def extract_ci_errors(repo: str, check_suite_id: int, github_token: str) -> list[CIError]:
     """Fetch GitHub check runs + annotations for a check suite.
 
-    Returns a list of CIError objects. Falls back to output.text when no
-    annotations are available. Returns [] on any error.
+    Returns a list of CIError objects (empty when the suite reports no errors).
+    Falls back to ``output.text`` when a run has no annotations.
+
+    Raises:
+        CIErrorExtractionError: if the token is missing or GitHub could not be
+            queried. Callers must treat this as "unknown", not as "clean".
     """
+    if not github_token:
+        raise CIErrorExtractionError("No GitHub token configured; cannot read CI check runs.")
+
     headers = {
         "Authorization": f"Bearer {github_token}",
         "Accept": "application/vnd.github+json",
@@ -48,12 +90,11 @@ async def extract_ci_errors(repo: str, check_suite_id: int, github_token: str) -
         async with httpx.AsyncClient(headers=headers, timeout=30.0) as client:
             # 1. Get all check runs for the suite
             runs_url = f"{_GITHUB_API}/repos/{repo}/check-suites/{check_suite_id}/check-runs"
-            runs_resp = await client.get(runs_url)
-            runs_data = runs_resp.json()
+            check_runs = await _paginate(client, runs_url, "check_runs", f"check runs for suite {check_suite_id}")
 
             errors: list[CIError] = []
 
-            for run in runs_data.get("check_runs", []):
+            for run in check_runs:
                 conclusion = run.get("conclusion") or ""
                 if conclusion not in _FAILING_CONCLUSIONS:
                     continue  # skip passing / neutral checks
@@ -64,8 +105,7 @@ async def extract_ci_errors(repo: str, check_suite_id: int, github_token: str) -
 
                 # 2. Fetch annotations for this run
                 ann_url = f"{_GITHUB_API}/repos/{repo}/check-runs/{run_id}/annotations"
-                ann_resp = await client.get(ann_url)
-                annotations = ann_resp.json()
+                annotations = await _paginate(client, ann_url, None, f"annotations for check run {run_id}")
 
                 if annotations:
                     for ann in annotations:
@@ -94,9 +134,43 @@ async def extract_ci_errors(repo: str, check_suite_id: int, github_token: str) -
 
             return errors
 
-    except Exception as exc:
-        logger.warning("Failed to extract CI errors for suite %s: %s", check_suite_id, exc)
-        return []
+    except CIErrorExtractionError:
+        raise
+    except httpx.HTTPError as exc:
+        raise CIErrorExtractionError(f"Could not reach GitHub for suite {check_suite_id}: {exc}") from exc
+
+
+async def _paginate(
+    client: httpx.AsyncClient,
+    url: str,
+    list_key: str | None,
+    what: str,
+) -> list[dict[str, Any]]:
+    """Collect every page of a GitHub list endpoint.
+
+    *list_key* names the field holding the items for object responses (e.g.
+    ``check_runs``); pass ``None`` when the endpoint returns a bare JSON array.
+    """
+    items: list[dict[str, Any]] = []
+    for page in range(1, _MAX_PAGES + 1):
+        resp = await client.get(url, params={"per_page": _PER_PAGE, "page": page})
+        _raise_for_status(resp, what)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise CIErrorExtractionError(f"GitHub returned a non-JSON body for {what}: {exc}") from exc
+
+        batch = payload.get(list_key, []) if list_key else payload
+        if not isinstance(batch, list):
+            raise CIErrorExtractionError(f"GitHub returned an unexpected payload for {what}: {type(batch).__name__}")
+
+        items.extend(item for item in batch if isinstance(item, dict))
+        if len(batch) < _PER_PAGE:
+            break
+    else:
+        logger.warning("Stopped paginating %s after %s pages", what, _MAX_PAGES)
+
+    return items
 
 
 # ---------------------------------------------------------------------------

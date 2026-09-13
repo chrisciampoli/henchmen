@@ -7,18 +7,18 @@ total from the same Firestore document that ``TaskTracker`` writes to, adds
 per-step deltas as the operative runs, and exposes a ceiling check the
 guardrails can consult before issuing the next model call.
 
-This is the L5 fix companion to ``OperativeGuardrails``. The accumulator
-is intentionally narrow: it only touches the ``estimated_cost_usd`` field
-on the ``task_executions`` document. All other fields (tokens, node
-metrics, etc.) are still owned by ``TaskTracker``.
+This is the L5 fix companion to ``OperativeGuardrails``. The accumulator is
+read-only against the store: it seeds itself once from ``estimated_cost_usd``
+(everything previous nodes spent, persisted by ``TaskTracker``) and then keeps
+the current node's spend in memory. ``TaskTracker.record_node_result`` is the
+single writer of that field — when both wrote it, every node's cost landed
+twice and the task ceiling tripped at half the configured budget.
 
-Concurrency notes: the in-process ``asyncio.Lock`` serializes add/check
-calls within a single operative process. Cross-process races between
-parallel operatives for the same task are out of scope here — Firestore
-Increment transforms would be the durable fix, but that requires plumbing
-through the ``DocumentStore`` protocol. A brief stale read is acceptable
-because the ceiling is advisory (we halt on the NEXT call rather than
-rejecting a call in flight).
+Concurrency notes: the in-process ``asyncio.Lock`` serializes add/check calls
+within a single operative process. Parallel operatives on the same task each
+see the cost committed by completed nodes but not each other's in-flight
+spend; that is acceptable because the ceiling is advisory (we halt on the NEXT
+call rather than rejecting a call in flight).
 """
 
 import asyncio
@@ -68,24 +68,17 @@ class TaskCostAccumulator:
         self._loaded = True
 
     async def add(self, delta_usd: float) -> None:
-        """Increment the running total and persist it."""
+        """Add a step's cost to the in-memory running total.
+
+        Deliberately does not write to the store: ``TaskTracker`` persists the
+        node's full cost once the operative reports, and a second writer here
+        would double-count every node.
+        """
         if delta_usd <= 0:
             return
         async with self._lock:
             await self._ensure_loaded()
             self._total_usd += delta_usd
-            try:
-                await self._store.update(
-                    _COLLECTION,
-                    self._task_id,
-                    {_COST_FIELD: self._total_usd},
-                )
-            except Exception as exc:
-                logger.warning(
-                    "TaskCostAccumulator: failed to persist cost for task %s: %s",
-                    self._task_id,
-                    exc,
-                )
 
     async def check_ceiling(self) -> bool:
         """Return True if the running total is still below the ceiling."""

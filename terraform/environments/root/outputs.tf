@@ -42,6 +42,16 @@ output "database_id" {
   value       = module.data_stores.database_id
 }
 
+output "dossier_bucket_name" {
+  description = "The GCS bucket holding dossier artifacts (HENCHMEN_GCS_BUCKET_DOSSIER)"
+  value       = module.data_stores.dossier_bucket_name
+}
+
+output "snapshots_bucket_name" {
+  description = "The GCS bucket holding operative snapshots (HENCHMEN_GCS_BUCKET_SNAPSHOTS)"
+  value       = module.data_stores.snapshots_bucket_name
+}
+
 # Pub/Sub
 output "topic_ids" {
   description = "Map of logical topic name to Pub/Sub topic ID"
@@ -71,8 +81,13 @@ output "service_urls" {
 }
 
 output "service_names" {
-  description = "Map of component name to fully-qualified Cloud Run service resource name"
+  description = "Map of component name to Cloud Run service name"
   value       = module.cloud_run_services.service_names
+}
+
+output "pubsub_audiences" {
+  description = "Map of component name to the OIDC audience the service verifies (HENCHMEN_PUBSUB_OIDC_AUDIENCE)"
+  value       = module.cloud_run_services.pubsub_audiences
 }
 
 # Cloud Run lairs
@@ -103,6 +118,11 @@ output "log_sink_name" {
   value       = module.observability.log_sink_name
 }
 
+output "log_bucket_id" {
+  description = "The resource ID of the log bucket the sink writes to"
+  value       = module.observability.log_bucket_id
+}
+
 output "dashboard_id" {
   description = "The resource name of the Henchmen monitoring dashboard"
   value       = module.observability.dashboard_id
@@ -111,12 +131,6 @@ output "dashboard_id" {
 output "alert_policy_ids" {
   description = "Map of alert policy name to resource name"
   value       = module.observability.alert_policy_ids
-}
-
-# Vertex AI
-output "vertex_ai_agent_id" {
-  description = "The resource ID of the Mastermind Vertex AI Agent Engine instance"
-  value       = module.vertex_ai.agent_id
 }
 
 # Scheduler (null when scheduler_enabled = false)
@@ -128,4 +142,14 @@ output "cleanup_job_name" {
 output "merge_queue_job_name" {
   description = "The name of the merge-queue-processor Cloud Scheduler job"
   value       = try(module.scheduler[0].merge_queue_job_name, null)
+}
+
+output "watchdog_job_name" {
+  description = "The name of the watchdog Cloud Scheduler job"
+  value       = try(module.scheduler[0].watchdog_job_name, null)
+}
+
+output "dlq_check_job_name" {
+  description = "The name of the DLQ check Cloud Scheduler job"
+  value       = try(module.scheduler[0].dlq_check_job_name, null)
 }

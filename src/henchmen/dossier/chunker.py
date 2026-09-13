@@ -10,7 +10,7 @@ import ast
 import os
 import re
 
-from pydantic import BaseModel
+from henchmen.models._base import StrictBase
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -111,7 +111,7 @@ FIXED_CHUNK_OVERLAP: int = 5
 # ---------------------------------------------------------------------------
 
 
-class CodeChunk(BaseModel):
+class CodeChunk(StrictBase):
     """A single embeddable chunk of source code."""
 
     file_path: str
@@ -180,7 +180,13 @@ def _get_node_end_line(node: ast.AST, source_lines: list[str]) -> int:
 
 
 def _chunk_python(file_path: str, content: str) -> list[CodeChunk]:
-    """Chunk Python source using AST parsing."""
+    """Chunk Python source using AST parsing.
+
+    Top-level functions and classes become symbol chunks; every line range
+    *not* covered by one (imports, constants, ``__all__``, script bodies,
+    def-less modules) is emitted as fixed-size chunks so module-level code is
+    still searchable.
+    """
     try:
         tree = ast.parse(content)
     except SyntaxError:
@@ -189,6 +195,7 @@ def _chunk_python(file_path: str, content: str) -> list[CodeChunk]:
     chunks: list[CodeChunk] = []
     lines = content.splitlines()
     language = "python"
+    covered: list[tuple[int, int]] = []  # 1-indexed inclusive top-level spans
 
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
@@ -206,6 +213,7 @@ def _chunk_python(file_path: str, content: str) -> list[CodeChunk]:
                     chunk_type="function",
                 )
             )
+            covered.append((start, end))
         elif isinstance(node, ast.ClassDef):
             # Emit the whole class as one chunk
             cls_start = node.lineno
@@ -222,6 +230,7 @@ def _chunk_python(file_path: str, content: str) -> list[CodeChunk]:
                     chunk_type="class",
                 )
             )
+            covered.append((cls_start, cls_end))
             # Also emit each method within the class
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
@@ -240,6 +249,61 @@ def _chunk_python(file_path: str, content: str) -> list[CodeChunk]:
                         )
                     )
 
+    chunks.extend(_chunk_uncovered_ranges(file_path, lines, covered, language))
+    return chunks
+
+
+def _chunk_uncovered_ranges(
+    file_path: str,
+    lines: list[str],
+    covered: list[tuple[int, int]],
+    language: str,
+) -> list[CodeChunk]:
+    """Emit fixed-size chunks for the line ranges no symbol chunk covers."""
+    chunks: list[CodeChunk] = []
+    cursor = 1  # 1-indexed
+    for start, end in sorted(covered):
+        if start > cursor:
+            chunks.extend(_chunk_line_range(file_path, lines, cursor, start - 1, language))
+        cursor = max(cursor, end + 1)
+    if cursor <= len(lines):
+        chunks.extend(_chunk_line_range(file_path, lines, cursor, len(lines), language))
+    return chunks
+
+
+def _chunk_line_range(
+    file_path: str,
+    lines: list[str],
+    start_line: int,
+    end_line: int,
+    language: str,
+) -> list[CodeChunk]:
+    """Split an inclusive 1-indexed line range into fixed-size chunks."""
+    segment = lines[start_line - 1 : end_line]
+    if not any(line.strip() for line in segment):
+        return []
+
+    chunks: list[CodeChunk] = []
+    offset = 0
+    while offset < len(segment):
+        end = min(offset + FIXED_CHUNK_LINES, len(segment))
+        body = "\n".join(segment[offset:end])
+        if body.strip():
+            chunks.append(
+                CodeChunk(
+                    file_path=file_path,
+                    start_line=start_line + offset,
+                    end_line=start_line + end - 1,
+                    symbol_name=None,
+                    language=language,
+                    content=body,
+                    chunk_type="fixed",
+                )
+            )
+        step = FIXED_CHUNK_LINES - FIXED_CHUNK_OVERLAP
+        if offset + step >= len(segment):
+            break
+        offset += step
     return chunks
 
 
@@ -256,11 +320,20 @@ _TS_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
-def _find_matching_brace(content: str, start: int) -> int:
-    """Find the position after the closing brace that matches the first opening brace at or after *start*."""
+def _find_matching_brace(content: str, start: int, limit: int | None = None) -> int:
+    """Position after the closing brace matching the first ``{`` at/after *start*.
+
+    ``limit`` bounds where the opening brace may appear — normally the offset
+    of the next declaration. A brace-less declaration (an expression-bodied
+    arrow such as ``export const add = (a, b) => a + b;``) must not swallow
+    the next function's body, so when no ``{`` occurs before ``limit`` the
+    chunk ends at the statement's terminating ``;`` or its line break.
+    """
+    bound = len(content) if limit is None else min(limit, len(content))
     idx = content.find("{", start)
-    if idx == -1:
-        return len(content)
+    if idx == -1 or idx >= bound:
+        return _find_statement_end(content, start, bound)
+
     depth = 0
     for i in range(idx, len(content)):
         if content[i] == "{":
@@ -270,6 +343,17 @@ def _find_matching_brace(content: str, start: int) -> int:
             if depth == 0:
                 return i + 1
     return len(content)
+
+
+def _find_statement_end(content: str, start: int, bound: int) -> int:
+    """End offset of a brace-less declaration: its ``;`` or its line break."""
+    semi = content.find(";", start)
+    newline = content.find("\n", start)
+    if semi != -1 and semi < bound and (newline == -1 or semi < newline):
+        return semi + 1
+    if newline != -1 and newline < bound:
+        return newline
+    return bound
 
 
 def _chunk_typescript(file_path: str, content: str) -> list[CodeChunk]:
@@ -293,11 +377,13 @@ def _chunk_typescript(file_path: str, content: str) -> list[CodeChunk]:
         return _chunk_fixed_size(file_path, content)
 
     chunks: list[CodeChunk] = []
-    for char_offset, name, chunk_type in declarations:
+    for position, (char_offset, name, chunk_type) in enumerate(declarations):
         # Find line number from char offset
         start_line = content[:char_offset].count("\n") + 1
+        # The next declaration bounds where this one's body may begin.
+        next_offset = declarations[position + 1][0] if position + 1 < len(declarations) else len(content)
         # Find the end of the block by brace matching
-        block_end_char = _find_matching_brace(content, char_offset)
+        block_end_char = _find_matching_brace(content, char_offset, limit=next_offset)
         # Also consume a trailing semicolon if present
         if block_end_char < len(content) and content[block_end_char] == ";":
             block_end_char += 1

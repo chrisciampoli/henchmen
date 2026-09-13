@@ -1,25 +1,35 @@
-"""GitHub tools - pull requests, issues, labels, assignments."""
+"""GitHub tools - pull requests, issues, labels, assignments.
+
+Credentials come from :class:`~henchmen.config.settings.Settings` (which
+accepts both ``HENCHMEN_GITHUB_TOKEN`` and the bare ``GITHUB_TOKEN`` a Cloud
+Run secret mount injects). The repository is the one the Operative was
+dispatched against — see :mod:`henchmen.arsenal._repo`.
+"""
 
 import asyncio
-import os
 from typing import Any
 
+from henchmen.arsenal._repo import current_repo_slug
 from henchmen.arsenal.registry import tool
 
 
 def _get_github_client() -> Any:
-    """Return an authenticated PyGithub client using GITHUB_TOKEN env var."""
+    """Return an authenticated PyGithub client using the configured token."""
     import github
 
-    token = os.environ.get("GITHUB_TOKEN", "")
-    return github.Github(token)
+    from henchmen.config.settings import get_settings
+
+    token = get_settings().github_token
+    if not token:
+        raise ValueError("No GitHub token configured (set HENCHMEN_GITHUB_TOKEN)")
+    return github.Github(auth=github.Auth.Token(token))
 
 
 def _get_repo(client: Any) -> Any:
-    """Return the repo object from GITHUB_REPO env var (format: owner/name)."""
-    repo_name = os.environ.get("GITHUB_REPO", "")
+    """Return the repo object for the repository this operative is working on."""
+    repo_name = current_repo_slug()
     if not repo_name:
-        raise ValueError("GITHUB_REPO environment variable is not set")
+        raise ValueError("No repository configured (REPO_URL or HENCHMEN_GITHUB_DEFAULT_REPO)")
     return client.get_repo(repo_name)
 
 

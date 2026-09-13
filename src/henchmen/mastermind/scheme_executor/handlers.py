@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 from henchmen.models.dossier import Dossier
 from henchmen.models.scheme import SchemeNode
 from henchmen.models.task import HenchmenTask
-from henchmen.utils.git import clone_repo
+from henchmen.utils.git import clone_repo, get_github_token
 from henchmen.utils.stack_detector import Stack, detect_stack
 
 if TYPE_CHECKING:
@@ -111,7 +111,7 @@ async def handle_fix_lint(
     """
     repo = task.context.repo
     branch = task.branch_name
-    github_token = os.environ.get("GITHUB_TOKEN", "")
+    github_token = get_github_token()
 
     if not repo:
         return {"condition": "fail", "message": "fix_lint failed (no repo)"}
@@ -252,57 +252,22 @@ async def handle_run_tests(
     return await _run_ci_check(executor, task, "tests")
 
 
-async def _get_affected_packages(workspace: str) -> list[str]:
-    """Detect changed packages in a monorepo via git diff.
-
-    Returns a list of package-relative paths (e.g. ``["./apps/api", "./packages/shared"]``)
-    suitable for ``pnpm turbo run --filter``.  Returns empty list if detection fails
-    or if changes span the root (run everything).
-    """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "diff",
-            "--name-only",
-            "origin/main",
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        diff_out, _ = await proc.communicate()
-        changed_files = [f.strip() for f in diff_out.decode().strip().split("\n") if f.strip()]
-    except Exception:
-        return []
-
-    if not changed_files:
-        return []
-
-    # Extract unique top-two-level directories (e.g. "apps/api", "packages/shared")
-    packages: set[str] = set()
-    for f in changed_files:
-        parts = f.split("/")
-        if len(parts) >= 2 and parts[0] in ("apps", "packages"):
-            packages.add(f"./{parts[0]}/{parts[1]}")
-        else:
-            # File at root or unknown directory — can't scope, run everything
-            return []
-
-    return sorted(packages)
-
-
 async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type: str) -> dict[str, Any]:
     """Clone the task's branch and run a specific CI check.
 
     Uses :func:`henchmen.utils.stack_detector.detect_stack` to pick the
-    right test / lint commands for the target repo's language. For
-    JS/TS monorepos (pnpm + turbo), scopes lint/test to affected
-    packages via ``--filter``. Other stacks run the detected commands
-    across the full workspace.
+    right test / lint commands for the target repo's language.
 
     In local mode (provider=local), commands are executed inside the
     operative Docker image via ``docker run`` with the workspace mounted
     as a volume. This ensures the correct toolchain (Node.js, npm,
     eslint, etc.) is available regardless of the host OS.
+
+    Fail-closed throughout: a clone failure, an undetectable stack or a
+    non-zero exit code all return ``condition: "fail"``. A project without a
+    lint/test script is expressed through the package manager's
+    ``--if-present`` flag (a real exit code of 0), never by masking the exit
+    code in the shell.
 
     Args:
         executor: The scheme executor (provides settings)
@@ -315,8 +280,9 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
 
     repo = task.context.repo
     branch = task.branch_name
+    base_branch = task.context.branch or "main"
     settings = get_settings()
-    github_token = settings.github_token or os.environ.get("GITHUB_TOKEN", "")
+    github_token = settings.github_token
     is_local = settings.provider == "local"
 
     if not repo:
@@ -332,12 +298,12 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
             logger.warning("Clone failed for %s check: %s", check_type, exc)
             return {"condition": "fail", "message": f"{check_type} failed (clone failed): {exc}"}
 
-        # Fetch origin/main for diff — must map ref explicitly
+        # Fetch the base branch for diffing — must map the ref explicitly
         fetch_proc = await asyncio.create_subprocess_exec(
             "git",
             "fetch",
             "origin",
-            "main:refs/remotes/origin/main",
+            f"{base_branch}:refs/remotes/origin/{base_branch}",
             cwd=workspace,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -348,10 +314,15 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
         logger.info("[SCHEME] Detected stack %s for %s check on task %s", stack.name, check_type, task.id)
 
         if stack.name == "unknown":
-            # No recognizable manifest — fail open with a clear message.
+            # No recognizable manifest — we cannot prove the change is safe,
+            # so escalate for human review rather than waving it through.
+            logger.warning("[SCHEME] %s could not detect a project stack for %s", check_type, repo)
             return {
-                "condition": "pass",
-                "message": f"{check_type} skipped — could not detect project stack",
+                "condition": "fail",
+                "message": (
+                    f"{check_type} failed — could not detect the project stack for {repo} "
+                    "(no pyproject.toml/package.json/go.mod/Cargo.toml/pom.xml found)"
+                ),
             }
 
         # Build the shell script that installs deps + runs the check.
@@ -359,43 +330,28 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
         # in cloud mode it runs natively (the host has the toolchain).
         shell_parts: list[str] = []
         if stack.install_command is not None:
-            # npm ci may fail if no lockfile; fall back to npm install
             install_str = " ".join(stack.install_command)
-            shell_parts.append(f"{install_str} || npm install --no-audit 2>/dev/null || true")
+            if stack.name == "node-pnpm":
+                # --frozen-lockfile fails when the lockfile is stale/absent.
+                install_str = f"{install_str} || pnpm install --no-frozen-lockfile"
+            elif stack.name == "node-npm":
+                # `npm ci` requires a lockfile; a plain install is the fallback.
+                install_str = f"{install_str} || npm install --no-audit"
+            shell_parts.append(install_str)
 
-        if check_type == "lint":
-            # Try the stack's lint command; if the project has no lint script,
-            # fall back to npx eslint (JS/TS) or the stack default.
-            lint_str = " ".join(stack.lint_command)
-            if stack.name.startswith("node"):
-                shell_parts.append(f"{lint_str} 2>/dev/null || echo 'LINT_SKIP: no lint script configured'")
-            else:
-                shell_parts.append(lint_str)
-        else:
-            test_str = " ".join(stack.test_command)
-            if stack.name.startswith("node"):
-                shell_parts.append(f"{test_str} 2>/dev/null || echo 'TEST_SKIP: no test script configured'")
-            else:
-                shell_parts.append(test_str)
+        check_command = stack.lint_command if check_type == "lint" else stack.test_command
+        shell_parts.append(" ".join(check_command))
 
         shell_script = " && ".join(shell_parts)
 
         if is_local:
             # Run inside the operative Docker image with the workspace mounted
-            result = await _run_in_docker(workspace, shell_script, settings)
+            result = await _run_in_docker(workspace, shell_script)
         else:
-            result = await _run_on_host(workspace, shell_parts, stack, check_type)
+            result = await _run_on_host(workspace, stack, check_type)
 
         passed = result["returncode"] == 0
         output = result["output"]
-
-        # Treat missing scripts as a pass — the project simply doesn't have lint/test configured
-        if not passed and "LINT_SKIP: no lint script configured" in output:
-            logger.info("[SCHEME] %s skipped for task %s — no lint script in project", check_type, task.id)
-            return {"condition": "pass", "message": f"{check_type} skipped — no lint script configured"}
-        if not passed and "TEST_SKIP: no test script configured" in output:
-            logger.info("[SCHEME] %s skipped for task %s — no test script in project", check_type, task.id)
-            return {"condition": "pass", "message": f"{check_type} skipped — no test script configured"}
 
         logger.info("[SCHEME] %s %s for task %s", check_type, "PASSED" if passed else "FAILED", task.id)
         if not passed:
@@ -414,16 +370,17 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
         shutil.rmtree(workspace, ignore_errors=True)
 
 
-async def _run_in_docker(workspace: str, shell_script: str, settings: Any) -> dict[str, Any]:
+async def _run_in_docker(workspace: str, shell_script: str) -> dict[str, Any]:
     """Run a CI check command inside the operative Docker image.
 
     Mounts the cloned workspace as a volume so the container has access
     to the code and the correct toolchain (Node.js, npm, Python, etc.).
+    Only reachable in local mode, where the image is always the locally
+    built ``henchmen-operative:local``.
     """
     # Convert Windows paths to Docker-compatible format
     docker_workspace = workspace.replace("\\", "/")
-    tag = "local" if settings.provider == "local" else settings.lair_operative_image_tag
-    image = f"henchmen-operative:{tag}"
+    image = "henchmen-operative:local"
 
     cmd = [
         "docker",
@@ -452,7 +409,7 @@ async def _run_in_docker(workspace: str, shell_script: str, settings: Any) -> di
     return {"returncode": proc.returncode or 0, "output": output}
 
 
-async def _run_on_host(workspace: str, shell_parts: list[str], stack: Stack, check_type: str) -> dict[str, Any]:
+async def _run_on_host(workspace: str, stack: Stack, check_type: str) -> dict[str, Any]:
     """Run CI check commands natively on the host (cloud mode)."""
     # Install dependencies
     if stack.install_command is not None:
@@ -490,81 +447,6 @@ async def _run_on_host(workspace: str, shell_parts: list[str], stack: Stack, che
     return {"returncode": proc.returncode or 0, "output": output}
 
 
-async def _run_lint_check(
-    workspace: str, stack: Stack, affected_packages: list[str]
-) -> asyncio.subprocess.Process | None:
-    """Run lint check, returning the subprocess or None if no files to lint.
-
-    For JS/TS monorepos the historical behaviour is preserved: scope to
-    affected packages via ``pnpm turbo run lint --filter`` when possible.
-    For all other stacks, delegate to ``stack.lint_command`` applied
-    across the workspace. Single-package JS/TS also short-circuits to
-    the ``eslint`` changed-file mode for speed.
-    """
-    if stack.is_monorepo:
-        if affected_packages:
-            filter_args: list[str] = []
-            for pkg in affected_packages:
-                filter_args.extend(["--filter", pkg])
-            return await asyncio.create_subprocess_exec(
-                "pnpm",
-                "turbo",
-                "run",
-                "lint",
-                *filter_args,
-                cwd=workspace,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        return await asyncio.create_subprocess_exec(
-            *stack.lint_command,
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-    # Single-package JS/TS: lint only changed files via eslint for speed.
-    if stack.name == "node-npm":
-        changed_proc = await asyncio.create_subprocess_exec(
-            "git",
-            "diff",
-            "--name-only",
-            "origin/main",
-            "--diff-filter=ACMR",
-            "--",
-            "*.ts",
-            "*.tsx",
-            "*.js",
-            "*.jsx",
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        changed_out, _ = await changed_proc.communicate()
-        changed_files = [f.strip() for f in changed_out.decode().strip().split("\n") if f.strip()]
-
-        if not changed_files:
-            return None
-
-        return await asyncio.create_subprocess_exec(
-            "npx",
-            "eslint",
-            *changed_files,
-            "--max-warnings=0",
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-    # All other stacks: run the stack's configured lint command
-    return await asyncio.create_subprocess_exec(
-        *stack.lint_command,
-        cwd=workspace,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Verification handler
 # ---------------------------------------------------------------------------
@@ -577,7 +459,9 @@ async def handle_verify_changes(
     """Deterministic verification: check branch has commits and source file changes."""
     repo = task.context.repo
     branch = task.branch_name
-    github_token = os.environ.get("GITHUB_TOKEN", "")
+    base_branch = task.context.branch or "main"
+    base_ref = f"origin/{base_branch}"
+    github_token = get_github_token()
 
     if not repo:
         return {"condition": "fail", "message": "verify_changes failed (no repo)"}
@@ -589,13 +473,13 @@ async def handle_verify_changes(
         except RuntimeError as exc:
             return {"condition": "fail", "message": f"verify_changes failed (clone failed): {exc}"}
 
-        logger.info("[SCHEME] verify_changes: cloned %s, fetching origin/main...", branch)
+        logger.info("[SCHEME] verify_changes: cloned %s, fetching %s...", branch, base_ref)
 
         fetch_proc = await asyncio.create_subprocess_exec(
             "git",
             "fetch",
             "origin",
-            "main:refs/remotes/origin/main",
+            f"{base_branch}:refs/remotes/origin/{base_branch}",
             "--depth=1",
             cwd=workspace,
             stdout=asyncio.subprocess.PIPE,
@@ -607,16 +491,17 @@ async def handle_verify_changes(
             if github_token:
                 err = err.replace(github_token, "***")
             logger.warning(
-                "[SCHEME] verify_changes: fetch origin/main failed (rc=%s): %s",
+                "[SCHEME] verify_changes: fetch %s failed (rc=%s): %s",
+                base_ref,
                 fetch_proc.returncode,
                 err,
             )
 
-        # Check for commits beyond origin/main
+        # Check for commits beyond the base branch
         proc = await asyncio.create_subprocess_exec(
             "git",
             "log",
-            "origin/main..HEAD",
+            f"{base_ref}..HEAD",
             "--oneline",
             cwd=workspace,
             stdout=asyncio.subprocess.PIPE,
@@ -630,7 +515,7 @@ async def handle_verify_changes(
             log_stderr = log_err.decode()[:200]
             return {
                 "condition": "fail",
-                "message": f"verify_changes failed: no commits on branch beyond main (stderr: {log_stderr})",
+                "message": (f"verify_changes failed: no commits on branch beyond {base_branch} (stderr: {log_stderr})"),
             }
 
         # Check for source file changes
@@ -638,7 +523,7 @@ async def handle_verify_changes(
             "git",
             "diff",
             "--name-only",
-            "origin/main",
+            base_ref,
             cwd=workspace,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -681,23 +566,33 @@ async def handle_create_pr(
     """Create a real GitHub pull request."""
     repo = task.context.repo
     branch_name = task.branch_name
-    github_token = os.environ.get("GITHUB_TOKEN", "")
+    github_token = get_github_token()
 
     if not repo or not github_token:
-        pr_url = f"https://github.com/{repo}/pull/new"
-        logger.warning("Cannot create real PR: repo=%s, token_present=%s", repo, bool(github_token))
-        return {"condition": "pass", "pr_url": pr_url, "message": "PR creation skipped (missing repo or token)"}
+        # Fail-closed: a fabricated ".../pull/new" URL used to be reported as a
+        # successful PR, which finalized the task and triggered CI on a PR that
+        # does not exist.
+        logger.error("Cannot create PR: repo=%s, token_present=%s", repo, bool(github_token))
+        missing = "repo" if not repo else "GitHub token (HENCHMEN_GITHUB_TOKEN)"
+        return {"condition": "fail", "message": f"PR creation failed: missing {missing}"}
 
     try:
-        from github import Github
+        from github import Auth, Github
 
         logger.info("[CREATE_PR] Creating PR for task %s on %s (branch: %s)", task.id, repo, branch_name)
 
-        g = Github(github_token)
+        g = Github(auth=Auth.Token(github_token))
         github_repo = g.get_repo(repo)
 
-        # Layer 2: PR dedup — check if PR already exists for this branch
-        existing_prs = list(github_repo.get_pulls(head=branch_name, state="open"))
+        # Layer 2: PR dedup — check if a PR already exists for this branch.
+        # GitHub ignores a ``head`` filter that lacks the ``owner:`` prefix and
+        # returns every open PR, so qualify it and re-check the ref locally.
+        owner = repo.split("/")[0]
+        existing_prs = [
+            pr
+            for pr in github_repo.get_pulls(head=f"{owner}:{branch_name}", state="open")
+            if pr.head.ref == branch_name
+        ]
         if existing_prs:
             pr_url = existing_prs[0].html_url
             logger.info("[CREATE_PR] PR already exists: %s", pr_url)

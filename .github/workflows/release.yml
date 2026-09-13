@@ -10,10 +10,80 @@ permissions:
   packages: write
 
 jobs:
-  release:
-    name: Build & publish release
+  # A tag push does not re-run the PR gates, so repeat them here. Without this
+  # a red commit could be tagged and published.
+  verify:
+    name: Lint, type-check & test
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev-integration]"
+
+      - name: Ruff check
+        run: ruff check src/ tests/ evals/
+
+      - name: Ruff format check
+        run: ruff format --check src/ tests/ evals/
+
+      - name: mypy
+        run: mypy src/ evals/
+
+      - name: pytest
+        env:
+          HENCHMEN_PROVIDER: local
+          HENCHMEN_GCP_PROJECT_ID: test-project
+          HENCHMEN_ENVIRONMENT: dev
+        run: pytest tests/ -v --tb=short
+
+  images:
+    name: Build & push images
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # GHCR container images — build all 4 service containers and push
+      # them to ghcr.io so self-hosters can pull without Artifact Registry.
+      - name: Log in to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push container images
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          # GHCR rejects uppercase paths and github.repository preserves the
+          # owner's login case, so forks with a mixed-case login would fail on
+          # `docker build -t` without this.
+          REPO="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          for svc in dispatch mastermind forge operative; do
+            docker build -f containers/${svc}/Dockerfile \
+              -t "${REPO}/${svc}:${TAG}" \
+              -t "${REPO}/${svc}:latest" .
+            docker push "${REPO}/${svc}:${TAG}"
+            docker push "${REPO}/${svc}:latest"
+          done
+
+  # The GitHub Release is created last: publishing it before the images meant a
+  # failed `docker push` left a release advertising images that do not exist,
+  # and the tag could not be re-pushed without deleting the release first.
+  publish:
+    name: Publish GitHub Release
+    needs: [verify, images]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -28,10 +98,27 @@ jobs:
       - name: Build sdist + wheel
         run: python -m build
 
-      - name: Verify package
+      # Guards against a mistyped tag shipping the previous version's wheel
+      # under a new release name. Compared with packaging.Version so PEP 440
+      # normalisation (v1.0.0-rc1 -> 1.0.0rc1) does not cause a false mismatch.
+      - name: Verify package imports and matches the tag
         run: |
+          set -euo pipefail
           pip install dist/*.whl
-          python -c "import henchmen; print('import ok')"
+          built=$(python -c "import henchmen; print(henchmen.__version__)")
+          echo "built version: ${built}; tag: ${GITHUB_REF_NAME}"
+          python - "$built" "${GITHUB_REF_NAME#v}" <<'PY'
+          import sys
+          from packaging.version import Version
+
+          built, tag = Version(sys.argv[1]), Version(sys.argv[2])
+          if built != tag:
+              sys.exit(
+                  f"ERROR: tag {sys.argv[2]} does not match packaged version {sys.argv[1]}. "
+                  "Update the 'version' field in pyproject.toml or re-tag."
+              )
+          print("version/tag match")
+          PY
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
@@ -41,24 +128,3 @@ jobs:
           prerelease: ${{ contains(github.ref_name, 'rc') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # GHCR container images — build all 4 service containers and push
-      # them to ghcr.io so self-hosters can pull without Artifact Registry.
-      - name: Log in to GHCR
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push container images
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          REPO="ghcr.io/${{ github.repository }}"
-          for svc in dispatch mastermind forge operative; do
-            docker build -f containers/${svc}/Dockerfile \
-              -t "${REPO}/${svc}:${TAG}" \
-              -t "${REPO}/${svc}:latest" .
-            docker push "${REPO}/${svc}:${TAG}"
-            docker push "${REPO}/${svc}:latest"
-          done

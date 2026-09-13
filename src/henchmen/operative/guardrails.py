@@ -6,6 +6,7 @@ import os
 import time
 from typing import TYPE_CHECKING, Any
 
+from henchmen.config.settings import Settings, get_settings
 from henchmen.models.operative import OperativeConfig
 from henchmen.models.scheme import StepBudget
 
@@ -14,25 +15,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Patterns that suggest path traversal attempts
-_TRAVERSAL_PATTERNS = ("../", "..\\", "/../", "\\..")
-
-# Maximum tokens allowed in a single message (soft limit).
-# Converted to chars (×4) for fast truncation without SDK calls.
-_MAX_MESSAGE_TOKENS = 16_000
-_MAX_MESSAGE_CHARS = _MAX_MESSAGE_TOKENS * 4  # 64K chars ≈ 16K tokens
+# Fallback per-message character budget when Settings cannot be loaded.
+# The real budget is ``settings.operative_max_message_tokens`` × 4.
+_MAX_MESSAGE_CHARS = 64_000
 
 
 class OperativeGuardrails:
-    """Enforces safety and logging constraints on operative execution."""
+    """Enforces safety and logging constraints on operative execution.
 
-    # Default per-operative cost ceiling in USD.  Can be overridden via the
-    # HENCHMEN_OPERATIVE_COST_CEILING_USD environment variable.
-    _DEFAULT_COST_CEILING_USD = 2.0
-
-    # Default wall-clock ceiling in seconds for free/local providers (e.g. Ollama)
-    # where USD cost is $0 and cannot serve as a stop signal.
-    _DEFAULT_WALLCLOCK_CEILING_SECONDS = 1800
+    Every limit (cost ceiling, wall-clock ceiling, per-message budget) comes
+    from :class:`Settings` so ``.env.local`` and the operative env passthrough
+    are the single source of truth — no raw ``os.environ`` reads.
+    """
 
     def __init__(
         self,
@@ -41,10 +35,15 @@ class OperativeGuardrails:
         max_steps: int = 20,
         task_cost_accumulator: "TaskCostAccumulator | None" = None,
         step_budget: StepBudget | None = None,
+        settings: Settings | None = None,
+        model_name: str | None = None,
     ) -> None:
         self.config = config
         self.allowed_tools = allowed_tools
         self.max_steps = max_steps
+        self.settings = settings or get_settings()
+        # Concrete model actually billed (tier names are resolved by the agent).
+        self.model_name = model_name or config.model_name
         self._step_budget = step_budget
         self._extensions_granted: int = 0
         self._effective_max_steps: int = step_budget.base_steps if step_budget else max_steps
@@ -59,18 +58,42 @@ class OperativeGuardrails:
         self._task_cost_accumulator = task_cost_accumulator
         self._first_input_tokens: int = 0
         self._start_time: float = time.monotonic()
+        self._preamble_len: int = 1
 
-        ceiling_env = os.environ.get("HENCHMEN_OPERATIVE_COST_CEILING_USD", "")
-        self._cost_ceiling_usd: float = float(ceiling_env) if ceiling_env else self._DEFAULT_COST_CEILING_USD
-
-        wallclock_env = os.environ.get("HENCHMEN_OPERATIVE_WALLCLOCK_CEILING_SECONDS", "")
-        self._wallclock_ceiling_seconds: int = (
-            int(wallclock_env) if wallclock_env else self._DEFAULT_WALLCLOCK_CEILING_SECONDS
-        )
+        self._cost_ceiling_usd: float = float(self.settings.operative_task_cost_ceiling_usd)
+        self._wallclock_ceiling_seconds: int = int(self.settings.operative_wallclock_ceiling_seconds)
+        self._max_message_chars: int = int(self.settings.operative_max_message_tokens) * 4
 
         # Keep strong references to fire-and-forget accumulator writes so
         # the event loop doesn't GC them mid-flight.
         self._pending_accumulator_tasks: set[asyncio.Task[None]] = set()
+
+    # ------------------------------------------------------------------
+    # Read-only views used by the agent loop
+    # ------------------------------------------------------------------
+
+    @property
+    def estimated_cost_usd(self) -> float:
+        """Running cost estimate for this node in USD."""
+        return self._estimated_cost_usd
+
+    @property
+    def cost_ceiling_usd(self) -> float:
+        """Per-node cost ceiling in USD."""
+        return self._cost_ceiling_usd
+
+    @property
+    def effective_max_steps(self) -> int:
+        """Current step budget, including any granted extensions."""
+        return self._effective_max_steps
+
+    def record_nudge(self) -> None:
+        """Count a nudge message injected by the agent loop."""
+        self._nudge_count += 1
+
+    def set_preamble_len(self, count: int) -> None:
+        """Number of seeded messages (dossier + task) that must survive trimming."""
+        self._preamble_len = max(1, count)
 
     # ------------------------------------------------------------------
     # Pre-tool hook
@@ -136,10 +159,11 @@ class OperativeGuardrails:
     def after_model_response(self, response: dict[str, Any]) -> None:
         """Track token usage, update running cost estimate, and log model response metadata.
 
-        Cached input tokens are billed at 25% of the standard input rate (Vertex AI
-        context caching discount), so they must be included in the ceiling check
-        and accumulator — the prior implementation ignored them and under-estimated
-        cost by whatever fraction of input was served from cache.
+        The provider's own ``estimated_cost_usd`` is authoritative when present:
+        it knows the concrete model it billed and the exact cache read/write
+        split. ``0.0`` from a free local provider is meaningful (it is what lets
+        the wall-clock ceiling take over), so only an *absent* key falls back to
+        the shared pricing table.
         """
         usage = response.get("usage", {})
         input_tokens = int(usage.get("input", 0) or 0)
@@ -153,16 +177,24 @@ class OperativeGuardrails:
             self._first_input_tokens = input_tokens
         self._step_count += 1
 
-        # Update running cost estimate. Pass cached_input_tokens so tracker.estimate_cost
-        # applies the 0.25x cache discount rather than full-price billing.
-        from henchmen.observability.tracker import estimate_cost
+        # Record the concrete model the provider reported, so telemetry and the
+        # OperativeReport never carry a tier name.
+        reported_model = str(response.get("model") or "")
+        if reported_model:
+            self.model_name = reported_model
 
-        step_cost = estimate_cost(
-            self.config.model_name,
-            input_tokens,
-            output_tokens,
-            cached_input_tokens=cached_input_tokens,
-        )
+        if "cost_usd" in usage:
+            step_cost = float(usage.get("cost_usd") or 0.0)
+        else:
+            from henchmen.providers.pricing import estimate_cost_for_settings
+
+            step_cost = estimate_cost_for_settings(
+                self.settings,
+                self.model_name,
+                input_tokens,
+                output_tokens,
+                cached_input_tokens=cached_input_tokens,
+            )
         self._estimated_cost_usd += step_cost
 
         # Propagate the delta to the task-level accumulator so the ceiling
@@ -201,38 +233,30 @@ class OperativeGuardrails:
         """Pre-process messages before sending to the model.
 
         Applies two optimizations:
-        1. Context windowing: keep first message (task) + last N messages, drop middle.
-           Must preserve tool_use/tool_result pairing — Claude rejects broken pairs.
-        2. Per-message truncation for oversized string content.
+        1. Context windowing: keep the whole seeded preamble (dossier context AND
+           the task description) + last N messages, drop the middle. Must
+           preserve tool_use/tool_result pairing — Claude rejects broken pairs.
+        2. Per-message truncation for oversized string content. The trim note is
+           appended *after* truncation so a huge dossier message can never cut
+           it off.
         """
         from henchmen.operative.agent_builder import _CONTEXT_WINDOW_KEEP_LAST
 
-        max_messages = _CONTEXT_WINDOW_KEEP_LAST + 1  # +1 for the initial task message
+        preamble_len = min(self._preamble_len, len(messages))
+        max_messages = _CONTEXT_WINDOW_KEEP_LAST + preamble_len
+        dropped = 0
         if len(messages) > max_messages:
             tail = messages[-_CONTEXT_WINDOW_KEEP_LAST:]
 
             # Ensure tail starts with a user message (tool_result or text) so
             # we don't break tool_use/tool_result pairing or role alternation.
-            while tail and tail[0].get("role") == "assistant" and len(tail) < len(messages) - 1:
+            while tail and tail[0].get("role") == "assistant" and len(tail) < len(messages) - preamble_len:
                 idx = len(messages) - len(tail) - 1
                 tail = [messages[idx]] + tail
 
-            dropped = len(messages) - len(tail)
-
-            # Prepend the original task as a fresh user message with a context note.
-            # This replaces all dropped messages with a single clean user message.
-            original_task = messages[0].get("content", "")
-            if isinstance(original_task, list):
-                original_task = str(original_task)
-            combined_first = {
-                "role": "user",
-                "content": (
-                    f"{original_task}\n\n"
-                    f"[Note: {dropped} earlier messages were trimmed to save context. "
-                    f"Continue from where you left off based on the recent messages below.]"
-                ),
-            }
-            messages = [combined_first] + tail
+            preamble = list(messages[:preamble_len])
+            dropped = len(messages) - len(tail) - len(preamble)
+            messages = preamble + tail
             logger.info(
                 "[guardrails] Context window applied: dropped %d middle messages (task=%s)",
                 dropped,
@@ -243,16 +267,32 @@ class OperativeGuardrails:
         processed = []
         for msg in messages:
             content = msg.get("content", "")
-            if isinstance(content, str) and len(content) > _MAX_MESSAGE_CHARS:
+            if isinstance(content, str) and len(content) > self._max_message_chars:
                 logger.warning(
                     "[guardrails] Truncating oversized message (%d chars → %d) (task=%s)",
                     len(content),
-                    _MAX_MESSAGE_CHARS,
+                    self._max_message_chars,
                     self.config.task_id,
                 )
-                content = content[:_MAX_MESSAGE_CHARS] + "\n[... truncated ...]"
+                content = content[: self._max_message_chars] + "\n[... truncated ...]"
                 msg = dict(msg, content=content)
             processed.append(msg)
+
+        # The note goes on the LAST preamble message (the task description) so
+        # the model always sees the task, and never on a dossier message whose
+        # tail may have just been truncated away.
+        if dropped:
+            note = (
+                f"\n\n[Note: {dropped} earlier messages were trimmed to save context. "
+                f"Continue from where you left off based on the recent messages below.]"
+            )
+            anchor = processed[preamble_len - 1]
+            anchor_content = anchor.get("content", "")
+            if isinstance(anchor_content, str):
+                processed[preamble_len - 1] = dict(anchor, content=anchor_content + note)
+            else:
+                processed.insert(preamble_len, {"role": "user", "content": note.strip()})
+
         return processed
 
     # ------------------------------------------------------------------
@@ -344,9 +384,10 @@ class OperativeGuardrails:
         }
 
     def get_telemetry(self) -> dict[str, Any]:
-        """Return comprehensive telemetry data."""
+        """Return comprehensive telemetry data (model_name is the concrete model billed)."""
         return {
-            "model_name": self.config.model_name,
+            "model_name": self.model_name,
+            "estimated_cost_usd": self._estimated_cost_usd,
             "total_input_tokens": self.token_usage.get("input", 0),
             "total_output_tokens": self.token_usage.get("output", 0),
             "model_calls": self._step_count,
@@ -369,19 +410,16 @@ class OperativeGuardrails:
         """Check if a path resolves to within the workspace using canonical resolution.
 
         Uses ``os.path.realpath`` so symlinks and ``..`` segments are fully
-        resolved before the prefix check, preventing symlink-based escapes
-        that pattern matching would miss.
+        resolved, then ``os.path.commonpath`` so a sibling directory that
+        merely shares a prefix (``/workspace-evil``) is rejected — mirroring
+        ``henchmen.arsenal._workspace.ensure_in_workspace``.
         """
-        resolved = os.path.realpath(os.path.join(workspace, path))
-        return resolved.startswith(os.path.realpath(workspace))
-
-    @staticmethod
-    def _has_path_traversal(path: str) -> bool:
-        """Return True if the path contains traversal sequences.
-
-        .. deprecated::
-            Kept for backward compatibility.  Prefer ``_is_path_safe`` which
-            uses canonical resolution instead of pattern matching.
-        """
-        normalised = os.path.normpath(path)
-        return any(pat in path for pat in _TRAVERSAL_PATTERNS) or normalised.startswith("..")
+        root = os.path.realpath(workspace)
+        resolved = os.path.realpath(os.path.join(root, path))
+        if resolved == root:
+            return True
+        try:
+            return os.path.commonpath([resolved, root]) == root
+        except ValueError:
+            # Different drives on Windows — treat as an escape.
+            return False

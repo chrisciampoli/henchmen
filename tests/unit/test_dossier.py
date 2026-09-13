@@ -2,12 +2,15 @@
 
 import asyncio as _asyncio
 import json
+import subprocess
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from henchmen.config.settings import Settings
 from henchmen.dossier.cache import SnapshotCache
-from henchmen.dossier.rules import RuleFileLoader
+from henchmen.dossier.rules import MAX_RULE_FILE_CHARS, RuleFileLoader
 from henchmen.models.dossier import CodeSearchResult, Dossier, RelatedIssue, RelatedPR, RuleFile
 
 # ---------------------------------------------------------------------------
@@ -30,14 +33,22 @@ def _make_task(**kwargs):
     return HenchmenTask(**defaults)
 
 
-def _make_settings(**kwargs) -> MagicMock:
-    s = MagicMock()
-    s.gcs_bucket_dossier = "my-dossier-bucket"
-    s.gcs_bucket_snapshots = "my-snapshots-bucket"
-    s.gcp_project_id = "my-project"
-    for k, v in kwargs.items():
-        setattr(s, k, v)
-    return s
+def _make_settings(**kwargs) -> Settings:
+    """Real Settings, not a MagicMock.
+
+    A MagicMock hands out truthy attributes for anything (``github_token``
+    included), which is how the builder tests used to shell out to a real
+    ``git clone`` against github.com.
+    """
+    defaults: dict[str, object] = {
+        "provider": "local",
+        "gcs_bucket_dossier": "my-dossier-bucket",
+        "gcs_bucket_snapshots": "my-snapshots-bucket",
+        "gcp_project_id": "my-project",
+        "github_token": "",
+    }
+    defaults.update(kwargs)
+    return Settings(**defaults)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +115,21 @@ class TestRuleFileLoaderScopedRules:
         rules_global = pytest.run_async(RuleFileLoader.load_global_rules(str(tmp_path)))
         rules_scoped = pytest.run_async(RuleFileLoader.load_rules(str(tmp_path)))
         assert len(rules_global) == len(rules_scoped)
+
+    def test_oversized_rule_file_is_truncated(self, tmp_path):
+        """Unbounded rule text can blow the dispatch cost estimate."""
+        (tmp_path / "CLAUDE.md").write_text("x" * (MAX_RULE_FILE_CHARS + 5_000), encoding="utf-8")
+
+        rules = pytest.run_async(RuleFileLoader.load_global_rules(str(tmp_path)))
+        assert len(rules) == 1
+        assert len(rules[0].content) < MAX_RULE_FILE_CHARS + 200
+        assert "[truncated" in rules[0].content
+
+    def test_normal_rule_file_is_not_truncated(self, tmp_path):
+        (tmp_path / "CLAUDE.md").write_text("short rules", encoding="utf-8")
+
+        rules = pytest.run_async(RuleFileLoader.load_global_rules(str(tmp_path)))
+        assert rules[0].content == "short rules"
 
     def test_path_outside_repo_is_ignored(self, tmp_path):
         (tmp_path / "CLAUDE.md").write_text("Root.", encoding="utf-8")
@@ -176,6 +202,13 @@ class TestSnapshotCacheKeyGeneration:
         k2 = cache._snapshot_key("https://github.com/org/repo", "develop")
         assert k1 != k2
 
+    def test_different_commit_sha_different_key(self):
+        """Without the commit in the key a restored workspace is stale forever."""
+        cache = self._make_cache()
+        k1 = cache._snapshot_key("https://github.com/org/repo", "main", "aaaaaaa")
+        k2 = cache._snapshot_key("https://github.com/org/repo", "main", "bbbbbbb")
+        assert k1 != k2
+
     def test_key_length(self):
         cache = self._make_cache()
         key = cache._snapshot_key("https://github.com/org/repo", "main")
@@ -222,10 +255,80 @@ class TestSnapshotCacheGetSnapshot:
         assert result is not None
         assert result.startswith("gs://my-bucket/")
 
+    @pytest.mark.asyncio
+    async def test_save_snapshot_returns_none_when_no_bucket(self):
+        """Mirrors get_snapshot: no bucket means "no cache", not an exception."""
+        settings = _make_settings(gcs_bucket_snapshots="")
+        cache = SnapshotCache(settings, object_store=AsyncMock())
+        assert await cache.save_snapshot("/tmp/ws", "https://github.com/org/repo") is None
+
+
+class TestSnapshotExtractionSafety:
+    def test_extract_uses_data_filter(self, tmp_path):
+        """A tarball member escaping the destination must not be written."""
+        import tarfile
+
+        from henchmen.dossier.cache import _extract_tarball
+
+        payload = tmp_path / "payload.txt"
+        payload.write_text("pwned", encoding="utf-8")
+        tarball = tmp_path / "evil.tar.gz"
+        with tarfile.open(tarball, "w:gz") as tar:
+            tar.add(payload, arcname="../escaped.txt")
+
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        with pytest.raises(tarfile.TarError):
+            _extract_tarball(str(tarball), str(dest))
+        assert not (tmp_path / "escaped.txt").exists()
+
 
 # ---------------------------------------------------------------------------
-# DossierBuilder – with mocked GCS
+# Import order — the dossier package must be importable in a fresh process
 # ---------------------------------------------------------------------------
+
+
+class TestImportOrder:
+    """Regression tests for the models<->dossier circular import.
+
+    These must run in a subprocess: tests/conftest.py imports
+    ``henchmen.models`` first, which masks the cycle inside pytest.
+    """
+
+    @pytest.mark.parametrize(
+        "module",
+        ["henchmen.dossier", "henchmen.dossier.chunker", "henchmen.models.dossier", "henchmen.mastermind.server"],
+    )
+    def test_module_imports_standalone(self, module):
+        result = subprocess.run(
+            [sys.executable, "-c", f"import {module}"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# DossierBuilder – with mocked object store and stubbed clone
+# ---------------------------------------------------------------------------
+
+
+def _init_git_repo(path, files: dict[str, str]) -> None:
+    """Create a throwaway git repo containing *files* and commit them."""
+    for rel, content in files.items():
+        target = path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+    subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(path), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "-q", "-m", "init"],
+        check=True,
+        capture_output=True,
+        env={**dict(__import__("os").environ), **env},
+    )
 
 
 class TestDossierBuilder:
@@ -244,11 +347,17 @@ class TestDossierBuilder:
         task = _make_task()
         req = DossierRequirement()
 
-        with patch.object(builder, "_upload_artifact", new_callable=AsyncMock, return_value="gs://bucket/dossier.json"):
+        with (
+            patch("henchmen.dossier.builder.clone_repo", new_callable=AsyncMock) as clone,
+            patch.object(builder, "upload_artifact", new_callable=AsyncMock, return_value="gs://bucket/dossier.json"),
+        ):
             dossier = await builder.build(task, req)
 
         assert isinstance(dossier, Dossier)
         assert dossier.task_id == task.id
+        # One shallow clone per task, not two (rules + conventions share it).
+        assert clone.await_count == 1
+        assert clone.await_args.kwargs["depth"] == 1
 
     @pytest.mark.asyncio
     async def test_build_fetches_files_when_requested(self):
@@ -263,7 +372,10 @@ class TestDossierBuilder:
         req = DossierRequirement(fetch_files=True)
 
         builder = self._make_builder()
-        with patch.object(builder, "_upload_artifact", new_callable=AsyncMock, return_value="gs://b/d.json"):
+        with (
+            patch("henchmen.dossier.builder.clone_repo", new_callable=AsyncMock),
+            patch.object(builder, "upload_artifact", new_callable=AsyncMock, return_value="gs://b/d.json"),
+        ):
             dossier = await builder.build(task, req)
 
         assert "src/foo.py" in dossier.relevant_files
@@ -276,7 +388,10 @@ class TestDossierBuilder:
         task = _make_task()
         builder = self._make_builder()
 
-        with patch.object(builder, "_upload_artifact", new_callable=AsyncMock, return_value="gs://b/d.json"):
+        with (
+            patch("henchmen.dossier.builder.clone_repo", new_callable=AsyncMock),
+            patch.object(builder, "upload_artifact", new_callable=AsyncMock, return_value="gs://b/d.json"),
+        ):
             dossier = await builder.build(task, req)
 
         assert dossier.relevant_files == []
@@ -293,9 +408,12 @@ class TestDossierBuilder:
         task = _make_task()
         builder = self._make_builder()
 
-        with patch.object(
-            builder, "_upload_artifact", new_callable=AsyncMock, return_value="gs://b/d.json"
-        ) as mock_upload:
+        with (
+            patch("henchmen.dossier.builder.clone_repo", new_callable=AsyncMock),
+            patch.object(
+                builder, "upload_artifact", new_callable=AsyncMock, return_value="gs://b/d.json"
+            ) as mock_upload,
+        ):
             dossier = await builder.build(task, req)
 
         mock_upload.assert_awaited_once()
@@ -329,19 +447,86 @@ class TestDossierBuilder:
         assert "henchmen/bar.py" in files
 
     @pytest.mark.asyncio
-    async def test_fetch_rule_files_returns_empty_list(self):
-        task = _make_task()
+    async def test_scan_repo_returns_empty_without_repo(self):
+        from henchmen.models.task import TaskContext
+
+        task = _make_task(context=TaskContext(repo=""))
         builder = self._make_builder()
-        rules = await builder._fetch_rule_files(task)
+        rules, conventions = await builder._scan_repo(task, fetch_rules=True)
         assert rules == []
+        assert conventions is None
+
+    @pytest.mark.asyncio
+    async def test_scan_repo_finds_rules_when_only_one_rule_file_exists(self, tmp_path):
+        """Repos rarely contain all four rule filenames; one must be enough."""
+        from henchmen.models.task import TaskContext
+
+        source = tmp_path / "source"
+        source.mkdir()
+        _init_git_repo(
+            source,
+            {
+                "CLAUDE.md": "# Root rules",
+                "src/CLAUDE.md": "# Src rules",
+                "pyproject.toml": "[tool.ruff]\nline-length = 120\n",
+            },
+        )
+
+        async def _fake_clone(repo, branch, workspace, token=None, **kwargs):
+            subprocess.run(
+                ["git", "clone", "-q", "--depth=1", source.as_uri(), workspace],
+                check=True,
+                capture_output=True,
+            )
+
+        task = _make_task(context=TaskContext(repo="org/repo", pr_diff="+++ b/src/app.py\n"))
+        builder = self._make_builder()
+        with patch("henchmen.dossier.builder.clone_repo", new=_fake_clone):
+            rules, conventions = await builder._scan_repo(task, fetch_rules=True)
+
+        paths = {r.path.replace("\\", "/") for r in rules}
+        assert "CLAUDE.md" in paths
+        assert "src/CLAUDE.md" in paths
+        assert conventions is not None
+        assert conventions.lint_config == "ruff"
 
     @pytest.mark.asyncio
     async def test_upload_artifact_skipped_when_no_bucket(self):
         task = _make_task()
         builder = self._make_builder(gcs_bucket_dossier="")
         dossier = Dossier(task_id=task.id)
-        uri = await builder._upload_artifact(dossier)
-        assert uri == ""
+        assert await builder.upload_artifact(dossier) is None
+
+    @pytest.mark.asyncio
+    async def test_upload_artifact_returns_uri(self):
+        task = _make_task()
+        builder = self._make_builder()
+        dossier = Dossier(task_id=task.id)
+        uri = await builder.upload_artifact(dossier)
+        assert uri == f"gs://my-dossier-bucket/dossiers/{task.id}/dossier.json"
+
+    @pytest.mark.asyncio
+    async def test_upload_failure_does_not_discard_context(self):
+        """An object-store outage must not nuke rules/PRs already fetched."""
+        from henchmen.models.scheme import DossierRequirement
+
+        builder = self._make_builder()
+        builder._object_store.put = AsyncMock(side_effect=RuntimeError("403 denied"))
+        task = _make_task()
+
+        with patch("henchmen.dossier.builder.clone_repo", new_callable=AsyncMock):
+            dossier = await builder.build(task, DossierRequirement())
+
+        assert dossier.artifact_uri is None
+
+    @pytest.mark.asyncio
+    async def test_github_token_comes_from_settings_only(self, monkeypatch):
+        """The builder must not read a raw GITHUB_TOKEN from the environment."""
+        monkeypatch.setenv("GITHUB_TOKEN", "raw-env-token")
+        builder = self._make_builder(github_token="")
+        task = _make_task()
+        prs = await builder._fetch_related_prs(task)
+        assert prs == []
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +585,14 @@ class TestTypedDossierModels:
 
         assert not hasattr(mod, "DossierArtifact")
 
+    def test_repo_structure_field_removed(self):
+        """The field was never populated and every consumer excluded it."""
+        with pytest.raises(Exception):
+            Dossier(task_id="t1", repo_structure="src/\n  foo.py")
+
+    def test_artifact_uri_defaults_to_none(self):
+        assert Dossier(task_id="t1").artifact_uri is None
+
 
 # ---------------------------------------------------------------------------
 # TaskAnalysis as Pydantic model
@@ -413,6 +606,25 @@ class TestTaskAnalysisPydantic:
         from henchmen.dossier.task_analyzer import TaskAnalysis
 
         assert issubclass(TaskAnalysis, BaseModel)
+
+    def test_task_analysis_is_strict_contract(self):
+        """It crosses the Mastermind->Operative boundary via dossier.json."""
+        from henchmen.dossier.task_analyzer import TaskAnalysis
+        from henchmen.models._base import StrictBase
+        from henchmen.models.dossier import TaskAnalysis as ModelsTaskAnalysis
+
+        assert TaskAnalysis is ModelsTaskAnalysis
+        assert issubclass(TaskAnalysis, StrictBase)
+        with pytest.raises(Exception):
+            TaskAnalysis(task_type="feature", unknown_key="drift")
+
+    def test_repo_conventions_is_strict_contract(self):
+        from henchmen.dossier.convention_detector import RepoConventions
+        from henchmen.models._base import StrictBase
+        from henchmen.models.dossier import RepoConventions as ModelsRepoConventions
+
+        assert RepoConventions is ModelsRepoConventions
+        assert issubclass(RepoConventions, StrictBase)
 
     def test_task_analysis_serializes(self):
         from henchmen.dossier.task_analyzer import TaskAnalysis

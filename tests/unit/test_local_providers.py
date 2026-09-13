@@ -818,7 +818,7 @@ class TestShellCIProvider:
     async def test_successful_build(self):
         from henchmen.providers.local.shell_ci import ShellCIProvider
 
-        provider = ShellCIProvider()
+        provider = ShellCIProvider(_mock_settings())
         build_id = await provider.trigger_build(
             repo_url="https://github.com/example/repo",
             branch="main",
@@ -832,7 +832,7 @@ class TestShellCIProvider:
     async def test_failing_build(self):
         from henchmen.providers.local.shell_ci import ShellCIProvider
 
-        provider = ShellCIProvider()
+        provider = ShellCIProvider(_mock_settings())
         build_id = await provider.trigger_build(
             repo_url="https://github.com/example/repo",
             branch="main",
@@ -845,7 +845,7 @@ class TestShellCIProvider:
     async def test_failing_stops_subsequent_commands(self):
         from henchmen.providers.local.shell_ci import ShellCIProvider
 
-        provider = ShellCIProvider()
+        provider = ShellCIProvider(_mock_settings())
         build_id = await provider.trigger_build(
             repo_url="https://github.com/example/repo",
             branch="main",
@@ -858,7 +858,7 @@ class TestShellCIProvider:
     async def test_get_logs_contains_output(self):
         from henchmen.providers.local.shell_ci import ShellCIProvider
 
-        provider = ShellCIProvider()
+        provider = ShellCIProvider(_mock_settings())
         build_id = await provider.trigger_build(
             repo_url="https://github.com/example/repo",
             branch="main",
@@ -871,7 +871,7 @@ class TestShellCIProvider:
     async def test_get_status_unknown_build(self):
         from henchmen.providers.local.shell_ci import ShellCIProvider
 
-        provider = ShellCIProvider()
+        provider = ShellCIProvider(_mock_settings())
         result = await provider.get_status("nonexistent-build")
         assert result.status == CIStatus.FAILURE
         assert result.error_message == "Build not found"
@@ -880,7 +880,7 @@ class TestShellCIProvider:
     async def test_get_logs_unknown_build_returns_empty(self):
         from henchmen.providers.local.shell_ci import ShellCIProvider
 
-        provider = ShellCIProvider()
+        provider = ShellCIProvider(_mock_settings())
         logs = await provider.get_logs("nonexistent-build")
         assert logs == ""
 
@@ -888,7 +888,7 @@ class TestShellCIProvider:
     async def test_cancel(self):
         from henchmen.providers.local.shell_ci import ShellCIProvider
 
-        provider = ShellCIProvider()
+        provider = ShellCIProvider(_mock_settings())
         build_id = await provider.trigger_build("url", "main", commands=["echo ok"])
         await provider.cancel(build_id)
         result = await provider.get_status(build_id)
@@ -963,3 +963,357 @@ class TestDockerOrchestrator:
         result = await orch.get_status("exec-fail")
         assert result.status == JobStatus.FAILED
         assert result.exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# SQLiteDocumentStore — query operator parity and storage location
+# ---------------------------------------------------------------------------
+
+
+class TestSQLiteQueryOperators:
+    @pytest.mark.asyncio
+    async def test_not_in_filter_excludes_matching_rows(self, tmp_path):
+        """`not-in` silently matched everything before, unlike DynamoDB."""
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "t.db"))
+        await store.set("tasks", "a", {"status": "queued"})
+        await store.set("tasks", "b", {"status": "failed"})
+        await store.set("tasks", "c", {"status": "done"})
+
+        results = await store.query("tasks", filters=[("status", "not-in", ["failed", "done"])])
+        assert [d["_id"] for d in results] == ["a"]
+
+    @pytest.mark.asyncio
+    async def test_array_contains_filter(self, tmp_path):
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "t.db"))
+        await store.set("prs", "p1", {"files_changed": ["a.py", "b.py"]})
+        await store.set("prs", "p2", {"files_changed": ["c.py"]})
+
+        results = await store.query("prs", filters=[("files_changed", "array-contains", "a.py")])
+        assert [d["_id"] for d in results] == ["p1"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_operator_raises_instead_of_returning_everything(self, tmp_path):
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "t.db"))
+        await store.set("tasks", "a", {"status": "queued"})
+
+        with pytest.raises(ValueError, match="Unsupported query operator"):
+            await store.query("tasks", filters=[("status", "starts-with", "q")])
+
+    @pytest.mark.asyncio
+    async def test_datetime_filter_value_compares_against_stored_iso_string(self, tmp_path):
+        from datetime import UTC, datetime, timedelta
+
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "t.db"))
+        now = datetime.now(UTC)
+        await store.set("leases", "old", {"expires_at": now - timedelta(hours=1)})
+        await store.set("leases", "new", {"expires_at": now + timedelta(hours=1)})
+
+        expired = await store.query("leases", filters=[("expires_at", "<", now)])
+        assert [d["_id"] for d in expired] == ["old"]
+
+    @pytest.mark.asyncio
+    async def test_unsafe_collection_name_is_rejected(self, tmp_path):
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "t.db"))
+        with pytest.raises(ValueError, match="Unsafe collection name"):
+            await store.get("tasks]; DROP TABLE tasks; --", "x")
+
+    def test_default_path_is_under_a_dot_henchmen_dir(self, tmp_path, monkeypatch):
+        """The DB must never land in the repository root."""
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore, default_db_path
+
+        monkeypatch.chdir(tmp_path)
+        settings = _mock_settings()
+        expected = default_db_path(settings)
+        assert expected.parent.name == ".henchmen"
+
+        store = SQLiteDocumentStore(settings)
+        assert store.path == expected
+        assert expected.parent.is_dir()
+
+    @pytest.mark.asyncio
+    async def test_update_does_not_clobber_a_concurrent_increment(self, tmp_path):
+        import asyncio
+
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "t.db"))
+        await store.set("task_executions", "t-1", {"tokens": 0, "status": "running"})
+
+        await asyncio.gather(
+            *[store.increment("task_executions", "t-1", {"tokens": 1}) for _ in range(10)],
+            store.update("task_executions", "t-1", {"status": "done"}),
+        )
+
+        doc = await store.get("task_executions", "t-1")
+        assert doc["tokens"] == 10
+        assert doc["status"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_close_releases_the_connection(self, tmp_path):
+        import sqlite3
+
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "t.db"))
+        await store.set("tasks", "a", {"x": 1})
+        await store.close()
+
+        with pytest.raises(sqlite3.ProgrammingError):
+            await store.get("tasks", "a")
+
+
+# ---------------------------------------------------------------------------
+# FilesystemObjectStore — path traversal
+# ---------------------------------------------------------------------------
+
+
+class TestFilesystemObjectStoreSafety:
+    @pytest.mark.asyncio
+    async def test_key_cannot_escape_the_store_root(self, tmp_path):
+        from henchmen.providers.local.filesystem import FilesystemObjectStore
+
+        store = FilesystemObjectStore(_mock_settings(), base_dir=str(tmp_path / "store"))
+        with pytest.raises(ValueError, match="escapes the store root"):
+            await store.put("dossiers", "../../escaped.txt", b"x")
+
+    @pytest.mark.asyncio
+    async def test_bucket_cannot_escape_the_store_root(self, tmp_path):
+        from henchmen.providers.local.filesystem import FilesystemObjectStore
+
+        store = FilesystemObjectStore(_mock_settings(), base_dir=str(tmp_path / "store"))
+        with pytest.raises(ValueError, match="escapes the store root"):
+            await store.get("../..", "secrets.env")
+
+
+# ---------------------------------------------------------------------------
+# ShellCIProvider — timeout and workspace
+# ---------------------------------------------------------------------------
+
+
+class TestShellCITimeout:
+    @pytest.mark.asyncio
+    async def test_hanging_command_times_out_and_stops_the_build(self):
+        """The timeout previously wrapped only process spawn, so it never fired."""
+        import sys
+
+        from henchmen.providers.local.shell_ci import ShellCIProvider
+
+        provider = ShellCIProvider(_mock_settings())
+        sleeper = '"' + sys.executable + '" -c "import time; time.sleep(30)"'
+        build_id = await provider.trigger_build(
+            repo_url="url",
+            branch="main",
+            commands=[sleeper, "echo SHOULD_NOT_RUN"],
+            timeout_seconds=1,
+        )
+
+        result = await provider.get_status(build_id)
+        assert result.status == CIStatus.TIMEOUT
+        logs = await provider.get_logs(build_id)
+        assert "TIMEOUT after 1s" in logs
+        assert "SHOULD_NOT_RUN" not in logs
+
+    @pytest.mark.asyncio
+    async def test_commands_run_in_the_given_workspace(self, tmp_path):
+        import sys
+
+        from henchmen.providers.local.shell_ci import ShellCIProvider
+
+        provider = ShellCIProvider(_mock_settings())
+        printer = '"' + sys.executable + '" -c "import os; print(os.getcwd())"'
+        build_id = await provider.trigger_build("url", "main", [printer], workspace=str(tmp_path))
+        logs = await provider.get_logs(build_id)
+        assert str(tmp_path) in logs
+
+
+# ---------------------------------------------------------------------------
+# DockerOrchestrator — timeout, cpu limit, cancel, log buffer
+# ---------------------------------------------------------------------------
+
+
+class _FakeStream:
+    def __init__(self, lines=()):
+        self._lines = list(lines)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._lines:
+            raise StopAsyncIteration
+        return self._lines.pop(0)
+
+
+class _FakeProcess:
+    def __init__(self, returncode=None, wait_delay=0.0, lines=()):
+        self.returncode = returncode
+        self._wait_delay = wait_delay
+        self.stdout = _FakeStream(lines)
+
+    async def wait(self):
+        import asyncio
+
+        await asyncio.sleep(self._wait_delay)
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    async def communicate(self):
+        return (b"", None)
+
+
+class TestDockerOrchestratorRuntime:
+    def _patch_exec(self, run_process, recorder):
+        async def fake_exec(*cmd, **kwargs):
+            recorder.append(list(cmd))
+            if len(cmd) > 1 and cmd[1] == "kill":
+                return _FakeProcess(returncode=0)
+            return run_process
+
+        return patch("asyncio.create_subprocess_exec", side_effect=fake_exec)
+
+    @pytest.mark.asyncio
+    async def test_cpu_limit_is_passed_to_docker_run(self):
+        from henchmen.providers.local.docker import DockerOrchestrator
+
+        commands: list[list[str]] = []
+        proc = _FakeProcess(wait_delay=30.0)
+        orch = DockerOrchestrator(_mock_settings())
+        with self._patch_exec(proc, commands):
+            exec_id = await orch.run_job("j", "img", {}, cpu="2", memory="4Gi", timeout_seconds=300)
+        orch._timeout_tasks[exec_id].cancel()
+
+        run_cmd = commands[0]
+        assert "--cpus" in run_cmd
+        assert run_cmd[run_cmd.index("--cpus") + 1] == "2"
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_the_container_and_reports_timed_out(self):
+        """A hung operative previously ran for ever and could never be TIMED_OUT."""
+        import asyncio
+
+        from henchmen.providers.local.docker import DockerOrchestrator
+
+        commands: list[list[str]] = []
+        proc = _FakeProcess(wait_delay=30.0)
+        orch = DockerOrchestrator(_mock_settings())
+        with self._patch_exec(proc, commands):
+            exec_id = await orch.run_job("j", "img", {}, timeout_seconds=1)
+            await asyncio.sleep(1.3)
+            assert any(cmd[:2] == ["docker", "kill"] for cmd in commands)
+            proc.returncode = -9
+            result = await orch.get_status(exec_id)
+
+        assert result.status == JobStatus.TIMED_OUT
+
+    @pytest.mark.asyncio
+    async def test_cancel_awaits_docker_kill(self):
+        from henchmen.providers.local.docker import DockerOrchestrator
+
+        commands: list[list[str]] = []
+        orch = DockerOrchestrator(_mock_settings())
+        with self._patch_exec(_FakeProcess(returncode=0), commands):
+            await orch.cancel("docker-abc")
+
+        assert commands == [["docker", "kill", "docker-abc"]]
+
+    @pytest.mark.asyncio
+    async def test_stream_logs_serves_the_drained_buffer(self):
+        """--rm deletes the container, so `docker logs` cannot be used after exit."""
+        import asyncio
+
+        from henchmen.providers.local.docker import DockerOrchestrator
+
+        commands: list[list[str]] = []
+        proc = _FakeProcess(returncode=0, lines=[b"line one\n", b"line two\n"])
+        orch = DockerOrchestrator(_mock_settings())
+        with self._patch_exec(proc, commands):
+            exec_id = await orch.run_job("j", "img", {}, timeout_seconds=60)
+            await orch._drain_tasks[exec_id]
+            orch._timeout_tasks[exec_id].cancel()
+            await asyncio.sleep(0)
+            lines = [line async for line in orch.stream_logs(exec_id)]
+
+        assert lines == ["line one", "line two"]
+
+
+# ---------------------------------------------------------------------------
+# InMemoryMessageBroker — HTTP forwarding
+# ---------------------------------------------------------------------------
+
+
+class _FakeHTTPResponse:
+    def __init__(self, status_code):
+        self.status_code = status_code
+
+
+class _RecordingHTTPClient:
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = 0
+        self.timeouts: list[float] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def post(self, url, json=None, timeout=None):  # noqa: ASYNC109 - mirrors httpx.AsyncClient.post
+        self.calls += 1
+        self.timeouts.append(timeout)
+        item = self.script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class TestInMemoryBrokerForwarding:
+    async def _forward(self, script):
+        from henchmen.providers.local.memory import InMemoryMessageBroker
+
+        client = _RecordingHTTPClient(script)
+        broker = InMemoryMessageBroker()
+        broker.set_forward_map({"topic": "http://localhost:8000/hook"})
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            patch("henchmen.providers.local.memory._FORWARD_RETRY_BACKOFF_SECONDS", 0),
+        ):
+            await broker.publish("topic", b"{}")
+            await broker.drain()
+        return client
+
+    @pytest.mark.asyncio
+    async def test_connection_failure_is_retried(self):
+        client = await self._forward([ConnectionError("boom"), _FakeHTTPResponse(200)])
+        assert client.calls == 2
+
+    @pytest.mark.asyncio
+    async def test_error_response_is_not_retried_and_is_logged(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="henchmen.providers.local.memory"):
+            client = await self._forward([_FakeHTTPResponse(500)])
+        assert client.calls == 1
+        assert "returned 500" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_retained_message_history_is_bounded(self):
+        from henchmen.providers.local import memory as memory_module
+        from henchmen.providers.local.memory import InMemoryMessageBroker
+
+        broker = InMemoryMessageBroker()
+        for _ in range(memory_module._MESSAGE_HISTORY + 25):
+            await broker.publish("busy", b"x")
+
+        assert len(broker.get_messages("busy")) == memory_module._MESSAGE_HISTORY

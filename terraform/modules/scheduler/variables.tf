@@ -13,12 +13,6 @@ variable "environment" {
   type        = string
 }
 
-variable "labels" {
-  description = "Labels to apply to Cloud Scheduler jobs"
-  type        = map(string)
-  default     = {}
-}
-
 variable "mastermind_url" {
   description = "The base URL of the Mastermind Cloud Run service"
   type        = string
@@ -26,6 +20,16 @@ variable "mastermind_url" {
 
 variable "forge_url" {
   description = "The base URL of the Forge Cloud Run service"
+  type        = string
+}
+
+variable "mastermind_audience" {
+  description = "OIDC audience registered on the Mastermind service (custom_audiences), used for scheduler tokens"
+  type        = string
+}
+
+variable "forge_audience" {
+  description = "OIDC audience registered on the Forge service (custom_audiences), used for scheduler tokens"
   type        = string
 }
 

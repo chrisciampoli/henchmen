@@ -55,6 +55,41 @@ class SemanticChunk(StrictBase):
     relevance_score: float = Field(..., description="Similarity score from vector search (0-1)")
 
 
+class TaskAnalysis(StrictBase):
+    """Analyzed task with extracted context clues.
+
+    Produced by ``henchmen.dossier.task_analyzer.TaskAnalyzer`` in the
+    Mastermind and re-parsed by the Operative from ``dossier.json``, so it
+    lives here with the other cross-component contracts.
+    """
+
+    task_type: str = Field(default="generic", description="Detected task type")
+    mentioned_files: list[str] = Field(default_factory=list, description="File paths mentioned in the task")
+    mentioned_errors: list[str] = Field(default_factory=list, description="Error patterns mentioned")
+    keywords: list[str] = Field(default_factory=list, description="Important keywords for file search")
+    ci_related: bool = Field(default=False, description="Whether this involves CI/test failures")
+    specific_file_target: str | None = Field(default=None, description="If a specific file is targeted")
+
+
+class RepoConventions(StrictBase):
+    """Detected conventions for a repository.
+
+    Produced by ``henchmen.dossier.convention_detector.detect_conventions``
+    and consumed by the Operative's system-prompt builder.
+    """
+
+    test_framework: str | None = Field(default=None, description="Detected test framework: pytest, jest, mocha, etc.")
+    import_style: str | None = Field(default=None, description="Import style: absolute, relative")
+    error_handling: str | None = Field(
+        default=None, description="Error handling pattern: try/except, Result type, etc."
+    )
+    type_system: str | None = Field(default=None, description="Type checking system: mypy, typescript strict, etc.")
+    naming_convention: str | None = Field(default=None, description="Naming convention: snake_case, camelCase")
+    indentation: str | None = Field(default=None, description="Indentation style: 2-space, 4-space, tabs")
+    lint_config: str | None = Field(default=None, description="Lint tool: ruff, eslint, flake8, etc.")
+    package_manager: str | None = Field(default=None, description="Package manager: pip, pnpm, npm, poetry, etc.")
+
+
 class Dossier(StrictBase):
     """Complete context package assembled for an operative prior to execution."""
 
@@ -77,13 +112,6 @@ class Dossier(StrictBase):
     conventions: RepoConventions | None = Field(
         default=None, description="Detected project conventions (test framework, lint config, naming, etc.)"
     )
-    repo_structure: str = Field(default="", description="Condensed directory tree of the repository")
-    artifact_uri: str | None = Field(default=None, description="GCS URI if this dossier has been serialized to storage")
-
-
-# Import here to avoid circular dependency — TaskAnalysis is used in Dossier annotation above
-# RepoConventions is referenced in Dossier via forward annotation — import and rebuild
-from henchmen.dossier.convention_detector import RepoConventions  # noqa: E402, F811
-from henchmen.dossier.task_analyzer import TaskAnalysis  # noqa: E402, F811
-
-Dossier.model_rebuild()
+    artifact_uri: str | None = Field(
+        default=None, description="Object-store URI if this dossier has been serialized to storage"
+    )

@@ -1,11 +1,11 @@
 """Operative models - represents a running agent instance and its report."""
 
-from datetime import datetime
 from enum import StrEnum
 
-from pydantic import Field
+from pydantic import AwareDatetime, Field
 
 from henchmen.models._base import StrictBase
+from henchmen.models.llm import ModelTier
 
 
 class OperativeStatus(StrEnum):
@@ -26,7 +26,13 @@ class OperativeConfig(StrictBase):
     task_id: str = Field(..., description="ID of the parent HenchmenTask")
     node_id: str = Field(..., description="Scheme node this operative is executing")
     scheme_id: str = Field(..., description="Scheme definition this operative belongs to")
-    model_name: str = Field(default="gemini-2.5-pro", description="Vertex AI model to use")
+    model_name: str = Field(
+        default=ModelTier.COMPLEX.value,
+        description=(
+            "Model tier (a ModelTier value such as 'default/complex') or a concrete model id; "
+            "resolved by the active LLM provider via henchmen.providers.tiers.resolve_model_name"
+        ),
+    )
     cpu: str = Field(default="4", description="vCPU allocation for the Cloud Run container")
     memory: str = Field(default="8Gi", description="Memory allocation for the Cloud Run container")
     timeout_seconds: int = Field(default=1800, description="Maximum execution time in seconds")
@@ -58,8 +64,10 @@ class OperativeReport(StrictBase):
     files_changed: list[str] = Field(default_factory=list, description="List of file paths modified")
     error: str | None = Field(default=None, description="Error message if the operative failed")
     block_reason: str | None = Field(default=None, description="Reason the operative is blocked (if status=BLOCKED)")
-    started_at: datetime = Field(..., description="UTC timestamp when the operative began executing")
-    completed_at: datetime | None = Field(default=None, description="UTC timestamp when the operative finished")
+    # Timezone-aware only: a naive datetime would silently mix with UTC values in
+    # Firestore ordering and wall_clock_seconds arithmetic (CLAUDE.md: always UTC).
+    started_at: AwareDatetime = Field(..., description="UTC timestamp when the operative began executing")
+    completed_at: AwareDatetime | None = Field(default=None, description="UTC timestamp when the operative finished")
     # Telemetry
     model_name: str = Field(default="", description="Model that was used for this operative")
     total_input_tokens: int = Field(default=0, description="Total input tokens consumed")

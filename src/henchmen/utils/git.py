@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -97,5 +96,12 @@ async def fetch_remote_ref(workspace: str, remote: str = "origin", ref: str = "m
 
 
 def get_github_token() -> str:
-    """Return the GitHub token from the environment, or empty string."""
-    return os.environ.get("GITHUB_TOKEN", "")
+    """Return the configured GitHub token, or an empty string.
+
+    Sourced from ``Settings.github_token``, which accepts both the
+    ``HENCHMEN_GITHUB_TOKEN`` spelling written to ``.env.local`` and the bare
+    ``GITHUB_TOKEN`` that Cloud Run secret mounts inject.
+    """
+    from henchmen.config.settings import get_settings
+
+    return get_settings().github_token

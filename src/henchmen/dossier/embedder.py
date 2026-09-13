@@ -4,47 +4,93 @@ Uses RAG Engine's managed corpus for auto-embedding and semantic retrieval.
 Pre-chunks code with our AST-aware chunker, then uploads each chunk as a
 separate RAG file to preserve symbol boundaries.
 
-Commit tracking metadata is stored via DocumentStore.
+Chunk metadata (repo, file path, line span, symbol, language) travels in a
+header line prepended to the uploaded chunk text, because ``RagFile``
+display names are capped at 128 characters and real paths blow past that.
+The display name carries only a bounded routing key so deletions can still
+find every file belonging to a source path.
 
-NOTE: This module is tightly coupled to Vertex AI RAG Engine. Abstracting
-behind a generic RAG provider interface is tracked as a roadmap item.
-See https://github.com/chrisciampoli/henchmen/issues — search "RAG provider".
+Commit tracking metadata is stored via the configured ``DocumentStore``.
+
+This module is tightly coupled to Vertex AI RAG Engine: when the SDK is not
+installed (``HENCHMEN_PROVIDER=local`` installs), indexing is a no-op and
+retrieval returns an empty list so the dossier pipeline degrades to
+grep-only context.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import logging
 import os
 import tempfile
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
+from pydantic import Field
+
+from henchmen.models._base import StrictBase
 from henchmen.models.dossier import SemanticChunk
 from henchmen.providers.interfaces.document_store import DocumentStore
 
 if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
     from henchmen.dossier.chunker import CodeChunk
 
 logger = logging.getLogger(__name__)
 
-# Vertex AI RAG Engine is optional. When ``vertexai`` is not installed or the
-# ``rag`` submodule is unavailable (e.g. running locally without a GCP SDK),
-# the dossier pipeline degrades to a grep-only mode: retrieval returns an
-# empty list, and indexing is a no-op. This lets ``HENCHMEN_PROVIDER=local``
-# developers run the system without a cloud account.
-try:
-    from vertexai import rag as _rag_module
-except ImportError:  # pragma: no cover — exercised by local-mode runs
-    _rag_module = None  # type: ignore[assignment]
+
+@lru_cache(maxsize=1)
+def _vertexai_installed() -> bool:
+    """Return True when the ``vertexai`` distribution is importable.
+
+    Uses ``find_spec`` rather than a module-level import: importing
+    ``vertexai.rag`` costs tens of seconds and would be paid by every
+    Mastermind cold start and every unit-test session that merely touches
+    this module.
+    """
+    try:
+        return importlib.util.find_spec("vertexai") is not None
+    except (ImportError, ValueError):  # pragma: no cover — broken install
+        return False
 
 
 def _rag_available() -> bool:
     """Return True when the Vertex AI RAG Engine SDK is importable."""
-    return _rag_module is not None
+    return _vertexai_installed()
 
 
 _UPLOAD_BATCH_SIZE: int = 50  # Chunks per batch to avoid rate limits
+_MAX_RETRIEVAL_TOP_K: int = 100  # Server-side cap we never exceed
+_CHUNK_CONTENT_LIMIT: int = 4000  # Characters of chunk body uploaded
+
+# Marker for the metadata header line prepended to every uploaded chunk.
+_CHUNK_HEADER_PREFIX = "# henchmen-chunk|"
+# Marker for the bounded display-name format (v2). Legacy files uploaded
+# before the 128-character cap was honoured use the pipe-separated metadata
+# format and are still parsed on retrieval and deletion.
+_DISPLAY_NAME_PREFIX = "h2|"
+
+
+class UpsertResult(StrictBase):
+    """Outcome of an ``upsert_chunks`` call.
+
+    ``upsert_chunks`` used to return a bare count, which callers could not
+    distinguish from "RAG unavailable" or "every upload failed" — so a
+    failed index run still looked like a success and the last-indexed commit
+    was advanced past files whose chunks were lost.
+    """
+
+    uploaded: int = Field(default=0, description="Chunks successfully uploaded to the corpus")
+    failed: int = Field(default=0, description="Chunks that could not be uploaded")
+    skipped_reason: str = Field(default="", description="Why the upsert was skipped entirely, if it was")
+
+    @property
+    def ok(self) -> bool:
+        """True when every requested chunk was uploaded and nothing was skipped."""
+        return self.failed == 0 and not self.skipped_reason
 
 
 def chunk_record_id(repo: str, file_path: str, start_line: int, end_line: int) -> str:
@@ -54,6 +100,110 @@ def chunk_record_id(repo: str, file_path: str, start_line: int, end_line: int) -
     """
     key = f"{repo}:{file_path}:{start_line}:{end_line}"
     return hashlib.sha256(key.encode()).hexdigest()[:40]
+
+
+def source_path_key(repo: str, file_path: str) -> str:
+    """Bounded routing key for every chunk of one source file in one repo."""
+    return hashlib.sha256(f"{repo}:{file_path}".encode()).hexdigest()[:32]
+
+
+def _resolve_settings(settings: Settings | None) -> Settings:
+    """Return the supplied settings or the process-wide singleton."""
+    if settings is not None:
+        return settings
+    from henchmen.config.settings import get_settings
+
+    return get_settings()
+
+
+def _corpus_defaults(
+    settings: Settings | None,
+    corpus_display_name: str,
+    project_id: str,
+    region: str,
+) -> tuple[str, str, str]:
+    """Fill empty corpus coordinates from Settings (never from literals)."""
+    if corpus_display_name and project_id and region:
+        return corpus_display_name, project_id, region
+    try:
+        resolved = _resolve_settings(settings)
+    except Exception:  # pragma: no cover — misconfigured env; keep caller values
+        logger.warning("Could not load Settings for RAG corpus defaults", exc_info=True)
+        return corpus_display_name, project_id, region
+    return (
+        corpus_display_name or resolved.rag_corpus_display_name,
+        project_id or resolved.gcp_project_id,
+        region or resolved.rag_corpus_region,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chunk metadata encoding
+# ---------------------------------------------------------------------------
+
+
+def build_display_name(repo: str, chunk: CodeChunk) -> str:
+    """Return the RagFile display name for a chunk.
+
+    ``RagFile.display_name`` is capped at 128 characters by the API, so the
+    name carries only two bounded hashes: the source-path key (used by
+    deletion) and the chunk record id (used for idempotency/debugging).
+    Human-readable metadata lives in the chunk header instead.
+    """
+    path_key = source_path_key(repo, chunk.file_path)
+    record_id = chunk_record_id(repo, chunk.file_path, chunk.start_line, chunk.end_line)
+    return f"{_DISPLAY_NAME_PREFIX}{path_key}|{record_id}"
+
+
+def build_chunk_payload(repo: str, chunk: CodeChunk) -> str:
+    """Return the text uploaded for a chunk: metadata header + source body."""
+    header = (
+        f"{_CHUNK_HEADER_PREFIX}{repo}|{chunk.file_path}|{chunk.start_line}|"
+        f"{chunk.end_line}|{chunk.symbol_name or ''}|{chunk.language}|{chunk.chunk_type}"
+    )
+    return f"{header}\n{chunk.content[:_CHUNK_CONTENT_LIMIT]}"
+
+
+def _parse_chunk_header(text: str) -> tuple[str, str, int, int, str, str] | None:
+    """Parse ``(repo, file_path, start, end, symbol, language)`` from chunk text."""
+    if not text:
+        return None
+    first_line = text.split("\n", 1)[0]
+    if not first_line.startswith(_CHUNK_HEADER_PREFIX):
+        return None
+    parts = first_line[len(_CHUNK_HEADER_PREFIX) :].split("|")
+    if len(parts) < 6:
+        return None
+    try:
+        return (parts[0], parts[1], int(parts[2]), int(parts[3]), parts[4], parts[5])
+    except ValueError:
+        return None
+
+
+def _strip_chunk_header(text: str) -> str:
+    """Return chunk text with the metadata header line removed."""
+    if text.startswith(_CHUNK_HEADER_PREFIX):
+        _, _, rest = text.partition("\n")
+        return rest
+    return text
+
+
+def _parse_display_name(display_name: str, default_repo: str) -> tuple[str, str, int, int, str, str] | None:
+    """Parse legacy pipe-separated metadata from a RAG file display name.
+
+    Legacy format: ``record_id|repo|file_path|start|end|symbol|language|chunk_type``.
+    Returns ``(repo, file_path, start_line, end_line, symbol_name, language)``
+    or ``None`` when the name carries no metadata (v2 names, or garbage).
+    """
+    if not display_name or display_name.startswith(_DISPLAY_NAME_PREFIX):
+        return None
+    parts = display_name.split("|")
+    if len(parts) >= 7:
+        try:
+            return (parts[1] or default_repo, parts[2], int(parts[3]), int(parts[4]), parts[5], parts[6])
+        except ValueError:
+            return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -68,16 +218,68 @@ def _init_vertex(project_id: str, region: str) -> None:
     vertexai.init(project=project_id, location=region)
 
 
-async def get_or_create_corpus(
-    corpus_display_name: str = "henchmen-code",
+# Resolved corpus resource names, keyed by (project_id, region, display_name).
+# A corpus resource name never changes, so caching avoids an O(corpora)
+# list_corpora round-trip on every task.
+_CORPUS_CACHE: dict[tuple[str, str, str], str] = {}
+
+
+def _reset_corpus_cache() -> None:
+    """Clear the resolved-corpus cache (tests and long-lived processes)."""
+    _CORPUS_CACHE.clear()
+
+
+async def get_corpus(
+    corpus_display_name: str = "",
     project_id: str = "",
-    region: str = "us-central1",
+    region: str = "",
+    settings: Settings | None = None,
+) -> str:
+    """Look up an existing RAG corpus by display name without creating one.
+
+    Returns the corpus resource name, or an empty string when it does not
+    exist or the Vertex AI RAG Engine SDK is unavailable. Read paths must use
+    this rather than ``get_or_create_corpus`` so a query never creates an
+    empty corpus as a side effect.
+    """
+    if not _rag_available():
+        logger.warning("Vertex AI RAG is not available — dossier will run in grep-only mode (get_corpus is a no-op)")
+        return ""
+
+    corpus_display_name, project_id, region = _corpus_defaults(settings, corpus_display_name, project_id, region)
+    cache_key = (project_id, region, corpus_display_name)
+    cached = _CORPUS_CACHE.get(cache_key)
+    if cached:
+        return cached
+
+    def _do() -> str:
+        from vertexai import rag
+
+        _init_vertex(project_id, region)
+        for corpus in rag.list_corpora():
+            if corpus.display_name == corpus_display_name:
+                return str(corpus.name)
+        return ""
+
+    name = await asyncio.to_thread(_do)
+    if name:
+        _CORPUS_CACHE[cache_key] = name
+    return name
+
+
+async def get_or_create_corpus(
+    corpus_display_name: str = "",
+    project_id: str = "",
+    region: str = "",
+    embedding_model: str = "",
+    settings: Settings | None = None,
 ) -> str:
     """Get an existing RAG corpus by display name, or create one.
 
     Returns the corpus resource name (e.g. ``projects/.../locations/.../ragCorpora/...``).
     Returns an empty string when the Vertex AI RAG Engine SDK is unavailable
     (e.g. local mode), allowing callers to gracefully skip RAG operations.
+    Only the indexing path should call this — reads use :func:`get_corpus`.
     """
     if not _rag_available():
         logger.warning(
@@ -85,21 +287,30 @@ async def get_or_create_corpus(
         )
         return ""
 
+    corpus_display_name, project_id, region = _corpus_defaults(settings, corpus_display_name, project_id, region)
+    if not embedding_model:
+        try:
+            embedding_model = _resolve_settings(settings).rag_embedding_model
+        except Exception:  # pragma: no cover — misconfigured env
+            logger.warning("Could not load Settings for RAG embedding model", exc_info=True)
+
+    existing = await get_corpus(corpus_display_name, project_id, region, settings=settings)
+    if existing:
+        logger.info("Found existing RAG corpus: %s", existing)
+        return existing
+
+    if not embedding_model:
+        logger.error("No RAG embedding model configured (HENCHMEN_RAG_EMBEDDING_MODEL); cannot create corpus")
+        return ""
+
     def _do() -> str:
         from vertexai import rag
 
         _init_vertex(project_id, region)
 
-        # Check if corpus already exists
-        for corpus in rag.list_corpora():
-            if corpus.display_name == corpus_display_name:
-                logger.info("Found existing RAG corpus: %s", corpus.name)
-                return str(corpus.name)
-
-        # Create new corpus with text-embedding-005
         embedding_config = rag.RagEmbeddingModelConfig(
             vertex_prediction_endpoint=rag.VertexPredictionEndpoint(
-                publisher_model="publishers/google/models/text-embedding-005"
+                publisher_model=f"publishers/google/models/{embedding_model}"
             )
         )
         new_corpus = rag.create_corpus(
@@ -112,12 +323,21 @@ async def get_or_create_corpus(
         logger.info("Created RAG corpus: %s", new_corpus.name)
         return str(new_corpus.name)
 
-    return await asyncio.to_thread(_do)
+    name = await asyncio.to_thread(_do)
+    if name:
+        _CORPUS_CACHE[(project_id, region, corpus_display_name)] = name
+    return name
 
 
 # ---------------------------------------------------------------------------
 # Upsert (upload pre-chunked code as individual RAG files)
 # ---------------------------------------------------------------------------
+
+
+def _is_rate_limit(exc: BaseException) -> bool:
+    """True when an exception looks like a Vertex AI quota / rate-limit error."""
+    text = str(exc)
+    return "RESOURCE_EXHAUSTED" in text or "429" in text
 
 
 async def upsert_chunks(
@@ -126,56 +346,89 @@ async def upsert_chunks(
     commit_sha: str,
     corpus_name: str = "",
     project_id: str = "",
-    region: str = "us-central1",
-    # Legacy params (ignored)
+    region: str = "",
     collection_name: str = "",
-    pinecone_api_key: str = "",
-    index_name: str = "",
-) -> int:
+    replace_existing: bool = False,
+    settings: Settings | None = None,
+) -> UpsertResult:
     """Upload pre-chunked code to a RAG corpus.
 
     Each chunk is written to a temp file and uploaded via ``rag.upload_file``.
-    The file display_name encodes metadata (repo, file_path, lines, symbol)
-    so we can reconstruct it on retrieval.
+    Chunk metadata travels in the uploaded text's header line so retrieval can
+    reconstruct it without exceeding the 128-character display-name cap.
 
-    Returns the number of chunks uploaded. When the Vertex AI RAG Engine SDK
-    is unavailable, returns ``0`` and logs a warning.
+    Args:
+        chunks: Pre-chunked source code.
+        repo: ``owner/repo`` slug the chunks belong to.
+        commit_sha: Commit the chunks were produced from (recorded in the
+            RagFile description for debugging).
+        corpus_name: Resolved corpus resource name; looked up when empty.
+        project_id: GCP project; defaults to ``settings.gcp_project_id``.
+        region: RAG corpus region; defaults to ``settings.rag_corpus_region``.
+        collection_name: Corpus *display* name; defaults to
+            ``settings.rag_corpus_display_name``.
+        replace_existing: Delete every RagFile already indexed for ``repo``
+            before uploading. Required for a full re-index, which would
+            otherwise duplicate every chunk.
+        settings: Settings override (defaults to the process singleton).
+
+    Returns:
+        An :class:`UpsertResult` distinguishing success, partial failure and
+        "skipped because RAG is unavailable".
     """
     if not chunks:
-        return 0
+        return UpsertResult()
 
     if not _rag_available():
         logger.warning(
             "Vertex AI RAG is not available — skipping upsert of %d chunks (grep-only mode)",
             len(chunks),
         )
-        return 0
+        return UpsertResult(skipped_reason="vertex-ai-rag-unavailable")
+
+    corpus_display_name, project_id, region = _corpus_defaults(settings, collection_name, project_id, region)
 
     if not corpus_name:
         corpus_name = await get_or_create_corpus(
-            corpus_display_name=collection_name or "henchmen-code",
+            corpus_display_name=corpus_display_name,
             project_id=project_id,
             region=region,
+            settings=settings,
+        )
+    if not corpus_name:
+        return UpsertResult(skipped_reason="rag-corpus-unavailable")
+
+    if replace_existing:
+        await delete_repo_chunks(
+            repo,
+            corpus_name=corpus_name,
+            project_id=project_id,
+            region=region,
+            collection_name=corpus_display_name,
+            settings=settings,
         )
 
-    def _upload_batch(batch: list[CodeChunk]) -> int:
+    def _upload_batch(batch: list[CodeChunk]) -> tuple[int, list[CodeChunk], int]:
+        """Upload a batch.
+
+        Returns ``(uploaded, remaining_after_rate_limit, permanently_failed)``.
+        Rate-limit errors stop the batch and hand the remaining chunks back so
+        the caller can back off and retry them — previously they were caught
+        per chunk here, which made the retry loop unreachable.
+        """
         from vertexai import rag
 
         _init_vertex(project_id, region)
         uploaded = 0
+        failed = 0
 
-        for chunk in batch:
-            record_id = chunk_record_id(repo, chunk.file_path, chunk.start_line, chunk.end_line)
-            # Encode metadata in display_name for retrieval reconstruction
-            display_name = (
-                f"{record_id}|{repo}|{chunk.file_path}|{chunk.start_line}|"
-                f"{chunk.end_line}|{chunk.symbol_name or ''}|{chunk.language}|{chunk.chunk_type}"
-            )
+        for index, chunk in enumerate(batch):
+            display_name = build_display_name(repo, chunk)
+            content = build_chunk_payload(repo, chunk)
 
             # Write chunk to temp file (RAG Engine requires file upload).
             # Use delete=False + manual unlink so the file survives the with
             # block until rag.upload_file has finished reading it.
-            content = f"# {chunk.file_path}\n{chunk.content[:4000]}"
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 suffix=".txt",
@@ -194,37 +447,45 @@ async def upsert_chunks(
                 )
                 uploaded += 1
             except Exception as exc:
-                if "ALREADY_EXISTS" in str(exc):
-                    uploaded += 1  # Count as success — idempotent
-                else:
-                    logger.warning("Failed to upload chunk %s: %s", record_id, exc)
+                if _is_rate_limit(exc):
+                    return uploaded, batch[index:], failed
+                failed += 1
+                logger.warning("Failed to upload chunk %s: %s", display_name, exc)
             finally:
                 os.unlink(tmp_path)
 
-        return uploaded
+        return uploaded, [], failed
 
-    # Upload in batches with rate limiting
     total = 0
+    total_failed = 0
     for i in range(0, len(chunks), _UPLOAD_BATCH_SIZE):
-        batch = chunks[i : i + _UPLOAD_BATCH_SIZE]
+        pending = chunks[i : i + _UPLOAD_BATCH_SIZE]
         for attempt in range(3):
             try:
-                count = await asyncio.to_thread(_upload_batch, batch)
-                total += count
-                break
+                count, pending, failed = await asyncio.to_thread(_upload_batch, pending)
             except Exception as exc:
-                if "RESOURCE_EXHAUSTED" in str(exc) or "429" in str(exc):
-                    wait = (attempt + 1) * 15
-                    logger.warning("Rate limited, waiting %ds (batch %d)...", wait, i)
-                    await asyncio.sleep(wait)
-                else:
-                    logger.error("Upload batch %d failed: %s", i, exc)
-                    break
+                logger.error("Upload batch %d failed: %s", i, exc)
+                total_failed += len(pending)
+                pending = []
+                break
+            total += count
+            total_failed += failed
+            if not pending:
+                break
+            wait = (attempt + 1) * 15
+            logger.warning("Rate limited, waiting %ds before retrying %d chunks (batch %d)", wait, len(pending), i)
+            await asyncio.sleep(wait)
+        if pending:
+            logger.error("Giving up on %d chunks in batch %d after rate-limit retries", len(pending), i)
+            total_failed += len(pending)
         if total > 0 and total % 200 == 0:
             logger.info("Uploaded %d/%d chunks...", total, len(chunks))
 
-    logger.info("Uploaded %d chunks to RAG corpus", total)
-    return total
+    if total_failed:
+        logger.error("Uploaded %d chunks to RAG corpus; %d chunks failed", total, total_failed)
+    else:
+        logger.info("Uploaded %d chunks to RAG corpus", total)
+    return UpsertResult(uploaded=total, failed=total_failed)
 
 
 # ---------------------------------------------------------------------------
@@ -232,20 +493,59 @@ async def upsert_chunks(
 # ---------------------------------------------------------------------------
 
 
+async def _delete_matching(
+    repo: str,
+    corpus_name: str,
+    project_id: str,
+    region: str,
+    file_paths: list[str] | None,
+) -> int:
+    """Delete RagFiles for ``repo``; when ``file_paths`` is None, delete all."""
+    path_keys = {source_path_key(repo, path) for path in file_paths} if file_paths is not None else None
+    path_set = set(file_paths) if file_paths is not None else None
+
+    def _delete() -> int:
+        from vertexai import rag
+
+        _init_vertex(project_id, region)
+        deleted = 0
+        for rag_file in rag.list_files(corpus_name=corpus_name):
+            display_name = rag_file.display_name or ""
+            matches = False
+            if display_name.startswith(_DISPLAY_NAME_PREFIX):
+                parts = display_name.split("|")
+                if len(parts) >= 2:
+                    matches = path_keys is None or parts[1] in path_keys
+            else:
+                legacy = _parse_display_name(display_name, repo)
+                if legacy is not None:
+                    file_repo, file_path = legacy[0], legacy[1]
+                    matches = file_repo == repo and (path_set is None or file_path in path_set)
+            if not matches:
+                continue
+            try:
+                rag.delete_file(name=rag_file.name)
+                deleted += 1
+            except Exception as exc:
+                logger.warning("Failed to delete RAG file %s: %s", rag_file.name, exc)
+        return deleted
+
+    return await asyncio.to_thread(_delete)
+
+
 async def delete_file_chunks(
     repo: str,
     file_paths: list[str],
     corpus_name: str = "",
     project_id: str = "",
-    region: str = "us-central1",
-    # Legacy params (ignored)
+    region: str = "",
     collection_name: str = "",
-    pinecone_api_key: str = "",
-    index_name: str = "",
+    settings: Settings | None = None,
 ) -> None:
     """Delete RAG files for the given source file paths.
 
-    No-op when the Vertex AI RAG Engine SDK is unavailable (local mode).
+    No-op when the Vertex AI RAG Engine SDK is unavailable (local mode) or
+    when the corpus does not exist — a delete must never create one.
     """
     if not _rag_available():
         logger.warning(
@@ -254,43 +554,67 @@ async def delete_file_chunks(
         )
         return
 
+    corpus_display_name, project_id, region = _corpus_defaults(settings, collection_name, project_id, region)
+
     if not corpus_name:
         try:
-            corpus_name = await get_or_create_corpus(
-                corpus_display_name=collection_name or "henchmen-code",
+            corpus_name = await get_corpus(
+                corpus_display_name=corpus_display_name,
                 project_id=project_id,
                 region=region,
+                settings=settings,
             )
         except Exception as exc:
             logger.warning("Could not get corpus for deletion: %s", exc)
             return
-
-    file_path_set = set(file_paths)
-
-    def _delete() -> int:
-        from vertexai import rag
-
-        _init_vertex(project_id, region)
-        deleted = 0
-        for rag_file in rag.list_files(corpus_name=corpus_name):
-            # Parse metadata from display_name
-            parts = (rag_file.display_name or "").split("|")
-            if len(parts) >= 3:
-                file_repo = parts[1]
-                file_path = parts[2]
-                if file_repo == repo and file_path in file_path_set:
-                    try:
-                        rag.delete_file(name=rag_file.name)
-                        deleted += 1
-                    except Exception as exc:
-                        logger.warning("Failed to delete RAG file %s: %s", rag_file.name, exc)
-        return deleted
+    if not corpus_name:
+        logger.info("No RAG corpus %r; nothing to delete", corpus_display_name)
+        return
 
     try:
-        count = await asyncio.to_thread(_delete)
+        count = await _delete_matching(repo, corpus_name, project_id, region, file_paths)
         logger.info("Deleted %d RAG files for %d source files", count, len(file_paths))
     except Exception as exc:
         logger.warning("RAG file deletion failed: %s", exc)
+
+
+async def delete_repo_chunks(
+    repo: str,
+    corpus_name: str = "",
+    project_id: str = "",
+    region: str = "",
+    collection_name: str = "",
+    settings: Settings | None = None,
+) -> None:
+    """Delete every indexed RagFile belonging to ``repo``.
+
+    Used before a full re-index; without it a re-index duplicates every chunk
+    because ``rag.upload_file`` always creates a new server-side file.
+    """
+    if not _rag_available():
+        return
+
+    corpus_display_name, project_id, region = _corpus_defaults(settings, collection_name, project_id, region)
+
+    if not corpus_name:
+        try:
+            corpus_name = await get_corpus(
+                corpus_display_name=corpus_display_name,
+                project_id=project_id,
+                region=region,
+                settings=settings,
+            )
+        except Exception as exc:
+            logger.warning("Could not get corpus for repo deletion: %s", exc)
+            return
+    if not corpus_name:
+        return
+
+    try:
+        count = await _delete_matching(repo, corpus_name, project_id, region, None)
+        logger.info("Deleted %d RAG files for %s before re-index", count, repo)
+    except Exception as exc:
+        logger.warning("RAG repo deletion failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -303,16 +627,17 @@ async def query_similar_chunks(
     repo: str,
     corpus_name: str = "",
     project_id: str = "",
-    region: str = "us-central1",
+    region: str = "",
     top_k: int = 20,
-    # Legacy params (ignored)
     collection_name: str = "",
-    pinecone_api_key: str = "",
-    index_name: str = "",
+    settings: Settings | None = None,
 ) -> list[SemanticChunk]:
     """Search for semantically similar code chunks using RAG Engine retrieval.
 
-    The corpus handles embedding the query automatically.
+    The corpus handles embedding the query automatically. Results from other
+    repositories sharing the corpus are dropped, so an operative is never
+    shown code from a repo it is not working on.
+
     Returns an empty list on any error or when the Vertex AI RAG Engine SDK
     is unavailable (graceful degradation).
     """
@@ -320,16 +645,25 @@ async def query_similar_chunks(
         logger.warning("Vertex AI RAG is not available — returning empty retrieval result (grep-only mode)")
         return []
 
+    corpus_display_name, project_id, region = _corpus_defaults(settings, collection_name, project_id, region)
+
     if not corpus_name:
         try:
-            corpus_name = await get_or_create_corpus(
-                corpus_display_name=collection_name or "henchmen-code",
+            corpus_name = await get_corpus(
+                corpus_display_name=corpus_display_name,
                 project_id=project_id,
                 region=region,
+                settings=settings,
             )
         except Exception:
             logger.warning("Could not get corpus for query, returning empty", exc_info=True)
             return []
+    if not corpus_name:
+        logger.info("No RAG corpus %r; returning empty retrieval result", corpus_display_name)
+        return []
+
+    # Over-fetch so the client-side repo filter still leaves top_k results.
+    fetch_k = min(max(top_k * 3, top_k), _MAX_RETRIEVAL_TOP_K)
 
     def _query() -> list[SemanticChunk]:
         from vertexai import rag
@@ -339,7 +673,7 @@ async def query_similar_chunks(
         response = rag.retrieval_query(
             text=query_text,
             rag_resources=[rag.RagResource(rag_corpus=corpus_name)],
-            rag_retrieval_config=rag.RagRetrievalConfig(top_k=top_k),
+            rag_retrieval_config=rag.RagRetrievalConfig(top_k=fetch_k),
         )
 
         chunks: list[SemanticChunk] = []
@@ -347,12 +681,25 @@ async def query_similar_chunks(
             return chunks
 
         for ctx in response.contexts.contexts:
-            # Try to reconstruct metadata from the source display_name
-            source = getattr(ctx, "source_display_name", "") or getattr(ctx, "source_uri", "") or ""
-            file_path, start_line, end_line, symbol_name, language = _parse_display_name(source, repo)
-            score = float(getattr(ctx, "distance", 0.0) or 0.0)
-            # RAG Engine returns distance (lower = better); convert to similarity
-            relevance = max(0.0, 1.0 - score) if score > 0 else 0.5
+            text = ctx.text or ""
+            meta = _parse_chunk_header(text)
+            if meta is None:
+                source = getattr(ctx, "source_display_name", "") or getattr(ctx, "source_uri", "") or ""
+                meta = _parse_display_name(source, repo)
+            if meta is None:
+                logger.debug("Dropping RAG context with unparseable metadata")
+                continue
+
+            chunk_repo, file_path, start_line, end_line, symbol_name, language = meta
+            if chunk_repo != repo:
+                # Every repo shares one corpus; foreign chunks point at files
+                # that do not exist in this workspace.
+                continue
+
+            # RAG Engine reports ``score`` (a distance — lower is better).
+            # There is no ``distance`` attribute on the context object.
+            score = float(getattr(ctx, "score", 0.0) or 0.0)
+            relevance = max(0.0, min(1.0, 1.0 - score)) if score > 0 else 0.5
 
             chunks.append(
                 SemanticChunk(
@@ -361,33 +708,17 @@ async def query_similar_chunks(
                     end_line=end_line,
                     symbol_name=symbol_name or None,
                     language=language,
-                    content=ctx.text or "",
+                    content=_strip_chunk_header(text),
                     relevance_score=relevance,
                 )
             )
-        return chunks
+        return chunks[:top_k]
 
     try:
         return await asyncio.to_thread(_query)
     except Exception:
         logger.warning("RAG retrieval failed, returning empty results", exc_info=True)
         return []
-
-
-def _parse_display_name(display_name: str, default_repo: str) -> tuple[str, int, int, str, str]:
-    """Parse metadata from a RAG file display_name.
-
-    Format: ``record_id|repo|file_path|start_line|end_line|symbol_name|language|chunk_type``
-
-    Returns (file_path, start_line, end_line, symbol_name, language).
-    """
-    parts = display_name.split("|")
-    if len(parts) >= 7:
-        try:
-            return (parts[2], int(parts[3]), int(parts[4]), parts[5], parts[6])
-        except (ValueError, IndexError):
-            pass
-    return ("unknown", 0, 0, "", "")
 
 
 # ---------------------------------------------------------------------------
@@ -397,23 +728,37 @@ def _parse_display_name(display_name: str, default_repo: str) -> tuple[str, int,
 _METADATA_COLLECTION = "vector_search_metadata"
 
 
+def _default_document_store(settings: Settings | None, project_id: str) -> DocumentStore:
+    """Build the DocumentStore configured for this deployment.
+
+    Previously hardwired to Firestore, which silently failed under
+    ``HENCHMEN_PROVIDER=local`` (SQLite) and ``aws`` (DynamoDB): the import
+    error was swallowed, so every incremental index run became a full run and
+    commit SHAs were dropped.
+    """
+    from henchmen.providers.registry import ProviderRegistry
+
+    resolved = _resolve_settings(settings)
+    if project_id and not resolved.gcp_project_id:
+        resolved = resolved.model_copy(update={"gcp_project_id": project_id})
+    return ProviderRegistry(resolved).get_document_store()
+
+
 async def get_last_indexed_commit(
     repo: str,
     document_store: DocumentStore | None = None,
-    # Legacy params (ignored)
-    pinecone_api_key: str = "",
-    index_name: str = "",
+    settings: Settings | None = None,
     project_id: str = "",
 ) -> str | None:
-    """Read the last indexed commit SHA from DocumentStore."""
+    """Read the last indexed commit SHA from the configured DocumentStore."""
     try:
-        store = document_store or _make_fallback_document_store(project_id)
+        store = document_store or _default_document_store(settings, project_id)
         data: dict[str, Any] | None = await store.get(_METADATA_COLLECTION, repo)
         if data and "commit_sha" in data:
             return str(data["commit_sha"])
         return None
     except Exception:
-        logger.warning("Failed to read last indexed commit for %s", repo, exc_info=True)
+        logger.error("Failed to read last indexed commit for %s", repo, exc_info=True)
         return None
 
 
@@ -421,29 +766,13 @@ async def set_last_indexed_commit(
     repo: str,
     commit_sha: str,
     document_store: DocumentStore | None = None,
-    # Legacy params (ignored)
-    pinecone_api_key: str = "",
-    index_name: str = "",
+    settings: Settings | None = None,
     project_id: str = "",
 ) -> None:
-    """Store the last indexed commit SHA in DocumentStore."""
+    """Store the last indexed commit SHA in the configured DocumentStore."""
     try:
-        store = document_store or _make_fallback_document_store(project_id)
+        store = document_store or _default_document_store(settings, project_id)
         await store.set(_METADATA_COLLECTION, repo, {"commit_sha": commit_sha, "repo": repo})
         logger.info("Set last indexed commit for %s to %s", repo, commit_sha)
     except Exception:
-        logger.warning("Failed to set last indexed commit for %s", repo, exc_info=True)
-
-
-def _make_fallback_document_store(project_id: str) -> DocumentStore:
-    """Create a GCP Firestore DocumentStore using a minimal settings stub.
-
-    Used when callers don't inject a DocumentStore (backward compatibility).
-    """
-    from henchmen.providers.gcp.firestore import FirestoreDocumentStore
-
-    class _MinimalSettings:
-        gcp_project_id: str = project_id
-        firestore_database: str = "(default)"
-
-    return FirestoreDocumentStore(_MinimalSettings())  # type: ignore[arg-type]
+        logger.error("Failed to set last indexed commit for %s", repo, exc_info=True)

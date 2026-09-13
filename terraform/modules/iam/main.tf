@@ -1,23 +1,26 @@
 # ---------------------------------------------------------------------------
 # IAM module — service accounts and their role bindings.
 #
-# Defense in depth: the conditions applied below (Vertex AI publisher scoping,
-# Cloud Run service-name prefix scoping) are *secondary* controls. The primary
-# enforcement boundary is still VPC Service Controls + the service perimeter
-# configured around this project. If a role binding here is wrong but VPC-SC
-# is correct, the blast radius is bounded by the perimeter. The conditions
-# here exist to shrink the blast radius further and to make the least-
-# privilege intent auditable from the terraform state alone.
+# Defense in depth: the conditions applied below (Vertex AI publisher scoping)
+# are *secondary* controls. The primary enforcement boundary is still VPC
+# Service Controls + the service perimeter configured around this project. If
+# a role binding here is wrong but VPC-SC is correct, the blast radius is
+# bounded by the perimeter. The conditions here exist to shrink the blast
+# radius further and to make the least-privilege intent auditable from the
+# terraform state alone.
 #
-# Firestore: collection-level ACLs cannot be expressed via google_project_iam
-# resources. Per-collection authorization must be enforced by Firestore
-# Security Rules (see terraform/modules/data-stores/firestore.rules) deployed
-# via the Firebase CLI or a google_firebaserules_ruleset resource — out of
-# scope for this module.
+# Conditions are deliberately written so that they cannot *silently* deny a
+# call the runtime actually makes: a condition that matches no real resource
+# name is indistinguishable from having no binding at all. See the comment on
+# the Vertex AI binding below.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Service Accounts
+#
+# One per workload identity. Arsenal has no service account because it runs
+# in-process inside the Operative container, and Dossier has none because it
+# is a library that runs inside Mastermind.
 # ---------------------------------------------------------------------------
 
 resource "google_service_account" "mastermind" {
@@ -41,13 +44,6 @@ resource "google_service_account" "operative" {
   description  = "Service account for Operative agent runner jobs"
 }
 
-resource "google_service_account" "arsenal" {
-  project      = var.project_id
-  account_id   = "sa-${var.environment}-arsenal"
-  display_name = "Henchmen ${var.environment} Arsenal Service Account"
-  description  = "Service account for the Arsenal MCP tool server"
-}
-
 resource "google_service_account" "forge" {
   project      = var.project_id
   account_id   = "sa-${var.environment}-forge"
@@ -55,77 +51,82 @@ resource "google_service_account" "forge" {
   description  = "Service account for the Forge CI pipeline service"
 }
 
-resource "google_service_account" "dossier" {
+# Caller identity for Pub/Sub push deliveries. Kept separate from the workload
+# identities so that a leaked Mastermind token cannot be replayed against
+# Dispatch/Forge as a legitimate push delivery, and so that
+# HENCHMEN_PUBSUB_OIDC_ALLOWED_EMAILS can name exactly one publisher.
+resource "google_service_account" "pubsub_push" {
   project      = var.project_id
-  account_id   = "sa-${var.environment}-dossier"
-  display_name = "Henchmen ${var.environment} Dossier Service Account"
-  description  = "Service account for the Dossier context builder service"
+  account_id   = "sa-${var.environment}-pubsub-push"
+  display_name = "Henchmen ${var.environment} Pub/Sub Push Service Account"
+  description  = "OIDC identity Pub/Sub uses to authenticate push deliveries to Cloud Run"
+}
+
+# Caller identity for Cloud Scheduler jobs (watchdog, DLQ check, cleanup,
+# merge queue). Only ever needs run.invoker on the two services it calls.
+resource "google_service_account" "scheduler" {
+  project      = var.project_id
+  account_id   = "sa-${var.environment}-scheduler"
+  display_name = "Henchmen ${var.environment} Cloud Scheduler Service Account"
+  description  = "OIDC identity Cloud Scheduler uses to invoke Mastermind and Forge"
 }
 
 # ---------------------------------------------------------------------------
 # Role sets (unconditioned, project-level bindings).
 #
 # Any role that needs a condition or resource-level narrowing is excluded
-# from these lists and applied below as a dedicated resource.
+# from these lists and applied below as a dedicated resource. Bucket-scoped
+# storage roles live in the data-stores module next to the buckets.
+#
+# roles/run.invoker is deliberately NOT granted at project level to any
+# workload identity: nothing in Henchmen calls another Cloud Run service
+# directly (all service-to-service traffic goes through Pub/Sub). The two
+# caller identities above get service-level run.invoker in the
+# cloud-run-services module instead.
 # ---------------------------------------------------------------------------
 
 locals {
-  # NOTE: roles/datastore.user is intentionally NOT in this list. Firestore
-  # does not support collection-level IAM via google_project_iam_member. The
-  # least-privilege pattern for mastermind's Firestore access is to:
-  #   1. Grant project-level datastore.user out of band (e.g. by gcloud or
-  #      by a separate binding owned by the platform team), and
-  #   2. Enforce per-collection authorization via Firestore Security Rules
-  #      in terraform/modules/data-stores/firestore.rules, which must be
-  #      deployed via the Firebase CLI or a google_firebaserules_ruleset
-  #      resource — out of scope for this IAM module.
-  #
-  # roles/aiplatform.user and roles/run.developer are also excluded: they
-  # are applied below with IAM conditions that scope them to Gemini publisher
-  # models and to `henchmen-${environment}-` Cloud Run services respectively.
+  # roles/run.developer is required *unconditioned* here: Mastermind creates
+  # and runs Cloud Run **Jobs** (`lair-<task>-<node>`) whose resource names are
+  # `projects/<p>/locations/<r>` (jobs.create) and
+  # `projects/<p>/locations/<r>/jobs/lair-...` (jobs.run). A condition scoped
+  # to `/services/henchmen-<env>-` never matches any of them and therefore
+  # denies every lair provisioning.
   mastermind_roles = [
-    "roles/run.invoker",
+    "roles/run.developer",
     "roles/pubsub.publisher",
     "roles/pubsub.subscriber",
+    "roles/datastore.user",
     "roles/cloudtrace.agent",
   ]
 
   dispatch_roles = [
-    "roles/run.invoker",
     "roles/pubsub.publisher",
     "roles/cloudtrace.agent",
   ]
 
-  # NOTE: roles/aiplatform.user is excluded here and applied below with a
-  # condition restricting the operative to Gemini publisher models only.
+  # roles/datastore.user (not .viewer): the operative writes `last_heartbeat`,
+  # partial reports and cost accumulation to Firestore.
   operative_roles = [
     "roles/pubsub.publisher",
-    "roles/datastore.viewer",
-    "roles/storage.objectViewer",
+    "roles/datastore.user",
     "roles/cloudtrace.agent",
   ]
 
-  arsenal_roles = [
-    "roles/run.invoker",
-  ]
-
-  # NOTE: sa-forge currently holds no Cloud Run IAM role (roles/run.*), so
-  # there is nothing to narrow via a service-name-prefix condition here. If
-  # forge ever gains a Cloud Run role, add it as a dedicated conditioned
-  # resource below matching the mastermind pattern.
   forge_roles = [
     "roles/cloudbuild.builds.editor",
     "roles/pubsub.publisher",
     "roles/pubsub.subscriber",
     "roles/datastore.user",
-    "roles/storage.objectViewer",
     "roles/cloudtrace.agent",
   ]
 
-  dossier_roles = [
-    "roles/storage.objectAdmin",
-    "roles/datastore.viewer",
-  ]
+  # Vertex AI callers. Mastermind queries the RAG corpus while building
+  # dossiers; the operative runs the coding models.
+  aiplatform_members = {
+    mastermind = google_service_account.mastermind.email
+    operative  = google_service_account.operative.email
+  }
 }
 
 resource "google_project_iam_member" "mastermind" {
@@ -152,14 +153,6 @@ resource "google_project_iam_member" "operative" {
   member  = "serviceAccount:${google_service_account.operative.email}"
 }
 
-resource "google_project_iam_member" "arsenal" {
-  for_each = toset(local.arsenal_roles)
-
-  project = var.project_id
-  role    = each.value
-  member  = "serviceAccount:${google_service_account.arsenal.email}"
-}
-
 resource "google_project_iam_member" "forge" {
   for_each = toset(local.forge_roles)
 
@@ -168,54 +161,42 @@ resource "google_project_iam_member" "forge" {
   member  = "serviceAccount:${google_service_account.forge.email}"
 }
 
-resource "google_project_iam_member" "dossier" {
-  for_each = toset(local.dossier_roles)
-
-  project = var.project_id
-  role    = each.value
-  member  = "serviceAccount:${google_service_account.dossier.email}"
-}
-
 # ---------------------------------------------------------------------------
 # Conditioned / resource-scoped bindings (defense in depth).
 # ---------------------------------------------------------------------------
 
-# Operative: roles/aiplatform.user restricted to Gemini publisher models only.
-# This is a HARD RULE in the Henchmen codebase — no Claude on Vertex AI — and
-# is enforced here in addition to the application-level scheme configuration.
+# roles/aiplatform.user, denied for every non-Google publisher model. This is
+# the IAM half of the HARD RULE "no Claude models on Vertex AI"; the other
+# half is the model tiering in Settings / scheme nodes.
 #
-# The IAM condition uses the CAEL (Common Expression Language) expression
-# evaluator. `resource.name` for Vertex AI predictions is of the form:
-#   projects/<project>/locations/<region>/publishers/google/models/gemini-*
-# Anything that does not start with that prefix (e.g. anthropic/claude-*,
-# meta/llama-*) will be denied.
-resource "google_project_iam_member" "operative_aiplatform_gemini_only" {
+# The condition is written as "the publisher segment is absent or is google"
+# rather than as a `startsWith(".../publishers/google/models/gemini")`
+# allow-list, because the latter also denies every Vertex AI resource that is
+# not a publisher model — RAG corpora (`/ragCorpora/`), context caches
+# (`/cachedContents/`), experiments and evaluation — which Henchmen uses.
+# `extract()` returns "" when the pattern does not match, so non-publisher
+# resources fall through the first clause and remain allowed.
+resource "google_project_iam_member" "aiplatform_google_publishers_only" {
+  for_each = local.aiplatform_members
+
   project = var.project_id
   role    = "roles/aiplatform.user"
-  member  = "serviceAccount:${google_service_account.operative.email}"
+  member  = "serviceAccount:${each.value}"
 
   condition {
-    title       = "gemini-publisher-models-only"
-    description = "Restrict operative Vertex AI access to Gemini publisher models only. Denies Claude and all other non-Google publisher models."
-    expression  = "resource.name.startsWith(\"projects/${var.project_id}/locations/${var.region}/publishers/google/models/gemini\")"
+    title       = "google-publisher-models-only"
+    description = "Deny Vertex AI publisher models from publishers other than Google (no Claude on Vertex AI). Non-publisher Vertex AI resources are unaffected."
+    expression  = "resource.name.extract(\"/publishers/{publisher}/\") == \"\" || resource.name.extract(\"/publishers/{publisher}/\") == \"google\""
   }
 }
 
-# Mastermind: roles/run.developer restricted to `henchmen-${environment}-`
-# Cloud Run services. This prevents a compromised Mastermind from creating or
-# mutating unrelated Cloud Run services in the same project.
-#
-# Cloud Run service resource names are of the form:
-#   projects/<project>/locations/<region>/services/<service-name>
-# where <service-name> is e.g. `henchmen-dev-mastermind`.
-resource "google_project_iam_member" "mastermind_run_developer_scoped" {
-  project = var.project_id
-  role    = "roles/run.developer"
-  member  = "serviceAccount:${google_service_account.mastermind.email}"
-
-  condition {
-    title       = "henchmen-services-only"
-    description = "Restrict mastermind Cloud Run admin access to henchmen-${var.environment}-* services only."
-    expression  = "resource.name.startsWith(\"projects/${var.project_id}/locations/${var.region}/services/henchmen-${var.environment}-\")"
-  }
+# Mastermind creates Cloud Run Jobs that *run as* the operative service
+# account. Cloud Run requires the caller to hold iam.serviceAccounts.actAs on
+# that service account; roles/run.developer does not include it, so without
+# this binding every create_job fails with
+# "Permission 'iam.serviceaccounts.actAs' denied on service account ...".
+resource "google_service_account_iam_member" "mastermind_actas_operative" {
+  service_account_id = google_service_account.operative.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.mastermind.email}"
 }

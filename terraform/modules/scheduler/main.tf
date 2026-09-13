@@ -15,7 +15,7 @@ resource "google_cloud_scheduler_job" "stale_task_cleanup" {
 
     oidc_token {
       service_account_email = var.scheduler_sa_email
-      audience              = var.mastermind_url
+      audience              = var.mastermind_audience
     }
   }
 
@@ -37,7 +37,7 @@ resource "google_cloud_scheduler_job" "merge_queue_processor" {
 
     oidc_token {
       service_account_email = var.scheduler_sa_email
-      audience              = var.forge_url
+      audience              = var.forge_audience
     }
   }
 
@@ -64,7 +64,7 @@ resource "google_cloud_scheduler_job" "watchdog" {
 
     oidc_token {
       service_account_email = var.scheduler_sa_email
-      audience              = var.mastermind_url
+      audience              = var.mastermind_audience
     }
   }
 
@@ -91,7 +91,7 @@ resource "google_cloud_scheduler_job" "dlq_check" {
 
     oidc_token {
       service_account_email = var.scheduler_sa_email
-      audience              = var.mastermind_url
+      audience              = var.mastermind_audience
     }
   }
 

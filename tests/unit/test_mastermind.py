@@ -99,7 +99,7 @@ def _branching_scheme() -> SchemeGraph:
     return SchemeGraph(definition)
 
 
-def _mock_settings():
+def _mock_settings(**overrides):
     """Build a real ``Settings`` instance with test-safe defaults.
 
     The real Settings class already provides sensible defaults for
@@ -114,14 +114,33 @@ def _mock_settings():
 
     os.environ.setdefault("HENCHMEN_GCP_PROJECT_ID", "test-project")
     get_settings.cache_clear()
-    return get_settings().model_copy(
-        update={
-            "provider": "gcp",
-            "vertex_ai_evaluation_enabled": False,
-            "lair_default_cpu": "2",
-            "lair_default_memory": "4Gi",
-        }
-    )
+    update = {
+        "provider": "gcp",
+        "vertex_ai_evaluation_enabled": False,
+        "lair_default_cpu": "2",
+        "lair_default_memory": "4Gi",
+        "github_token": "",
+    }
+    update.update(overrides)
+    return get_settings().model_copy(update=update)
+
+
+def _fake_store() -> MagicMock:
+    """DocumentStore double — keeps TaskTracker/LairManager off real providers."""
+    store = MagicMock()
+    store.get = AsyncMock(return_value=None)
+    store.set = AsyncMock()
+    store.update = AsyncMock()
+    store.delete = AsyncMock()
+    store.query = AsyncMock(return_value=[])
+    store.increment = AsyncMock()
+    store.update_if = AsyncMock(return_value=True)
+    return store
+
+
+def _make_agent(settings=None, **kwargs) -> MastermindAgent:
+    """MastermindAgent with an injected store so no real provider is built."""
+    return MastermindAgent(settings=settings or _mock_settings(), document_store=_fake_store(), **kwargs)
 
 
 # ===========================================================================
@@ -146,19 +165,82 @@ class TestSchemeExecutorDeterministic:
     async def test_execute_linear_deterministic_scheme(self):
         graph = _linear_scheme(["create_branch", "prefetch_context", "create_pr"])
         mock_lair = MagicMock(spec=LairManager)
-        settings = _mock_settings()
+        settings = _mock_settings(github_token="ghp_" + "t" * 36)
+
+        mock_pr = MagicMock()
+        mock_pr.html_url = "https://github.com/acme/webapp/pull/7"
+        mock_pr.number = 7
+        mock_repo = MagicMock()
+        mock_repo.get_pulls.return_value = []
+        mock_repo.create_pull.return_value = mock_pr
 
         executor = SchemeExecutor(graph, mock_lair, settings)
         task = _make_task()
         dossier = Dossier(task_id=task.id)
 
-        result = await executor.execute(task, dossier)
+        with (
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=settings.github_token),
+            patch("github.Github") as mock_github,
+        ):
+            mock_github.return_value.get_repo.return_value = mock_repo
+            result = await executor.execute(task, dossier)
 
         assert result["final_status"] == "pr_created"
-        assert result["pr_url"] is not None
+        assert result["pr_url"] == "https://github.com/acme/webapp/pull/7"
         assert "create_branch" in result["nodes_executed"]
         assert "prefetch_context" in result["nodes_executed"]
         assert "create_pr" in result["nodes_executed"]
+
+    @pytest.mark.asyncio
+    async def test_create_pr_fails_closed_without_token(self):
+        """No GitHub token must NOT be reported as a created PR (fail-closed)."""
+        graph = _linear_scheme(["create_pr"])
+        mock_lair = MagicMock(spec=LairManager)
+        settings = _mock_settings(github_token="")
+
+        executor = SchemeExecutor(graph, mock_lair, settings)
+        task = _make_task()
+        dossier = Dossier(task_id=task.id)
+
+        with patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=""):
+            result = await executor.execute(task, dossier)
+
+        assert result["node_results"]["create_pr"]["condition"] == "fail"
+        assert "pr_url" not in result["node_results"]["create_pr"]
+        assert result["pr_url"] is None
+        assert result["final_status"] == "escalated"
+
+    @pytest.mark.asyncio
+    async def test_create_pr_dedup_scopes_head_to_owner(self):
+        """get_pulls must be filtered by owner:branch, and the ref re-checked locally."""
+        from henchmen.mastermind.scheme_executor.handlers import handle_create_pr
+
+        settings = _mock_settings(github_token="ghp_" + "t" * 36)
+        executor = SchemeExecutor(_linear_scheme(["create_pr"]), MagicMock(spec=LairManager), settings)
+        task = _make_task()
+
+        unrelated_pr = MagicMock()
+        unrelated_pr.head.ref = "someone-elses-branch"
+        unrelated_pr.html_url = "https://github.com/acme/webapp/pull/1"
+        created = MagicMock()
+        created.html_url = "https://github.com/acme/webapp/pull/2"
+        created.number = 2
+
+        mock_repo = MagicMock()
+        mock_repo.get_pulls.return_value = [unrelated_pr]
+        mock_repo.create_pull.return_value = created
+
+        with (
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=settings.github_token),
+            patch("github.Github") as mock_github,
+        ):
+            mock_github.return_value.get_repo.return_value = mock_repo
+            result = await handle_create_pr(executor, _make_node("create_pr"), task, Dossier(task_id=task.id))
+
+        assert mock_repo.get_pulls.call_args.kwargs["head"] == f"acme:{task.branch_name}"
+        # The unrelated open PR must not be mistaken for this task's PR.
+        assert result["pr_url"] == "https://github.com/acme/webapp/pull/2"
+        mock_repo.create_pull.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_execute_escalate_node(self):
@@ -176,7 +258,8 @@ class TestSchemeExecutorDeterministic:
         assert result["escalated"] is True
 
     @pytest.mark.asyncio
-    async def test_unknown_node_id_defaults_to_pass(self):
+    async def test_unknown_deterministic_node_fails_closed(self):
+        """A deterministic node with no handler is a gate that never ran — fail, don't pass."""
         graph = _linear_scheme(["unknown_step", "create_pr"])
         mock_lair = MagicMock(spec=LairManager)
         settings = _mock_settings()
@@ -186,8 +269,31 @@ class TestSchemeExecutorDeterministic:
         dossier = Dossier(task_id=task.id)
 
         result = await executor.execute(task, dossier)
-        # Unknown node returns pass, execution continues to create_pr
-        assert "create_pr" in result["nodes_executed"]
+
+        assert result["node_results"]["unknown_step"]["condition"] == "fail"
+        assert result["escalated"] is True
+        # Execution must NOT continue on to create a PR.
+        assert "create_pr" not in result["nodes_executed"]
+
+    def test_validate_deterministic_handlers_reports_missing(self):
+        from henchmen.mastermind.scheme_executor import validate_deterministic_handlers
+
+        problems = validate_deterministic_handlers(_linear_scheme(["unknown_step"]))
+        assert len(problems) == 1
+        assert "unknown_step" in problems[0]
+
+    def test_shipped_schemes_have_every_deterministic_handler(self):
+        from henchmen.mastermind.scheme_executor import validate_deterministic_handlers
+
+        SchemeRegistry.clear()
+        SchemeRegistry.auto_discover()
+        try:
+            for scheme_id in SchemeRegistry.list_schemes():
+                graph = SchemeRegistry.get(scheme_id)
+                assert graph is not None
+                assert validate_deterministic_handlers(graph) == []
+        finally:
+            SchemeRegistry.clear()
 
 
 class TestSchemeExecutorAgentic:
@@ -468,7 +574,7 @@ class TestMastermindSelectScheme:
 
     @pytest.mark.asyncio
     async def test_selects_bugfix_for_bug_keywords(self):
-        agent = MastermindAgent(settings=_mock_settings())
+        agent = _make_agent()
         for keyword in ["bug", "fix", "error", "crash", "broken"]:
             task = _make_task(title=f"There is a {keyword} here", description="details")
             scheme = await agent._select_scheme(task)
@@ -476,7 +582,7 @@ class TestMastermindSelectScheme:
 
     @pytest.mark.asyncio
     async def test_selects_feature_for_feature_keywords(self):
-        agent = MastermindAgent(settings=_mock_settings())
+        agent = _make_agent()
         for keyword in ["feature", "add", "implement", "create", "build"]:
             task = _make_task(title=f"Please {keyword} something", description="details")
             scheme = await agent._select_scheme(task)
@@ -484,17 +590,45 @@ class TestMastermindSelectScheme:
 
     @pytest.mark.asyncio
     async def test_defaults_to_bugfix_for_ambiguous_task(self):
-        agent = MastermindAgent(settings=_mock_settings())
+        agent = _make_agent()
         task = _make_task(title="Update readme", description="Just some text")
         scheme = await agent._select_scheme(task)
         assert scheme == "bugfix_standard"
 
     @pytest.mark.asyncio
     async def test_bug_keyword_in_description_matches(self):
-        agent = MastermindAgent(settings=_mock_settings())
+        agent = _make_agent()
         task = _make_task(title="Something", description="There is a critical bug")
         scheme = await agent._select_scheme(task)
         assert scheme == "bugfix_standard"
+
+    @pytest.mark.asyncio
+    async def test_mixed_title_prefers_bugfix_over_feature(self):
+        """'Fix crash when adding an item' is a bug, not a feature (docs/schemes.md)."""
+        agent = _make_agent()
+        task = _make_task(title="Fix crash when adding an item to the cart", description="")
+        assert await agent._select_scheme(task) == "bugfix_standard"
+
+    @pytest.mark.asyncio
+    async def test_substring_lookalikes_do_not_match(self):
+        """'address'/'padding' are not 'add'; 'prefix' is not 'fix'; 'debug' is not 'bug'."""
+        agent = _make_agent()
+        task = _make_task(title="Tidy the address padding prefix in the debugger", description="no keywords here")
+        assert await agent._select_scheme(task) == "bugfix_standard"  # default, not feature
+
+    @pytest.mark.asyncio
+    async def test_goal_keywords_select_decomposition(self):
+        agent = _make_agent()
+        for keyword in ["improve", "optimize", "refactor all", "fix all", "update all", "migrate"]:
+            task = _make_task(title=f"Please {keyword} the codebase", description="details")
+            scheme = await agent._select_scheme(task)
+            assert scheme == "goal_decomposition", f"Failed for goal keyword: {keyword}"
+
+    @pytest.mark.asyncio
+    async def test_goal_keywords_only_match_title(self):
+        agent = _make_agent()
+        task = _make_task(title="Something odd", description="we should improve this someday")
+        assert await agent._select_scheme(task) == "bugfix_standard"
 
 
 # ===========================================================================
@@ -523,7 +657,7 @@ class TestMastermindHandleTask:
         downstream handler chain (which has its own dedicated tests).
         """
         settings = _mock_settings()
-        agent = MastermindAgent(settings=settings)
+        agent = _make_agent(settings)
 
         # Mock the DossierBuilder
         mock_builder = AsyncMock()
@@ -579,7 +713,7 @@ class TestMastermindHandleTask:
     async def test_handle_task_escalates_on_unknown_scheme(self, mock_builder_cls):
         """If scheme graph is not found, task should be escalated."""
         settings = _mock_settings()
-        agent = MastermindAgent(settings=settings)
+        agent = _make_agent(settings)
 
         # Clear registry so no schemes are found
         SchemeRegistry.clear()
@@ -595,7 +729,7 @@ class TestMastermindHandleTask:
     async def test_handle_task_escalates_on_exception(self, mock_builder_cls):
         """If an exception occurs, task should be escalated."""
         settings = _mock_settings()
-        agent = MastermindAgent(settings=settings)
+        agent = _make_agent(settings)
 
         # Make _select_scheme raise
         agent._select_scheme = AsyncMock(side_effect=RuntimeError("boom"))
@@ -630,18 +764,6 @@ class TestLairManagerBuildJobConfig:
         assert env_vars["REPO_URL"] == "acme/webapp"
         assert env_vars["BRANCH"] == "main"
 
-    def test_long_running_node_gets_more_resources(self):
-        # Resource scaling happens in create_lair, not in env vars.
-        # Verify timeout threshold logic: >300s uses 4cpu/8Gi.
-        node_long = _make_node("long_node", timeout_seconds=600)
-        node_short = _make_node("short_node", timeout_seconds=30)
-        assert node_long.timeout_seconds > 300
-        assert node_short.timeout_seconds <= 300
-
-    def test_short_running_node_uses_defaults(self):
-        node = _make_node("short_node", timeout_seconds=30)
-        assert node.timeout_seconds <= 300
-
     def test_model_name_override(self):
         settings = _mock_settings()
         lm = LairManager(settings)
@@ -651,14 +773,17 @@ class TestLairManagerBuildJobConfig:
         env_vars = lm._build_env_vars(task, node, "lair-model-001")
         assert env_vars["MODEL_NAME"] == "gemini-2.5-flash"
 
-    def test_model_name_fallback_to_settings(self):
+    def test_model_name_falls_back_to_the_complex_tier(self):
+        """A provider-neutral tier, not a Gemini model name (which OpenAI/Bedrock reject)."""
+        from henchmen.models.llm import ModelTier
+
         settings = _mock_settings()
         lm = LairManager(settings)
         task = _make_task()
         node = _make_node("fallback_node")  # model_name=None
 
         env_vars = lm._build_env_vars(task, node, "lair-fb-001")
-        assert env_vars["MODEL_NAME"] == "gemini-2.5-pro"
+        assert env_vars["MODEL_NAME"] == ModelTier.COMPLEX.value
 
     def test_image_contains_project_and_region(self):
         settings = _mock_settings()
@@ -678,13 +803,8 @@ class TestLairManagerBuildJobConfig:
 
 class TestFetchSemanticChunks:
     def _make_agent(self):
-        settings = MagicMock()
-        settings.gcp_project_id = "test-project"
-        settings.pinecone_api_key_secret = ""
-        settings.pinecone_index_name = "henchmen-code"
-        settings.vertex_ai_embedding_model = "text-embedding-005"
         with patch("henchmen.mastermind.agent.LairManager"):
-            return MastermindAgent(settings=settings)
+            return _make_agent()
 
     def _make_task(self):
         return HenchmenTask(

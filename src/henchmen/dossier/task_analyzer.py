@@ -2,18 +2,13 @@
 
 import re
 
-from pydantic import BaseModel, Field
+from henchmen.models.dossier import TaskAnalysis
 
-
-class TaskAnalysis(BaseModel):
-    """Analyzed task with extracted context clues."""
-
-    task_type: str = Field(default="generic", description="Detected task type")
-    mentioned_files: list[str] = Field(default_factory=list, description="File paths mentioned in the task")
-    mentioned_errors: list[str] = Field(default_factory=list, description="Error patterns mentioned")
-    keywords: list[str] = Field(default_factory=list, description="Important keywords for file search")
-    ci_related: bool = Field(default=False, description="Whether this involves CI/test failures")
-    specific_file_target: str | None = Field(default=None, description="If a specific file is targeted")
+# ``TaskAnalysis`` is a cross-component data contract (it is serialised into
+# ``dossier.json`` by the Mastermind and re-parsed by the Operative), so it
+# lives in ``henchmen.models.dossier``. It is re-exported here because this
+# module is where it is produced.
+__all__ = ["TaskAnalysis", "TaskAnalyzer"]
 
 
 class TaskAnalyzer:

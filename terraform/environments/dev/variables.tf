@@ -36,9 +36,43 @@ variable "github_default_repo" {
 }
 
 variable "container_image_tag" {
-  description = "Container image tag to deploy (e.g. a git short SHA or 'latest')"
+  description = "Container image tag to deploy. Empty means the images are not built yet and a public placeholder image is deployed instead."
   type        = string
-  default     = "latest"
+  default     = ""
+}
+
+variable "container_images" {
+  description = "Per-component container image overrides (keys: mastermind, dispatch, forge)"
+  type        = map(string)
+  default     = {}
+}
+
+# ---------------------------------------------------------------------------
+# Intake configuration
+# ---------------------------------------------------------------------------
+
+variable "jira_base_url" {
+  description = "Jira base URL (e.g. https://acme.atlassian.net). Empty disables the Jira intake env on Dispatch."
+  type        = string
+  default     = ""
+}
+
+variable "jira_email" {
+  description = "Jira account email used with the Jira API token"
+  type        = string
+  default     = ""
+}
+
+variable "internal_only_ingress" {
+  description = "Restrict Mastermind and Forge to internal ingress (Pub/Sub push and Cloud Scheduler count as internal)"
+  type        = bool
+  default     = true
+}
+
+variable "dispatch_public_ingress" {
+  description = "Allow unauthenticated invocation of Dispatch (required for GitHub / Jira webhooks)"
+  type        = bool
+  default     = false
 }
 
 # ---------------------------------------------------------------------------
@@ -55,10 +89,10 @@ variable "lair_memory" {
   type        = string
 }
 
-variable "allowlist_cidrs" {
-  description = "Additional egress CIDR ranges to allow"
-  type        = list(string)
-  default     = []
+variable "lair_timeout" {
+  description = "Maximum execution duration for a Lair job, in seconds"
+  type        = number
+  default     = 1800
 }
 
 variable "scheduler_enabled" {
@@ -70,4 +104,28 @@ variable "enable_cloud_build" {
   description = "Whether to provision Cloud Build triggers"
   type        = bool
   default     = false
+}
+
+variable "enable_cloud_build_notifications" {
+  description = "Create the push subscription from the project's `cloud-builds` topic to Forge"
+  type        = bool
+  default     = false
+}
+
+variable "seed_secret_placeholders" {
+  description = "Seed every Secret Manager secret with a placeholder version. Set false once the secrets hold real values."
+  type        = bool
+  default     = true
+}
+
+variable "log_retention_days" {
+  description = "Retention, in days, for the Henchmen log bucket"
+  type        = number
+  default     = 30
+}
+
+variable "artifact_retention_days" {
+  description = "Days after which dossier artifacts and operative snapshots are deleted"
+  type        = number
+  default     = 90
 }

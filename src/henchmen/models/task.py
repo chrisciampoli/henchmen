@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import uuid4
 
-from pydantic import Field
+from pydantic import AwareDatetime, Field
 
 from henchmen.models._base import StrictBase
 
@@ -52,7 +52,9 @@ class HenchmenTask(StrictBase):
     description: str = Field(..., description="Full task description")
     context: TaskContext = Field(..., description="Contextual information for the operative")
     priority: TaskPriority = Field(default=TaskPriority.NORMAL, description="Task execution priority")
-    created_at: datetime = Field(
+    # Timezone-aware only — a naive datetime round-tripped through the document
+    # store would sort against UTC values incorrectly (CLAUDE.md: always UTC).
+    created_at: AwareDatetime = Field(
         default_factory=lambda: datetime.now(UTC), description="UTC timestamp of task creation"
     )
     created_by: str = Field(..., description="User or system that created the task")

@@ -1,6 +1,7 @@
-"""Forge - CI orchestration, merge queue, and silent-failure detection."""
+"""Forge - post-PR CI checks, merge queue, and silent-failure detection."""
 
-from henchmen.forge.ci_orchestrator import CIOrchestrator
+from henchmen.forge.ci_runner import CIRunner
 from henchmen.forge.merge_queue import MergeQueue
+from henchmen.forge.silent_failure_detector import Finding, SilentFailureDetector
 
-__all__ = ["CIOrchestrator", "MergeQueue"]
+__all__ = ["CIRunner", "Finding", "MergeQueue", "SilentFailureDetector"]

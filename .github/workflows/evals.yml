@@ -17,9 +17,12 @@ on:
           - openai
           - anthropic
           - vertex
-          - ollama
+          # `ollama` is deliberately absent: a hosted runner has no Ollama
+          # server and pulling a coding model would blow the job budget. Run
+          # it locally instead:
+          #   henchmen eval run --provider ollama --write-baseline
       fixture:
-        description: "Fixture to run (leave blank for --all)"
+        description: "Fixture to run (leave blank to run every fixture)"
         required: false
         type: string
         default: ""
@@ -45,11 +48,15 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install dependencies (local + dev)
-        run: pip install -e ".[local,dev]"
+      # `all` rather than `local`: the vertex option resolves VertexAIProvider,
+      # which imports google.genai — not part of the local extra.
+      - name: Install dependencies (all providers + dev)
+        run: pip install -e ".[all,dev]"
 
       - name: Run eval
         env:
+          HENCHMEN_PROVIDER: local
+          HENCHMEN_ENVIRONMENT: dev
           HENCHMEN_OPENAI_API_KEY: ${{ secrets.HENCHMEN_OPENAI_API_KEY }}
           HENCHMEN_ANTHROPIC_API_KEY: ${{ secrets.HENCHMEN_ANTHROPIC_API_KEY }}
           HENCHMEN_GCP_PROJECT_ID: ${{ secrets.HENCHMEN_GCP_PROJECT_ID }}
@@ -62,14 +69,17 @@ jobs:
 
           # Write the GCP credentials file if a vertex run was requested.
           if [ "$PROVIDER" = "vertex" ] && [ -n "${GOOGLE_APPLICATION_CREDENTIALS_JSON:-}" ]; then
-            echo "$GOOGLE_APPLICATION_CREDENTIALS_JSON" > /tmp/gcp-sa.json
+            install -m 600 /dev/null /tmp/gcp-sa.json
+            printf '%s' "$GOOGLE_APPLICATION_CREDENTIALS_JSON" > /tmp/gcp-sa.json
             export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-sa.json
           fi
 
+          # Explicit `run` sub-command; running every fixture is the default
+          # when --fixture is omitted.
           if [ -z "$FIXTURE" ]; then
-            henchmen eval --provider "$PROVIDER" --all --write-baseline
+            henchmen eval run --provider "$PROVIDER" --write-baseline
           else
-            henchmen eval --provider "$PROVIDER" --fixture "$FIXTURE" --write-baseline
+            henchmen eval run --provider "$PROVIDER" --fixture "$FIXTURE"
           fi
 
       - name: Show diff
@@ -78,6 +88,10 @@ jobs:
       - name: Create pull request
         uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c # v6.1.0
         with:
+          # GitHub does not run `pull_request` workflows for PRs opened with the
+          # default GITHUB_TOKEN, so the baseline PR would show no checks. Set
+          # an EVALS_PR_TOKEN (PAT or GitHub App token) to get CI on it.
+          token: ${{ secrets.EVALS_PR_TOKEN || secrets.GITHUB_TOKEN }}
           branch: "evals/update-${{ github.event.inputs.provider }}"
           title: "evals: refresh ${{ github.event.inputs.provider }} baseline"
           body: |
@@ -95,6 +109,7 @@ jobs:
             - [ ] Numbers look sane (no NaN / null scores)
             - [ ] No secrets leaked into the diff
             - [ ] `last_updated` timestamp is today
+            - [ ] CI ran on this PR (if not, `EVALS_PR_TOKEN` is unset — push an empty commit)
           commit-message: "evals: refresh ${{ github.event.inputs.provider }} baseline"
           add-paths: |
             evals/baseline.json

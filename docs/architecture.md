@@ -70,7 +70,7 @@ Each handler uses a `TaskNormalizer` to convert the source-specific payload into
 
 ### Mastermind
 
-**Source:** `src/henchmen/mastermind/agent.py`, `scheme_executor.py`, `lair_manager.py`, `state_machine.py`, `server.py`
+**Source:** `src/henchmen/mastermind/agent.py`, `scheme_executor/`, `lair_manager.py`, `server.py`
 **Container:** `containers/mastermind/Dockerfile`
 **Cloud Run service:** `henchmen-{env}-mastermind`
 
@@ -325,4 +325,4 @@ The system uses a tiered Gemini strategy to balance cost and quality. **Hard rul
 | **Gemini 2.5 Flash** (`gemini-2.5-flash`) | `verify_changes`, `plan_implementation` | Fast and cheap (~95% less than Pro) for verification gates and planning steps. Low-latency turnaround for quality checks. |
 | **Deterministic** | `fix_lint` | `eslint --fix` / `ruff --fix` -- zero LLM cost, no Cloud Run Job. |
 
-The `model_name` field on each `SchemeNode` determines which model is used. If not set, it falls back to the `vertex_ai_model_complex` setting (Gemini 2.5 Pro by default). All model calls route through `_call_gemini` (via the google-genai SDK against Vertex AI); there is no Anthropic/Claude routing path.
+The `model_name` field on each `SchemeNode` names a **tier** (`default/complex`, `default/light`, `default/reasoning`), not a concrete model. The configured LLM provider resolves it through `henchmen.providers.tiers.resolve_model_name`, reading the matching `Settings` field, so the same scheme runs unchanged on Anthropic, OpenAI, Vertex AI, Bedrock or Ollama. A node with no `model_name` defaults to `default/complex`.

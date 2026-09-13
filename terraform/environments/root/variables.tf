@@ -35,9 +35,69 @@ variable "github_default_repo" {
 }
 
 variable "container_image_tag" {
-  description = "Container image tag to deploy (e.g. a git short SHA or 'latest')"
+  description = <<-EOT
+    Container image tag to deploy (e.g. a git short SHA or 'latest').
+
+    Empty (the default) means the Henchmen images have not been pushed yet:
+    every service deploys var.placeholder_image so the first apply on a fresh
+    project converges. Build and push the images, then set this and re-apply.
+  EOT
   type        = string
-  default     = "latest"
+  default     = ""
+}
+
+variable "container_images" {
+  description = "Per-component container image overrides (keys: mastermind, dispatch, forge). Wins over container_image_tag."
+  type        = map(string)
+  default     = {}
+}
+
+variable "placeholder_image" {
+  description = "Public image deployed while container_image_tag is empty"
+  type        = string
+  default     = "us-docker.pkg.dev/cloudrun/container/hello"
+}
+
+variable "seed_secret_placeholders" {
+  description = "Seed every Secret Manager secret with a placeholder version so the first apply produces startable revisions. Set false on projects whose secrets already hold real values."
+  type        = bool
+  default     = true
+}
+
+variable "jira_base_url" {
+  description = "Jira base URL (e.g. https://acme.atlassian.net). Empty disables the Jira intake env on Dispatch."
+  type        = string
+  default     = ""
+}
+
+variable "jira_email" {
+  description = "Jira account email used with the Jira API token. Empty disables the Jira intake env on Dispatch."
+  type        = string
+  default     = ""
+}
+
+variable "dispatch_public_ingress" {
+  description = "Allow unauthenticated invocation of Dispatch (required for GitHub / Jira webhooks, which cannot present a Google OIDC token)."
+  type        = bool
+  default     = false
+}
+
+variable "internal_only_ingress" {
+  description = "Restrict Mastermind and Forge to internal ingress (Pub/Sub push and Cloud Scheduler count as internal)"
+  type        = bool
+  default     = true
+}
+
+variable "log_retention_days" {
+  description = "Retention, in days, for the Henchmen log bucket"
+  type        = number
+  default     = 30
+}
+
+variable "artifact_retention_days" {
+  description = "Days after which dossier artifacts and operative snapshots are deleted"
+  type        = number
+  default     = 90
 }
 
 # ---------------------------------------------------------------------------
@@ -56,10 +116,10 @@ variable "lair_memory" {
   type        = string
 }
 
-variable "allowlist_cidrs" {
-  description = "Additional egress CIDR ranges to allow (e.g. Slack, Jira/Atlassian)"
-  type        = list(string)
-  default     = []
+variable "lair_timeout" {
+  description = "Maximum execution duration for a Lair job, in seconds"
+  type        = number
+  default     = 1800
 }
 
 variable "scheduler_enabled" {
@@ -69,6 +129,12 @@ variable "scheduler_enabled" {
 
 variable "enable_cloud_build" {
   description = "Whether to provision Cloud Build triggers. Requires manual GitHub repo connection via GCP Console first."
+  type        = bool
+  default     = false
+}
+
+variable "enable_cloud_build_notifications" {
+  description = "Create the push subscription from the project's `cloud-builds` topic to Forge. Requires at least one Cloud Build run to have created that topic."
   type        = bool
   default     = false
 }

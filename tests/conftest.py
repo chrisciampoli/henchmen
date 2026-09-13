@@ -14,6 +14,7 @@ Conventions enforced here (see CONTRIBUTING.md for the full rationale):
   helpers that used to live in ~8 test modules.
 """
 
+import os
 from collections.abc import Iterator
 
 import pytest
@@ -51,6 +52,21 @@ def _isolate_settings() -> Iterator[None]:
     get_settings.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove every ``HENCHMEN_*`` variable from the environment.
+
+    ``Settings`` reads the process environment, so without this a developer's
+    exported ``HENCHMEN_LLM_PROVIDER`` — or one a previous test set and did not
+    clean up — silently changes what the next test resolves. That is how the
+    tier-pricing assertions became order-dependent: under one ordering the
+    active provider was Ollama, whose models are free, so "every tier has a
+    price" failed for reasons that had nothing to do with the code under test.
+    """
+    for name in [n for n in os.environ if n.startswith("HENCHMEN_")]:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def mock_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     """Return a real ``Settings`` instance with test-safe defaults.
@@ -58,6 +74,10 @@ def mock_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     Shared across unit and integration tests. Replaces per-module
     ``_mock_settings()`` helpers that built ``MagicMock`` settings objects
     — using the real class catches schema drift and keeps the tests honest.
+
+    ``_env_file=None`` keeps the developer's ``.env.local`` out of the test
+    run; combined with ``_hermetic_settings_env`` the result depends only on
+    what the test itself sets.
     """
     monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "dev")
     monkeypatch.setenv("HENCHMEN_GCP_PROJECT_ID", "test-project")
@@ -65,7 +85,7 @@ def mock_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     # `_isolate_settings` already cleared the cache; re-clear here defensively
     # so that the setenv calls above are picked up for this fixture's return.
     get_settings.cache_clear()
-    return get_settings()
+    return Settings(_env_file=None)  # type: ignore[call-arg]
 
 
 @pytest.fixture

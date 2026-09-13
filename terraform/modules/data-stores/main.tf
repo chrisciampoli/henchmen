@@ -1,3 +1,13 @@
+# ---------------------------------------------------------------------------
+# Firestore
+#
+# Access control is IAM-only. Firestore Security Rules are deliberately NOT
+# used here: they are evaluated for Firebase client-SDK traffic, and every
+# Henchmen component talks to Firestore through the server SDK, which
+# authenticates with IAM and bypasses rules entirely. Per-writer isolation, if
+# ever needed, means a separate database — not a ruleset.
+# ---------------------------------------------------------------------------
+
 resource "google_firestore_database" "henchmen" {
   project     = var.project_id
   name        = "henchmen-${var.environment}"
@@ -76,38 +86,83 @@ resource "google_firestore_index" "operative_reports_task_id_completed_at" {
 }
 
 # ---------------------------------------------------------------------------
-# Firestore security rules (least-privilege enforcement for the mastermind SA)
-# ---------------------------------------------------------------------------
+# Object storage
 #
-# Collection-level authorization cannot be expressed via project-level IAM
-# bindings, so rules are deployed as a first-class terraform resource here.
-# The firestore.rules file uses a single ${mastermind_sa_email_pattern}
-# template variable so the email regex stays in sync with var.project_id.
+# Bucket names are globally unique, so they are prefixed with the project ID.
+# HENCHMEN_GCS_BUCKET_DOSSIER / _SNAPSHOTS are injected from the outputs below
+# (see the cloud-run-services and cloud-run-lairs modules); without them the
+# dossier upload is skipped and the snapshot cache raises.
+# ---------------------------------------------------------------------------
 
-locals {
-  # Escape the dot in the project ID because it lands inside a regex match.
-  _mastermind_sa_email_pattern = "sa-${var.environment}-mastermind@${replace(var.project_id, ".", "\\\\.")}\\\\.iam\\\\.gserviceaccount\\\\.com"
-}
+resource "google_storage_bucket" "dossier" {
+  project                     = var.project_id
+  name                        = "${var.project_id}-henchmen-${var.environment}-dossier"
+  location                    = var.region
+  storage_class               = "STANDARD"
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  force_destroy               = var.environment != "prod"
+  labels                      = var.labels
 
-resource "google_firebaserules_ruleset" "firestore" {
-  project = var.project_id
-
-  source {
-    files {
-      name = "firestore.rules"
-      content = templatefile("${path.module}/firestore.rules", {
-        mastermind_sa_email_pattern = local._mastermind_sa_email_pattern
-      })
+  lifecycle_rule {
+    condition {
+      age = var.artifact_retention_days
+    }
+    action {
+      type = "Delete"
     }
   }
-
-  depends_on = [google_firestore_database.henchmen]
 }
 
-resource "google_firebaserules_release" "firestore" {
-  project      = var.project_id
-  name         = "cloud.firestore/${google_firestore_database.henchmen.name}"
-  ruleset_name = "projects/${var.project_id}/rulesets/${google_firebaserules_ruleset.firestore.name}"
+resource "google_storage_bucket" "snapshots" {
+  project                     = var.project_id
+  name                        = "${var.project_id}-henchmen-${var.environment}-snapshots"
+  location                    = var.region
+  storage_class               = "STANDARD"
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  force_destroy               = var.environment != "prod"
+  labels                      = var.labels
 
-  depends_on = [google_firebaserules_ruleset.firestore]
+  lifecycle_rule {
+    condition {
+      age = var.artifact_retention_days
+    }
+    action {
+      type = "Delete"
+    }
+  }
+}
+
+# Bucket-scoped storage access, in place of a project-level storage role.
+# Mastermind builds and uploads dossiers; the operative reads its dossier and
+# writes workspace snapshots.
+resource "google_storage_bucket_iam_member" "dossier_mastermind" {
+  bucket = google_storage_bucket.dossier.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${var.service_account_emails["mastermind"]}"
+}
+
+resource "google_storage_bucket_iam_member" "dossier_operative" {
+  bucket = google_storage_bucket.dossier.name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${var.service_account_emails["operative"]}"
+}
+
+resource "google_storage_bucket_iam_member" "dossier_forge" {
+  bucket = google_storage_bucket.dossier.name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${var.service_account_emails["forge"]}"
+}
+
+resource "google_storage_bucket_iam_member" "snapshots_mastermind" {
+  bucket = google_storage_bucket.snapshots.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${var.service_account_emails["mastermind"]}"
+}
+
+resource "google_storage_bucket_iam_member" "snapshots_operative" {
+  bucket = google_storage_bucket.snapshots.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${var.service_account_emails["operative"]}"
 }

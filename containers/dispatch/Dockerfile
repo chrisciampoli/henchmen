@@ -15,7 +15,8 @@ RUN pip install --no-cache-dir --prefix=/install -e .
 # --- Runtime stage ---
 FROM python:3.12.8-slim-bookworm@sha256:2199a62885a12290dc9c5be3ca0681d367576ab7bf037da120e564723292a2f0
 
-RUN apt-get update && apt-get install -y --no-install-recommends bash && rm -rf /var/lib/apt/lists/*
+# git is required by the embedding pipeline in henchmen.dispatch.handlers.cli
+RUN apt-get update && apt-get install -y --no-install-recommends bash git && rm -rf /var/lib/apt/lists/*
 
 # Copy Python packages from builder
 COPY --from=builder /install /usr/local

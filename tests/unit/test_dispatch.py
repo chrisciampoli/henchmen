@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from henchmen.dispatch.api_models import CreateTaskRequest
 from henchmen.dispatch.normalizer import TaskNormalizer
 from henchmen.models.task import HenchmenTask, TaskPriority, TaskSource
 
@@ -181,6 +182,7 @@ class TestTaskNormalizerFromGithub:
             "comment": {
                 "body": "@henchmen fix this",
                 "user": {"login": "reviewer"},
+                "author_association": "COLLABORATOR",
             },
             "repository": {"full_name": "acme/backend"},
         }
@@ -293,7 +295,7 @@ class TestCliHandler:
 
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="msg-001")):
             result = await handle_cli_request(
-                {"title": "Do something", "repo": "acme/api"},
+                CreateTaskRequest(title="Do something", repo="acme/api"),
                 normalizer,
                 settings,
             )
@@ -310,7 +312,7 @@ class TestCliHandler:
         settings = _mock_settings()
 
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="x")):
-            result = await handle_cli_request({"title": "T"}, normalizer, settings)
+            result = await handle_cli_request(CreateTaskRequest(title="T", repo="acme/api"), normalizer, settings)
 
         assert len(result["task_id"]) == 36
 
@@ -436,7 +438,11 @@ class TestGithubHandler:
                 "state": "open",
                 "head": {"ref": "feature"},
             },
-            "comment": {"body": "@henchmen fix this", "user": {"login": "reviewer"}},
+            "comment": {
+                "body": "@henchmen fix this",
+                "user": {"login": "reviewer"},
+                "author_association": "MEMBER",
+            },
             "repository": {"full_name": "acme/api"},
         }
 
@@ -548,7 +554,6 @@ class TestCliEmbedCommand:
             result = await handle_embed_command(
                 repo="acme-org/sample-repo",
                 full=True,
-                pinecone_api_key="test-key",
                 settings=MagicMock(),
             )
 
@@ -567,7 +572,6 @@ class TestCliEmbedCommand:
             await handle_embed_command(
                 repo="acme-org/sample-repo",
                 full=False,
-                pinecone_api_key="test-key",
                 settings=MagicMock(),
             )
 
@@ -807,3 +811,833 @@ class TestSlackBotMalformedEvents:
         task = normalizer.from_slack(event)
         assert task.context.thread_messages is not None
         assert any("fix the auth module" in m for m in task.context.thread_messages)
+
+
+# ---------------------------------------------------------------------------
+# Normalizer regressions (real Slack markup, thread context, repo fallback)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizerRegressions:
+    def test_real_slack_mention_markup_stripped_from_title(self):
+        """Slack sends ``<@U0BOT123>``, never the literal ``<@henchmen>``."""
+        n = TaskNormalizer()
+        event = {
+            "event": {
+                "type": "app_mention",
+                "user": "U123",
+                "channel": "C456",
+                "ts": "1700000.000001",
+                "text": "<@U0BOT123> fix the login bug",
+            }
+        }
+        task = n.from_slack(event)
+        assert "<@" not in task.title
+        assert task.title == "fix the login bug"
+
+    def test_slack_mention_markup_with_label_stripped(self):
+        n = TaskNormalizer()
+        event = {"event": {"type": "app_mention", "text": "<@U0BOT123|henchmen> deploy staging"}}
+        task = n.from_slack(event)
+        assert "<@" not in task.title
+        assert task.title == "deploy staging"
+
+    def test_fetched_thread_messages_reach_the_task(self):
+        """The bot puts fetched replies on ``event.thread_messages`` (strings)."""
+        n = TaskNormalizer()
+        event = {
+            "event": {
+                "type": "app_mention",
+                "user": "U123",
+                "channel": "C456",
+                "ts": "1700000.000001",
+                "thread_ts": "1699999.000001",
+                "text": "fix the auth module",
+                "thread_messages": ["previous context message", "fix the auth module"],
+            }
+        }
+        task = n.from_slack(event)
+        messages = task.context.thread_messages or []
+        assert any("previous context message" in m for m in messages)
+        # The mention text must not be duplicated.
+        assert messages.count("fix the auth module") == 1
+
+    def test_slack_repo_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "acme/fallback")
+        settings = _mock_settings()
+        n = TaskNormalizer()
+        task = n.from_slack({"event": {"type": "app_mention", "text": "do it"}}, settings)
+        assert task.context.repo == "acme/fallback"
+
+    def test_cli_repo_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "acme/fallback")
+        settings = _mock_settings()
+        n = TaskNormalizer()
+        task = n.from_cli({"title": "T"}, settings)
+        assert task.context.repo == "acme/fallback"
+
+    def test_jira_repo_from_plain_field_then_default(self, monkeypatch):
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "acme/fallback")
+        settings = _mock_settings()
+        n = TaskNormalizer()
+
+        explicit = n.from_jira(
+            {"issue": {"key": "P-1", "fields": {"summary": "S", "repo": "acme/explicit"}}},
+            settings,
+        )
+        assert explicit.context.repo == "acme/explicit"
+
+        fallback = n.from_jira({"issue": {"key": "P-2", "fields": {"summary": "S"}}}, settings)
+        assert fallback.context.repo == "acme/fallback"
+
+    def test_issue_comment_on_pr_uses_comment_body_and_pr_source_id(self):
+        n = TaskNormalizer()
+        payload = {
+            "action": "created",
+            "issue": {
+                "number": 12,
+                "title": "Broken login",
+                "body": "issue body",
+                "pull_request": {"url": "https://api.github.com/repos/acme/api/pulls/12"},
+                "user": {"login": "alice"},
+                "labels": [],
+                "state": "open",
+            },
+            "comment": {"body": "@henchmen fix this", "user": {"login": "bob"}},
+            "repository": {"full_name": "acme/api", "default_branch": "main"},
+        }
+        task = n.from_github(payload)
+        assert task.source_id == "pr-12"
+        assert task.description == "@henchmen fix this"
+        assert task.created_by == "bob"
+
+    @pytest.mark.asyncio
+    async def test_publish_task_attaches_dedup_key(self):
+        n = TaskNormalizer()
+        settings = _mock_settings()
+        task = n.from_cli({"title": "T", "repo": "acme/api"})
+        broker = AsyncMock()
+        broker.publish = AsyncMock(return_value="m1")
+
+        await n.publish_task(task, settings, broker=broker, dedup_key="github:abc")
+
+        kwargs = broker.publish.call_args[1]
+        assert kwargs["dedup_key"] == "github:abc"
+        assert kwargs["task_id"] == task.id
+
+
+# ---------------------------------------------------------------------------
+# GitHub trigger predicates (action filter, authorization, CI conclusions)
+# ---------------------------------------------------------------------------
+
+
+def _pr_comment(action="created", association="COLLABORATOR", body="@henchmen fix this"):
+    return {
+        "action": action,
+        "pull_request": {
+            "number": 3,
+            "title": "PR title",
+            "body": "PR body",
+            "user": {"login": "dev"},
+            "labels": [],
+            "state": "open",
+            "head": {"ref": "feature"},
+        },
+        "comment": {"body": body, "user": {"login": "reviewer"}, "author_association": association},
+        "repository": {"full_name": "acme/api"},
+    }
+
+
+class TestGithubTriggerFilters:
+    @pytest.mark.asyncio
+    async def test_edited_comment_does_not_dispatch(self):
+        from henchmen.dispatch.handlers.github import handle_github_webhook
+
+        normalizer = TaskNormalizer()
+        with patch.object(normalizer, "publish_task", new=AsyncMock()) as publish:
+            result = await handle_github_webhook(_pr_comment(action="edited"), normalizer, _mock_settings())
+        assert result["status"] == "ignored"
+        publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_deleted_comment_does_not_dispatch(self):
+        from henchmen.dispatch.handlers.github import handle_github_webhook
+
+        normalizer = TaskNormalizer()
+        result = await handle_github_webhook(_pr_comment(action="deleted"), normalizer, _mock_settings())
+        assert result["status"] == "ignored"
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_commenter_is_rejected(self):
+        from henchmen.dispatch.handlers.github import handle_github_webhook
+
+        normalizer = TaskNormalizer()
+        with patch.object(normalizer, "publish_task", new=AsyncMock()) as publish:
+            result = await handle_github_webhook(_pr_comment(association="NONE"), normalizer, _mock_settings())
+        assert result == {"status": "ignored", "reason": "unauthorized commenter"}
+        publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_author_association_is_rejected(self):
+        """Fail closed: a payload without author_association never dispatches."""
+        from henchmen.dispatch.handlers.github import handle_github_webhook
+
+        payload = _pr_comment()
+        del payload["comment"]["author_association"]
+        normalizer = TaskNormalizer()
+        result = await handle_github_webhook(payload, normalizer, _mock_settings())
+        assert result["status"] == "ignored"
+
+    @pytest.mark.asyncio
+    async def test_issue_comment_on_pr_dispatches(self):
+        from henchmen.dispatch.handlers.github import handle_github_webhook
+
+        payload = {
+            "action": "created",
+            "issue": {
+                "number": 12,
+                "title": "Broken login",
+                "body": "",
+                "pull_request": {"url": "https://api.github.com/repos/acme/api/pulls/12"},
+                "user": {"login": "alice"},
+                "labels": [],
+                "state": "open",
+            },
+            "comment": {
+                "body": "@henchmen fix this",
+                "user": {"login": "alice"},
+                "author_association": "OWNER",
+            },
+            "repository": {"full_name": "acme/api", "default_branch": "main"},
+        }
+        normalizer = TaskNormalizer()
+        with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="m")):
+            result = await handle_github_webhook(payload, normalizer, _mock_settings())
+        assert result["status"] == "dispatched"
+        assert result["trigger"] == "pr_comment"
+
+    def test_red_check_suite_conclusions_count_as_ci_failure(self):
+        from henchmen.dispatch.handlers.github import _is_ci_failure_on_henchmen_branch
+
+        for conclusion in ("failure", "timed_out", "startup_failure", "action_required"):
+            payload = {
+                "action": "completed",
+                "check_suite": {"conclusion": conclusion, "head_branch": "henchmen/abc123"},
+            }
+            assert _is_ci_failure_on_henchmen_branch(payload) is True, conclusion
+
+    def test_success_and_cancelled_are_not_ci_failures(self):
+        from henchmen.dispatch.handlers.github import _is_ci_failure_on_henchmen_branch
+
+        for conclusion in ("success", "cancelled", "neutral", "skipped", "stale", None):
+            payload = {
+                "action": "completed",
+                "check_suite": {"conclusion": conclusion, "head_branch": "henchmen/abc123"},
+            }
+            assert _is_ci_failure_on_henchmen_branch(payload) is False, conclusion
+
+    @pytest.mark.asyncio
+    async def test_ci_failure_payload_includes_conclusion(self):
+        import json
+
+        from henchmen.dispatch.handlers.github import handle_ci_failure_webhook
+
+        payload = {
+            "action": "completed",
+            "check_suite": {
+                "conclusion": "timed_out",
+                "head_branch": "henchmen/task-1",
+                "id": 7,
+                "head_sha": "deadbeef",
+            },
+            "repository": {"full_name": "acme/api"},
+        }
+        broker = AsyncMock()
+        broker.publish = AsyncMock(return_value="m")
+        result = await handle_ci_failure_webhook(payload, _mock_settings(), broker=broker)
+        assert result["conclusion"] == "timed_out"
+        published = json.loads(broker.publish.call_args[0][1].decode())
+        assert published["conclusion"] == "timed_out"
+
+
+# ---------------------------------------------------------------------------
+# Jira transition detection
+# ---------------------------------------------------------------------------
+
+
+class TestJiraTransitionDetection:
+    @pytest.mark.asyncio
+    async def test_changelog_status_change_dispatches(self):
+        from henchmen.dispatch.handlers.jira import handle_jira_webhook
+
+        payload = {
+            "webhookEvent": "jira:issue_updated",
+            "changelog": {"items": [{"field": "status", "toString": "Ready for Henchmen"}]},
+            "issue": {"key": "PROJ-9", "fields": {"summary": "Do it", "repo": "acme/api"}},
+        }
+        normalizer = TaskNormalizer()
+        with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="m")):
+            result = await handle_jira_webhook(payload, normalizer, _mock_settings())
+        assert result["status"] == "dispatched"
+
+    @pytest.mark.asyncio
+    async def test_unrelated_changelog_is_ignored(self):
+        from henchmen.dispatch.handlers.jira import handle_jira_webhook
+
+        payload = {
+            "webhookEvent": "jira:issue_updated",
+            "changelog": {"items": [{"field": "assignee", "toString": "someone"}]},
+            "issue": {"key": "PROJ-9", "fields": {"summary": "Do it"}},
+        }
+        result = await handle_jira_webhook(payload, TaskNormalizer(), _mock_settings())
+        assert result["status"] == "ignored"
+
+    @pytest.mark.asyncio
+    async def test_post_function_transition_still_dispatches(self):
+        from henchmen.dispatch.handlers.jira import handle_jira_webhook
+
+        payload = {
+            "transition": {"transitionName": "Ready for Henchmen"},
+            "issue": {"key": "PROJ-9", "fields": {"summary": "Do it"}},
+        }
+        normalizer = TaskNormalizer()
+        with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="m")):
+            result = await handle_jira_webhook(payload, normalizer, _mock_settings())
+        assert result["status"] == "dispatched"
+
+
+# ---------------------------------------------------------------------------
+# Slack mention detection via the bot's own user id
+# ---------------------------------------------------------------------------
+
+
+class TestSlackMentionDetection:
+    @pytest.mark.asyncio
+    async def test_message_event_with_bot_user_id_dispatches(self):
+        from henchmen.dispatch.handlers.slack import handle_slack_event
+
+        payload = {
+            "authorizations": [{"user_id": "U0BOT123"}],
+            "event": {
+                "type": "message",
+                "user": "U1",
+                "channel": "C1",
+                "ts": "1700.1",
+                "text": "<@U0BOT123> please fix this",
+            },
+        }
+        normalizer = TaskNormalizer()
+        with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="m")):
+            result = await handle_slack_event(payload, normalizer, _mock_settings())
+        assert result["status"] == "dispatched"
+
+    @pytest.mark.asyncio
+    async def test_message_mentioning_another_user_is_ignored(self):
+        from henchmen.dispatch.handlers.slack import handle_slack_event
+
+        payload = {
+            "authorizations": [{"user_id": "U0BOT123"}],
+            "event": {"type": "message", "user": "U1", "text": "<@U9999999> ping"},
+        }
+        result = await handle_slack_event(payload, TaskNormalizer(), _mock_settings())
+        assert result["status"] == "ignored"
+
+
+# ---------------------------------------------------------------------------
+# Embedding pipeline hygiene
+# ---------------------------------------------------------------------------
+
+
+class TestEmbeddingPipelineGuards:
+    @pytest.mark.asyncio
+    async def test_rejects_repo_that_is_not_owner_slash_name(self):
+        from henchmen.dispatch.handlers.cli import run_embedding_pipeline
+
+        result = await run_embedding_pipeline(repo="--upload-pack=evil", mode="full", settings=_mock_settings())
+        assert result["status"] == "failed"
+        assert "invalid repo name" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_clone_uses_resolved_default_branch_and_settings_token(self, monkeypatch):
+        from henchmen.dispatch.handlers import cli as cli_handlers
+
+        monkeypatch.setenv("HENCHMEN_GITHUB_TOKEN", "ghp-from-settings")
+        settings = _mock_settings()
+
+        clone = AsyncMock(side_effect=RuntimeError("stop here"))
+        monkeypatch.setattr(cli_handlers, "clone_repo", clone)
+        monkeypatch.setattr(
+            cli_handlers,
+            "_resolve_default_branch",
+            AsyncMock(return_value="develop"),
+        )
+
+        result = await cli_handlers.run_embedding_pipeline(repo="acme/api", mode="full", settings=settings)
+
+        assert result["status"] == "failed"
+        args, kwargs = clone.call_args
+        assert args[1] == "develop"
+        assert kwargs["token"] == "ghp-from-settings"
+
+
+# ---------------------------------------------------------------------------
+# Webhook signature verification (fail-closed intake)
+# ---------------------------------------------------------------------------
+
+
+def json_dumps(obj) -> bytes:
+    """Serialize *obj* exactly as it will be signed and sent."""
+    import json
+
+    return json.dumps(obj).encode("utf-8")
+
+
+def _sign_sha256(secret: str, body: bytes) -> str:
+    import hashlib
+    import hmac
+
+    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+def _sign_slack(secret: str, timestamp: str, body: bytes) -> str:
+    import hashlib
+    import hmac
+
+    basestring = b"v0:" + timestamp.encode() + b":" + body
+    return "v0=" + hmac.new(secret.encode(), basestring, hashlib.sha256).hexdigest()
+
+
+class TestWebhookSignatures:
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("HENCHMEN_GCP_PROJECT_ID", "test-project")
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "dev")
+        monkeypatch.setenv("HENCHMEN_GITHUB_WEBHOOK_SECRET", "gh-secret")
+        monkeypatch.setenv("HENCHMEN_SLACK_SIGNING_SECRET", "slack-secret")
+        monkeypatch.setenv("HENCHMEN_JIRA_WEBHOOK_SECRET", "jira-secret")
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "acme/api")
+        yield
+
+    @pytest.fixture
+    def client(self):
+        import henchmen.dispatch.server as server
+
+        server._delivery_guard.clear()
+        with TestClient(server.app) as c:
+            yield c
+
+    def test_github_valid_signature_accepted(self, client):
+        body = json_dumps({"action": "opened"})
+        resp = client.post(
+            "/webhooks/github",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": _sign_sha256("gh-secret", body),
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ignored"
+
+    def test_github_bad_signature_rejected(self, client):
+        body = json_dumps({"action": "opened"})
+        resp = client.post(
+            "/webhooks/github",
+            content=body,
+            headers={"Content-Type": "application/json", "X-Hub-Signature-256": "sha256=deadbeef"},
+        )
+        assert resp.status_code == 401
+
+    def test_github_missing_signature_rejected(self, client):
+        body = json_dumps({"action": "opened"})
+        resp = client.post("/webhooks/github", content=body, headers={"Content-Type": "application/json"})
+        assert resp.status_code == 401
+
+    def test_slack_valid_signature_accepted(self, client):
+        import time
+
+        body = json_dumps({"event": {"type": "message", "text": "hello"}})
+        ts = str(int(time.time()))
+        resp = client.post(
+            "/webhooks/slack",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Slack-Request-Timestamp": ts,
+                "X-Slack-Signature": _sign_slack("slack-secret", ts, body),
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ignored"
+
+    def test_slack_stale_timestamp_rejected(self, client):
+        import time
+
+        body = json_dumps({"event": {"type": "app_mention", "text": "@henchmen go"}})
+        ts = str(int(time.time()) - 3600)
+        resp = client.post(
+            "/webhooks/slack",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Slack-Request-Timestamp": ts,
+                "X-Slack-Signature": _sign_slack("slack-secret", ts, body),
+            },
+        )
+        assert resp.status_code == 401
+
+    def test_slack_bad_signature_rejected(self, client):
+        import time
+
+        body = json_dumps({"event": {"type": "app_mention", "text": "@henchmen go"}})
+        resp = client.post(
+            "/webhooks/slack",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Slack-Request-Timestamp": str(int(time.time())),
+                "X-Slack-Signature": "v0=nope",
+            },
+        )
+        assert resp.status_code == 401
+
+    def test_slack_non_utf8_body_is_rejected_not_crashed(self, client):
+        """A non-UTF-8 body must fail the HMAC check rather than raise."""
+        import time
+
+        body = b"\xff\xfe not json"
+        ts = str(int(time.time()))
+        resp = client.post(
+            "/webhooks/slack",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Slack-Request-Timestamp": ts,
+                "X-Slack-Signature": _sign_slack("slack-secret", ts, body),
+            },
+        )
+        # Signature is valid, so the failure must come from JSON parsing (400).
+        assert resp.status_code == 400
+
+    def test_jira_x_hub_signature_accepted(self, client):
+        """Jira Cloud signs with X-Hub-Signature (this was the broken header)."""
+        body = json_dumps({"webhookEvent": "jira:issue_updated", "issue": {"key": "P-1", "fields": {}}})
+        resp = client.post(
+            "/webhooks/jira",
+            content=body,
+            headers={"Content-Type": "application/json", "X-Hub-Signature": _sign_sha256("jira-secret", body)},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ignored"
+
+    def test_jira_atlassian_header_still_accepted(self, client):
+        body = json_dumps({"webhookEvent": "jira:issue_updated", "issue": {"key": "P-2", "fields": {}}})
+        resp = client.post(
+            "/webhooks/jira",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Atlassian-Webhook-Signature": _sign_sha256("jira-secret", body),
+            },
+        )
+        assert resp.status_code == 200
+
+    def test_jira_missing_signature_rejected(self, client):
+        body = json_dumps({"webhookEvent": "jira:issue_updated", "issue": {"key": "P-3", "fields": {}}})
+        resp = client.post("/webhooks/jira", content=body, headers={"Content-Type": "application/json"})
+        assert resp.status_code == 401
+
+
+class TestRequireSigningSecret:
+    def test_dev_allows_missing_secret(self):
+        from henchmen.config.settings import Environment
+        from henchmen.dispatch.server import _require_signing_secret
+
+        _require_signing_secret(Environment.DEV, "", integration="slack")
+
+    @pytest.mark.parametrize("env_name", ["staging", "prod"])
+    def test_staging_and_prod_reject_missing_secret(self, env_name):
+        from fastapi import HTTPException
+
+        from henchmen.config.settings import Environment
+        from henchmen.dispatch.server import _require_signing_secret
+
+        with pytest.raises(HTTPException) as exc:
+            _require_signing_secret(Environment(env_name), "", integration="github")
+        assert exc.value.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Pub/Sub OIDC verification
+# ---------------------------------------------------------------------------
+
+
+def _pubsub_request(headers=None):
+    from starlette.requests import Request
+
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/pubsub/task-planned",
+            "headers": raw,
+            "query_string": b"",
+            "client": ("10.0.0.1", 1234),
+        }
+    )
+
+
+class TestPubsubOidc:
+    @pytest.mark.asyncio
+    async def test_dev_without_audience_or_token_is_allowed(self, monkeypatch):
+        from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
+
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "dev")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_AUDIENCE", "")
+        await verify_pubsub_oidc(_pubsub_request(), _mock_settings())
+
+    @pytest.mark.asyncio
+    async def test_dev_with_token_but_no_audience_is_rejected(self, monkeypatch):
+        from fastapi import HTTPException
+
+        from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
+
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "dev")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_AUDIENCE", "")
+        with pytest.raises(HTTPException) as exc:
+            await verify_pubsub_oidc(_pubsub_request({"Authorization": "Bearer abc"}), _mock_settings())
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_staging_without_audience_is_rejected(self, monkeypatch):
+        from fastapi import HTTPException
+
+        from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
+
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "staging")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_AUDIENCE", "")
+        with pytest.raises(HTTPException) as exc:
+            await verify_pubsub_oidc(_pubsub_request(), _mock_settings())
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_audience_set_but_no_token_is_rejected(self, monkeypatch):
+        from fastapi import HTTPException
+
+        from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
+
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "dev")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_AUDIENCE", "https://dispatch.example")
+        with pytest.raises(HTTPException) as exc:
+            await verify_pubsub_oidc(_pubsub_request(), _mock_settings())
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_valid_token_outside_email_allow_list_is_rejected(self, monkeypatch):
+        from fastapi import HTTPException
+
+        from henchmen.dispatch import pubsub_auth
+
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "prod")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_AUDIENCE", "https://dispatch.example")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_ALLOWED_EMAILS", "pubsub@acme.iam.gserviceaccount.com")
+
+        fake_id_token = MagicMock()
+        fake_id_token.verify_oauth2_token.return_value = {"email": "intruder@evil.example"}
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "google.auth.transport.requests": MagicMock(),
+                    "google.oauth2.id_token": fake_id_token,
+                },
+            ),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await pubsub_auth.verify_pubsub_oidc(_pubsub_request({"Authorization": "Bearer jwt"}), _mock_settings())
+        assert exc.value.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# /api/v1/tasks request validation
+# ---------------------------------------------------------------------------
+
+
+class TestCreateTaskValidation:
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("HENCHMEN_GCP_PROJECT_ID", "test-project")
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        # Set empty rather than delete: Settings also reads .env.local.
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "")
+        yield
+
+    @pytest.fixture
+    def client(self):
+        from henchmen.dispatch.server import app
+
+        with TestClient(app) as c:
+            yield c
+
+    def test_missing_title_returns_422(self, client):
+        assert client.post("/api/v1/tasks", json={}).status_code == 422
+
+    def test_invalid_priority_returns_422(self, client):
+        resp = client.post("/api/v1/tasks", json={"title": "T", "repo": "a/b", "priority": "urgent"})
+        assert resp.status_code == 422
+
+    def test_non_string_title_returns_422(self, client):
+        resp = client.post("/api/v1/tasks", json={"title": 12345, "repo": "a/b"})
+        assert resp.status_code == 422
+
+    def test_json_string_body_returns_422(self, client):
+        resp = client.post("/api/v1/tasks", json="title")
+        assert resp.status_code == 422
+
+    def test_missing_repo_without_default_returns_422(self, client):
+        resp = client.post("/api/v1/tasks", json={"title": "T"})
+        assert resp.status_code == 422
+
+    def test_repo_falls_back_to_default(self, client, monkeypatch):
+        from henchmen.config.settings import get_settings
+
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "acme/api")
+        # The client fixture already warmed the Settings cache with the empty
+        # value set by ``_env``; drop it so the route sees the new default.
+        get_settings.cache_clear()
+        resp = client.post("/api/v1/tasks", json={"title": "T"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "dispatched"
+
+
+# ---------------------------------------------------------------------------
+# Webhook replay protection
+# ---------------------------------------------------------------------------
+
+
+class TestWebhookIdempotency:
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("HENCHMEN_GCP_PROJECT_ID", "test-project")
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "dev")
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "acme/api")
+        yield
+
+    @pytest.fixture
+    def client(self):
+        import henchmen.dispatch.server as server
+
+        server._delivery_guard.clear()
+        with TestClient(server.app) as c:
+            yield c
+
+    def _issue_labeled(self):
+        return {
+            "action": "labeled",
+            "label": {"name": "henchmen"},
+            "issue": {
+                "number": 5,
+                "title": "Bug report",
+                "body": "",
+                "user": {"login": "alice"},
+                "labels": [{"name": "henchmen"}],
+                "state": "open",
+            },
+            "repository": {"full_name": "acme/api", "default_branch": "main"},
+        }
+
+    def test_github_redelivery_is_ignored(self, client):
+        headers = {"X-GitHub-Delivery": "delivery-1"}
+        first = client.post("/webhooks/github", json=self._issue_labeled(), headers=headers)
+        second = client.post("/webhooks/github", json=self._issue_labeled(), headers=headers)
+        assert first.json()["status"] == "dispatched"
+        assert second.json()["status"] == "ignored"
+        assert second.json()["reason"] == "duplicate delivery"
+
+    def test_distinct_deliveries_both_dispatch(self, client):
+        first = client.post("/webhooks/github", json=self._issue_labeled(), headers={"X-GitHub-Delivery": "delivery-a"})
+        second = client.post(
+            "/webhooks/github", json=self._issue_labeled(), headers={"X-GitHub-Delivery": "delivery-b"}
+        )
+        assert first.json()["status"] == "dispatched"
+        assert second.json()["status"] == "dispatched"
+
+    def test_slack_retry_header_short_circuits(self, client):
+        payload = {
+            "event_id": "Ev123",
+            "event": {"type": "app_mention", "user": "U1", "channel": "C1", "ts": "1.1", "text": "go"},
+        }
+        resp = client.post("/webhooks/slack", json=payload, headers={"X-Slack-Retry-Num": "1"})
+        assert resp.json() == {"status": "ignored", "reason": "slack retry"}
+
+    def test_slack_same_event_id_is_ignored_second_time(self, client):
+        payload = {
+            "event_id": "Ev999",
+            "event": {"type": "app_mention", "user": "U1", "channel": "C1", "ts": "1.1", "text": "go"},
+        }
+        first = client.post("/webhooks/slack", json=payload)
+        second = client.post("/webhooks/slack", json=payload)
+        assert first.json()["status"] == "dispatched"
+        assert second.json()["status"] == "ignored"
+
+
+class TestTTLSet:
+    def test_first_add_is_new_and_replay_is_not(self):
+        from henchmen.dispatch.idempotency import TTLSet
+
+        guard = TTLSet()
+        assert guard.add_if_absent("k") is True
+        assert guard.add_if_absent("k") is False
+
+    def test_empty_key_is_never_deduped(self):
+        from henchmen.dispatch.idempotency import TTLSet
+
+        guard = TTLSet()
+        assert guard.add_if_absent("") is True
+        assert guard.add_if_absent("") is True
+
+    def test_entries_expire(self):
+        from henchmen.dispatch.idempotency import TTLSet
+
+        guard = TTLSet(ttl_seconds=0.0)
+        assert guard.add_if_absent("k") is True
+        assert guard.add_if_absent("k") is True
+
+    def test_max_entries_is_enforced(self):
+        from henchmen.dispatch.idempotency import TTLSet
+
+        guard = TTLSet(max_entries=5)
+        for i in range(50):
+            guard.add_if_absent(f"k{i}")
+        assert len(guard._seen) <= 5
+
+
+# ---------------------------------------------------------------------------
+# Container contract: the dispatch image must serve the FastAPI app
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchContainer:
+    def _repo_root(self):
+        import pathlib
+
+        return pathlib.Path(__file__).resolve().parents[2]
+
+    def test_entrypoint_execs_uvicorn_with_the_fastapi_app(self):
+        entrypoint = (self._repo_root() / "containers" / "dispatch" / "entrypoint.sh").read_text(encoding="utf-8")
+        assert "uvicorn henchmen.dispatch.server:app" in entrypoint
+        assert "exec uvicorn" in entrypoint
+        # The stub health server that only answered GET must be gone.
+        assert "BaseHTTPRequestHandler" not in entrypoint
+
+    def test_dockerfile_runs_the_entrypoint(self):
+        dockerfile = (self._repo_root() / "containers" / "dispatch" / "Dockerfile").read_text(encoding="utf-8")
+        assert 'CMD ["./entrypoint.sh"]' in dockerfile
+
+    def test_requirements_drop_unused_packages(self):
+        reqs = (self._repo_root() / "containers" / "dispatch" / "requirements.txt").read_text(encoding="utf-8")
+        for unused in ("jira", "google-cloud-secret-manager", "google-cloud-logging"):
+            assert unused not in reqs

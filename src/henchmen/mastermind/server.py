@@ -10,9 +10,10 @@ import base64
 import contextlib
 import json
 import logging
-import re
+import os
 import signal
 import traceback
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
@@ -27,35 +28,26 @@ import henchmen.schemes.goal_decomposition  # noqa: F401
 from henchmen.config.settings import get_settings
 from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
 from henchmen.mastermind.agent import MastermindAgent
+from henchmen.mastermind.scheme_executor import validate_deterministic_handlers
 from henchmen.models.task import HenchmenTask
 from henchmen.observability.api import create_metrics_router
+from henchmen.schemes.registry import SchemeRegistry
+from henchmen.utils.redaction import install_secret_redaction
 
 logger = logging.getLogger(__name__)
 
 # Graceful shutdown event — set when SIGTERM received
 _shutdown_event = asyncio.Event()
 
+# Redact secrets in every log record this process emits, from every logger and
+# through every handler (a root-logger Filter would miss child loggers and %s
+# arguments entirely).
+install_secret_redaction()
 
-class _SecretRedactionFilter(logging.Filter):
-    """Logging filter that redacts known secret token patterns before they reach Cloud Logging."""
-
-    _PATTERNS = [
-        re.compile(r"(ghp_[a-zA-Z0-9]{36})"),  # GitHub personal access tokens
-        re.compile(r"(ghs_[a-zA-Z0-9]{36})"),  # GitHub server-to-server tokens
-        re.compile(r"(xoxb-[a-zA-Z0-9-]+)"),  # Slack bot tokens
-        re.compile(r"(sk-[a-zA-Z0-9]{32,})"),  # OpenAI / generic secret keys
-        re.compile(r"(x-access-token:[^@\s]+)"),  # Git clone credential URLs
-    ]
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        msg = str(record.msg)
-        for pattern in self._PATTERNS:
-            msg = pattern.sub("***REDACTED***", msg)
-        record.msg = msg
-        return True
-
-
-logging.getLogger().addFilter(_SecretRedactionFilter())
+# Identifies this process when holding the watchdog lease. K_REVISION alone is
+# shared by every replica of a Cloud Run revision, so two replicas would each
+# believe they hold the lease.
+_INSTANCE_ID = f"{os.environ.get('K_REVISION') or os.environ.get('HOSTNAME') or 'local'}-{uuid.uuid4().hex[:8]}"
 
 # Singleton agent instance
 _agent: MastermindAgent | None = None
@@ -109,6 +101,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     agent = get_agent()
     router = create_metrics_router(agent.tracker)
     app.include_router(router)
+
+    # Surface configuration problems once, at boot, instead of failing a task
+    # hours later (missing API key, empty tier model, missing OIDC audience).
+    for problem in settings.validate_for_runtime():
+        logger.error("[mastermind] Configuration problem: %s", problem)
+
+    # A deterministic node with no handler is a gate that silently never runs.
+    for scheme_id in SchemeRegistry.list_schemes():
+        graph = SchemeRegistry.get(scheme_id)
+        if graph is None:
+            continue
+        for problem in validate_deterministic_handlers(graph):
+            logger.error("[mastermind] Scheme problem: %s", problem)
 
     # Register SIGTERM handler for graceful shutdown on Cloud Run
     loop = asyncio.get_running_loop()
@@ -192,7 +197,7 @@ async def _acquire_watchdog_lease(
 _DEDUP_INFLIGHT_TTL_SECONDS = 900
 
 
-async def _check_message_dedup(message_id: str, dedup_key: str | None = None) -> bool:
+async def _check_message_dedup(message_id: str, dedup_key: str | None = None, handler: str = "task-intake") -> bool:
     """Check if a Pub/Sub message (or an explicit dedup key) was already processed.
 
     Two-phase dedup (E2 fix):
@@ -270,7 +275,10 @@ async def _check_message_dedup(message_id: str, dedup_key: str | None = None) ->
                 {
                     "status": "in_flight",
                     "acquired_at": now.isoformat(),
-                    "handler": "task-intake",
+                    # ``cleanup_processed_messages`` filters on processed_at, so
+                    # in_flight markers need it too or they are never reaped.
+                    "processed_at": now.isoformat(),
+                    "handler": handler,
                     "key": key,
                 },
             )
@@ -285,7 +293,7 @@ async def _check_message_dedup(message_id: str, dedup_key: str | None = None) ->
     return bool(message_id and await _check_or_claim(message_id))
 
 
-async def _mark_message_done(message_id: str, dedup_key: str | None = None) -> None:
+async def _mark_message_done(message_id: str, dedup_key: str | None = None, handler: str = "task-intake") -> None:
     """Upgrade an ``in_flight`` dedup marker to ``done`` after successful processing.
 
     This is the second half of the E2 two-phase dedup fix. Call this ONLY
@@ -307,7 +315,7 @@ async def _mark_message_done(message_id: str, dedup_key: str | None = None) -> N
                 {
                     "status": "done",
                     "processed_at": now,
-                    "handler": "task-intake",
+                    "handler": handler,
                     "key": key,
                 },
             )
@@ -439,10 +447,11 @@ async def _process_task(agent: MastermindAgent, task: HenchmenTask) -> None:
             wall_clock_seconds=task_metrics.get("wall_clock_seconds", 0.0) if task_metrics else 0.0,
         )
 
-        # Notify Slack if the task came from Slack
-        if task.source.value == "slack":
-            logger.info("[MASTERMIND] Sending Slack notification for task %s", task.id)
-            await _notify_slack(task, result)
+        # Notify Slack. Tasks from Slack get a threaded reply; everything else
+        # falls back to the configured notification channel (and is a no-op
+        # when neither a token nor a channel is configured).
+        logger.info("[MASTERMIND] Sending Slack notification for task %s", task.id)
+        await _notify_slack(task, result)
 
     except Exception as exc:
         logger.exception("[MASTERMIND] ERROR processing task %s: %s", task.id, exc)
@@ -494,12 +503,12 @@ def _format_ci_result_message(pr_number: int, ci_passed: bool, failed_checks: li
 
 async def _notify_slack(task: HenchmenTask, result: dict[str, Any]) -> None:
     """Send a status update back to Slack."""
-    import os
-
     from slack_sdk import WebClient
 
-    bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
+    settings = get_settings()
+    bot_token = settings.slack_bot_token
     if not bot_token:
+        logger.info("[MASTERMIND] Slack notification skipped — HENCHMEN_SLACK_BOT_TOKEN is not set")
         return
 
     client = WebClient(token=bot_token)
@@ -508,7 +517,9 @@ async def _notify_slack(task: HenchmenTask, result: dict[str, Any]) -> None:
     status = "escalated" if final_status == "escalated" else result.get("status", "unknown")
     scheme_id = result.get("scheme_id", "unknown")
 
-    if status == "completed":
+    # ``pr_created`` is the success status the executor reports when a PR was
+    # opened; treating it as generic used to drop the PR link from the message.
+    if status in ("completed", "pr_created"):
         pr_url = result.get("result", {}).get("pr_url", "")
         text = f"Task completed! Scheme: `{scheme_id}`"
         if pr_url:
@@ -549,19 +560,29 @@ async def _notify_slack(task: HenchmenTask, result: dict[str, Any]) -> None:
 
     logger.info("[MASTERMIND] Slack notification: status=%s, scheme=%s", status, scheme_id)
 
-    # Extract channel and thread_ts from source_id (format: "channel/thread_ts")
+    # Extract channel and thread_ts from source_id (format: "channel/thread_ts").
+    # Tasks that did not originate in Slack (CLI, Jira, GitHub) have no thread
+    # to reply in, so they go to the configured notification channel instead.
     parts = task.source_id.split("/")
     if len(parts) >= 2:
         channel = parts[0]
-        thread_ts = parts[1]
-        logger.info("[MASTERMIND] Posting to Slack channel=%s thread=%s", channel, thread_ts)
-        try:
-            client.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
-            logger.info("[MASTERMIND] Slack notification sent successfully")
-        except Exception as exc:
-            logger.error("[MASTERMIND] Failed to notify Slack: %s", exc)
+        thread_ts: str | None = parts[1]
     else:
-        logger.error("[MASTERMIND] Cannot parse source_id for Slack: %s", task.source_id)
+        channel = settings.slack_notification_channel
+        thread_ts = None
+        if not channel:
+            logger.info(
+                "[MASTERMIND] No Slack thread in source_id %r and no HENCHMEN_SLACK_NOTIFICATION_CHANNEL set",
+                task.source_id,
+            )
+            return
+
+    logger.info("[MASTERMIND] Posting to Slack channel=%s thread=%s", channel, thread_ts)
+    try:
+        client.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
+        logger.info("[MASTERMIND] Slack notification sent successfully")
+    except Exception as exc:
+        logger.error("[MASTERMIND] Failed to notify Slack: %s", exc)
 
 
 @app.post("/pubsub/operative-complete")
@@ -577,7 +598,7 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
 
         # Layer 1: Pub/Sub message-level dedup
         message_id = envelope.get("message", {}).get("messageId", "")
-        if await _check_message_dedup(message_id):
+        if await _check_message_dedup(message_id, handler="operative-complete"):
             logger.info("Duplicate operative-complete message %s, skipping", message_id)
             return {"status": "duplicate", "message_id": message_id}
 
@@ -620,6 +641,8 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
             output_tokens=report.total_output_tokens,
         )
 
+        # Two-phase dedup: only now is the message really processed.
+        await _mark_message_done(message_id, handler="operative-complete")
         return {"status": "ok"}
     except Exception as exc:
         logger.error("Failed to process operative-complete: %s", exc)
@@ -638,7 +661,6 @@ async def forge_result_handler(request: Request) -> dict[str, Any]:
 
         request_id = data.get("request_id", "")
         agent = get_agent()
-        agent.notify_forge_result(request_id, data)
 
         # Track CI result
         task_id = data.get("task_id", "")
@@ -655,49 +677,39 @@ async def forge_result_handler(request: Request) -> dict[str, Any]:
 
 @app.post("/pubsub/ci-failure")
 async def ci_failure_handler(request: Request) -> dict[str, Any]:
-    """Handle CI failure events from Pub/Sub."""
+    """Handle CI failure events from Pub/Sub.
+
+    An undecodable envelope is acknowledged (retrying will not help); a failure
+    while handling a well-formed event returns 500 so Pub/Sub redelivers.
+    """
     await verify_pubsub_oidc(request, get_settings())
     try:
         envelope = await request.json()
         message = envelope.get("message", {})
         data_b64 = message.get("data", "")
         data = json.loads(base64.b64decode(data_b64).decode("utf-8"))
-
-        task_id_prefix = data.get("task_id_prefix", "")
-        repo = data.get("repo", "")
-        branch = data.get("branch", "")
-        check_suite_id = data.get("check_suite_id", 0)
-
-        if not task_id_prefix:
-            return {"status": "error", "detail": "missing task_id_prefix"}
-
-        agent = get_agent()
-        try:
-            await _handle_ci_failure(agent, task_id_prefix, repo, branch, check_suite_id)
-            return {"status": "completed"}
-        except Exception as ci_exc:
-            tb_str = "".join(traceback.format_exception(type(ci_exc), ci_exc, ci_exc.__traceback__))
-            logger.error("[CI-LOOP] FAILED for %s: %s", task_id_prefix, ci_exc)
-            logger.error("[CI-LOOP] Traceback: %s", tb_str[:1000])
-            raise HTTPException(status_code=500, detail=f"CI failure handling failed: {ci_exc}") from ci_exc
     except Exception as exc:
-        logger.error("Failed to process ci-failure: %s", exc)
+        logger.error("Failed to decode ci-failure message: %s", exc)
         return {"status": "error", "detail": str(exc)}
 
+    task_id_prefix = data.get("task_id_prefix", "")
+    repo = data.get("repo", "")
+    branch = data.get("branch", "")
+    check_suite_id = data.get("check_suite_id", 0)
 
-async def _handle_ci_failure(
-    agent: MastermindAgent,
-    task_id_prefix: str,
-    repo: str,
-    branch: str,
-    check_suite_id: int,
-) -> None:
-    """Process CI failure in the background."""
+    if not task_id_prefix:
+        return {"status": "error", "detail": "missing task_id_prefix"}
+
     try:
+        agent = get_agent()
         result = await agent.handle_ci_failure(task_id_prefix, repo, branch, check_suite_id)
         logger.info("[CI-LOOP] Result: %s", result)
+        return {"status": "completed", "result": result}
     except Exception as exc:
-        logger.error("[CI-LOOP] Error: %s", exc)
+        tb_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        logger.error("[CI-LOOP] FAILED for %s: %s", task_id_prefix, exc)
+        logger.error("[CI-LOOP] Traceback: %s", tb_str[:1000])
+        raise HTTPException(status_code=500, detail=f"CI failure handling failed: {exc}") from exc
 
 
 @app.get("/api/v1/metrics/summary")
@@ -729,16 +741,12 @@ async def watchdog_handler() -> dict[str, Any]:
     resume-publish dedup key below it eliminates the most common double
     re-publish race.
     """
-    import os
-    import uuid
-
     agent = get_agent()
     env = agent.settings.environment.value
 
     # Best-effort lease: skip this tick if another replica already holds it.
-    instance_id = os.environ.get("K_REVISION") or os.environ.get("HOSTNAME") or str(uuid.uuid4())
     store = agent.tracker._store
-    have_lease = await _acquire_watchdog_lease(store, env, instance_id, ttl_seconds=60)
+    have_lease = await _acquire_watchdog_lease(store, env, _INSTANCE_ID, ttl_seconds=60)
     if not have_lease:
         return {"stalled_found": 0, "recovered": 0, "escalated": 0, "skipped": "lease_held"}
 
@@ -790,31 +798,63 @@ async def watchdog_handler() -> dict[str, Any]:
     return {"stalled_found": len(stalled), "recovered": recovered, "escalated": escalated}
 
 
+def _dlq_task_id(message: dict[str, Any]) -> str:
+    """Best-effort task id for a dead-lettered message.
+
+    Publishers attach ``task_id`` as a Pub/Sub attribute; the payload itself
+    carries ``id`` (a task) or ``resume_task_id`` (a watchdog resume).
+    """
+    attributes = message.get("attributes") or {}
+    if isinstance(attributes, dict) and attributes.get("task_id"):
+        return str(attributes["task_id"])
+    raw = message.get("data", "")
+    if isinstance(raw, bytes | bytearray):
+        raw = raw.decode("utf-8", errors="replace")
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("task_id") or payload.get("resume_task_id") or payload.get("id") or "")
+
+
 @app.post("/api/v1/check-dlq")
 async def check_dlq_handler() -> dict[str, Any]:
     """Check dead letter queue for lost messages.
 
-    Called every 15 minutes by Cloud Scheduler.  Pulls up to 10 messages
-    from the DLQ subscription via the ``MessageBroker`` provider interface,
-    logs them, and acknowledges so they don't pile up.  Returns the count
-    of dead-lettered messages found.
+    Called every 15 minutes by Cloud Scheduler.  Pulls up to 10 messages from
+    the DLQ subscription via the ``MessageBroker`` provider interface and
+    escalates the task each one carries before acknowledging, so a
+    dead-lettered task surfaces for human review instead of vanishing into a
+    truncated log line.  Returns the count of dead-lettered messages found.
     """
     agent = get_agent()
-    env = agent.settings.environment.value
-    subscription_name = f"henchmen-{env}-dead-letter-sub"
+    subscription_name = f"{agent.settings.pubsub_topic_dead_letter}-sub"
 
     try:
         broker = agent._get_broker()
         messages = await broker.pull_dlq(subscription_name, max_messages=10)
         count = len(messages)
 
+        escalated = 0
         if count > 0:
             logger.warning("[DLQ] Found %d dead-lettered messages", count)
             for msg in messages:
-                data = str(msg.get("data", ""))[:500]
-                logger.warning("[DLQ] Message: %s", data)
+                task_id = _dlq_task_id(msg)
+                if not task_id:
+                    logger.warning("[DLQ] Message with no identifiable task: %s", str(msg.get("data", ""))[:500])
+                    continue
+                try:
+                    await agent.tracker.mark_escalated(
+                        task_id, reason="Message dead-lettered after exhausting Pub/Sub retries"
+                    )
+                    escalated += 1
+                    logger.warning("[DLQ] Escalated dead-lettered task %s", task_id)
+                except Exception as exc:
+                    logger.error("[DLQ] Failed to escalate task %s: %s", task_id, exc)
 
-        return {"dead_letter_count": count}
+        return {"dead_letter_count": count, "escalated": escalated}
     except NotImplementedError as exc:
         # Provider (e.g. AWS SNS) does not expose a DLQ pull path.
         logger.info("[DLQ] Check skipped (provider unsupported): %s", exc)

@@ -251,3 +251,115 @@ class TestChunkFiles:
         paths = {c.file_path for c in all_chunks}
         assert "hello.py" in paths
         assert "package-lock.json" not in paths
+
+
+# ---------------------------------------------------------------------------
+# Module-level Python code (no top-level def/class)
+# ---------------------------------------------------------------------------
+
+
+class TestPythonModuleLevelCode:
+    def test_def_less_module_still_produces_chunks(self):
+        """`where is MAX_RETRIES defined` must be answerable by RAG."""
+        content = textwrap.dedent(
+            """\
+            import os
+
+            MAX_RETRIES = 3
+            TIMEOUT = 30
+            __all__ = ["MAX_RETRIES", "TIMEOUT"]
+            """
+        )
+        chunks = chunk_file("constants.py", content)
+        assert chunks
+        assert "MAX_RETRIES" in chunks[0].content
+        assert chunks[0].chunk_type == "fixed"
+
+    def test_empty_package_init_produces_no_chunks(self):
+        assert chunk_file("pkg/__init__.py", "\n\n   \n") == []
+
+    def test_constants_between_functions_are_indexed(self):
+        content = textwrap.dedent(
+            """\
+            def first():
+                return 1
+
+            SENTINEL_VALUE = "between"
+
+            def second():
+                return 2
+            """
+        )
+        chunks = chunk_file("mod.py", content)
+        assert any("SENTINEL_VALUE" in c.content and c.chunk_type == "fixed" for c in chunks)
+        assert {c.symbol_name for c in chunks} >= {"first", "second"}
+
+    def test_leading_imports_are_indexed(self):
+        content = textwrap.dedent(
+            """\
+            import os
+            from pathlib import Path
+
+
+            def go():
+                return Path(os.getcwd())
+            """
+        )
+        chunks = chunk_file("mod.py", content)
+        fixed = [c for c in chunks if c.chunk_type == "fixed"]
+        assert fixed
+        assert "from pathlib import Path" in fixed[0].content
+        assert fixed[0].start_line == 1
+
+    def test_line_numbers_of_gap_chunks_are_absolute(self):
+        content = "def a():\n    return 1\n\nX = 5\nY = 6\n"
+        chunks = chunk_file("mod.py", content)
+        gap = next(c for c in chunks if c.chunk_type == "fixed")
+        assert gap.start_line == 3
+        assert gap.end_line == 5
+
+
+# ---------------------------------------------------------------------------
+# Brace-less (expression-bodied) arrow functions
+# ---------------------------------------------------------------------------
+
+
+class TestExpressionBodiedArrows:
+    def test_arrow_chunk_does_not_swallow_next_function(self):
+        content = textwrap.dedent(
+            """\
+            export const add = (a, b) => a + b;
+            export const sub = (a, b) => a - b;
+
+            function big() {
+              const x = 1;
+              return x;
+            }
+            """
+        )
+        chunks = chunk_file("math.ts", content)
+        by_name = {c.symbol_name: c for c in chunks}
+
+        assert by_name["add"].start_line == 1
+        assert by_name["add"].end_line == 1
+        assert "big" not in by_name["add"].content
+        assert by_name["sub"].end_line == 2
+        assert "big" not in by_name["sub"].content
+        assert "const x = 1;" in by_name["big"].content
+
+    def test_braced_arrow_still_captures_its_body(self):
+        content = textwrap.dedent(
+            """\
+            export const run = (a) => {
+              return a * 2;
+            };
+
+            function other() {
+              return 0;
+            }
+            """
+        )
+        chunks = chunk_file("run.ts", content)
+        by_name = {c.symbol_name: c for c in chunks}
+        assert "return a * 2;" in by_name["run"].content
+        assert "other" not in by_name["run"].content

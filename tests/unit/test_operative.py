@@ -1,5 +1,6 @@
 """Unit tests for the Operative runtime components."""
 
+import io
 import logging
 import sys
 import tempfile
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from henchmen.models.llm import ModelTier
 from henchmen.models.operative import OperativeConfig, OperativeReport, OperativeStatus
 from henchmen.operative.guardrails import OperativeGuardrails
 
@@ -75,8 +77,13 @@ class TestOperativeConfig:
             OperativeConfig(node_id="n", scheme_id="s")  # task_id missing
 
     def test_model_name_default(self):
+        """The default is a provider-neutral tier, not a concrete model id.
+
+        A Gemini name here would be handed verbatim to whichever provider is
+        configured, which is what broke the Anthropic and OpenAI paths.
+        """
         config = OperativeConfig(task_id="t", node_id="n", scheme_id="s")
-        assert config.model_name == "gemini-2.5-pro"
+        assert config.model_name == ModelTier.COMPLEX.value
 
 
 # ---------------------------------------------------------------------------
@@ -199,12 +206,9 @@ class TestGuardrailsPathTraversal:
         assert result is not None
         assert "traversal" in result["error"].lower()
 
-    @staticmethod
-    def test_traversal_detection_static():
-        assert OperativeGuardrails._has_path_traversal("../../etc/passwd") is True
-        assert OperativeGuardrails._has_path_traversal("/workspace/src/foo.py") is False
-        assert OperativeGuardrails._has_path_traversal("./relative/path.py") is False
-        assert OperativeGuardrails._has_path_traversal("normal/path.py") is False
+    def test_sibling_prefix_directory_blocked(self):
+        """/workspace-evil shares a prefix with /workspace but is outside it."""
+        assert OperativeGuardrails._is_path_safe("../workspace-evil/secrets", "/workspace") is False
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +384,7 @@ class TestTemplatePriority:
         ):
             from henchmen.operative.agent_builder import build_operative_agent
 
-            agent = await build_operative_agent(config, "/tmp/workspace", settings)
+            agent = await build_operative_agent(config, "/tmp/workspace", settings, MagicMock())
 
         assert agent.instruction == "Custom node instructions here."
 
@@ -405,7 +409,7 @@ class TestTemplatePriority:
             from henchmen.operative.agent_builder import build_operative_agent
             from henchmen.operative.prompt_templates import get_prompt_template
 
-            agent = await build_operative_agent(config, "/tmp/workspace", settings)
+            agent = await build_operative_agent(config, "/tmp/workspace", settings, MagicMock())
 
         assert agent.instruction == get_prompt_template("test_fix")
         assert "fixing failing tests" in agent.instruction
@@ -431,7 +435,7 @@ class TestTemplatePriority:
             from henchmen.operative.agent_builder import build_operative_agent
             from henchmen.operative.prompt_templates import get_prompt_template
 
-            agent = await build_operative_agent(config, "/tmp/workspace", settings)
+            agent = await build_operative_agent(config, "/tmp/workspace", settings, MagicMock())
 
         assert agent.instruction == get_prompt_template("generic")
 
@@ -468,7 +472,7 @@ class TestBootstrapTimeoutStatus:
             patch("henchmen.operative.bootstrap.ProviderRegistry", return_value=mock_registry),
             patch("henchmen.operative.bootstrap.initialize_workspace", new_callable=AsyncMock, return_value="/tmp/ws"),
             patch("henchmen.operative.bootstrap._build_file_context", new_callable=AsyncMock, return_value=""),
-            patch("henchmen.operative.bootstrap.build_operative_agent") as mock_build,
+            patch("henchmen.operative.bootstrap.build_operative_agent", new_callable=AsyncMock) as mock_build,
             patch("henchmen.operative.bootstrap._check_for_changes", new_callable=AsyncMock, return_value=True),
             patch("henchmen.operative.bootstrap._create_branch_and_push", new_callable=AsyncMock),
             patch("henchmen.operative.bootstrap.publish_report", new_callable=AsyncMock) as mock_publish,
@@ -477,8 +481,16 @@ class TestBootstrapTimeoutStatus:
             mock_get_settings.return_value = MagicMock()
             mock_get_settings.return_value.vertex_ai_model_complex = "test-model"
 
-            mock_agent = AsyncMock()
-            mock_agent.run.side_effect = TimeoutError("step limit")
+            # The agent is a sync object with one async method. A bare
+            # AsyncMock would make get_telemetry() return a coroutine and hide
+            # the telemetry-preservation behaviour this test exists to pin.
+            mock_agent = MagicMock()
+            mock_agent.run = AsyncMock(side_effect=TimeoutError("step limit"))
+            mock_agent.get_telemetry.return_value = {
+                "model_name": "claude-sonnet-5",
+                "total_input_tokens": 1234,
+                "total_output_tokens": 56,
+            }
             mock_build.return_value = mock_agent
 
             await run_operative()
@@ -646,89 +658,83 @@ class TestGuardrailsCanonicalPathValidation:
 # ---------------------------------------------------------------------------
 
 
-class TestSecretRedactionFilter:
-    """Test that secret patterns are redacted from log records."""
+class TestSecretRedactionInOperativeLogs:
+    """Secrets must be redacted for records emitted by henchmen.* module loggers.
 
-    def _make_record(self, msg: str) -> logging.LogRecord:
-        return logging.LogRecord(
-            name="test",
-            level=logging.INFO,
-            pathname="test.py",
-            lineno=1,
-            msg=msg,
-            args=(),
-            exc_info=None,
-        )
+    Regression: the filter used to be attached to the root *logger*, which never
+    sees records propagated from child loggers, and it only rewrote
+    ``record.msg`` so ``logger.error("push failed: %s", token)`` leaked.
+    """
 
-    def test_github_pat_redacted(self):
-        from henchmen.mastermind.server import _SecretRedactionFilter
+    def _capture(self) -> tuple[logging.Handler, io.StringIO]:
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        return handler, stream
 
-        f = _SecretRedactionFilter()
-        record = self._make_record("token is ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef1234")
-        f.filter(record)
-        assert "ghp_" not in str(record.msg)
-        assert "***REDACTED***" in str(record.msg)
+    def _install(self, handler: logging.Handler) -> None:
+        from henchmen.operative.bootstrap import install_log_redaction
 
-    def test_github_server_token_redacted(self):
-        from henchmen.mastermind.server import _SecretRedactionFilter
+        root = logging.getLogger()
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
+        install_log_redaction()
 
-        f = _SecretRedactionFilter()
-        record = self._make_record("ghs_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef1234")
-        f.filter(record)
-        assert "ghs_" not in str(record.msg)
-        assert "***REDACTED***" in str(record.msg)
+    def test_child_logger_message_redacted(self):
+        handler, stream = self._capture()
+        self._install(handler)
+        try:
+            logging.getLogger("henchmen.operative.test").info("token is ghp_" + "a" * 36)
+        finally:
+            logging.getLogger().removeHandler(handler)
+        output = stream.getvalue()
+        assert "ghp_" not in output
+        assert "***REDACTED***" in output
 
-    def test_slack_token_redacted(self):
-        from henchmen.mastermind.server import _SecretRedactionFilter
+    def test_percent_arg_token_redacted(self):
+        handler, stream = self._capture()
+        self._install(handler)
+        try:
+            logging.getLogger("henchmen.operative.test").error("push failed: %s", "ghp_" + "b" * 36)
+        finally:
+            logging.getLogger().removeHandler(handler)
+        output = stream.getvalue()
+        assert "ghp_" not in output
+        assert "***REDACTED***" in output
 
-        f = _SecretRedactionFilter()
-        record = self._make_record("bot token: xoxb-123-456-abc")
-        f.filter(record)
-        assert "xoxb-" not in str(record.msg)
-        assert "***REDACTED***" in str(record.msg)
+    def test_anthropic_key_redacted(self):
+        handler, stream = self._capture()
+        self._install(handler)
+        try:
+            logging.getLogger("henchmen.operative.test").info("key: sk-ant-api03-%s", "c" * 40)
+        finally:
+            logging.getLogger().removeHandler(handler)
+        output = stream.getvalue()
+        assert "sk-ant-api03" not in output
+        assert "***REDACTED***" in output
 
-    def test_openai_key_redacted(self):
-        from henchmen.mastermind.server import _SecretRedactionFilter
-
-        f = _SecretRedactionFilter()
-        record = self._make_record("key: sk-abcdefghijklmnopqrstuvwxyz123456")
-        f.filter(record)
-        assert "sk-" not in str(record.msg)
-        assert "***REDACTED***" in str(record.msg)
-
-    def test_git_credential_url_redacted(self):
-        from henchmen.mastermind.server import _SecretRedactionFilter
-
-        f = _SecretRedactionFilter()
-        record = self._make_record("clone https://x-access-token:ghp_secret123@github.com/repo")
-        f.filter(record)
-        assert "x-access-token:ghp" not in str(record.msg)
-        assert "***REDACTED***" in str(record.msg)
+    def test_traceback_text_redacted(self):
+        handler, stream = self._capture()
+        self._install(handler)
+        try:
+            try:
+                raise RuntimeError("git push failed: https://x-access-token:ghp_" + "d" * 36 + "@github.com/o/r")
+            except RuntimeError:
+                logging.getLogger("henchmen.operative.test").exception("push failed")
+        finally:
+            logging.getLogger().removeHandler(handler)
+        output = stream.getvalue()
+        assert "x-access-token:ghp" not in output
+        assert "***REDACTED***" in output
 
     def test_clean_message_unchanged(self):
-        from henchmen.mastermind.server import _SecretRedactionFilter
-
-        f = _SecretRedactionFilter()
-        record = self._make_record("nothing secret here, just normal logging")
-        f.filter(record)
-        assert str(record.msg) == "nothing secret here, just normal logging"
-
-    def test_filter_returns_true(self):
-        """Filter must return True so the log record is not suppressed."""
-        from henchmen.mastermind.server import _SecretRedactionFilter
-
-        f = _SecretRedactionFilter()
-        record = self._make_record("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef1234")
-        assert f.filter(record) is True
-
-    def test_bootstrap_filter_class_exists(self):
-        """Verify the bootstrap module also has the filter class."""
-        from henchmen.operative.bootstrap import _SecretRedactionFilter as BootstrapFilter
-
-        f = BootstrapFilter()
-        record = self._make_record("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef1234")
-        f.filter(record)
-        assert "***REDACTED***" in str(record.msg)
+        handler, stream = self._capture()
+        self._install(handler)
+        try:
+            logging.getLogger("henchmen.operative.test").info("nothing secret here")
+        finally:
+            logging.getLogger().removeHandler(handler)
+        assert "nothing secret here" in stream.getvalue()
 
 
 # ---------------------------------------------------------------------------

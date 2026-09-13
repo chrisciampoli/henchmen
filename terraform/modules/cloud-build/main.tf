@@ -32,20 +32,26 @@ resource "google_cloudbuild_trigger" "pr_ci" {
   }
 
   build {
+    # One step, not four: each Cloud Build step runs in a fresh container and
+    # only /workspace survives between them, so installing the dev extras in
+    # its own step leaves ruff/mypy/pytest missing from every later step.
+    # The command list mirrors the task completion checklist in CLAUDE.md.
     step {
-      name = "python:3.12"
-      args = ["pip", "install", "-e", ".[dev]"]
-    }
-    step {
-      name = "python:3.12"
-      args = ["python", "-m", "ruff", "check", "."]
-    }
-    step {
-      name = "python:3.12"
-      args = ["python", "-m", "pytest", "tests/", "-v"]
+      name       = "python:3.12"
+      entrypoint = "bash"
+      args = [
+        "-c",
+        join(" && ", [
+          "pip install -e '.[dev]'",
+          "ruff check src/ tests/",
+          "ruff format --check src/ tests/",
+          "mypy src/",
+          "pytest tests/unit/ -q",
+        ]),
+      ]
     }
 
-    timeout = "600s"
+    timeout = "1200s"
   }
 }
 

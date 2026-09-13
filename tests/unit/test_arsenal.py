@@ -1,4 +1,4 @@
-"""Unit tests for Arsenal - ToolRegistry, ArsenalServer, and tool modules."""
+"""Unit tests for Arsenal - ToolRegistry and the tool modules."""
 
 import pytest
 
@@ -406,74 +406,6 @@ class TestGitPushSplit:
         tools = ToolRegistry.list_tools(category="git_ops")
         assert "git_push" in tools
         assert "git_force_push" in tools
-
-
-# ---------------------------------------------------------------------------
-# ArsenalServer
-# ---------------------------------------------------------------------------
-
-
-class TestArsenalServer:
-    def _load_code_intel(self) -> None:
-        import importlib
-
-        import henchmen.arsenal.tools.code_intel as mod
-
-        importlib.reload(mod)
-
-    def test_server_creates_with_requirement(self):
-        from henchmen.arsenal.server import ArsenalServer
-
-        self._load_code_intel()
-        req = _make_requirement(["code_intel"])
-        server = ArsenalServer(req)
-        assert server is not None
-        assert server.requirement == req
-
-    def test_server_has_mcp_instance(self):
-        from henchmen.arsenal.server import ArsenalServer
-
-        self._load_code_intel()
-        req = _make_requirement(["code_intel"])
-        server = ArsenalServer(req)
-        assert server.mcp is not None
-
-    def test_server_get_app_returns_object(self):
-        from henchmen.arsenal.server import ArsenalServer
-
-        self._load_code_intel()
-        req = _make_requirement(["code_intel"])
-        server = ArsenalServer(req)
-        app = server.get_app()
-        assert app is not None
-
-    def test_server_excludes_destructive_when_not_allowed(self):
-        import importlib
-
-        import henchmen.arsenal.tools.code_edit as mod
-        from henchmen.arsenal.server import ArsenalServer
-
-        importlib.reload(mod)
-        req = _make_requirement(["code_edit"], allow_destructive=False)
-        ArsenalServer(req)
-        # Verify file_delete was excluded: the registered tool names on mcp
-        # We can check via the ToolRegistry filter directly
-        tools = ToolRegistry.get_tools_for_requirement(req)
-        names = {t.name for t in tools}
-        assert "file_delete" not in names
-
-    def test_server_includes_destructive_when_allowed(self):
-        import importlib
-
-        import henchmen.arsenal.tools.code_edit as mod
-        from henchmen.arsenal.server import ArsenalServer
-
-        importlib.reload(mod)
-        req = _make_requirement(["code_edit"], allow_destructive=True)
-        ArsenalServer(req)
-        tools = ToolRegistry.get_tools_for_requirement(req)
-        names = {t.name for t in tools}
-        assert "file_delete" in names
 
 
 # ---------------------------------------------------------------------------

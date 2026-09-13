@@ -28,9 +28,12 @@ from typing import TYPE_CHECKING, Any
 from henchmen.models.operative import OperativeReport
 from henchmen.models.task import HenchmenTask
 from henchmen.providers.interfaces.document_store import DocumentStore
+from henchmen.providers.pricing import estimate_cost_for_settings, lookup_price
+from henchmen.providers.tiers import active_llm_provider, resolve_model_name
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
+    from henchmen.models.evaluation import EvaluationResult
 
 logger = logging.getLogger(__name__)
 
@@ -38,36 +41,66 @@ logger = logging.getLogger(__name__)
 # Cost estimation
 # ---------------------------------------------------------------------------
 
-# Model pricing configuration: (input_price_per_1M, output_price_per_1M) in USD.
-# Maintained here as a lookup dict rather than in Settings because these change
-# infrequently and adding per-model fields to Settings would be over-engineering.
-_PRICE_MAP: dict[str, tuple[float, float]] = {
-    "claude-sonnet-4@20250514": (3.0, 15.0),
-    "claude-haiku-4-5@20251001": (0.80, 4.0),
-    "gemini-3.1-pro": (2.0, 12.0),
-    "gemini-2.5-pro": (1.25, 10.0),
-    "gemini-2.5-flash": (0.15, 0.60),
-}
 
+def _resolved_settings(settings: "Settings | None" = None) -> "Settings | None":
+    """The Settings to price against, or ``None`` when they cannot be built.
 
-def estimate_cost(model_name: str, input_tokens: int, output_tokens: int, cached_input_tokens: int = 0) -> float:
-    """Estimate USD cost for a model call. Returns 0.0 for unknown models.
-
-    Cached input tokens are billed at 25% of the standard input rate
-    (75% discount via Gemini context caching).
+    Observability must never raise, and ``Settings()`` can legitimately fail
+    (e.g. ``HENCHMEN_PROVIDER=gcp`` with no project id), so callers degrade to
+    provider-agnostic pricing rather than blowing up a task.
     """
-    prices = _PRICE_MAP.get(model_name)
-    if not prices:
-        if input_tokens > 0 or output_tokens > 0:
-            logger.warning("Unknown model for cost estimation: %s", model_name)
+    if settings is not None:
+        return settings
+    try:
+        from henchmen.config.settings import get_settings
+
+        return get_settings()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Cost estimation could not load Settings: %s", exc)
+        return None
+
+
+def estimate_cost(
+    model_name: str,
+    input_tokens: int,
+    output_tokens: int,
+    cached_input_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    settings: "Settings | None" = None,
+) -> float:
+    """Estimate USD cost for a model call. Returns 0.0 for unpriced models.
+
+    Prices come from :mod:`henchmen.providers.pricing`, the single source of
+    truth. Tier names (``default/complex``, ``default/light``,
+    ``default/reasoning``) are resolved through the *configured* provider, so a
+    Gemini deployment is never priced at Anthropic rates and a free Ollama run
+    costs 0.0 — which is what lets the guardrails fall back to their wall-clock
+    ceiling.
+
+    ``input_tokens`` is the TOTAL prompt size including ``cached_input_tokens``
+    and ``cache_write_tokens``; those are re-priced at the provider's cache
+    rates rather than the full input rate.
+    """
+    active = _resolved_settings(settings)
+    if active is None:
+        from henchmen.providers.pricing import estimate_cost as _price_only
+
+        return _price_only(model_name, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens)
+
+    concrete = resolve_model_name(active, model_name)
+    if lookup_price(concrete) is None:
+        # Local models are free by design, so an unpriced name there is expected.
+        if (input_tokens > 0 or output_tokens > 0) and active_llm_provider(active) != "local":
+            logger.warning("Unknown model for cost estimation: %s (resolved to %s)", model_name, concrete)
         return 0.0
-    input_price, output_price = prices
-    # Cached tokens are billed at 25% of standard input price
-    non_cached = max(0, input_tokens - cached_input_tokens)
-    cached_cost = cached_input_tokens * input_price * 0.25 / 1_000_000
-    standard_cost = non_cached * input_price / 1_000_000
-    output_cost = output_tokens * output_price / 1_000_000
-    return standard_cost + cached_cost + output_cost
+    return estimate_cost_for_settings(
+        active,
+        model_name,
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        cache_write_tokens,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -77,13 +110,33 @@ def estimate_cost(model_name: str, input_tokens: int, output_tokens: int, cached
 _COLLECTION = "task_executions"
 _RETENTION_DAYS = 30
 
+# Final statuses that mean "the task did what it was asked to do". The
+# executor reports ``pr_created`` on the happy path and ``completed`` when a
+# scheme finished without opening a PR; both count as success everywhere.
+SUCCESS_STATUSES: frozenset[str] = frozenset({"completed", "pr_created"})
+
+# ``execution_state`` values the stalled-task watchdog must ignore. The
+# watchdog only looks for ``running``, so every terminal transition has to move
+# the task out of that state or a finished task keeps getting "recovered".
+EXECUTION_STATE_COMPLETED = "completed"
+EXECUTION_STATE_ESCALATED = "escalated"
+
 
 class TaskTracker:
     """Persists task execution telemetry to a DocumentStore.
 
-    All methods silently catch exceptions — observability must never block task execution.
-    Accepts a DocumentStore via dependency injection; falls back to creating a
-    Firestore-backed store when none is provided (legacy compatibility).
+    All methods silently catch exceptions — observability must never block task
+    execution. The DocumentStore is injected; when it is omitted the configured
+    one is built from ``ProviderRegistry``, so the tracker never reaches for a
+    provider-specific client of its own.
+
+    Timestamps are stored as ISO-8601 UTC strings rather than native datetimes.
+    Aware ISO-8601 strings sort lexicographically in the same order as the
+    instants they denote, so range filters (``last_heartbeat <``,
+    ``created_at >=``, ``expires_at <``) work identically on Firestore,
+    DynamoDB and the local SQLite store — the SQLite store JSON-encodes
+    datetimes on write and would otherwise raise ``TypeError`` comparing a
+    string column against a ``datetime`` filter value.
     """
 
     def __init__(self, settings: "Settings", document_store: DocumentStore | None = None) -> None:
@@ -93,33 +146,16 @@ class TaskTracker:
         # and are atomic across replicas, so the lock is only needed for
         # the structured-merge branch.
         self._doc_locks: dict[str, asyncio.Lock] = {}
+        self._settings = settings
+        if document_store is None:
+            # Build the configured store rather than hard-coding Firestore:
+            # the old fallback imported google.cloud.firestore on every
+            # provider and silently degraded to a no-op store on failure,
+            # which made telemetry vanish without an error.
+            from henchmen.providers.registry import ProviderRegistry
 
-        if document_store is not None:
-            self._store = document_store
-            # Legacy compatibility attributes — some code paths still reference _db/_collection
-            # directly (e.g. server.py dedup check). Those callers must be updated; here we
-            # set them to None so AttributeError surfaces clearly instead of silently misbehaving.
-            self._db = None
-            self._collection = None
-        else:
-            # Fallback: build a Firestore-backed DocumentStore for backward compatibility.
-            # This path is used when TaskTracker is constructed without explicit providers.
-            try:
-                from google.cloud import firestore
-
-                db = firestore.Client(
-                    project=settings.gcp_project_id,
-                    database=settings.firestore_database,
-                )
-                self._db = db
-                self._collection = db.collection(_COLLECTION)
-                # Wrap the raw Firestore client in a thin adapter so _store works too.
-                self._store = _FirestoreLegacyAdapter(db)
-            except Exception as exc:
-                logger.warning("Failed to initialize Firestore client: %s", exc)
-                self._db = None
-                self._collection = None
-                self._store = _NullDocumentStore()
+            document_store = ProviderRegistry(settings).get_document_store()
+        self._store = document_store
 
     def _get_lock(self, doc_id: str) -> asyncio.Lock:
         """Return the per-document asyncio.Lock, creating it on first use.
@@ -149,7 +185,7 @@ class TaskTracker:
                 "source": task.source.value,
                 "scheme_id": scheme_id,
                 "task_payload": task.model_dump(mode="json"),
-                "created_at": now,
+                "created_at": now.isoformat(),
                 "completed_at": None,
                 "final_status": None,
                 "pr_url": None,
@@ -166,12 +202,12 @@ class TaskTracker:
                 "rag_chunks_retrieved": 0,
                 "files_changed": [],
                 "confidence_score": 0.0,
-                "expires_at": now + timedelta(days=_RETENTION_DAYS),
+                "expires_at": (now + timedelta(days=_RETENTION_DAYS)).isoformat(),
                 "ci_fix_attempts": 0,
                 "ci_fix_in_progress": False,
                 "execution_state": "running",
                 "current_node_id": None,
-                "last_heartbeat": now,
+                "last_heartbeat": now.isoformat(),
                 "recovery_attempts": 0,
                 "escalation_reason": None,
                 "escalation_node": None,
@@ -189,17 +225,29 @@ class TaskTracker:
         replicas can't clobber each other's additions. Structured
         fields (node_metrics dict, files_changed list) still use a
         merged update guarded by a per-doc asyncio lock.
+
+        This is the *only* writer of ``estimated_cost_usd``.
+        ``TaskCostAccumulator`` tracks the same spend in memory inside the
+        operative so the task-level ceiling can fire mid-node, but it does not
+        persist — otherwise every node's cost would land twice.
         """
         try:
-            model_name = getattr(report, "model_name", "") or ""
+            raw_model = getattr(report, "model_name", "") or ""
+            # Reports may still carry a tier name ("default/complex"); record
+            # the model that actually ran so cost_by_model and the experiment
+            # params name a real model.
+            model_name = resolve_model_name(self._settings, raw_model) if raw_model else ""
             cost = estimate_cost(
                 model_name,
                 report.total_input_tokens,
                 report.total_output_tokens,
+                cached_input_tokens=report.cached_input_tokens,
+                settings=self._settings,
             )
             node_data = {
                 "input_tokens": report.total_input_tokens,
                 "output_tokens": report.total_output_tokens,
+                "cached_input_tokens": report.cached_input_tokens,
                 "model_calls": report.model_calls,
                 "tool_calls": report.tool_calls_count,
                 "wall_clock_seconds": report.wall_clock_seconds,
@@ -263,6 +311,35 @@ class TaskTracker:
         except Exception as exc:
             logger.warning("Failed to record RAG chunks for task %s: %s", task_id, exc)
 
+    async def record_evaluation(self, task_id: str, result: "EvaluationResult") -> None:
+        """Persist post-operative evaluation scores on the task document.
+
+        Written unconditionally — a result carrying ``evaluation_error`` still
+        holds the diff-signal fallback scores, which are the only quality
+        signal available when the evaluation API is unreachable.
+        """
+        try:
+            await self._store.update(
+                _COLLECTION,
+                task_id,
+                {
+                    "evaluation_scores": {
+                        "fulfillment": result.fulfillment_score,
+                        "tool_call_valid": result.tool_call_valid_score,
+                        "safety": result.safety_score,
+                        "overall_quality": result.overall_quality,
+                    },
+                    "evaluation_error": result.evaluation_error,
+                },
+            )
+            logger.info(
+                "Recorded evaluation for task %s: quality=%.2f",
+                task_id,
+                result.overall_quality,
+            )
+        except Exception as exc:
+            logger.warning("Failed to record evaluation for task %s: %s", task_id, exc)
+
     async def record_ci_result(self, task_id: str, ci_passed: bool) -> None:
         """Update CI pass/fail status."""
         try:
@@ -274,16 +351,23 @@ class TaskTracker:
     async def finalize_task(
         self, task_id: str, final_status: str, pr_url: str | None = None, pr_number: int | None = None
     ) -> None:
-        """Mark task as completed with final status."""
+        """Mark task as completed with final status.
+
+        Also moves ``execution_state`` out of ``running`` so the stalled-task
+        watchdog stops "recovering" tasks that already finished.
+        """
         try:
+            execution_state = EXECUTION_STATE_ESCALATED if final_status == "escalated" else EXECUTION_STATE_COMPLETED
             await self._store.update(
                 _COLLECTION,
                 task_id,
                 {
-                    "completed_at": datetime.now(UTC),
+                    "completed_at": datetime.now(UTC).isoformat(),
                     "final_status": final_status,
                     "pr_url": pr_url,
                     "pr_number": pr_number,
+                    "execution_state": execution_state,
+                    "current_node_id": None,
                 },
             )
             logger.info("Finalized task %s: %s", task_id, final_status)
@@ -311,7 +395,7 @@ class TaskTracker:
                     "node_results": node_results,
                     "retry_counts": retry_counts,
                     "execution_state": "running",
-                    "last_heartbeat": datetime.now(UTC),
+                    "last_heartbeat": datetime.now(UTC).isoformat(),
                 },
             )
         except Exception as exc:
@@ -323,7 +407,7 @@ class TaskTracker:
             await self._store.update(
                 _COLLECTION,
                 task_id,
-                {"last_heartbeat": datetime.now(UTC)},
+                {"last_heartbeat": datetime.now(UTC).isoformat()},
             )
         except Exception as exc:
             logger.debug("Heartbeat update failed (non-fatal): %s", exc)
@@ -340,10 +424,10 @@ class TaskTracker:
         """Mark a task as escalated (unrecoverable)."""
         try:
             update_data: dict[str, Any] = {
-                "execution_state": "escalated",
+                "execution_state": EXECUTION_STATE_ESCALATED,
                 "final_status": "escalated",
                 "escalation_reason": reason,
-                "completed_at": datetime.now(UTC),
+                "completed_at": datetime.now(UTC).isoformat(),
             }
             if escalation_node is not None:
                 update_data["escalation_node"] = escalation_node
@@ -371,7 +455,7 @@ class TaskTracker:
                 _COLLECTION,
                 filters=[
                     ("execution_state", "==", "running"),
-                    ("last_heartbeat", "<", cutoff),
+                    ("last_heartbeat", "<", cutoff.isoformat()),
                 ],
             )
         except Exception as exc:
@@ -396,7 +480,7 @@ class TaskTracker:
             cutoff = datetime.now(UTC) - timedelta(days=days)
             return await self._store.query(
                 _COLLECTION,
-                filters=[("created_at", ">=", cutoff)],
+                filters=[("created_at", ">=", cutoff.isoformat())],
                 order_by="created_at",
                 order_direction="DESCENDING",
             )
@@ -412,7 +496,7 @@ class TaskTracker:
                 return {"total_tasks": 0, "days": days}
 
             total = len(tasks)
-            pr_created = sum(1 for t in tasks if t.get("final_status") == "pr_created")
+            succeeded = sum(1 for t in tasks if str(t.get("final_status") or "").lower() in SUCCESS_STATUSES)
             escalated = sum(1 for t in tasks if t.get("final_status") == "escalated")
             total_cost = sum(t.get("estimated_cost_usd", 0) for t in tasks)
             total_tokens_in = sum(t.get("total_input_tokens", 0) for t in tasks)
@@ -434,7 +518,7 @@ class TaskTracker:
 
             return {
                 "total_tasks": total,
-                "success_rate": pr_created / total if total else 0.0,
+                "success_rate": succeeded / total if total else 0.0,
                 "escalation_rate": escalated / total if total else 0.0,
                 "avg_cost_usd": total_cost / total if total else 0.0,
                 "total_cost_usd": total_cost,
@@ -473,7 +557,7 @@ class TaskTracker:
             now = datetime.now(UTC)
             expired = await self._store.query(
                 _COLLECTION,
-                filters=[("expires_at", "<", now)],
+                filters=[("expires_at", "<", now.isoformat())],
                 limit=batch_size,
             )
             deleted = 0
@@ -492,21 +576,32 @@ class TaskTracker:
     async def cleanup_processed_messages(self, retention_days: int = 7, batch_size: int = 200) -> int:
         """Delete processed message dedup records older than retention_days.
 
+        Dedup markers come in two shapes: ``done`` markers carry
+        ``processed_at``, while ``in_flight`` markers written by a handler that
+        crashed before committing only carry ``acquired_at``. Filtering on
+        ``processed_at`` alone leaks the in-flight ones forever, so both fields
+        are swept.
+
         Returns the number of documents deleted.
         """
         try:
-            cutoff = datetime.now(UTC) - timedelta(days=retention_days)
-            old_messages = await self._store.query(
-                "processed_messages",
-                filters=[("processed_at", "<", cutoff.isoformat())],
-                limit=batch_size,
-            )
+            cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+            stale: dict[str, dict[str, Any]] = {}
+            for timestamp_field in ("processed_at", "acquired_at"):
+                rows = await self._store.query(
+                    "processed_messages",
+                    filters=[(timestamp_field, "<", cutoff)],
+                    limit=batch_size,
+                )
+                for row in rows:
+                    key = row.get("key", "")
+                    if key:
+                        stale[key] = row
+
             deleted = 0
-            for doc in old_messages:
-                key = doc.get("key", "")
-                if key:
-                    await self._store.delete("processed_messages", key)
-                    deleted += 1
+            for key in list(stale)[:batch_size]:
+                await self._store.delete("processed_messages", key)
+                deleted += 1
             if deleted:
                 logger.info("Cleaned up %d old processed messages", deleted)
             return deleted
@@ -535,131 +630,3 @@ class TaskTracker:
         except Exception as exc:
             logger.warning("Failed to get task by prefix %s: %s", task_id_prefix, exc)
             return None
-
-
-# ---------------------------------------------------------------------------
-# Legacy compatibility adapters (used when no DocumentStore is injected)
-# ---------------------------------------------------------------------------
-
-
-class _FirestoreLegacyAdapter:
-    """Thin async wrapper around a synchronous Firestore Client for the legacy fallback path."""
-
-    def __init__(self, db: Any) -> None:
-        self._db = db
-
-    async def get(self, collection: str, document_id: str) -> dict[str, Any] | None:
-        def _read() -> dict[str, Any] | None:
-            doc = self._db.collection(collection).document(document_id).get()
-            if doc.exists:
-                return doc.to_dict() or {}
-            return None
-
-        return await asyncio.to_thread(_read)
-
-    async def set(self, collection: str, document_id: str, data: dict[str, Any]) -> None:
-        await asyncio.to_thread(self._db.collection(collection).document(document_id).set, data)
-
-    async def update(self, collection: str, document_id: str, data: dict[str, Any]) -> None:
-        await asyncio.to_thread(self._db.collection(collection).document(document_id).update, data)
-
-    async def delete(self, collection: str, document_id: str) -> None:
-        await asyncio.to_thread(self._db.collection(collection).document(document_id).delete)
-
-    async def query(
-        self,
-        collection: str,
-        filters: list[tuple[str, str, Any]] | None = None,
-        order_by: str | None = None,
-        order_direction: str = "ASCENDING",
-        limit: int | None = None,
-    ) -> list[dict[str, Any]]:
-        from google.cloud import firestore
-
-        def _query() -> list[dict[str, Any]]:
-            ref: Any = self._db.collection(collection)
-            if filters:
-                for field, op, value in filters:
-                    ref = ref.where(field, op, value)
-            if order_by:
-                direction = firestore.Query.DESCENDING if order_direction == "DESCENDING" else firestore.Query.ASCENDING
-                ref = ref.order_by(order_by, direction=direction)
-            if limit:
-                ref = ref.limit(limit)
-            return [doc.to_dict() for doc in ref.stream()]
-
-        return await asyncio.to_thread(_query)
-
-    async def increment(self, collection: str, document_id: str, field_deltas: dict[str, int | float]) -> None:
-        from google.cloud import firestore
-
-        if not field_deltas:
-            return
-        payload = {field: firestore.Increment(delta) for field, delta in field_deltas.items()}
-        await asyncio.to_thread(self._db.collection(collection).document(document_id).update, payload)
-
-    async def update_if(
-        self,
-        collection: str,
-        document_id: str,
-        expected_field: str,
-        expected_value: Any,
-        new_values: dict[str, Any],
-    ) -> bool:
-        from google.cloud import firestore
-
-        doc_ref = self._db.collection(collection).document(document_id)
-        transaction = self._db.transaction()
-
-        @firestore.transactional
-        def _txn(txn: Any) -> bool:
-            snapshot = doc_ref.get(transaction=txn)
-            if not snapshot.exists:
-                return False
-            current = snapshot.to_dict() or {}
-            if current.get(expected_field) != expected_value:
-                return False
-            txn.update(doc_ref, new_values)
-            return True
-
-        result: bool = await asyncio.to_thread(_txn, transaction)
-        return result
-
-
-class _NullDocumentStore:
-    """No-op DocumentStore used when Firestore initialization fails."""
-
-    async def get(self, collection: str, document_id: str) -> dict[str, Any] | None:
-        return None
-
-    async def set(self, collection: str, document_id: str, data: dict[str, Any]) -> None:
-        pass
-
-    async def update(self, collection: str, document_id: str, data: dict[str, Any]) -> None:
-        pass
-
-    async def delete(self, collection: str, document_id: str) -> None:
-        pass
-
-    async def query(
-        self,
-        collection: str,
-        filters: list[tuple[str, str, Any]] | None = None,
-        order_by: str | None = None,
-        order_direction: str = "ASCENDING",
-        limit: int | None = None,
-    ) -> list[dict[str, Any]]:
-        return []
-
-    async def increment(self, collection: str, document_id: str, field_deltas: dict[str, int | float]) -> None:
-        pass
-
-    async def update_if(
-        self,
-        collection: str,
-        document_id: str,
-        expected_field: str,
-        expected_value: Any,
-        new_values: dict[str, Any],
-    ) -> bool:
-        return False

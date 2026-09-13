@@ -499,6 +499,24 @@ def integration_settings(monkeypatch) -> Settings:
     monkeypatch.setenv("HENCHMEN_GCP_PROJECT_ID", "test-project")
     monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "dev")
     monkeypatch.setenv("HENCHMEN_GCP_REGION", "us-central1")
+    # Blank every outbound credential. Settings reads the developer's
+    # .env.local, and without this an integration test that exercises a real
+    # handler will authenticate against live GitHub/Slack/Jira with their
+    # personal token. os.environ outranks the dotenv files, so setting these
+    # empty is what makes the suite hermetic.
+    for name in (
+        "HENCHMEN_GITHUB_TOKEN",
+        "GITHUB_TOKEN",
+        "HENCHMEN_SLACK_BOT_TOKEN",
+        "SLACK_BOT_TOKEN",
+        "HENCHMEN_SLACK_APP_TOKEN",
+        "SLACK_APP_TOKEN",
+        "HENCHMEN_JIRA_API_TOKEN",
+        "JIRA_API_TOKEN",
+        "HENCHMEN_ANTHROPIC_API_KEY",
+        "HENCHMEN_OPENAI_API_KEY",
+    ):
+        monkeypatch.setenv(name, "")
     # Clear once more so the setenv calls above are reflected in the returned
     # instance (autouse fixture already ran before monkeypatch was applied).
     get_settings.cache_clear()
@@ -565,6 +583,9 @@ def github_pr_comment_event() -> dict:
         "comment": {
             "body": "@henchmen fix this authentication issue",
             "user": {"login": "reviewer"},
+            # Real GitHub payloads always carry this; the handler requires a
+            # trusted association before it will spend money on an operative.
+            "author_association": "MEMBER",
         },
         "pull_request": {
             "number": 99,

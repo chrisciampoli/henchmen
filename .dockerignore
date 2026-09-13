@@ -2,6 +2,7 @@
 .github
 .claude
 .serena
+.superpowers
 .ruff_cache
 .mypy_cache
 .pytest_cache
@@ -11,7 +12,15 @@ __pycache__
 tests/
 terraform/
 docs/
+evals/
+scripts/
+ci/
 *.md
+# pyproject declares `readme = "README.md"`; without this exception every
+# `pip install -e .` in the container builds emits
+# "SetuptoolsWarning: File 'README.md' cannot be found" and ships wheel
+# metadata with an empty long description.
+!README.md
 .env
 .env.*
 *.tfvars
@@ -21,3 +30,7 @@ docs/
 node_modules/
 .vscode/
 .idea/
+# Local SQLite dev store (provider=local) — runtime state, never in an image.
+henchmen_*.db
+henchmen_*.db-shm
+henchmen_*.db-wal

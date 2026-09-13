@@ -21,6 +21,22 @@ _STATUS_FAILED = "failed"
 # Maximum time an entry can stay in "merging" state before it is considered stale.
 _MERGING_TTL = timedelta(minutes=30)
 
+# How many pending entries to pull when picking the next candidate. The store
+# interface only supports a single ``order_by``, so priority is applied in the
+# client over this window.
+_CANDIDATE_WINDOW = 50
+
+
+def _now_iso() -> str:
+    """Current UTC timestamp as a sortable ISO-8601 string.
+
+    Timestamps are stored as strings, not ``datetime`` objects: SQLite and
+    DynamoDB both serialise datetimes to ISO strings on write, so a stored
+    value later compared against a ``datetime`` filter raises ``TypeError``.
+    UTC ISO-8601 sorts lexicographically, so range filters still work.
+    """
+    return datetime.now(UTC).isoformat()
+
 
 class MergeQueue:
     """FIFO merge serialization for parallel Operatives using DocumentStore."""
@@ -37,7 +53,11 @@ class MergeQueue:
         return ProviderRegistry(self.settings).get_document_store()
 
     async def enqueue(self, pr_url: str, task_id: str, priority: int = 0) -> str:
-        """Add a PR to the merge queue. Returns queue entry ID."""
+        """Add a PR to the merge queue. Returns queue entry ID.
+
+        Higher *priority* entries are dequeued before lower ones; entries of
+        equal priority are dequeued oldest-first.
+        """
         store = self._get_store()
         entry_id = str(uuid4())
         entry = {
@@ -45,7 +65,7 @@ class MergeQueue:
             "pr_url": pr_url,
             "task_id": task_id,
             "status": _STATUS_PENDING,
-            "created_at": datetime.now(UTC),
+            "created_at": _now_iso(),
             "priority": priority,
             "error": None,
         }
@@ -68,14 +88,19 @@ class MergeQueue:
         * DynamoDB ``ConditionExpression``
         * SQLite per-doc asyncio locks
 
-        Callers that lose a CAS race can simply retry on the next
-        poll; no other cleanup is required because the losing caller
-        never performed a write.
+        The CAS alone only protects a *single* entry, so two replicas
+        interleaving their reads could each claim a *different* entry and
+        both believe they hold the queue. After a winning CAS the claim is
+        therefore re-verified against every merging entry; a replica that
+        finds an older concurrent claim releases its own entry back to
+        ``pending`` and returns ``None``.
+
+        Callers that lose a race can simply retry on the next poll.
         """
         store = self._get_store()
 
         # First, expire stale "merging" entries that exceeded the TTL.
-        await self._expire_stale_merging(store)
+        await self.expire_stale_merging()
 
         # Check if any entry is currently merging (serialization guard).
         merging_docs = await store.query(
@@ -87,21 +112,14 @@ class MergeQueue:
             # A merge is already in progress — do not start another.
             return None
 
-        # Find the next pending entry, ordered by created_at (FIFO).
-        pending_docs = await store.query(
-            _COLLECTION,
-            filters=[("status", "==", _STATUS_PENDING)],
-            order_by="created_at",
-            limit=1,
-        )
-        if not pending_docs:
+        candidate = await self._next_candidate(store)
+        if candidate is None:
             return None
-
-        candidate = pending_docs[0]
         entry_id = candidate["id"]
 
         # Atomic claim via compare-and-set: only the replica that sees
         # ``status == 'pending'`` at commit time wins.
+        claimed_at = _now_iso()
         claimed = await store.update_if(
             _COLLECTION,
             entry_id,
@@ -109,7 +127,7 @@ class MergeQueue:
             _STATUS_PENDING,
             {
                 "status": _STATUS_MERGING,
-                "merging_started_at": datetime.now(UTC),
+                "merging_started_at": claimed_at,
             },
         )
         if not claimed:
@@ -121,16 +139,61 @@ class MergeQueue:
             )
             return None
 
+        if not await self._confirm_sole_claim(store, entry_id, claimed_at):
+            return None
+
         candidate["status"] = _STATUS_MERGING
+        candidate["merging_started_at"] = claimed_at
         return candidate
 
-    async def _expire_stale_merging(self, store: DocumentStore) -> None:
+    async def _next_candidate(self, store: DocumentStore) -> dict[str, Any] | None:
+        """Pick the next pending entry: highest priority first, then FIFO."""
+        pending_docs = await store.query(
+            _COLLECTION,
+            filters=[("status", "==", _STATUS_PENDING)],
+            order_by="created_at",
+            limit=_CANDIDATE_WINDOW,
+        )
+        if not pending_docs:
+            return None
+        # ``order_by`` already gives FIFO; a stable sort on -priority keeps that
+        # ordering within each priority band.
+        return sorted(pending_docs, key=lambda doc: -int(doc.get("priority") or 0))[0]
+
+    async def _confirm_sole_claim(self, store: DocumentStore, entry_id: str, claimed_at: str) -> bool:
+        """Verify this replica holds the only merging claim, releasing it if not."""
+        merging_docs = await store.query(_COLLECTION, filters=[("status", "==", _STATUS_MERGING)])
+        # Ties are broken on entry id so that two replicas claiming in the same
+        # microsecond cannot both decide to release.
+        mine = (claimed_at, entry_id)
+        rivals = [
+            doc
+            for doc in merging_docs
+            if doc.get("id") != entry_id and (str(doc.get("merging_started_at") or ""), str(doc.get("id"))) < mine
+        ]
+        if not rivals:
+            return True
+
+        logger.info(
+            "[merge-queue] Releasing entry %s — replica %s claimed concurrently",
+            entry_id,
+            rivals[0].get("id"),
+        )
+        await store.update(
+            _COLLECTION,
+            entry_id,
+            {"status": _STATUS_PENDING, "merging_started_at": None},
+        )
+        return False
+
+    async def expire_stale_merging(self) -> int:
         """Mark stale 'merging' entries as failed if they exceeded the TTL.
 
         Prevents a permanently blocked queue when a merge process crashes
-        without completing.
+        without completing. Returns the number of entries expired.
         """
-        cutoff = datetime.now(UTC) - _MERGING_TTL
+        store = self._get_store()
+        cutoff = (datetime.now(UTC) - _MERGING_TTL).isoformat()
         stale_docs = await store.query(
             _COLLECTION,
             filters=[("status", "==", _STATUS_MERGING), ("merging_started_at", "<", cutoff)],
@@ -146,6 +209,7 @@ class MergeQueue:
                     "error": f"Merge TTL exceeded ({_MERGING_TTL})",
                 },
             )
+        return len(stale_docs)
 
     async def mark_merged(self, entry_id: str) -> None:
         """Mark a queue entry as successfully merged."""

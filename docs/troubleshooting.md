@@ -43,8 +43,9 @@ disables the Slack intake (e.g. `gcp` without the Socket Mode token).
 
 1. Confirm `SLACK_SIGNING_SECRET` in `.env.local` matches the one in the
    Slack app config exactly (no whitespace, no trailing newline).
-2. Confirm `HENCHMEN_PROVIDER=local` (or `HENCHMEN_DISPATCH_SLACK=true` on
-   GCP).
+2. Confirm both `HENCHMEN_SLACK_BOT_TOKEN` and `HENCHMEN_SLACK_APP_TOKEN`
+   are set. The Socket Mode client starts from the Dispatch app's lifespan
+   and logs a line naming both variables when either is missing.
 3. Restart `henchmen serve` after changing `.env.local` -- settings are
    cached.
 
@@ -171,11 +172,11 @@ rather than burn through your wallet.
 
 **Fix:**
 
-1. See the current cap and total: `curl http://localhost:8000/metrics/summary`
+1. See the current cap and total: `curl http://localhost:8000/mastermind/metrics/summary`
 2. Raise the ceiling in `.env.local`:
 
    ```bash
-   HENCHMEN_COST_CEILING_USD_PER_TASK=2.50
+   HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD=2.50
    ```
 
 3. Restart the service.

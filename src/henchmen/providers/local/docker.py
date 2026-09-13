@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -15,6 +16,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Containers run with --rm, so `docker logs` is unavailable once they exit.
+# Keep the last N drained lines per execution instead.
+_LOG_BUFFER_LINES = 2000
+
 
 class DockerOrchestrator:
     """ContainerOrchestrator backed by local Docker."""
@@ -23,6 +28,9 @@ class DockerOrchestrator:
         self._settings = settings
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._drain_tasks: dict[str, asyncio.Task[None]] = {}
+        self._timeout_tasks: dict[str, asyncio.Task[None]] = {}
+        self._logs: dict[str, deque[str]] = {}
+        self._timed_out: set[str] = set()
 
     async def run_job(
         self,
@@ -44,6 +52,9 @@ class DockerOrchestrator:
             cmd.extend(["-e", f"{k}={v}"])
         mem = memory.lower().replace("gi", "g").replace("mi", "m")
         cmd.extend(["--memory", mem])
+        cpu_limit = _cpu_limit(cpu)
+        if cpu_limit:
+            cmd.extend(["--cpus", cpu_limit])
         cmd.append(image)
         logger.info("Starting Docker container %s with image %s", exec_id, image)
         process = await asyncio.create_subprocess_exec(
@@ -52,6 +63,8 @@ class DockerOrchestrator:
             stderr=asyncio.subprocess.STDOUT,
         )
         self._processes[exec_id] = process
+        buffer: deque[str] = deque(maxlen=_LOG_BUFFER_LINES)
+        self._logs[exec_id] = buffer
 
         # Drain stdout in the background so the pipe buffer never fills up
         # (a full pipe would block the Docker CLI and hang the container).
@@ -61,11 +74,48 @@ class DockerOrchestrator:
             async for line in proc.stdout:
                 text = line.decode(errors="replace").rstrip()
                 if text:
+                    buffer.append(text)
                     logger.info("[operative:%s] %s", eid[:12], text)
 
         task = asyncio.create_task(_drain(process, exec_id))
         self._drain_tasks[exec_id] = task
+        self._timeout_tasks[exec_id] = asyncio.create_task(self._enforce_timeout(exec_id, timeout_seconds))
         return exec_id
+
+    async def _enforce_timeout(self, exec_id: str, timeout_seconds: int) -> None:
+        """Kill the container once ``timeout_seconds`` elapses and mark it TIMED_OUT."""
+        process = self._processes.get(exec_id)
+        if process is None or timeout_seconds <= 0:
+            return
+        try:
+            await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
+            return
+        except TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            raise
+        logger.warning("Docker container %s exceeded %ss — killing it", exec_id, timeout_seconds)
+        self._timed_out.add(exec_id)
+        await self._docker_kill(exec_id)
+
+    @staticmethod
+    async def _docker_kill(execution_id: str) -> None:
+        """Run `docker kill` and wait for it, logging a non-zero exit."""
+        proc = await asyncio.create_subprocess_exec(
+            "docker",
+            "kill",
+            execution_id,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning(
+                "docker kill %s exited %s: %s",
+                execution_id,
+                proc.returncode,
+                (stdout or b"").decode(errors="replace").strip(),
+            )
 
     async def get_status(self, execution_id: str) -> JobResult:
         """Return the current status of a Docker container execution."""
@@ -74,23 +124,64 @@ class DockerOrchestrator:
             return JobResult(job_id=execution_id, status=JobStatus.FAILED, exit_code=-1)
         if process.returncode is None:
             return JobResult(job_id=execution_id, status=JobStatus.RUNNING)
+        self._cleanup(execution_id)
+        if execution_id in self._timed_out:
+            # A killed-on-timeout container must never be reported as completed:
+            # its verification work never ran.
+            return JobResult(
+                job_id=execution_id,
+                status=JobStatus.TIMED_OUT,
+                exit_code=process.returncode,
+                logs=self._buffered_logs(execution_id),
+            )
         status = JobStatus.COMPLETED if process.returncode == 0 else JobStatus.FAILED
-        return JobResult(job_id=execution_id, status=status, exit_code=process.returncode)
+        return JobResult(
+            job_id=execution_id,
+            status=status,
+            exit_code=process.returncode,
+            logs=self._buffered_logs(execution_id),
+        )
+
+    def _cleanup(self, execution_id: str) -> None:
+        """Drop finished bookkeeping tasks for a terminated execution."""
+        timeout_task = self._timeout_tasks.pop(execution_id, None)
+        if timeout_task is not None and not timeout_task.done():
+            timeout_task.cancel()
+        drain_task = self._drain_tasks.get(execution_id)
+        if drain_task is not None and drain_task.done():
+            self._drain_tasks.pop(execution_id, None)
+
+    def _buffered_logs(self, execution_id: str) -> str | None:
+        buffer = self._logs.get(execution_id)
+        if not buffer:
+            return None
+        return "\n".join(buffer)
 
     async def cancel(self, execution_id: str) -> None:
-        """Send a docker kill to a running container."""
-        await asyncio.create_subprocess_exec("docker", "kill", execution_id)
+        """Send a docker kill to a running container and wait for it."""
+        self._cleanup(execution_id)
+        await self._docker_kill(execution_id)
 
     async def stream_logs(self, execution_id: str) -> AsyncIterator[str]:
-        """Stream stdout/stderr from a running or completed container."""
-        process = await asyncio.create_subprocess_exec(
-            "docker",
-            "logs",
-            "-f",
-            execution_id,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        if process.stdout:
-            async for line in process.stdout:
-                yield line.decode()
+        """Yield the drained stdout/stderr captured for an execution.
+
+        Containers are started with ``--rm``, so once one exits Docker has
+        already removed it and ``docker logs`` would fail; the drain task's
+        buffer is the only surviving copy.
+        """
+        buffer = self._logs.get(execution_id)
+        if buffer is None:
+            return
+        for line in list(buffer):
+            yield line
+
+
+def _cpu_limit(cpu: str) -> str:
+    """Return a `--cpus` value for a numeric vCPU string, else ''."""
+    try:
+        value = float(cpu)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    return f"{value:g}"

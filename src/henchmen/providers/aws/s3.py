@@ -15,8 +15,7 @@ class S3ObjectStore:
     def __init__(self, settings: Settings) -> None:
         import boto3
 
-        region = getattr(settings, "aws_region", "us-east-1")
-        self._client: Any = boto3.client("s3", region_name=region)
+        self._client: Any = boto3.client("s3", region_name=settings.aws_region)
 
     async def put(self, bucket: str, key: str, data: bytes) -> None:
         """Upload bytes to an S3 object."""
@@ -28,8 +27,14 @@ class S3ObjectStore:
 
     async def get(self, bucket: str, key: str) -> bytes:
         """Download an S3 object as bytes."""
-        response = await asyncio.to_thread(self._client.get_object, Bucket=bucket, Key=key)
-        return bytes(response["Body"].read())
+
+        def _read() -> bytes:
+            # Body.read() streams the object over the network, so it has to
+            # run in the worker thread too, not back on the event loop.
+            response = self._client.get_object(Bucket=bucket, Key=key)
+            return bytes(response["Body"].read())
+
+        return await asyncio.to_thread(_read)
 
     async def get_file(self, bucket: str, key: str, file_path: str) -> None:
         """Download an S3 object to a local file."""
@@ -56,9 +61,26 @@ class S3ObjectStore:
         await asyncio.to_thread(self._client.delete_object, Bucket=bucket, Key=key)
 
     async def list_keys(self, bucket: str, prefix: str = "") -> list[str]:
-        """List S3 object keys with an optional prefix."""
+        """List S3 object keys with an optional prefix.
+
+        ``list_objects_v2`` caps a response at 1000 keys, so every page is
+        followed via ``ContinuationToken``; stopping at the first page would
+        silently truncate larger buckets.
+        """
         kwargs: dict[str, Any] = {"Bucket": bucket}
         if prefix:
             kwargs["Prefix"] = prefix
-        response = await asyncio.to_thread(self._client.list_objects_v2, **kwargs)
-        return [obj["Key"] for obj in response.get("Contents", [])]
+
+        def _list_all() -> list[str]:
+            keys: list[str] = []
+            page_kwargs = dict(kwargs)
+            while True:
+                response = self._client.list_objects_v2(**page_kwargs)
+                keys.extend(str(obj["Key"]) for obj in response.get("Contents", []))
+                token = response.get("NextContinuationToken")
+                if not response.get("IsTruncated") or not token:
+                    break
+                page_kwargs["ContinuationToken"] = token
+            return keys
+
+        return await asyncio.to_thread(_list_all)

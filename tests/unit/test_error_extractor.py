@@ -127,19 +127,96 @@ class TestExtractCIErrors:
         assert all(e.check_name == "lint" for e in errors)
 
     @pytest.mark.asyncio
-    async def test_api_error_returns_empty(self):
-        """Any exception returns an empty list."""
-        from henchmen.forge.error_extractor import extract_ci_errors
+    async def test_transport_error_raises_instead_of_returning_empty(self):
+        """A transport failure is 'unknown', never 'no errors found'."""
+        import httpx
+
+        from henchmen.forge.error_extractor import CIErrorExtractionError, extract_ci_errors
 
         mock_client = AsyncMock()
-        mock_client.get = AsyncMock(side_effect=Exception("Network error"))
+        mock_client.get = AsyncMock(side_effect=httpx.ConnectError("Network error"))
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("henchmen.forge.error_extractor.httpx.AsyncClient", return_value=mock_client),
+            pytest.raises(CIErrorExtractionError),
+        ):
+            await extract_ci_errors("org/repo", 999, "gh-token")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [401, 403, 404])
+    async def test_auth_failure_raises_explicit_error(self, status):
+        """Regression: a 401 body decoded to [] and looked exactly like a clean suite."""
+        from henchmen.forge.error_extractor import CIErrorExtractionError, extract_ci_errors
+
+        denied = _make_async_response({"message": "Bad credentials"}, status_code=status)
+        denied.text = '{"message": "Bad credentials"}'
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=denied)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("henchmen.forge.error_extractor.httpx.AsyncClient", return_value=mock_client),
+            pytest.raises(CIErrorExtractionError) as exc_info,
+        ):
+            await extract_ci_errors("org/repo", 999, "gh-token")
+
+        assert exc_info.value.status_code == status
+        assert "token" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_empty_token_raises_without_calling_github(self):
+        from henchmen.forge.error_extractor import CIErrorExtractionError, extract_ci_errors
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock()
+
+        with (
+            patch("henchmen.forge.error_extractor.httpx.AsyncClient", return_value=mock_client),
+            pytest.raises(CIErrorExtractionError),
+        ):
+            await extract_ci_errors("org/repo", 999, "")
+
+        mock_client.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unexpected_annotation_payload_raises(self):
+        """An error object where a list was expected must not silently yield []."""
+        from henchmen.forge.error_extractor import CIErrorExtractionError, extract_ci_errors
+
+        check_runs_resp = _make_async_response({"check_runs": [_make_check_run(conclusion="failure", run_id=7)]})
+        weird_resp = _make_async_response({"message": "Resource not accessible"})
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=[check_runs_resp, weird_resp])
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("henchmen.forge.error_extractor.httpx.AsyncClient", return_value=mock_client),
+            pytest.raises(CIErrorExtractionError),
+        ):
+            await extract_ci_errors("org/repo", 999, "gh-token")
+
+    @pytest.mark.asyncio
+    async def test_requests_full_pages(self):
+        """Pagination: 30 check runs per page would hide failures on large suites."""
+        from henchmen.forge.error_extractor import extract_ci_errors
+
+        check_runs_resp = _make_async_response({"check_runs": []})
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=check_runs_resp)
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
         with patch("henchmen.forge.error_extractor.httpx.AsyncClient", return_value=mock_client):
-            errors = await extract_ci_errors("org/repo", 999, "gh-token")
+            assert await extract_ci_errors("org/repo", 999, "gh-token") == []
 
-        assert errors == []
+        assert mock_client.get.call_args.kwargs["params"]["per_page"] == 100
 
     @pytest.mark.asyncio
     async def test_no_line_number(self):

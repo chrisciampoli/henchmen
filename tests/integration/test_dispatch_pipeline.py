@@ -295,6 +295,18 @@ class TestGitHubDispatchPipeline:
         assertions.assert_valid_henchmen_task(task_data)
 
     @pytest.mark.asyncio
+    async def test_github_pr_comment_from_outsider_is_ignored(
+        self, dispatch_client: AsyncClient, github_pr_comment_event: dict
+    ):
+        """An untrusted commenter cannot spend money by @-mentioning the bot."""
+        github_pr_comment_event["comment"]["author_association"] = "NONE"
+
+        resp = await _post(dispatch_client, "/webhooks/github", github_pr_comment_event)
+
+        assert resp["status"] == "ignored"
+        self.mock_pubsub.assert_published_to(TASK_INTAKE_TOPIC, count=0)
+
+    @pytest.mark.asyncio
     async def test_github_pr_comment_captures_branch(self, dispatch_client: AsyncClient, github_pr_comment_event: dict):
         """context.branch must equal the PR head branch 'feature/auth-update'."""
         await _post(dispatch_client, "/webhooks/github", github_pr_comment_event)

@@ -7,24 +7,56 @@ from typing import TYPE_CHECKING, Any
 
 from google import genai
 
-from henchmen.models.llm import LLMResponse, Message, MessageRole, ModelTier, TokenUsage, ToolCall, ToolDefinition
+from henchmen.models.llm import (
+    LLMResponse,
+    Message,
+    MessageRole,
+    ModelTier,
+    TokenUsage,
+    ToolCall,
+    ToolDefinition,
+    ToolParameter,
+)
+from henchmen.providers.llm_common import normalize_finish_reason, resolve_provider_model
+from henchmen.providers.pricing import estimate_cost
+from henchmen.providers.tiers import tier_models
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
-_PRICE_MAP: dict[str, tuple[float, float]] = {
-    "gemini-3.1-pro": (2.0, 12.0),
-    "gemini-2.5-pro": (1.25, 10.0),
-    "gemini-2.5-flash": (0.15, 0.60),
-}
+PROVIDER_NAME = "gcp"
 
-_TIER_MAP_KEYS: dict[str, str] = {
-    ModelTier.COMPLEX: "vertex_ai_model_complex",
-    ModelTier.LIGHT: "vertex_ai_model_light",
-    ModelTier.REASONING: "vertex_ai_model_complex",
-}
+
+def _gemini_schema(param: ToolParameter) -> dict[str, Any]:
+    """Build a Gemini parameter schema (upper-cased types, enum and array items preserved)."""
+    schema: dict[str, Any] = {"type": param.type.upper(), "description": param.description}
+    if param.enum:
+        schema["enum"] = list(param.enum)
+    if param.items:
+        schema["items"] = _upper_types(param.items)
+    elif param.type.lower() == "array":
+        # Gemini rejects an ARRAY declaration with no item type; assume strings
+        # rather than failing the whole tool list.
+        schema["items"] = {"type": "STRING"}
+    return schema
+
+
+def _upper_types(schema: dict[str, Any]) -> dict[str, Any]:
+    """Recursively upper-case JSON-Schema ``type`` values for the Gemini dialect."""
+    out: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key == "type" and isinstance(value, str):
+            out[key] = value.upper()
+        elif key in ("items", "properties") and isinstance(value, dict):
+            if key == "properties":
+                out[key] = {k: _upper_types(v) if isinstance(v, dict) else v for k, v in value.items()}
+            else:
+                out[key] = _upper_types(value)
+        else:
+            out[key] = value
+    return out
 
 
 class VertexAIProvider:
@@ -40,18 +72,23 @@ class VertexAIProvider:
 
     def resolve_tier(self, tier: str) -> str:
         """Map a ModelTier to the concrete model name from settings."""
-        setting_key = _TIER_MAP_KEYS.get(tier)
-        if setting_key:
-            return str(getattr(self._settings, setting_key))
-        return tier
+        return resolve_provider_model(self._settings, tier, PROVIDER_NAME)
 
     def supported_models(self) -> list[str]:
-        """Return the list of Gemini models available on Vertex AI."""
-        return ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3.1-pro"]
+        """Return the configured tier models, deduped and in tier order."""
+        models = tier_models(self._settings, PROVIDER_NAME)
+        seen: set[str] = set()
+        out: list[str] = []
+        for tier in (ModelTier.COMPLEX, ModelTier.LIGHT, ModelTier.REASONING):
+            name = models.get(tier, "")
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
 
     async def count_tokens(self, text: str, model: str) -> int:
-        """Count tokens for the given text using the specified model."""
-        response = await self._client.aio.models.count_tokens(model=model, contents=text)
+        """Count tokens for the given text using the specified model or tier."""
+        response = await self._client.aio.models.count_tokens(model=self.resolve_tier(model), contents=text)
         return response.total_tokens or 0
 
     async def generate(
@@ -66,12 +103,8 @@ class VertexAIProvider:
         """Generate a response from the Gemini model via Vertex AI."""
         from google.genai import types
 
-        contents = []
-        for msg in messages:
-            if msg.role == MessageRole.SYSTEM:
-                continue
-            role = "model" if msg.role == MessageRole.ASSISTANT else "user"
-            contents.append(types.Content(role=role, parts=[types.Part(text=msg.content)]))
+        model = self.resolve_tier(model)
+        contents = self._build_contents(messages, types)
 
         genai_tools: list[Any] | None = None
         if tools:
@@ -80,7 +113,7 @@ class VertexAIProvider:
                 params: dict[str, Any] = {}
                 required: list[str] = []
                 for p in tool.parameters:
-                    params[p.name] = {"type": p.type.upper(), "description": p.description}
+                    params[p.name] = _gemini_schema(p)
                     if p.required:
                         required.append(p.name)
                 declarations.append(
@@ -125,6 +158,7 @@ class VertexAIProvider:
                         )
 
         usage_meta = response.usage_metadata
+        # Gemini's prompt_token_count already includes cached tokens.
         input_tokens: int = int(usage_meta.prompt_token_count) if usage_meta and usage_meta.prompt_token_count else 0
         output_tokens: int = (
             int(usage_meta.candidates_token_count) if usage_meta and usage_meta.candidates_token_count else 0
@@ -132,14 +166,9 @@ class VertexAIProvider:
         cached: int = (
             int(usage_meta.cached_content_token_count) if usage_meta and usage_meta.cached_content_token_count else 0
         )
-        cost = self._estimate_cost(model, input_tokens, output_tokens, cached)
+        cost = estimate_cost(model, input_tokens, output_tokens, cached_input_tokens=cached)
 
-        finish = "tool_use" if tool_calls else "stop"
-        if response.candidates and response.candidates[0].finish_reason:
-            reason = str(response.candidates[0].finish_reason)
-            if "MAX_TOKENS" in reason:
-                finish = "max_tokens"
-
+        raw_finish = response.candidates[0].finish_reason if response.candidates else None
         return LLMResponse(
             content=content_text,
             tool_calls=tool_calls,
@@ -151,14 +180,43 @@ class VertexAIProvider:
                 estimated_cost_usd=cost,
             ),
             model=model,
-            finish_reason=finish,
+            finish_reason=normalize_finish_reason(raw_finish, has_tool_calls=bool(tool_calls)),
         )
 
-    def _estimate_cost(self, model: str, input_tokens: int, output_tokens: int, cached: int) -> float:
-        """Estimate USD cost for a Gemini API call, accounting for cache discounts."""
-        prices = _PRICE_MAP.get(model, (1.25, 10.0))
-        billable_input = input_tokens - cached
-        cached_cost = (cached / 1_000_000) * prices[0] * 0.25
-        input_cost = (billable_input / 1_000_000) * prices[0]
-        output_cost = (output_tokens / 1_000_000) * prices[1]
-        return input_cost + cached_cost + output_cost
+    @staticmethod
+    def _build_contents(messages: list[Message], types: Any) -> list[Any]:
+        """Convert henchmen messages to Gemini ``Content`` turns.
+
+        Tool calls become ``function_call`` parts and tool results become
+        ``function_response`` parts; empty text parts are never emitted (Vertex
+        rejects them with 400 INVALID_ARGUMENT) and consecutive same-role turns
+        are merged so the conversation stays alternating.
+        """
+        call_names: dict[str, str] = {}
+        for msg in messages:
+            for tc in msg.tool_calls or []:
+                call_names[tc.id] = tc.name
+
+        contents: list[Any] = []
+        for msg in messages:
+            if msg.role == MessageRole.SYSTEM:
+                continue
+            parts: list[Any] = []
+            if msg.role == MessageRole.TOOL:
+                call_id = msg.tool_call_id or ""
+                name = call_names.get(call_id) or call_id.removeprefix("call_") or "tool"
+                parts.append(types.Part.from_function_response(name=name, response={"result": msg.content}))
+                role = "user"
+            else:
+                role = "model" if msg.role == MessageRole.ASSISTANT else "user"
+                if msg.content.strip():
+                    parts.append(types.Part(text=msg.content))
+                for tc in msg.tool_calls or []:
+                    parts.append(types.Part.from_function_call(name=tc.name, args=tc.arguments))
+            if not parts:
+                continue
+            if contents and contents[-1].role == role:
+                contents[-1].parts.extend(parts)
+            else:
+                contents.append(types.Content(role=role, parts=parts))
+        return contents

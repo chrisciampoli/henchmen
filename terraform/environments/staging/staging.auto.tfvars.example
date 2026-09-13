@@ -1,0 +1,43 @@
+# Everything `terraform plan` needs from you before it can run in this
+# directory, plus the optional knobs worth knowing about.
+#
+#   cp staging.auto.tfvars.example terraform.tfvars
+#   $EDITOR terraform.tfvars
+#   gcloud storage buckets create gs://henchmen-tfstate-$PROJECT_ID-staging \
+#     --location=us-central1 --uniform-bucket-level-access
+#   terraform init -backend-config=bucket=henchmen-tfstate-$PROJECT_ID-staging
+#   terraform plan -out=tier1.tfplan && terraform apply tier1.tfplan
+#
+# Copy it to `terraform.tfvars` — which is git-ignored and auto-loaded —
+# rather than over `staging.auto.tfvars`, which is committed and carries the
+# per-environment sizing. The two files do not overlap.
+
+# ---------------------------------------------------------------------------
+# Required — no defaults, plan fails (or prompts) without them
+# ---------------------------------------------------------------------------
+
+project_id          = "my-gcp-project"
+github_owner        = "my-org"
+github_default_repo = "my-org/my-target-repo"
+
+# ---------------------------------------------------------------------------
+# Optional
+# ---------------------------------------------------------------------------
+
+# Images are deployed from a public placeholder until this is set. Build and
+# push mastermind/dispatch/forge/operative first, then set the tag (or a
+# digest) and re-apply.
+# container_image_tag = "latest"
+
+# Set to false once real values have been added to Secret Manager, so a later
+# apply cannot create a placeholder version that shadows them.
+# seed_secret_placeholders = true
+
+# Required for GitHub / Jira webhooks: they cannot present a Google OIDC token,
+# so without this their deliveries are rejected at the Cloud Run edge. Only
+# enable it once /api/v1/tasks on Dispatch is protected by its own token.
+# dispatch_public_ingress = false
+
+# Jira intake (the API token itself lives in Secret Manager).
+# jira_base_url = "https://acme.atlassian.net"
+# jira_email    = "bot@acme.example"

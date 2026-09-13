@@ -58,14 +58,14 @@ _ENVIRONMENTAL_MARKERS: tuple[str, ...] = (
     "no space left",
 )
 
+# Deliberately narrow: generic fragments such as "test_", "assert " and
+# "expected " matched ordinary messages ("File not found: tests/test_foo.py",
+# "expected str, got int") and mis-routed them to the test-failure recovery hint.
 _TEST_FAILURE_MARKERS: tuple[str, ...] = (
     "test failed",
     "tests failed",
     "assertion error",
     "assertionerror",
-    "assert ",
-    "expected ",
-    "test_",
     "failed test",
     "failures=",
     "errors=",
@@ -140,28 +140,48 @@ RECOVERY_STRATEGIES: dict[str, str] = {
 }
 
 
-def classify_tool_failure(tool_result: Any) -> FailureClass:
+_CHECK_TOOLS: tuple[str, ...] = ("run_tests", "test_runner", "run_lint", "type_check")
+
+
+def classify_tool_failure(tool_result: Any, tool_name: str = "") -> FailureClass:
     """Classify a tool result into one of the ``FailureClass`` categories.
 
     Accepts ``Any`` so callers do not need to type-check before invoking.
-    Returns ``"none"`` if the result is not a dict or has no ``error`` field.
+    ``tool_name`` should be passed by the agent loop: the Arsenal handlers
+    return their payload without it, so relying on ``tool_result["tool_name"]``
+    alone left every check-tool branch dead.
+
+    Check tools (``run_tests`` / ``run_lint`` / ``type_check``) report failure
+    through ``success``/``return_code`` rather than an ``error`` key, so those
+    are treated as failure signals too. Returns ``"none"`` when the result is
+    not a dict or carries no failure signal.
     """
     if not isinstance(tool_result, dict):
         return "none"
 
+    name = (tool_name or str(tool_result.get("tool_name", ""))).lower()
     error = tool_result.get("error")
+
+    if not error and name in _CHECK_TOOLS:
+        # A skipped check (no lint/test script configured) is not a failure.
+        if tool_result.get("skipped"):
+            return "none"
+        failed = tool_result.get("success") is False or int(tool_result.get("return_code", 0) or 0) != 0
+        if not failed:
+            return "none"
+        return "test_failure" if name in ("run_tests", "test_runner") else "lint_error"
+
     if not error:
         return "none"
 
     message = str(error).lower()
-    tool_name = str(tool_result.get("tool_name", "")).lower()
 
     # Check for test failures first (high specificity)
-    if tool_name in ("run_tests", "test_runner") or any(m in message for m in _TEST_FAILURE_MARKERS):
+    if name in ("run_tests", "test_runner") or any(m in message for m in _TEST_FAILURE_MARKERS):
         return "test_failure"
 
     # Lint/type check errors
-    if tool_name in ("run_lint", "type_check") or any(m in message for m in _LINT_ERROR_MARKERS):
+    if name in ("run_lint", "type_check") or any(m in message for m in _LINT_ERROR_MARKERS):
         return "lint_error"
 
     # Transient / tool errors

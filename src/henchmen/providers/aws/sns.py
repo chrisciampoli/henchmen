@@ -25,9 +25,9 @@ class SNSMessageBroker:
     def __init__(self, settings: Settings) -> None:
         import boto3
 
-        self._region = getattr(settings, "aws_region", "us-east-1")
-        self._account_id = getattr(settings, "aws_account_id", "")
-        self._prefix = getattr(settings, "aws_resource_prefix", "henchmen")
+        self._region = settings.aws_region
+        self._account_id = settings.aws_account_id
+        self._prefix = settings.aws_resource_prefix
         self._client: Any = boto3.client("sns", region_name=self._region)
         self._sqs_client: Any | None = None
 
@@ -50,7 +50,13 @@ class SNSMessageBroker:
         ordering_key: str | None = None,
         **attributes: str,
     ) -> str:
-        """Publish a message to an SNS topic. Returns message ID."""
+        """Publish a message to an SNS topic. Returns message ID.
+
+        ``ordering_key`` maps to a FIFO message group. Standard (non-FIFO)
+        topics reject ``MessageGroupId`` with InvalidParameter, so it is only
+        sent for a ``.fifo`` topic; on a standard topic the key is ignored
+        (SNS has no ordering there to request).
+        """
         topic_arn = self._topic_arn(topic)
         kwargs: dict[str, Any] = {
             "TopicArn": topic_arn,
@@ -59,7 +65,10 @@ class SNSMessageBroker:
         if attributes:
             kwargs["MessageAttributes"] = {k: {"DataType": "String", "StringValue": v} for k, v in attributes.items()}
         if ordering_key:
-            kwargs["MessageGroupId"] = ordering_key
+            if topic_arn.endswith(".fifo"):
+                kwargs["MessageGroupId"] = ordering_key
+            else:
+                logger.debug("Ignoring ordering_key on standard SNS topic %s", topic_arn)
 
         response = await asyncio.to_thread(self._client.publish, **kwargs)
         return str(response.get("MessageId", ""))
@@ -71,11 +80,11 @@ class SNSMessageBroker:
     ) -> list[dict[str, Any]]:
         """Pull and acknowledge dead-lettered messages from an SQS queue.
 
-        ``subscription_name`` is the short-name of the SQS queue that
-        backs the dead-letter subscription (e.g.
-        ``henchmen-dev-dead-letter``). The queue URL is resolved via
-        ``sqs.get_queue_url`` so callers don't need to know the account
-        ID or full ARN.
+        ``subscription_name`` is resolved with ``sqs.get_queue_url`` so
+        callers don't need the account ID or full ARN — it must therefore be
+        the *SQS queue name* on AWS, not the GCP-style subscription
+        short-name (``...-dead-letter-sub``) that Mastermind currently
+        derives; a name with no matching queue raises ``RuntimeError``.
 
         Returned messages match the shape of the GCP Pub/Sub
         implementation so downstream consumers can treat both providers

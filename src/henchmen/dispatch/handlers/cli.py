@@ -3,10 +3,12 @@
 import asyncio
 import logging
 import os
+import re
 import shutil
 import tempfile
 from typing import TYPE_CHECKING, Any
 
+from henchmen.dispatch.api_models import CreateTaskRequest
 from henchmen.dispatch.normalizer import TaskNormalizer
 from henchmen.providers.interfaces.message_broker import MessageBroker
 from henchmen.utils.git import clone_repo
@@ -16,15 +18,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# ``owner/name`` as GitHub allows it. Validated before the value is ever
+# interpolated into a clone URL or passed to git as an argument.
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
 
 async def handle_cli_request(
-    data: dict[str, Any],
+    data: CreateTaskRequest,
     normalizer: TaskNormalizer,
     settings: "Settings",
     broker: MessageBroker | None = None,
 ) -> dict[str, Any]:
     """Process a CLI task creation request."""
-    task = normalizer.from_cli(data)
+    task = normalizer.from_cli(data.model_dump(), settings)
     msg_id = await normalizer.publish_task(task, settings, broker=broker)
     return {"task_id": task.id, "message_id": msg_id, "status": "dispatched"}
 
@@ -33,8 +39,6 @@ async def handle_embed_command(
     repo: str,
     full: bool,
     settings: "Settings",
-    # Legacy param kept for backward compatibility
-    pinecone_api_key: str = "",
 ) -> dict[str, Any]:
     """Handle the 'embed' CLI command. Runs the embedding pipeline locally."""
     mode = "full" if full else "incremental"
@@ -45,13 +49,40 @@ async def handle_embed_command(
     )
 
 
+async def _resolve_default_branch(repo: str, token: str) -> str:
+    """Return the repo's default branch via ``git ls-remote --symref``.
+
+    Falls back to ``main`` when the remote cannot be queried. The token is
+    never logged: only the parsed ref name is used.
+    """
+    url = f"https://x-access-token:{token}@github.com/{repo}.git" if token else f"https://github.com/{repo}.git"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "ls-remote",
+            "--symref",
+            url,
+            "HEAD",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+    except OSError as exc:
+        logger.warning("[EMBED] Could not run git ls-remote for %s: %s", repo, exc)
+        return "main"
+    for line in stdout.decode(errors="replace").splitlines():
+        if line.startswith("ref:"):
+            ref = line.split()[1]
+            return ref.rsplit("/", 1)[-1]
+    logger.warning("[EMBED] Could not resolve default branch for %s; assuming 'main'", repo)
+    return "main"
+
+
 async def run_embedding_pipeline(
     repo: str,
     mode: str,
     settings: "Settings",
     commit_sha: str | None = None,
-    # Legacy param kept for backward compatibility
-    pinecone_api_key: str = "",
 ) -> dict[str, Any]:
     """Run the code embedding pipeline for a repository.
 
@@ -69,20 +100,24 @@ async def run_embedding_pipeline(
         upsert_chunks,
     )
 
+    if not _REPO_RE.match(repo):
+        return {"status": "failed", "error": f"invalid repo name: {repo!r} (expected 'owner/name')"}
+
     collection_name = settings.rag_corpus_display_name
     project_id = settings.gcp_project_id
     region = settings.rag_corpus_region
-    github_token = os.environ.get("GITHUB_TOKEN", "")
+    github_token = settings.github_token
 
     logger.info("[EMBED] Starting %s embedding for %s", mode, repo)
 
     # Clone the repo
     tmp_dir = tempfile.mkdtemp(prefix="henchmen-embed-")
     try:
+        default_branch = await _resolve_default_branch(repo, github_token)
         try:
             await clone_repo(
                 repo,
-                "main",
+                default_branch,
                 tmp_dir,
                 token=github_token or None,
                 depth=50,

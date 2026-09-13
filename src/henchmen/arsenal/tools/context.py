@@ -15,16 +15,23 @@ file — use ``file_read`` (code_intel) instead.
 """
 
 import ast
-import asyncio
 import logging
 import os
 import re
 from pathlib import Path
 from typing import Any
 
+from henchmen.arsenal._process import SEARCH_TIMEOUT_SECONDS, run_command
+from henchmen.arsenal._repo import current_repo_slug
+from henchmen.arsenal._workspace import current_workspace_dir, ensure_in_workspace
 from henchmen.arsenal.registry import tool
 
 logger = logging.getLogger(__name__)
+
+# Directories that are never worth grepping in a target repo.
+_SKIP_DIRS = (".git", "node_modules", "dist", "build", ".venv", "__pycache__", ".next", ".turbo")
+
+_SOURCE_GLOBS = ("*.py", "*.ts", "*.js", "*.tsx", "*.jsx", "*.go", "*.rs", "*.java")
 
 
 @tool(
@@ -47,19 +54,22 @@ async def semantic_search(query: str, top_k: int = 5) -> dict[str, Any]:
 
     top_k = max(1, min(top_k, 20))  # Clamp to reasonable range
 
-    # Try RAG-based semantic search
+    # Try RAG-based semantic search. The corpus lives in
+    # ``settings.rag_corpus_region`` (which may differ from the main GCP
+    # region) under ``settings.rag_corpus_display_name`` — querying anywhere
+    # else finds nothing and creates an empty duplicate corpus.
     try:
+        from henchmen.config.settings import get_settings
         from henchmen.dossier.embedder import query_similar_chunks
 
-        repo = os.environ.get("REPO_SLUG", "")
-        project_id = os.environ.get("HENCHMEN_GCP_PROJECT_ID", "")
-        region = os.environ.get("HENCHMEN_GCP_REGION", "us-central1")
+        settings = get_settings()
 
         chunks = await query_similar_chunks(
             query_text=query,
-            repo=repo,
-            project_id=project_id,
-            region=region,
+            repo=current_repo_slug(),
+            collection_name=settings.rag_corpus_display_name,
+            project_id=settings.gcp_project_id,
+            region=settings.rag_corpus_region,
             top_k=top_k,
         )
 
@@ -80,7 +90,11 @@ async def semantic_search(query: str, top_k: int = 5) -> dict[str, Any]:
             return {"results": results, "source": "rag"}
 
     except Exception as exc:
-        logger.debug("RAG semantic search unavailable, falling back to grep: %s", exc)
+        logger.warning(
+            "RAG semantic search failed (%s: %s), falling back to grep",
+            type(exc).__name__,
+            exc,
+        )
 
     # Fallback: grep-based search
     return await _grep_fallback(query, top_k)
@@ -95,38 +109,39 @@ async def _grep_fallback(query: str, top_k: int) -> dict[str, Any]:
         terms = query.split()[:3]
 
     search_term = terms[0] if terms else query[:20]
-    workspace = os.getcwd()
+    workspace = current_workspace_dir()
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "grep",
-            "-rl",
-            "--include=*.py",
-            "--include=*.ts",
-            "--include=*.js",
-            "--include=*.tsx",
-            "--include=*.jsx",
-            "--include=*.go",
-            "--include=*.rs",
-            "--include=*.java",
-            "-i",
-            search_term,
-            workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        matches = stdout.decode().strip().split("\n")
-        matches = [m for m in matches if m][:top_k]
+    args = ["grep", "-rl"]
+    for glob in _SOURCE_GLOBS:
+        args.append(f"--include={glob}")
+    for skip in _SKIP_DIRS:
+        args.append(f"--exclude-dir={skip}")
+    # ``-e`` plus ``--`` so a term starting with a dash is searched for
+    # instead of being parsed as a grep option.
+    args.extend(["-i", "-e", search_term, "--", workspace])
 
-        results = []
-        for match_path in matches:
+    proc_result = await run_command(*args, timeout_seconds=SEARCH_TIMEOUT_SECONDS)
+    if proc_result.get("error"):
+        return {"error": f"Grep fallback also failed: {proc_result['error']}", "source": "none"}
+    if proc_result["return_code"] not in (0, 1):
+        stderr = proc_result["stderr"].strip()
+        return {"error": f"Grep fallback also failed: {stderr}", "source": "none"}
+
+    matches = [m for m in proc_result["stdout"].splitlines() if m.strip()][:top_k]
+    results = []
+    for match_path in matches:
+        try:
             rel = str(Path(match_path).relative_to(workspace))
-            results.append({"file_path": rel.replace("\\", "/"), "source": "grep"})
+        except ValueError:
+            rel = match_path
+        results.append({"file_path": rel.replace("\\", "/"), "source": "grep"})
 
-        return {"results": results, "source": "grep_fallback", "search_term": search_term}
-    except Exception as exc:
-        return {"error": f"Grep fallback also failed: {exc}", "source": "none"}
+    return {"results": results, "source": "grep_fallback", "search_term": search_term}
+
+
+def _missing_file(path: str) -> bool:
+    """Return True when ``path`` does not exist (kept sync for the async tool)."""
+    return not os.path.exists(path)
 
 
 @tool(
@@ -138,23 +153,31 @@ async def _grep_fallback(query: str, top_k: int) -> dict[str, Any]:
         "Do NOT use as a substitute for reading the file — use file_read instead."
     ),
 )
-def find_related(file_path: str, depth: int = 1) -> dict[str, Any]:
+async def find_related(file_path: str, depth: int = 1) -> dict[str, Any]:
     """Parse imports and find related files.
 
     For Python files, uses the ``ast`` module to parse import statements.
     For JS/TS files, uses regex to match ``import`` and ``require`` statements.
     Resolves import paths to actual file paths relative to the workspace.
+
+    Declared ``async`` like every other Arsenal handler: the operative loop
+    awaits handlers unconditionally, so a plain ``def`` here fails every call
+    with "'dict' object can't be awaited".
     """
-    if not os.path.exists(file_path):
+    try:
+        safe_path = ensure_in_workspace(file_path)
+    except PermissionError as exc:
+        return {"error": f"access denied: {exc}"}
+    if _missing_file(safe_path):
         return {"error": f"File not found: {file_path}"}
 
     depth = max(1, min(depth, 3))  # Clamp depth to prevent explosion
 
-    workspace = os.getcwd()
+    workspace = current_workspace_dir()
     visited: set[str] = set()
     related: dict[str, list[str]] = {}
 
-    _discover_imports(file_path, workspace, depth, visited, related)
+    _discover_imports(safe_path, workspace, depth, visited, related)
 
     return {"file": file_path, "related": related, "depth": depth}
 

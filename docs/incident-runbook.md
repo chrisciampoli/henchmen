@@ -83,17 +83,23 @@ A reasonable crontab entry:
 
 ### Adding a new LLM model to the price map
 
-The cost tracker keeps a static price map in
-`src/henchmen/observability/tracker.py` (look for `_PRICE_MAP`). If you add a
-model that is not listed, token usage will still be recorded but the cost
-column in `/metrics/summary` will read `$0.00`. To fix:
+Token prices live in exactly one place: `PRICE_TABLE` in
+`src/henchmen/providers/pricing.py`. A model that is not listed still has its
+token usage recorded, but its cost reads `$0.00` and it therefore never trips
+the per-task ceiling. To fix:
 
-1. Open `src/henchmen/observability/tracker.py`.
-2. Add an entry to `_PRICE_MAP` with the exact model string your provider
-   returns (e.g. `"gpt-4o-mini-2024-07-18"`) and per-1M-token input / output
-   rates in USD.
+1. Open `src/henchmen/providers/pricing.py`.
+2. Add a `PRICE_TABLE` entry keyed on the first-party model family id (e.g.
+   `"gpt-4o-mini"`), using the `_anthropic`, `_gemini` or `_openai` helper so
+   the cache-read and cache-write rates follow that vendor's discount. Dated
+   snapshots, Vertex `@` forms and Bedrock ids normalise onto that key
+   automatically, so one entry usually covers every spelling.
 3. Restart the process.
-4. Confirm with `curl http://localhost:8000/metrics/summary | jq .total_cost_usd`.
+4. Confirm with
+   `curl -H "Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN" http://localhost:8000/mastermind/metrics/summary | jq .total_cost_usd`.
+
+Do not add a second price map anywhere. Cost is always computed through
+`estimate_cost` / `estimate_cost_for_settings` from that module.
 
 ## Alert Conditions
 

@@ -1,11 +1,17 @@
-"""Unit tests for Forge: CIOrchestrator, MergeQueue, PRBuilder."""
+"""Unit tests for Forge: MergeQueue and the Forge HTTP/Pub/Sub server.
 
+``CIOrchestrator`` and ``PRBuilder`` were deleted as dead code (nothing in
+``src/`` imported them); the live CI path is covered by
+``tests/unit/test_ci_runner.py`` plus the server tests below.
+"""
+
+import base64
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from henchmen.providers.interfaces.ci_provider import CIResult, CIStatus
+from henchmen.forge.server import ForgeCIError, app
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -28,15 +34,6 @@ def _mock_broker():
     return broker
 
 
-def _mock_ci_provider():
-    provider = AsyncMock()
-    provider.trigger_build = AsyncMock(return_value="build-abc-123")
-    provider.get_status = AsyncMock(
-        return_value=CIResult(build_id="build-abc-123", status=CIStatus.SUCCESS, logs_url="https://logs/url")
-    )
-    return provider
-
-
 def _mock_document_store():
     store = AsyncMock()
     store.set = AsyncMock()
@@ -50,107 +47,27 @@ def _mock_document_store():
     return store
 
 
-# ===========================================================================
-# CIOrchestrator
-# ===========================================================================
+@pytest.fixture
+def forge_app(forge_settings):
+    """Install mock providers on ``app.state`` (lifespan does not run in tests)."""
+    broker = _mock_broker()
+    store = _mock_document_store()
+    app.state.message_broker = broker
+    app.state.document_store = store
+    yield broker, store
+    for attr in ("message_broker", "document_store"):
+        if hasattr(app.state, attr):
+            delattr(app.state, attr)
 
 
-class TestCIOrchestratorTriggerBuild:
-    @pytest.mark.asyncio
-    async def test_trigger_build_calls_ci_provider(self, forge_settings):
-        from henchmen.forge.ci_orchestrator import CIOrchestrator
-
-        settings = forge_settings
-        ci_provider = _mock_ci_provider()
-        orchestrator = CIOrchestrator(settings, ci_provider=ci_provider)
-
-        build_id = await orchestrator.trigger_build("acme/backend", "feature-x", 42)
-
-        assert build_id == "build-abc-123"
-        ci_provider.trigger_build.assert_called_once()
-        call_kwargs = ci_provider.trigger_build.call_args.kwargs
-        assert "acme/backend" in call_kwargs["repo_url"]
-        assert call_kwargs["branch"] == "feature-x"
-
-    @pytest.mark.asyncio
-    async def test_trigger_build_includes_pr_branch(self, forge_settings):
-        from henchmen.forge.ci_orchestrator import CIOrchestrator
-
-        settings = forge_settings
-        ci_provider = _mock_ci_provider()
-        orchestrator = CIOrchestrator(settings, ci_provider=ci_provider)
-
-        await orchestrator.trigger_build("acme/repo", "pr-10", 10)
-
-        ci_provider.trigger_build.assert_called_once()
-        call_kwargs = ci_provider.trigger_build.call_args.kwargs
-        assert call_kwargs["branch"] == "pr-10"
+def _published(broker):
+    """Return the decoded payloads published through a mock broker."""
+    return [json.loads(call.args[1].decode("utf-8")) for call in broker.publish.call_args_list]
 
 
-class TestCIOrchestratorPublishResult:
-    @pytest.mark.asyncio
-    async def test_publishes_to_correct_topic(self, forge_settings):
-        from henchmen.forge.ci_orchestrator import CIOrchestrator
-
-        settings = forge_settings
-        broker = _mock_broker()
-        orchestrator = CIOrchestrator(settings, broker=broker)
-
-        result = {"request_id": "req-1", "status": "passed"}
-        await orchestrator._publish_result("req-1", result)
-
-        broker.publish.assert_called_once()
-        call_args = broker.publish.call_args
-        topic = call_args.args[0]
-        # Real Settings class applies the env prefix — dev default
-        assert topic == "henchmen-dev-forge-result"
-
-        data_bytes = call_args.args[1]
-        published = json.loads(data_bytes.decode("utf-8"))
-        assert published["status"] == "passed"
-        assert published["request_id"] == "req-1"
-
-    @pytest.mark.asyncio
-    async def test_publishes_with_request_id_attribute(self, forge_settings):
-        from henchmen.forge.ci_orchestrator import CIOrchestrator
-
-        settings = forge_settings
-        broker = _mock_broker()
-        orchestrator = CIOrchestrator(settings, broker=broker)
-
-        await orchestrator._publish_result("req-42", {"request_id": "req-42", "status": "failed"})
-
-        call_kwargs = broker.publish.call_args.kwargs
-        assert call_kwargs.get("request_id") == "req-42"
-
-    @pytest.mark.asyncio
-    async def test_run_ci_publishes_result_on_success(self, forge_settings):
-        from henchmen.forge.ci_orchestrator import CIOrchestrator
-
-        settings = forge_settings
-        ci_provider = _mock_ci_provider()
-        broker = _mock_broker()
-        orchestrator = CIOrchestrator(settings, ci_provider=ci_provider, broker=broker)
-
-        result = await orchestrator.run_ci("https://github.com/acme/backend/pull/5", "req-99")
-
-        broker.publish.assert_called_once()
-        assert result["status"] == CIStatus.SUCCESS.value
-        assert result["build_id"] == "build-abc-123"
-
-    @pytest.mark.asyncio
-    async def test_run_ci_fails_on_invalid_url(self, forge_settings):
-        from henchmen.forge.ci_orchestrator import CIOrchestrator
-
-        settings = forge_settings
-        broker = _mock_broker()
-        orchestrator = CIOrchestrator(settings, broker=broker)
-
-        result = await orchestrator.run_ci("not-a-url", "req-bad")
-
-        assert result["status"] == "failed"
-        assert "parse" in result["error"].lower() or "not-a-url" in result["error"]
-        broker.publish.assert_called_once()
+def _pubsub_envelope(payload: dict, message_id: str = "msg-1") -> dict:
+    data = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8")
+    return {"message": {"data": data, "messageId": message_id}}
 
 
 # ===========================================================================
@@ -163,18 +80,14 @@ class TestMergeQueueEnqueue:
     async def test_enqueue_writes_to_document_store(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = forge_settings
         store = _mock_document_store()
-        queue = MergeQueue(settings, document_store=store)
+        queue = MergeQueue(forge_settings, document_store=store)
 
         entry_id = await queue.enqueue("https://github.com/acme/repo/pull/1", "task-abc")
 
         assert entry_id != ""
         store.set.assert_called_once()
-        call_args = store.set.call_args
-        collection = call_args.args[0]
-        written_id = call_args.args[1]
-        written = call_args.args[2]
+        collection, written_id, written = store.set.call_args.args
         assert collection == "merge_queue"
         assert written_id == entry_id
         assert written["pr_url"] == "https://github.com/acme/repo/pull/1"
@@ -182,17 +95,27 @@ class TestMergeQueueEnqueue:
         assert written["status"] == "pending"
 
     @pytest.mark.asyncio
+    async def test_enqueue_stores_created_at_as_iso_string(self, forge_settings):
+        """Datetimes round-trip as ISO strings in SQLite/DynamoDB; store them that way."""
+        from henchmen.forge.merge_queue import MergeQueue
+
+        store = _mock_document_store()
+        queue = MergeQueue(forge_settings, document_store=store)
+
+        await queue.enqueue("https://github.com/acme/repo/pull/1", "task-abc")
+
+        created_at = store.set.call_args.args[2]["created_at"]
+        assert isinstance(created_at, str)
+        assert created_at.endswith("+00:00")
+
+    @pytest.mark.asyncio
     async def test_enqueue_returns_unique_ids(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = forge_settings
         store = _mock_document_store()
-        queue = MergeQueue(settings, document_store=store)
+        queue = MergeQueue(forge_settings, document_store=store)
 
-        id1 = await queue.enqueue("https://github.com/acme/repo/pull/1", "t1")
-        id2 = await queue.enqueue("https://github.com/acme/repo/pull/2", "t2")
-
-        assert id1 != id2
+        assert await queue.enqueue("url-1", "t1") != await queue.enqueue("url-2", "t2")
 
 
 class TestMergeQueueDequeue:
@@ -200,64 +123,41 @@ class TestMergeQueueDequeue:
     async def test_dequeue_returns_none_when_merge_in_progress(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = forge_settings
         store = _mock_document_store()
-        queue = MergeQueue(settings, document_store=store)
+        queue = MergeQueue(forge_settings, document_store=store)
+        merging_entry = {"id": "e1", "status": "merging"}
 
-        merging_entry = {
-            "id": "e1",
-            "pr_url": "url",
-            "task_id": "t1",
-            "status": "merging",
-            "created_at": None,
-            "priority": 0,
-            "error": None,
-        }
-
-        # _expire_stale_merging query returns empty (no stale entries),
-        # then the merging-check query returns a result → should return None
+        # expire-stale query: empty, merging-check: one result -> None
         store.query = AsyncMock(side_effect=[[], [merging_entry]])
 
-        result = await queue.dequeue()
-
-        assert result is None
+        assert await queue.dequeue() is None
 
     @pytest.mark.asyncio
     async def test_dequeue_returns_none_when_queue_empty(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = forge_settings
         store = _mock_document_store()
-        queue = MergeQueue(settings, document_store=store)
-
-        # _expire_stale_merging query: no stale, merging-check: empty, pending-check: empty
+        queue = MergeQueue(forge_settings, document_store=store)
         store.query = AsyncMock(return_value=[])
 
-        result = await queue.dequeue()
-
-        assert result is None
+        assert await queue.dequeue() is None
 
     @pytest.mark.asyncio
     async def test_dequeue_claims_pending_entry_via_update_if(self, forge_settings):
         """Happy path: pending entry found, CAS succeeds, entry returned with status=merging."""
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = forge_settings
         store = _mock_document_store()
-        queue = MergeQueue(settings, document_store=store)
-
+        queue = MergeQueue(forge_settings, document_store=store)
         pending_entry = {
             "id": "e-pending",
-            "pr_url": "https://github.com/acme/repo/pull/5",
-            "task_id": "t5",
             "status": "pending",
-            "created_at": None,
             "priority": 0,
-            "error": None,
+            "created_at": "2026-01-01T00:00:00+00:00",
         }
 
-        # expire stale: empty, merging check: empty, pending check: one result
-        store.query = AsyncMock(side_effect=[[], [], [pending_entry]])
+        # expire stale, merging check, pending candidates, sole-claim confirmation
+        store.query = AsyncMock(side_effect=[[], [], [pending_entry], [{"id": "e-pending"}]])
         store.update_if = AsyncMock(return_value=True)
 
         result = await queue.dequeue()
@@ -266,46 +166,107 @@ class TestMergeQueueDequeue:
         assert result["id"] == "e-pending"
         assert result["status"] == "merging"
 
-        # dequeue must use update_if (CAS) — NOT a plain update — so two racing
-        # Forge replicas can't both claim the same entry.
         store.update_if.assert_called_once()
         call = store.update_if.call_args
-        # signature: update_if(collection, doc_id, expected_field, expected_value, new_values)
         assert call.args[0] == "merge_queue"
         assert call.args[1] == "e-pending"
         assert call.args[2] == "status"
         assert call.args[3] == "pending"
         new_values = call.args[4]
         assert new_values["status"] == "merging"
+        assert isinstance(new_values["merging_started_at"], str)
 
     @pytest.mark.asyncio
     async def test_dequeue_returns_none_when_cas_conflict_loses(self, forge_settings):
-        """Conflict path: another replica claimed the entry first, update_if returns False."""
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = forge_settings
         store = _mock_document_store()
-        queue = MergeQueue(settings, document_store=store)
-
-        pending_entry = {
-            "id": "e-contested",
-            "pr_url": "https://github.com/acme/repo/pull/6",
-            "task_id": "t6",
-            "status": "pending",
-            "created_at": None,
-            "priority": 0,
-            "error": None,
-        }
-        # expire stale: empty, merging check: empty, pending check: one result
+        queue = MergeQueue(forge_settings, document_store=store)
+        pending_entry = {"id": "e-contested", "status": "pending", "priority": 0}
         store.query = AsyncMock(side_effect=[[], [], [pending_entry]])
-        # Another worker won the CAS first — we lose.
         store.update_if = AsyncMock(return_value=False)
+
+        assert await queue.dequeue() is None
+        store.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dequeue_prefers_higher_priority(self, forge_settings):
+        from henchmen.forge.merge_queue import MergeQueue
+
+        store = _mock_document_store()
+        queue = MergeQueue(forge_settings, document_store=store)
+        low = {"id": "low", "status": "pending", "priority": 0, "created_at": "2026-01-01T00:00:00+00:00"}
+        high = {"id": "high", "status": "pending", "priority": 10, "created_at": "2026-01-02T00:00:00+00:00"}
+        store.query = AsyncMock(side_effect=[[], [], [low, high], [{"id": "high"}]])
+
+        result = await queue.dequeue()
+
+        assert result is not None and result["id"] == "high"
+        assert store.update_if.call_args.args[1] == "high"
+
+    @pytest.mark.asyncio
+    async def test_dequeue_releases_claim_when_another_replica_claimed_first(self, forge_settings):
+        """Two replicas must not both hold a merge claim, even on different entries."""
+        from henchmen.forge.merge_queue import MergeQueue
+
+        store = _mock_document_store()
+        queue = MergeQueue(forge_settings, document_store=store)
+        pending_entry = {"id": "mine", "status": "pending", "priority": 0}
+        rival = {"id": "theirs", "status": "merging", "merging_started_at": "2000-01-01T00:00:00+00:00"}
+        store.query = AsyncMock(side_effect=[[], [], [pending_entry], [rival, {"id": "mine"}]])
 
         result = await queue.dequeue()
 
         assert result is None
-        # No plain update fallback — the CAS must be the only claim attempt.
-        store.update.assert_not_called()
+        store.update.assert_called_once()
+        assert store.update.call_args.args[1] == "mine"
+        assert store.update.call_args.args[2]["status"] == "pending"
+
+
+class TestMergeQueueExpiry:
+    @pytest.mark.asyncio
+    async def test_expire_uses_iso_string_cutoff(self, forge_settings):
+        """A datetime filter value would raise TypeError against ISO-string fields."""
+        from henchmen.forge.merge_queue import MergeQueue
+
+        store = _mock_document_store()
+        queue = MergeQueue(forge_settings, document_store=store)
+        store.query = AsyncMock(return_value=[])
+
+        await queue.expire_stale_merging()
+
+        filters = store.query.call_args.kwargs["filters"]
+        cutoff = next(value for field, op, value in filters if field == "merging_started_at")
+        assert isinstance(cutoff, str)
+
+    @pytest.mark.asyncio
+    async def test_expire_marks_stale_entries_failed(self, forge_settings):
+        from henchmen.forge.merge_queue import MergeQueue
+
+        store = _mock_document_store()
+        queue = MergeQueue(forge_settings, document_store=store)
+        store.query = AsyncMock(return_value=[{"id": "stale"}])
+
+        expired = await queue.expire_stale_merging()
+
+        assert expired == 1
+        assert store.update.call_args.args[2]["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_dequeue_twice_against_real_sqlite_store(self, forge_settings, tmp_path):
+        """Regression: the second dequeue used to raise TypeError comparing str < datetime."""
+        from henchmen.forge.merge_queue import MergeQueue
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(forge_settings, db_path=str(tmp_path / "queue.db"))
+        queue = MergeQueue(forge_settings, document_store=store)
+
+        await queue.enqueue("https://github.com/acme/repo/pull/1", "t1")
+        first = await queue.dequeue()
+        second = await queue.dequeue()
+
+        assert first is not None and first["status"] == "merging"
+        assert second is None  # serialization guard: one merge at a time
 
 
 class TestMergeQueueMarkMergedAndFailed:
@@ -313,9 +274,8 @@ class TestMergeQueueMarkMergedAndFailed:
     async def test_mark_merged_updates_status(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = forge_settings
         store = _mock_document_store()
-        queue = MergeQueue(settings, document_store=store)
+        queue = MergeQueue(forge_settings, document_store=store)
 
         await queue.mark_merged("entry-001")
 
@@ -325,9 +285,8 @@ class TestMergeQueueMarkMergedAndFailed:
     async def test_mark_failed_updates_status_and_error(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = forge_settings
         store = _mock_document_store()
-        queue = MergeQueue(settings, document_store=store)
+        queue = MergeQueue(forge_settings, document_store=store)
 
         await queue.mark_failed("entry-002", "Merge conflict")
 
@@ -341,32 +300,19 @@ class TestMergeQueueGetQueue:
     async def test_get_queue_length_counts_pending(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = forge_settings
         store = _mock_document_store()
-        queue = MergeQueue(settings, document_store=store)
+        queue = MergeQueue(forge_settings, document_store=store)
+        store.query = AsyncMock(return_value=[{"id": f"e{i}", "status": "pending"} for i in range(3)])
 
-        entries = [{"id": f"e{i}", "status": "pending"} for i in range(3)]
-        store.query = AsyncMock(return_value=entries)
-
-        length = await queue.get_queue_length()
-
-        assert length == 3
-        store.query.assert_called_once()
-        call_kwargs = store.query.call_args
-        assert call_kwargs.kwargs.get("filters") == [("status", "==", "pending")] or (
-            len(call_kwargs.args) > 1 and ("status", "==", "pending") in call_kwargs.args[1]
-        )
+        assert await queue.get_queue_length() == 3
 
     @pytest.mark.asyncio
     async def test_get_queue_returns_all_entries(self, forge_settings):
         from henchmen.forge.merge_queue import MergeQueue
 
-        settings = forge_settings
         store = _mock_document_store()
-        queue = MergeQueue(settings, document_store=store)
-
-        entries = [{"id": f"e{i}", "status": "pending", "pr_url": f"url-{i}"} for i in range(2)]
-        store.query = AsyncMock(return_value=entries)
+        queue = MergeQueue(forge_settings, document_store=store)
+        store.query = AsyncMock(return_value=[{"id": f"e{i}", "pr_url": f"url-{i}"} for i in range(2)])
 
         result = await queue.get_queue()
 
@@ -375,109 +321,248 @@ class TestMergeQueueGetQueue:
 
 
 # ===========================================================================
-# PRBuilder
+# Forge server: failure publishing
 # ===========================================================================
 
 
-class TestPRBuilderCreatePR:
+class TestPublishCIFailure:
     @pytest.mark.asyncio
-    async def test_create_pr_with_correct_labels(self, forge_settings):
-        from henchmen.forge.pr_builder import PRBuilder
+    async def test_publishes_to_configured_topic(self, forge_settings, forge_app):
+        """Regression: the literal 'forge-result' topic never reached Mastermind."""
+        from henchmen.forge.server import _publish_ci_failure
 
-        settings = forge_settings
-        builder = PRBuilder(settings)
-        builder._get_token = MagicMock(return_value="fake-token")
+        broker, _store = forge_app
 
-        mock_pr = MagicMock()
-        mock_pr.html_url = "https://github.com/acme/repo/pull/10"
-        mock_pr.number = 10
-        mock_pr.title = "Fix bug"
+        await _publish_ci_failure("https://github.com/a/b/pull/1", "task-1", "req-1", reason="clone-failed")
 
-        mock_github_repo = MagicMock()
-        mock_github_repo.create_pull = MagicMock(return_value=mock_pr)
+        broker.publish.assert_called_once()
+        assert broker.publish.call_args.args[0] == forge_settings.pubsub_topic_forge_result
+        assert broker.publish.call_args.args[0] != "forge-result"
+        payload = _published(broker)[0]
+        assert payload["status"] == "failed"
+        assert payload["reason"] == "clone-failed"
 
-        mock_g = MagicMock()
-        mock_g.get_repo = MagicMock(return_value=mock_github_repo)
 
-        with patch("github.Github", return_value=mock_g):
-            result = await builder.create_pr(
-                repo="acme/repo",
-                head_branch="feature-x",
-                base_branch="main",
-                title="Fix bug",
-                body="Bug fix description",
-                task_id="task-999",
-            )
+class TestRunCIForPRFailurePaths:
+    @pytest.mark.asyncio
+    async def test_unparseable_pr_url_publishes_failure(self, forge_settings, forge_app):
+        from henchmen.forge.server import _run_ci_for_pr
 
-        assert result["pr_url"] == "https://github.com/acme/repo/pull/10"
-        assert result["pr_number"] == 10
-        mock_pr.add_to_labels.assert_called_once_with("henchmen-operative")
+        broker, _store = forge_app
+
+        with pytest.raises(ForgeCIError) as exc_info:
+            await _run_ci_for_pr("https://github.com/acme/pull/", "task-1", "req-1")
+
+        assert exc_info.value.published is True
+        assert exc_info.value.retriable is False
+        payload = _published(broker)[0]
+        assert payload["status"] == "failed"
+        assert payload["reason"] == "parse-error"
 
     @pytest.mark.asyncio
-    async def test_create_pr_passes_correct_args(self, forge_settings):
-        from henchmen.forge.pr_builder import PRBuilder
+    async def test_missing_github_token_outside_dev_fails_closed(self, forge_app):
+        from henchmen.config.settings import Environment, Settings
+        from henchmen.forge.server import _run_ci_for_pr
 
-        settings = forge_settings
-        builder = PRBuilder(settings)
-        builder._get_token = MagicMock(return_value="fake-token")
+        broker, _store = forge_app
+        # Explicit instance: a developer's .env.local must not make this test pass.
+        staging = Settings(environment=Environment.STAGING, github_token="", gcp_project_id="test-project")
 
-        mock_pr = MagicMock()
-        mock_pr.html_url = "https://github.com/acme/repo/pull/11"
-        mock_pr.number = 11
-        mock_pr.title = "New feature"
+        with (
+            patch("henchmen.forge.server.get_settings", return_value=staging),
+            pytest.raises(ForgeCIError) as exc_info,
+        ):
+            await _run_ci_for_pr("https://github.com/acme/repo/pull/7", "task-1", "req-1")
 
-        mock_github_repo = MagicMock()
-        mock_github_repo.create_pull = MagicMock(return_value=mock_pr)
+        assert exc_info.value.retriable is False
+        assert _published(broker)[0]["reason"] == "missing-github-token"
 
-        mock_g = MagicMock()
-        mock_g.get_repo = MagicMock(return_value=mock_github_repo)
+    @pytest.mark.asyncio
+    async def test_github_lookup_failure_publishes_retriable_failure(self, forge_settings, forge_app, monkeypatch):
+        from henchmen.forge.server import _run_ci_for_pr
 
-        with patch("github.Github", return_value=mock_g):
-            await builder.create_pr(
-                repo="acme/repo",
-                head_branch="feat-branch",
-                base_branch="develop",
-                title="New feature",
-                body="Feature body",
-                task_id="task-888",
-            )
+        broker, _store = forge_app
+        monkeypatch.setenv("HENCHMEN_GITHUB_TOKEN", "gh-token")
 
-        mock_github_repo.create_pull.assert_called_once_with(
-            title="New feature",
-            body=builder._build_body("Feature body", "task-888"),
-            head="feat-branch",
-            base="develop",
+        failing_client = MagicMock()
+        failing_client.get_repo.side_effect = RuntimeError("404 Not Found")
+
+        with patch("github.Github", return_value=failing_client), pytest.raises(ForgeCIError) as exc_info:
+            await _run_ci_for_pr("https://github.com/acme/repo/pull/7", "task-1", "req-1")
+
+        assert exc_info.value.retriable is True
+        assert _published(broker)[0]["reason"] == "github-api-error"
+
+    @pytest.mark.asyncio
+    async def test_clone_failure_publishes_failure(self, forge_settings, forge_app, monkeypatch):
+        from henchmen.forge.server import _run_ci_for_pr
+
+        broker, _store = forge_app
+        monkeypatch.setenv("HENCHMEN_GITHUB_TOKEN", "gh-token")
+
+        with (
+            patch("github.Github", return_value=_github_client_stub()),
+            patch(
+                "henchmen.forge.server.clone_repo",
+                new=AsyncMock(side_effect=RuntimeError("git clone failed: ***")),
+            ),
+            pytest.raises(ForgeCIError) as exc_info,
+        ):
+            await _run_ci_for_pr("https://github.com/acme/repo/pull/7", "task-1", "req-1")
+
+        assert exc_info.value.published is True
+        assert _published(broker)[0]["reason"] == "clone-failed"
+
+    @pytest.mark.asyncio
+    async def test_ci_runner_exception_publishes_failure(self, forge_settings, forge_app, monkeypatch):
+        from henchmen.forge.server import _run_ci_for_pr
+
+        broker, _store = forge_app
+        monkeypatch.setenv("HENCHMEN_GITHUB_TOKEN", "gh-token")
+        runner = MagicMock()
+        runner.run = AsyncMock(side_effect=OSError("disk full"))
+
+        with (
+            patch("github.Github", return_value=_github_client_stub()),
+            patch("henchmen.forge.server.clone_repo", new=AsyncMock()),
+            patch("henchmen.forge.ci_runner.CIRunner", return_value=runner),
+            pytest.raises(ForgeCIError),
+        ):
+            await _run_ci_for_pr("https://github.com/acme/repo/pull/7", "task-1", "req-1")
+
+        assert _published(broker)[0]["reason"] == "ci-error"
+
+
+def _github_client_stub(pr=None):
+    """A PyGithub client stub whose PR exposes head/base refs."""
+    pr = pr or MagicMock()
+    pr.head.ref = "feature-branch"
+    pr.base.ref = "main"
+    repo = MagicMock()
+    repo.get_pull.return_value = pr
+    client = MagicMock()
+    client.get_repo.return_value = repo
+    return client
+
+
+class TestRunCIForPRSuccess:
+    @pytest.mark.asyncio
+    async def test_skipped_checks_are_reported_not_swallowed(self, forge_settings, forge_app, monkeypatch):
+        from henchmen.forge.server import _run_ci_for_pr
+
+        broker, _store = forge_app
+        monkeypatch.setenv("HENCHMEN_GITHUB_TOKEN", "gh-token")
+        pr = MagicMock()
+        client = _github_client_stub(pr)
+
+        runner = MagicMock()
+        runner.run = AsyncMock(
+            return_value={
+                "passed": True,
+                "failed": [],
+                "skipped": ["tests"],
+                "summary": "SKIP: tests",
+                "checks": [
+                    {"name": "tests", "status": "skipped", "passed": False, "output": "", "error": "no npm"},
+                ],
+            }
         )
 
+        with (
+            patch("github.Github", return_value=client),
+            patch("henchmen.forge.server.clone_repo", new=AsyncMock()) as mock_clone,
+            patch("henchmen.forge.ci_runner.CIRunner", return_value=runner),
+        ):
+            await _run_ci_for_pr("https://github.com/acme/repo/pull/7", "task-1", "req-1")
 
-class TestPRBuilderBuildBody:
-    def test_build_body_includes_task_id(self, forge_settings):
-        from henchmen.forge.pr_builder import PRBuilder
+        # The clone must be deep enough for a merge base with the PR base branch.
+        assert mock_clone.call_args.kwargs["depth"] > 1
+        # The base ref drives the changed-file scope.
+        assert runner.run.call_args.kwargs["base_ref"] == "main"
 
-        settings = forge_settings
-        builder = PRBuilder(settings)
+        payload = _published(broker)[0]
+        assert payload["status"] == "passed"
+        assert payload["skipped"] == ["tests"]
 
-        body = builder._build_body("My description", "task-42")
-        assert "task-42" in body
-        assert "My description" in body
+        comment = pr.create_issue_comment.call_args.args[0]
+        assert "skipped" in comment.lower()
 
-    def test_build_body_includes_henchmen_attribution(self, forge_settings):
-        from henchmen.forge.pr_builder import PRBuilder
 
-        settings = forge_settings
-        builder = PRBuilder(settings)
+# ===========================================================================
+# Forge server: Pub/Sub handler
+# ===========================================================================
 
-        body = builder._build_body("Desc", "task-1")
-        assert "Henchmen" in body
 
-    def test_build_body_appends_to_original(self, forge_settings):
-        from henchmen.forge.pr_builder import PRBuilder
+class TestForgeRequestHandler:
+    def test_non_retriable_failure_is_acked_without_double_publish(self, forge_settings, forge_app):
+        from fastapi.testclient import TestClient
 
-        settings = forge_settings
-        builder = PRBuilder(settings)
+        broker, _store = forge_app
+        error = ForgeCIError("parse-error: bad url", published=True, retriable=False)
 
-        body = builder._build_body("Original body content", "task-5")
-        assert body.startswith("Original body content")
+        with (
+            patch("henchmen.forge.server.verify_pubsub_oidc", new=AsyncMock()),
+            patch("henchmen.forge.server._run_ci_for_pr", new=AsyncMock(side_effect=error)),
+        ):
+            resp = TestClient(app).post(
+                "/pubsub/forge-request",
+                json=_pubsub_envelope({"pr_url": "https://github.com/a/b/pull/1", "task_id": "t1"}),
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "failed"
+        broker.publish.assert_not_called()
+
+    def test_unexpected_exception_publishes_failure_and_500s(self, forge_settings, forge_app):
+        from fastapi.testclient import TestClient
+
+        broker, _store = forge_app
+
+        with (
+            patch("henchmen.forge.server.verify_pubsub_oidc", new=AsyncMock()),
+            patch("henchmen.forge.server._run_ci_for_pr", new=AsyncMock(side_effect=RuntimeError("boom"))),
+        ):
+            resp = TestClient(app).post(
+                "/pubsub/forge-request",
+                json=_pubsub_envelope({"pr_url": "https://github.com/a/b/pull/1", "task_id": "t1"}),
+            )
+
+        assert resp.status_code == 500
+        assert _published(broker)[0]["reason"] == "forge-exception"
+
+    def test_request_id_falls_back_to_local_broker_message_id(self, forge_settings, forge_app):
+        """The in-memory broker spells it `messageId`; correlation must not read 'unknown'."""
+        from fastapi.testclient import TestClient
+
+        seen = {}
+
+        async def _capture(pr_url, task_id, request_id):
+            seen["request_id"] = request_id
+
+        with (
+            patch("henchmen.forge.server.verify_pubsub_oidc", new=AsyncMock()),
+            patch("henchmen.forge.server._run_ci_for_pr", new=AsyncMock(side_effect=_capture)),
+        ):
+            resp = TestClient(app).post(
+                "/pubsub/forge-request",
+                json=_pubsub_envelope({"pr_url": "https://github.com/a/b/pull/1", "task_id": "t1"}, "local-42"),
+            )
+
+        assert resp.status_code == 200
+        assert seen["request_id"] == "local-42"
+
+    def test_build_complete_requires_oidc(self, forge_settings, forge_app):
+        """Every /pubsub/* handler is OIDC-verified; this one used to be open."""
+        from fastapi import HTTPException
+        from fastapi.testclient import TestClient
+
+        with patch(
+            "henchmen.forge.server.verify_pubsub_oidc",
+            new=AsyncMock(side_effect=HTTPException(status_code=401, detail="unauthorized")),
+        ):
+            resp = TestClient(app).post("/pubsub/build-complete", json=_pubsub_envelope({"id": "b1"}))
+
+        assert resp.status_code == 401
 
 
 # ===========================================================================
@@ -486,14 +571,17 @@ class TestPRBuilderBuildBody:
 
 
 class TestProcessQueueEndpoint:
-    def test_process_queue_returns_ok(self):
+    def test_process_queue_reports_real_counts(self, forge_settings, forge_app):
         from fastapi.testclient import TestClient
 
-        from henchmen.forge.server import app
+        _broker, store = forge_app
+        # expire_stale_merging finds one stale entry; get_queue_length finds two pending.
+        store.query = AsyncMock(side_effect=[[{"id": "stale"}], [{"id": "p1"}, {"id": "p2"}]])
 
-        client = TestClient(app)
-        resp = client.post("/api/v1/process-queue")
+        resp = TestClient(app).post("/api/v1/process-queue")
+
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-        assert "processed" in data
+        assert data["processed"] == 1
+        assert data["pending"] == 2

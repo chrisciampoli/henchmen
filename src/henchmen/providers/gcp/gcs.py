@@ -49,5 +49,10 @@ class GCSObjectStore:
 
     async def list_keys(self, bucket: str, prefix: str = "") -> list[str]:
         """List all object keys in a bucket, optionally filtered by prefix."""
-        blobs = await asyncio.to_thread(self._client.list_blobs, bucket, prefix=prefix)
-        return [blob.name for blob in blobs]
+
+        def _collect() -> list[str]:
+            # list_blobs returns a lazy HTTPIterator — each page is fetched on
+            # iteration, so the iteration itself must happen off the event loop.
+            return [str(blob.name) for blob in self._client.list_blobs(bucket, prefix=prefix)]
+
+        return await asyncio.to_thread(_collect)

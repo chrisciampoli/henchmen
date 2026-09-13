@@ -13,12 +13,6 @@ variable "environment" {
   type        = string
 }
 
-variable "labels" {
-  description = "Labels to apply to Cloud Build resources"
-  type        = map(string)
-  default     = {}
-}
-
 variable "github_owner" {
   description = "GitHub organisation or username that owns the repository"
   type        = string

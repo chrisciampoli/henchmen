@@ -1,4 +1,25 @@
-# VPC Network
+# ---------------------------------------------------------------------------
+# Networking
+#
+# The VPC exists so Cloud Run can reach private-range resources through a
+# Serverless VPC Access connector. Public egress (GitHub, Slack, Jira, Google
+# APIs) deliberately does NOT traverse this VPC: every service and lair sets
+# `vpc_access { egress = "PRIVATE_RANGES_ONLY" }`, and the jobs Mastermind
+# creates at runtime attach no connector at all.
+#
+# There is therefore no egress firewall here. A previous revision carried a
+# deny-all egress rule plus a hand-maintained CIDR allowlist for GitHub /
+# Slack / Atlassian; because no Henchmen traffic ever traversed the VPC, those
+# rules governed nothing while reading as if outbound traffic were controlled.
+#
+# Making egress control real needs all three of: Cloud NAT on this subnet, an
+# egress allowlist (or, better, an HTTPS proxy that resolves names at request
+# time instead of pinning third-party IP ranges), and `egress = "ALL_TRAFFIC"`
+# with the connector attached to the runtime-created lair jobs — which is a
+# code change in the Cloud Run orchestrator, not a terraform one. Until all
+# three land, this module does not claim to restrict egress.
+# ---------------------------------------------------------------------------
+
 resource "google_compute_network" "vpc" {
   project                 = var.project_id
   name                    = "henchmen-${var.environment}-vpc"
@@ -6,7 +27,6 @@ resource "google_compute_network" "vpc" {
   description             = "Henchmen Agent Factory VPC network"
 }
 
-# Subnet
 resource "google_compute_subnetwork" "subnet" {
   project                  = var.project_id
   name                     = "henchmen-${var.environment}-subnet"
@@ -33,82 +53,8 @@ resource "google_compute_firewall" "allow_internal" {
   source_ranges = [var.subnet_cidr]
 }
 
-# ---------------------------------------------------------------------------
-# Egress firewall policy
-#
-# The hand-maintained CIDR allowlist below (GitHub, Google APIs, Vertex AI,
-# Slack, Atlassian/Jira) is APPROXIMATE. Third-party providers rotate their
-# IP ranges without notice — Slack's api.slack.com ranges in particular are
-# known to drift, and the published ranges aren't a stable contract. This
-# means the allowlist will silently stop matching new endpoints and cause
-# intermittent 503s from dispatch/forge until the ranges are refreshed.
-#
-# The recommended long-term fix is two-pronged:
-#   1. Private Google Access + VPC Service Controls for everything Google
-#      (Vertex AI, Cloud Run, Pub/Sub, Firestore, Artifact Registry) — this
-#      removes the need to maintain any CIDRs for google.com endpoints.
-#   2. HTTPS egress proxies (e.g. Cloud NAT + a forwarding proxy, or a
-#      dedicated tinyproxy/squid on GCE) for third-party APIs (GitHub, Slack,
-#      Jira). The proxy does DNS at request time, eliminating the IP drift
-#      problem, and gives a single chokepoint for audit logging and WAF.
-#
-# TODO(D12): replace IP allowlist with VPC-SC + egress proxy.
-# ---------------------------------------------------------------------------
-
-# Firewall: deny all egress (default deny)
-resource "google_compute_firewall" "deny_all_egress" {
-  project     = var.project_id
-  name        = "henchmen-${var.environment}-deny-all-egress"
-  network     = google_compute_network.vpc.id
-  description = "Deny all egress traffic by default"
-  direction   = "EGRESS"
-  priority    = 1000
-
-  deny {
-    protocol = "all"
-  }
-
-  destination_ranges = ["0.0.0.0/0"]
-}
-
-# Firewall: allow egress to permitted external endpoints
-# GitHub API: 140.82.112.0/20, 192.30.252.0/22
-# Google APIs / Vertex AI: 199.36.153.4/30 (restricted.googleapis.com), 34.126.0.0/18
-# Slack API: 54.84.0.0/13, 52.20.0.0/14 (approximate; override via allowlist_cidrs)
-# Atlassian/Jira: 104.192.136.0/21
-resource "google_compute_firewall" "allow_egress_allowlist" {
-  project     = var.project_id
-  name        = "henchmen-${var.environment}-allow-egress-allowlist"
-  network     = google_compute_network.vpc.id
-  description = "Allow egress to GitHub API, Vertex AI, Google APIs, Slack, and Atlassian/Jira"
-  direction   = "EGRESS"
-  priority    = 900
-
-  allow {
-    protocol = "tcp"
-    ports    = ["443"]
-  }
-
-  destination_ranges = concat(
-    [
-      # GitHub API
-      "140.82.112.0/20",
-      "192.30.252.0/22",
-      # Google APIs (restricted.googleapis.com)
-      "199.36.153.4/30",
-      # Vertex AI / Google Cloud APIs
-      "34.126.0.0/18",
-      # Slack API
-      "54.80.0.0/13",
-      "52.20.0.0/14",
-      # Atlassian / Jira
-      "104.192.136.0/21",
-    ],
-    var.allowlist_cidrs,
-  )
-}
-
-# VPC Serverless Connector (for Cloud Run to reach the VPC)
+# VPC Serverless Connector (for Cloud Run to reach the VPC).
+# min_instances = 2 is the floor the API enforces for a connector.
 resource "google_vpc_access_connector" "connector" {
   project       = var.project_id
   name          = "henchmen-${var.environment}-connector"

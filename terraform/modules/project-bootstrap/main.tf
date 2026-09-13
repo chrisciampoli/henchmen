@@ -1,14 +1,20 @@
 locals {
   apis = [
+    # Required before any google_project_iam_member binding can be applied on
+    # a fresh project — setIamPolicy goes through Cloud Resource Manager.
+    "cloudresourcemanager.googleapis.com",
+    "serviceusage.googleapis.com",
     "run.googleapis.com",
     "cloudbuild.googleapis.com",
     "pubsub.googleapis.com",
     "firestore.googleapis.com",
-    "firebaserules.googleapis.com",
     "secretmanager.googleapis.com",
+    "storage.googleapis.com",
     "artifactregistry.googleapis.com",
     "logging.googleapis.com",
     "monitoring.googleapis.com",
+    # Every service account is granted roles/cloudtrace.agent.
+    "cloudtrace.googleapis.com",
     "cloudscheduler.googleapis.com",
     "aiplatform.googleapis.com",
     "compute.googleapis.com",

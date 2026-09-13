@@ -30,10 +30,13 @@ class TestNudgeDetectorStuckStates:
 
     def test_mixed_search_tools_also_detected(self):
         nd = NudgeDetector(max_steps=30)
+        # Every name here must be a tool Arsenal actually registers — the
+        # detector keys off the real tool names, so a fictional one would make
+        # this pass for the wrong reason.
         nd.record_tool_call("grep_search")
         nd.record_tool_call("file_read")
-        nd.record_tool_call("code_search")
-        nd.record_tool_call("find_file")
+        nd.record_tool_call("symbol_lookup")
+        nd.record_tool_call("file_search")
         nd.record_tool_call("grep_search")
         nd.record_tool_call("file_read")
         assert nd.check_stuck(8) == StuckState.SEARCH_LOOP

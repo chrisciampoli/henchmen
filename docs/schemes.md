@@ -317,14 +317,16 @@ If validation fails, a `ValueError` is raised at import time with detailed error
 
 The `model_name` field on each `SchemeNode` determines the LLM used. If not set, it falls back to the `vertex_ai_model_complex` setting (Gemini 2.5 Pro by default).
 
-**Hard rule:** Henchmen uses Gemini on Vertex AI exclusively. No Claude models on Vertex AI.
+**Hard rule:** on Vertex AI, Henchmen uses Gemini exclusively. No Claude models on Vertex AI.
 
-Available models and their recommended use (mirrors the tiering in `CLAUDE.md`):
+A node names a tier; the configured provider resolves it (mirrors the table in `CLAUDE.md`):
 
-| Model | Price Tier | Best For |
-|-------|-----------|----------|
-| `gemini-3.1-pro` | High | Test fixing and other reasoning-heavy steps (`fix_tests`, `analyze_goal`) |
-| `gemini-2.5-pro` | Medium | Core code generation (`implement_fix`, `implement_feature`); default for `vertex_ai_model_complex` |
-| `gemini-2.5-flash` | Low | Verification gates, planning, classification (`verify_changes`, `plan_implementation`) |
+| Tier | Best for | Anthropic | OpenAI | Vertex AI |
+|------|----------|-----------|--------|-----------|
+| `default/reasoning` | `fix_tests`, `analyze_goal` | `claude-opus-5` | `o3` | `gemini-3.1-pro` |
+| `default/complex` | `implement_fix`, `implement_feature` | `claude-sonnet-5` | `gpt-4.1` | `gemini-2.5-pro` |
+| `default/light` | planning, classification | `claude-haiku-4-5` | `gpt-4.1-mini` | `gemini-2.5-flash` |
 
-All model calls route through `_call_gemini` (via the google-genai SDK against Vertex AI). There is no Anthropic/Claude routing path.
+Each cell is a `Settings` field, e.g. `HENCHMEN_VERTEX_AI_MODEL_REASONING`.
+
+Model calls go through the configured `LLMProvider`, which resolves the tier to a concrete model from `Settings`. Anthropic, OpenAI, Vertex AI, Bedrock and Ollama are all supported.
