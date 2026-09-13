@@ -62,9 +62,16 @@ def _hermetic_settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
     tier-pricing assertions became order-dependent: under one ordering the
     active provider was Ollama, whose models are free, so "every tier has a
     price" failed for reasons that had nothing to do with the code under test.
+
+    ``HENCHMEN_PROVIDER`` is then pinned to ``local``. The default is ``gcp``,
+    so without this a stripped environment sends any test that builds a
+    provider at a real Firestore/Pub/Sub client — which is exactly what
+    happens on a machine with no ``.env.local``, such as CI. A test that wants
+    another provider sets it itself.
     """
     for name in [n for n in os.environ if n.startswith("HENCHMEN_")]:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
 
 
 @pytest.fixture
