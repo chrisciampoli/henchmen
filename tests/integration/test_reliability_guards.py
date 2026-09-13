@@ -145,15 +145,14 @@ class TestCostCeilingGuard:
     @pytest.fixture(autouse=True)
     def _setup(self, integration_settings, mock_gcs, monkeypatch):
         self.settings = integration_settings
+        # A priced LLM provider is a precondition, not an incidental: the
+        # pre-dispatch gate compares an estimated cost against the ceiling, and
+        # Ollama models cost $0, so under the default local provider the gate
+        # can never fire and this test would silently assert nothing.
+        monkeypatch.setattr(self.settings, "llm_provider", "anthropic", raising=False)
         # Force the task-level cost ceiling to trip on the first agentic node.
-        # The scheme executor reads HENCHMEN_COST_CEILING_USD directly (see
-        # scheme_executor.executor._execute_agentic) — a value of $0.01 is
-        # orders of magnitude below the estimated dispatch cost of any real
-        # scheme node, so the check fires before the lair is even created.
-        monkeypatch.setenv("HENCHMEN_COST_CEILING_USD", "0.01")
-        # Also override the setting for accumulator-style checks inside the
-        # operative (belt and braces — the in-process guardrail uses the
-        # settings field, the pre-dispatch check uses the env var).
+        # $0.01 is orders of magnitude below the estimated dispatch cost of any
+        # real scheme node, so the check fires before the lair is created.
         monkeypatch.setattr(self.settings, "operative_task_cost_ceiling_usd", 0.01, raising=False)
         SchemeRegistry.clear()
         SchemeRegistry.auto_discover()

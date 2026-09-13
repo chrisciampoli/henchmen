@@ -770,11 +770,18 @@ class TestTierResolution:
         assert not is_tier_name(resolved)
 
     @pytest.mark.parametrize("tier", list(ModelTier), ids=lambda t: t.value)
-    def test_tier_has_a_nonzero_price(self, tier: ModelTier, mock_settings):
-        """The pre-dispatch cost gate is useless if a tier name prices at $0."""
+    @pytest.mark.parametrize("provider", ["anthropic", "openai", "gcp", "aws"])
+    def test_tier_has_a_nonzero_price(self, tier: ModelTier, provider: str, mock_settings):
+        """The pre-dispatch cost gate is useless if a tier name prices at $0.
+
+        The provider is named explicitly. Ollama models are free by design, so
+        leaving it to ambient configuration would make this assertion pass or
+        fail on whether a developer happened to have Ollama selected.
+        """
         from henchmen.providers.pricing import estimate_cost_for_settings
 
-        cost = estimate_cost_for_settings(mock_settings, tier.value, 100_000, 10_000)
+        settings = mock_settings.model_copy(update={"llm_provider": provider})
+        cost = estimate_cost_for_settings(settings, tier.value, 100_000, 10_000)
         assert cost > 0
 
     def test_scheme_node_model_names_resolve(self, mock_settings):
