@@ -4,6 +4,21 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+# Files whose "secrets" are almost always fixtures, not credentials.
+_TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?|__tests__|spec|fixtures)/|(^|/)conftest\.py$|(^|/)test_[^/]*\.py$|"
+    r"[^/]*_test\.py$|[^/]*\.(test|spec)\.[jt]sx?$",
+    re.IGNORECASE,
+)
+
+# Values that are obviously not real credentials.
+_PLACEHOLDER_RE = re.compile(
+    r"test|dummy|placeholder|example|sample|fake|changeme|xxx+|<[^>]+>|x-access-token",
+    re.IGNORECASE,
+)
+
+_SCAN_FLAGS = re.IGNORECASE | re.MULTILINE | re.DOTALL
+
 
 @dataclass
 class Finding:
@@ -19,7 +34,13 @@ class Finding:
 class SilentFailureDetector:
     """Scans diffs for patterns that indicate silent failures."""
 
-    # Patterns to detect in added lines (lines starting with +)
+    # Patterns to detect in added lines (lines starting with +).
+    #
+    # Every regex is anchored so that an unrelated identifier cannot trip it:
+    # ``pass``/``retry`` carry word boundaries, and ``catch`` bodies are matched
+    # with an explicit brace-bounded group rather than ``.*`` so that multi-line
+    # blocks are covered. ``body_excludes`` marks patterns whose ``body`` group
+    # is re-checked: a match is dropped when the body contains any of the tokens.
     PATTERNS: list[dict[str, Any]] = [
         {
             "name": "empty_catch",
@@ -29,25 +50,35 @@ class SilentFailureDetector:
         },
         {
             "name": "catch_pass",
-            "regex": r"except\s*.*:\s*\n\s*pass",
+            "regex": r"except\b[^\n]*?:\s*(?:\n\s*)?pass\b",
             "severity": "critical",
             "description": "Bare except/pass — errors are silently ignored",
         },
         {
             "name": "catch_return_null",
-            "regex": r"catch\s*\([^)]*\)\s*\{[^}]*return\s+(null|undefined|None)",
+            "regex": r"catch\s*\([^)]*\)\s*\{[^}]*return\s+(?:null|undefined|None)\b",
             "severity": "warning",
             "description": "Catch block returns null/None — failure is hidden from caller",
         },
         {
+            "name": "except_return_none",
+            "regex": r"except\b[^\n]*?:\s*(?:\n\s*)?return\s+None\b",
+            "severity": "warning",
+            "description": "except block returns None — failure is hidden from caller",
+        },
+        {
             "name": "no_error_logging",
-            "regex": r"catch\s*\([^)]*\)\s*\{(?!.*(?:log|console|print|logger)).*\}",
+            "regex": r"catch\s*\([^)]*\)\s*\{(?P<body>[^{}]*)\}",
+            "body_excludes": ("log", "console", "print", "throw", "raise", "reject", "report"),
             "severity": "warning",
             "description": "Catch block without logging — failures will be invisible",
         },
         {
             "name": "retry_no_backoff",
-            "regex": r"retry|while.*retry|for.*attempt(?!.*(?:sleep|backoff|delay|wait))",
+            "regex": (
+                r"\b(?:while|for)\b[^\n]*\b(?:retry|retries|attempt|attempts)\w*"
+                r"(?![^\n]*(?:sleep|backoff|delay|wait))"
+            ),
             "severity": "warning",
             "description": "Retry logic without backoff — may hammer external services",
         },
@@ -62,12 +93,6 @@ class SilentFailureDetector:
             "regex": r"(?:password|secret|api_key|token)\s*=\s*['\"][^'\"]{8,}['\"]",
             "severity": "critical",
             "description": "Possible hardcoded secret — should use environment variables",
-        },
-        {
-            "name": "noop_change",
-            "regex": None,  # Special case — detected by comparing added/removed
-            "severity": "warning",
-            "description": "File appears to have no meaningful changes (whitespace only or duplicate content)",
         },
     ]
 
@@ -110,18 +135,31 @@ class SilentFailureDetector:
         """Scan a set of added lines for patterns."""
         findings = []
         full_text = "\n".join(lines)
+        is_test_file = bool(_TEST_PATH_RE.search(file))
 
         for pattern in self.PATTERNS:
-            if pattern["regex"] is None:
-                continue  # Special cases handled elsewhere
+            excludes: tuple[str, ...] = pattern.get("body_excludes", ())
 
-            matches = re.finditer(pattern["regex"], full_text, re.IGNORECASE | re.MULTILINE)
-            for match in matches:
+            for match in re.finditer(pattern["regex"], full_text, _SCAN_FLAGS):
+                if excludes:
+                    body = match.groupdict().get("body") or ""
+                    if not body.strip():
+                        continue  # An empty body is already reported by ``empty_catch``.
+                    if any(token in body.lower() for token in excludes):
+                        continue
+
+                severity = pattern["severity"]
+                if pattern["name"] == "hardcoded_secret":
+                    if is_test_file:
+                        continue  # Test fixtures are not production credentials.
+                    if _PLACEHOLDER_RE.search(match.group(0)):
+                        severity = "warning"
+
                 # Find approximate line number
                 line_num = full_text[: match.start()].count("\n") + 1
                 findings.append(
                     Finding(
-                        severity=pattern["severity"],
+                        severity=severity,
                         pattern=pattern["name"],
                         description=pattern["description"],
                         file=file,

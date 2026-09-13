@@ -7,35 +7,34 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from henchmen.models.llm import LLMResponse, Message, ModelTier, TokenUsage, ToolCall, ToolDefinition
+from henchmen.models.llm import LLMResponse, Message, MessageRole, ModelTier, TokenUsage, ToolCall, ToolDefinition
+from henchmen.providers.llm_common import json_schema, normalize_finish_reason, resolve_provider_model
+from henchmen.providers.tiers import TIER_FIELDS, is_tier_name
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
+PROVIDER_NAME = "local"
+
 
 class OllamaProvider:
     """LLMProvider backed by a local Ollama server.
 
     .. note::
-       BYO-LLM via Ollama is experimental. Scheme nodes that reference cloud
-       model names (e.g. ``gemini-2.5-pro``) are remapped to a local Ollama
-       model. This flattens the scheme's model tiering — a task that intended
-       to use a reasoning-heavy model and a lightweight model will run both
-       nodes on the same local model. A warning is logged on every remap so
-       that degraded parity is visible to the operator.
+       BYO-LLM via Ollama is experimental. Each tier can name its own local
+       model (``HENCHMEN_LLM_OLLAMA_MODEL_COMPLEX`` / ``_LIGHT`` / ``_REASONING``);
+       a tier left unset falls back to ``HENCHMEN_LLM_OLLAMA_MODEL`` and logs a
+       one-shot warning, because running every node on one model flattens the
+       scheme's tiering and diverges from cloud-model parity.
 
        For best results, use an Ollama model with native tool-calling support
        (e.g. ``qwen2.5-coder:7b`` or ``llama3.3``). Models like ``llama3.2``
        have known weaknesses around function calling under Ollama.
     """
 
-    # Map cloud model name prefixes or tier names to recommended local Ollama
-    # models. The operator can override any of these via env vars of the form
-    # ``HENCHMEN_LLM_OLLAMA_MODEL_<TIER_NAME>`` (e.g.
-    # ``HENCHMEN_LLM_OLLAMA_MODEL_COMPLEX=qwen2.5-coder:7b``). Future work: wire
-    # these into Settings with proper fields.
+    # Recommended local model per tier, surfaced in the fallback warning.
     _TIER_HINTS: dict[str, str] = {
         "COMPLEX": "qwen2.5-coder:7b (tool-calling capable, strong for code)",
         "LIGHT": "qwen2.5:3b (smaller, faster for planning/analysis)",
@@ -43,11 +42,17 @@ class OllamaProvider:
     }
 
     def __init__(self, settings: Settings) -> None:
+        self._settings = settings
         self._base_url = getattr(settings, "llm_ollama_base_url", "http://localhost:11434")
         self._default_model = getattr(settings, "llm_ollama_model", "llama3.2")
         self._skip_probe = bool(getattr(settings, "llm_ollama_skip_probe", False))
         self._client = httpx.AsyncClient(base_url=self._base_url, timeout=300.0)
-        # Track which tier flattens we've already warned about to avoid log noise.
+        # Which tiers have their own model configured; the rest fall back to
+        # llm_ollama_model and warn once.
+        self._explicit_tiers: dict[str, bool] = {
+            tier.value: bool(str(getattr(settings, field, "") or ""))
+            for tier, field in TIER_FIELDS[PROVIDER_NAME].items()
+        }
         self._warned_tiers: set[str] = set()
         # C3 capability probe state: None → not probed, "ok" → probed OK,
         # "skipped" → short-circuited via llm_ollama_skip_probe, "failed"
@@ -55,53 +60,61 @@ class OllamaProvider:
         self._tool_probe_state: str | None = None
 
     def resolve_tier(self, tier: str) -> str:
-        """Map any model tier or non-local model name to the configured Ollama model.
+        """Resolve a tier to its configured local model, or flatten a cloud model name.
 
-        In local mode, scheme nodes may reference cloud model names like
-        ``gemini-2.5-pro``. These need to be mapped to the local Ollama model.
-        This flattens the scheme's model tiering; a WARNING is logged per
-        distinct mapping so the operator can see that their default scheme's
-        tier differentiation has collapsed.
+        A tier with its own ``HENCHMEN_LLM_OLLAMA_MODEL_<TIER>`` resolves
+        silently. A tier without one falls back to ``llm_ollama_model`` and
+        warns once, as does any non-local model name a scheme still references.
         """
-        if tier in (ModelTier.COMPLEX, ModelTier.LIGHT, ModelTier.REASONING):
-            self._warn_tier_flatten(tier)
-            return self._default_model
+        if is_tier_name(tier):
+            resolved = resolve_provider_model(self._settings, tier, PROVIDER_NAME)
+            if not self._explicit_tiers.get(tier, False):
+                self._warn_tier_flatten(tier, resolved)
+            return resolved
         # If the model name doesn't look like a local Ollama model, remap it
         if tier.startswith(("gemini", "claude", "gpt")):
-            self._warn_tier_flatten(tier)
+            self._warn_tier_flatten(tier, self._default_model)
             return self._default_model
         return tier
 
-    def _warn_tier_flatten(self, tier: str) -> None:
+    def _warn_tier_flatten(self, tier: str, resolved: str) -> None:
         """Emit a one-shot warning when a tier/cloud-model name is flattened to the default."""
         if tier in self._warned_tiers:
             return
         self._warned_tiers.add(tier)
-        # Normalize a tier/model-name to a hint key. ``tier`` may be a plain
-        # string (a cloud model name) or a ModelTier value (string enum), so
-        # we look up the enum member by value rather than using .name.
-        hint_key: str | None = None
+        # ``tier`` may be a plain string (a cloud model name) or a ModelTier
+        # value, so look up the enum member by value rather than using .name.
+        hint_key: str | None
         try:
             hint_key = ModelTier(tier).name
         except ValueError:
             hint_key = None
         hint = self._TIER_HINTS.get(hint_key) if hint_key else None
+        setting = TIER_FIELDS[PROVIDER_NAME].get(ModelTier(tier)) if hint_key else None
         logger.warning(
             "[ollama] Flattening tier/model '%s' -> '%s'. "
             "Your scheme's model tiering is collapsed to a single local model — "
-            "results will diverge from cloud-model parity. "
+            "results will diverge from cloud-model parity. Set HENCHMEN_%s to give this tier its own model. "
             "Recommended local model for this tier: %s",
             tier,
-            self._default_model,
+            resolved,
+            (setting or "LLM_OLLAMA_MODEL").upper(),
             hint or "see docs/schemes.md for recommended local models",
         )
 
     def supported_models(self) -> list[str]:
-        """Return the configured default model as the supported model list."""
-        return [self._default_model]
+        """Return the distinct local models configured across the tiers."""
+        seen: set[str] = set()
+        out: list[str] = []
+        tier_configured = (str(getattr(self._settings, f, "") or "") for f in TIER_FIELDS[PROVIDER_NAME].values())
+        for name in (self._default_model, *tier_configured):
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
 
     async def count_tokens(self, text: str, model: str) -> int:
-        """Approximate token count using a 4-chars-per-token heuristic."""
+        """Approximate token count using a 4-chars-per-token heuristic (model-independent)."""
         return len(text) // 4
 
     async def generate(
@@ -114,8 +127,7 @@ class OllamaProvider:
         system_prompt: str | None = None,
     ) -> LLMResponse:
         """Send a chat completion request to the Ollama API."""
-        # Always resolve cloud model names to the local Ollama model.
-        # Scheme nodes reference "gemini-2.5-pro" etc. which Ollama doesn't have.
+        # Always resolve tier/cloud model names to a local Ollama model.
         model = self.resolve_tier(model)
 
         # C3: up-front tool-calling capability probe. The very first call
@@ -132,8 +144,7 @@ class OllamaProvider:
         ollama_messages: list[dict[str, Any]] = []
         if system_prompt:
             ollama_messages.append({"role": "system", "content": system_prompt})
-        for msg in messages:
-            ollama_messages.append({"role": msg.role.value, "content": msg.content})
+        ollama_messages.extend(self._build_messages(messages))
         payload: dict[str, Any] = {
             "model": model,
             "messages": ollama_messages,
@@ -171,11 +182,38 @@ class OllamaProvider:
                 input_tokens=prompt_tokens,
                 output_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
+                # Local inference has no per-token price.
                 estimated_cost_usd=0.0,
             ),
             model=model,
-            finish_reason="tool_use" if tool_calls else "stop",
+            finish_reason=normalize_finish_reason(data.get("done_reason"), has_tool_calls=bool(tool_calls)),
         )
+
+    @staticmethod
+    def _build_messages(messages: list[Message]) -> list[dict[str, Any]]:
+        """Convert henchmen messages to the Ollama chat payload.
+
+        Assistant turns replay their ``tool_calls`` so the chat template renders
+        each tool result next to the call it answers.
+        """
+        call_names: dict[str, str] = {}
+        for msg in messages:
+            for tc in msg.tool_calls or []:
+                call_names[tc.id] = tc.name
+
+        result: list[dict[str, Any]] = []
+        for msg in messages:
+            entry: dict[str, Any] = {"role": msg.role.value, "content": msg.content}
+            if msg.role == MessageRole.TOOL:
+                name = call_names.get(msg.tool_call_id or "")
+                if name:
+                    entry["tool_name"] = name
+            elif msg.role == MessageRole.ASSISTANT and msg.tool_calls:
+                entry["tool_calls"] = [
+                    {"function": {"name": tc.name, "arguments": tc.arguments}} for tc in msg.tool_calls
+                ]
+            result.append(entry)
+        return result
 
     async def _probe_tool_calling(self, model: str) -> None:
         """Issue a canary request with a trivial tool to verify tool-calling support.
@@ -230,18 +268,12 @@ class OllamaProvider:
 
     @staticmethod
     def _convert_tool(tool: ToolDefinition) -> dict[str, Any]:
-        properties: dict[str, Any] = {}
-        required: list[str] = []
-        for p in tool.parameters:
-            properties[p.name] = {"type": p.type, "description": p.description}
-            if p.required:
-                required.append(p.name)
         return {
             "type": "function",
             "function": {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": {"type": "object", "properties": properties, "required": required},
+                "parameters": json_schema(tool),
             },
         }
 

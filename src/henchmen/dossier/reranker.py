@@ -1,22 +1,28 @@
-"""Rerank RAG chunks for relevance using Gemini Flash.
+"""Rerank RAG chunks for relevance using the configured light-tier model.
 
 After the initial vector similarity search returns top-N chunks, this module
-sends chunk summaries to a fast LLM (Gemini 2.5 Flash by default) to produce
-a task-specific relevance score. The result is a tighter, higher-quality
-context window for the operative.
+sends chunk summaries to a fast LLM (the ``light`` tier — Gemini Flash on
+Vertex AI) to produce a task-specific relevance score. The result is a
+tighter, higher-quality context window for the operative.
 
 Graceful degradation: if the LLM call fails for any reason, the original
 chunks are returned sorted by their existing relevance_score so the dossier
 pipeline never breaks.
+
+Status: no production caller yet — ``MastermindAgent._fetch_semantic_chunks``
+is the intended call site, immediately after ``query_similar_chunks``.
 """
 
 import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import Field
 
 from henchmen.models._base import StrictBase
+
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -101,12 +107,30 @@ def _parse_rerank_response(response_text: str, num_chunks: int) -> list[tuple[in
     return results
 
 
+_RERANK_SYSTEM_PROMPT = "You are a code relevance scorer. Return only valid JSON."
+
+
+def _resolve_model(model: str, settings: "Settings | None") -> str:
+    """Resolve a model name or tier name against Settings.
+
+    Model names are never hardcoded here (CLAUDE.md): an empty ``model``
+    means "the configured light tier".
+    """
+    from henchmen.config.settings import get_settings
+    from henchmen.models.llm import ModelTier
+    from henchmen.providers.tiers import resolve_model_name
+
+    resolved_settings = settings or get_settings()
+    return resolve_model_name(resolved_settings, model or ModelTier.LIGHT.value)
+
+
 async def rerank_chunks(
     chunks: list[dict[str, Any]],
     task_description: str,
     llm_provider: Any,
-    model: str = "gemini-2.5-flash",
+    model: str = "",
     top_k: int = 10,
+    settings: "Settings | None" = None,
 ) -> list[RerankerResult]:
     """Rerank code chunks by LLM-scored relevance to the task.
 
@@ -119,9 +143,12 @@ async def rerank_chunks(
     llm_provider:
         An ``LLMProvider`` instance for making the scoring call.
     model:
-        Gemini model to use for scoring. Defaults to Flash for cost.
+        Model or tier name to score with. Empty means the configured
+        ``light`` tier (cheapest).
     top_k:
         Number of top-scoring chunks to return.
+    settings:
+        Settings override used to resolve ``model``.
 
     Returns
     -------
@@ -143,13 +170,12 @@ async def rerank_chunks(
         from henchmen.models.llm import Message, MessageRole
 
         response = await llm_provider.generate(
-            model=model,
+            model=_resolve_model(model, settings),
             messages=[Message(role=MessageRole.USER, content=prompt)],
-            system_instruction="You are a code relevance scorer. Return only valid JSON.",
+            system_prompt=_RERANK_SYSTEM_PROMPT,
         )
 
-        response_text = response.text if hasattr(response, "text") else str(response.content)
-        scored_pairs = _parse_rerank_response(response_text, len(chunks))
+        scored_pairs = _parse_rerank_response(response.content or "", len(chunks))
 
         if scored_pairs:
             # Build results from scored pairs

@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 
 from henchmen.arsenal.registry import ToolRegistry
-from henchmen.arsenal.server import ArsenalServer
 from henchmen.arsenal.tools.code_edit import (
     file_create,
     file_delete,
@@ -366,15 +365,3 @@ class TestToolRegistryIntegration:
 
         tool_names = {t.name for t in tools}
         assert "file_delete" in tool_names
-
-    def test_arsenal_server_registers_filtered_tools(self):
-        req = ArsenalRequirement(tool_sets=["code_intel"], allow_destructive=False)
-        server = ArsenalServer(requirement=req)
-
-        # The MCP server should have exactly the code_intel tools registered.
-        # FastMCP stores tools in _tool_manager._tools (dict keyed by name).
-        registered = set(server.mcp._tool_manager._tools.keys())
-        assert registered  # non-empty
-        # All registered tools must be code_intel tools
-        expected_tool_names = {t.name for t in ToolRegistry.get_tools_for_requirement(req)}
-        assert registered == expected_tool_names

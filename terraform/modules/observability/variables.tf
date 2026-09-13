@@ -13,14 +13,19 @@ variable "environment" {
   type        = string
 }
 
-variable "labels" {
-  description = "Labels to apply to observability resources"
-  type        = map(string)
-  default     = {}
-}
-
 variable "notification_channels" {
   description = "List of Cloud Monitoring notification channel resource names to attach to alert policies"
   type        = list(string)
   default     = []
+}
+
+variable "log_retention_days" {
+  description = "Retention, in days, for the Henchmen log bucket"
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.log_retention_days > 0
+    error_message = "log_retention_days must be greater than 0."
+  }
 }

@@ -215,12 +215,16 @@ opened on your test repo.
 ## Step 8 — Verify with `henchmen doctor`
 
 ```bash
-henchmen doctor --env dev
+henchmen doctor
 ```
 
-This runs a self-check on the local SDK: Docker, gcloud, Python,
-credentials, required Settings fields, git identity, and the remote
-service health endpoints. Green across the board means you're done.
+`doctor` builds the same `Settings` the services use, so it reads your
+`.env.local`, then checks Python, Docker, git identity, the operative image,
+and every credential you configured — including whether the GitHub token can
+push to your default repo. It also prints the model each tier resolves to.
+Add `--offline` to skip the network probes. Green across the board means the
+local side is ready; the Cloud Run services are checked by their own
+`/health` endpoints.
 
 ---
 

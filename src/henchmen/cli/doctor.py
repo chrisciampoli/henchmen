@@ -1,43 +1,49 @@
 """`henchmen doctor` — self-check CLI command.
 
-Runs a series of diagnostic checks to verify that the local environment
-is ready to run Henchmen. Exits non-zero if any check fails.
+Runs a series of diagnostic checks to verify that the local environment is
+ready to run Henchmen. Exits non-zero if any check fails.
+
+Everything is derived from :class:`~henchmen.config.settings.Settings` (which
+reads ``.env.local`` then ``.env``) rather than from raw ``os.environ``, so
+doctor sees exactly the configuration ``henchmen serve`` / ``eval`` / ``chat``
+will see. The live credential probes are the same ones ``henchmen init`` runs
+— they live in :mod:`henchmen.cli.checks` — and are skipped with ``--offline``.
 """
 
 from __future__ import annotations
 
-import os
+import argparse
 import subprocess
 import sys
-from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from henchmen.cli import checks
+from henchmen.cli.checks import CheckResult, CheckStatus
 
-class CheckStatus(str, Enum):  # noqa: UP042 — project convention: str, Enum pattern per CLAUDE.md
-    """Outcome of a single diagnostic check."""
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
 
-    OK = "ok"
-    WARN = "warn"
-    FAIL = "fail"
-
-
-@dataclass
-class CheckResult:
-    """Result of a single check."""
-
-    name: str
-    status: CheckStatus
-    message: str
-    hint: str | None = None
-
-    @property
-    def is_ok(self) -> bool:
-        return self.status == CheckStatus.OK
-
-    @property
-    def is_failure(self) -> bool:
-        return self.status == CheckStatus.FAIL
+__all__ = [
+    "CheckResult",
+    "CheckStatus",
+    "add_doctor_arguments",
+    "check_docker",
+    "check_env_file",
+    "check_git_identity",
+    "check_github",
+    "check_jira",
+    "check_llm_credentials",
+    "check_model_tiers",
+    "check_operative_image",
+    "check_python_version",
+    "check_runtime_config",
+    "check_settings",
+    "check_slack",
+    "load_settings",
+    "run_doctor",
+    "run_doctor_cli",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -162,89 +168,207 @@ def check_env_file() -> CheckResult:
             name=".env.local",
             status=CheckStatus.WARN,
             message="No .env.local — using .env as fallback",
-            hint="Copy .env.example to .env.local and customize it: `cp .env.example .env.local`",
+            hint="Run `henchmen init` to generate a .env.local.",
         )
     if (cwd / ".env.example").is_file():
         return CheckResult(
             name=".env.local",
             status=CheckStatus.WARN,
             message=".env.example found but .env.local missing",
-            hint="Copy .env.example to .env.local and customize it: `cp .env.example .env.local`",
+            hint="Run `henchmen init` to generate a .env.local.",
         )
     return CheckResult(
         name=".env.local",
         status=CheckStatus.WARN,
         message="No .env / .env.local / .env.example in current directory",
-        hint="Create a .env.local with `HENCHMEN_` env vars — see docs/deploy-gcp.md.",
+        hint="Run `henchmen init` from the directory you start Henchmen in.",
     )
 
 
-def check_llm_credentials() -> CheckResult:
-    """Verify credentials are present for the configured LLM provider."""
-    provider = os.environ.get("HENCHMEN_LLM_PROVIDER", "").strip().lower()
-    if not provider:
-        provider = os.environ.get("HENCHMEN_PROVIDER", "local").strip().lower()
+def load_settings() -> tuple[Settings | None, CheckResult]:
+    """Build ``Settings`` the way the services do, reporting validation errors.
 
-    if provider in ("ollama", "local", ""):
-        return CheckResult(
-            name="LLM credentials",
-            status=CheckStatus.OK,
-            message="Provider=ollama (no API key required)",
+    Returns ``(settings, result)``; ``settings`` is ``None`` when construction
+    failed, in which case ``result`` is a FAIL carrying pydantic's message.
+    """
+    from henchmen.config.settings import Settings
+
+    try:
+        settings = Settings()
+    except ValueError as exc:  # pydantic ValidationError subclasses ValueError
+        detail = str(exc).strip().splitlines()
+        first = detail[0] if detail else "invalid settings"
+        return None, CheckResult(
+            name="Settings",
+            status=CheckStatus.FAIL,
+            message=f"Settings failed to load: {first}",
+            hint="Run `henchmen init` to rewrite .env.local, or fix the offending HENCHMEN_ value by hand.",
         )
+    return settings, CheckResult(
+        name="Settings",
+        status=CheckStatus.OK,
+        message=(
+            f"provider={settings.provider}, llm={_llm_provider(settings)}, environment={settings.environment.value}"
+        ),
+    )
+
+
+def check_settings() -> CheckResult:
+    """Construct ``Settings`` so pydantic validation runs exactly as it does at startup."""
+    return load_settings()[1]
+
+
+def _llm_provider(settings: Settings) -> str:
+    from henchmen.providers.tiers import active_llm_provider
+
+    return active_llm_provider(settings)
+
+
+def check_model_tiers(settings: Settings) -> CheckResult:
+    """Report the concrete model each tier resolves to for the active provider."""
+    from henchmen.models.llm import ModelTier
+    from henchmen.providers.tiers import tier_models
+
+    models = tier_models(settings)
+    if not models:
+        return CheckResult(
+            name="Model tiers",
+            status=CheckStatus.FAIL,
+            message=f"No tier mapping for LLM provider {_llm_provider(settings)!r}",
+            hint="Set HENCHMEN_LLM_PROVIDER to one of: gcp, aws, local, openai, anthropic.",
+        )
+    missing = sorted(tier.value for tier, model in models.items() if not model)
+    rendered = ", ".join(f"{tier.value.split('/')[-1]}={models[tier] or '(unset)'}" for tier in ModelTier)
+    if missing:
+        return CheckResult(
+            name="Model tiers",
+            status=CheckStatus.FAIL,
+            message=f"{rendered} — no model configured for {', '.join(missing)}",
+            hint="Run `henchmen init` to pick models, or set the HENCHMEN_*_MODEL_<TIER> variables.",
+        )
+    return CheckResult(name="Model tiers", status=CheckStatus.OK, message=rendered)
+
+
+def check_llm_credentials(settings: Settings, *, offline: bool = False) -> CheckResult:
+    """Verify credentials for the configured LLM provider, live when possible.
+
+    Only ``HENCHMEN_``-prefixed keys count: the providers read
+    ``settings.openai_api_key`` / ``settings.anthropic_api_key``, and the lair
+    forwards only those into operative containers, so a bare ``OPENAI_API_KEY``
+    on the host would never reach a run.
+    """
+    name = "LLM credentials"
+    provider = _llm_provider(settings)
+
+    if provider == "local":
+        if offline:
+            return CheckResult(name, CheckStatus.OK, f"Ollama at {settings.llm_ollama_base_url} (not probed)")
+        return checks.check_ollama(settings.llm_ollama_base_url)
+
     if provider == "openai":
-        key = os.environ.get("HENCHMEN_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        if key:
+        if not settings.openai_api_key:
             return CheckResult(
-                name="LLM credentials",
-                status=CheckStatus.OK,
-                message="HENCHMEN_OPENAI_API_KEY is set",
+                name,
+                CheckStatus.FAIL,
+                "HENCHMEN_LLM_PROVIDER=openai but no API key set",
+                hint="Set HENCHMEN_OPENAI_API_KEY in .env.local (a bare OPENAI_API_KEY is not read).",
             )
-        return CheckResult(
-            name="LLM credentials",
-            status=CheckStatus.FAIL,
-            message="HENCHMEN_LLM_PROVIDER=openai but no API key set",
-            hint="Set HENCHMEN_OPENAI_API_KEY in .env.local",
-        )
+        if offline:
+            return CheckResult(name, CheckStatus.OK, "HENCHMEN_OPENAI_API_KEY is set (not verified)")
+        return checks.check_openai_key(settings.openai_api_key)
+
     if provider == "anthropic":
-        key = os.environ.get("HENCHMEN_ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
-        if key:
+        if not settings.anthropic_api_key:
             return CheckResult(
-                name="LLM credentials",
-                status=CheckStatus.OK,
-                message="HENCHMEN_ANTHROPIC_API_KEY is set",
+                name,
+                CheckStatus.FAIL,
+                "HENCHMEN_LLM_PROVIDER=anthropic but no API key set",
+                hint="Set HENCHMEN_ANTHROPIC_API_KEY in .env.local (a bare ANTHROPIC_API_KEY is not read).",
             )
-        return CheckResult(
-            name="LLM credentials",
-            status=CheckStatus.FAIL,
-            message="HENCHMEN_LLM_PROVIDER=anthropic but no API key set",
-            hint="Set HENCHMEN_ANTHROPIC_API_KEY in .env.local",
-        )
-    if provider in ("gcp", "vertex"):
-        # Vertex AI uses Application Default Credentials
-        if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("GOOGLE_CLOUD_PROJECT"):
-            return CheckResult(
-                name="LLM credentials",
-                status=CheckStatus.OK,
-                message="GCP ADC environment detected",
-            )
-        return CheckResult(
-            name="LLM credentials",
-            status=CheckStatus.WARN,
-            message="Provider=gcp but GOOGLE_APPLICATION_CREDENTIALS not set",
-            hint="Run `gcloud auth application-default login` before running henchmen.",
-        )
+        if offline:
+            return CheckResult(name, CheckStatus.OK, "HENCHMEN_ANTHROPIC_API_KEY is set (not verified)")
+        return checks.check_anthropic_key(settings.anthropic_api_key)
+
+    if provider == "gcp":
+        if offline:
+            return CheckResult(name, CheckStatus.OK, f"Vertex AI in {settings.gcp_project_id} (not probed)")
+        return checks.check_vertex(settings.gcp_project_id, settings.gcp_region)
+
     if provider == "aws":
         return CheckResult(
-            name="LLM credentials",
-            status=CheckStatus.WARN,
-            message="Provider=aws — AWS support is experimental",
+            name,
+            CheckStatus.WARN,
+            "Provider=aws — Bedrock support is experimental",
             hint="Configure an AWS profile with Bedrock InvokeModel permissions.",
         )
 
+    from henchmen.providers.tiers import CANONICAL_LLM_PROVIDERS
+
     return CheckResult(
-        name="LLM credentials",
-        status=CheckStatus.WARN,
-        message=f"Unknown provider {provider!r} — cannot verify credentials",
+        name,
+        CheckStatus.FAIL,
+        f"Unknown LLM provider {provider!r}",
+        hint=f"Valid values: {', '.join(CANONICAL_LLM_PROVIDERS)} (ollama=local, vertex=gcp, bedrock=aws).",
+    )
+
+
+def check_github(settings: Settings, *, offline: bool = False) -> CheckResult:
+    """Verify the GitHub token and, when set, the default target repository."""
+    name = "GitHub"
+    if not settings.github_token:
+        return CheckResult(
+            name,
+            CheckStatus.WARN,
+            "no GitHub token configured — operatives cannot clone or open PRs",
+            hint="Set HENCHMEN_GITHUB_TOKEN (or GITHUB_TOKEN) to a PAT with the 'repo' scope.",
+        )
+    if offline:
+        return CheckResult(name, CheckStatus.OK, "HENCHMEN_GITHUB_TOKEN is set (not verified)")
+    if settings.github_default_repo:
+        repo = settings.github_default_repo
+        if "/" not in repo and settings.github_default_org:
+            repo = f"{settings.github_default_org}/{repo}"
+        return checks.check_github_repo(settings.github_token, repo)
+    return checks.check_github_token(settings.github_token)
+
+
+def check_slack(settings: Settings, *, offline: bool = False) -> CheckResult:
+    """Verify the Slack bot and app-level tokens when Slack intake is configured."""
+    name = "Slack"
+    if not settings.slack_bot_token and not settings.slack_app_token:
+        return CheckResult(name, CheckStatus.OK, "not configured (Slack intake disabled)")
+    if offline:
+        return CheckResult(name, CheckStatus.OK, "Slack tokens are set (not verified)")
+    bot = checks.check_slack_bot_token(settings.slack_bot_token)
+    if bot.is_failure:
+        return bot
+    app = checks.check_slack_app_token(settings.slack_app_token)
+    if app.is_failure:
+        return app
+    return CheckResult(name, CheckStatus.OK, f"{bot.message}; Socket Mode token valid")
+
+
+def check_jira(settings: Settings, *, offline: bool = False) -> CheckResult:
+    """Verify Jira credentials when Jira intake is configured."""
+    name = "Jira"
+    configured = any((settings.jira_base_url, settings.jira_email, settings.jira_api_token))
+    if not configured:
+        return CheckResult(name, CheckStatus.OK, "not configured (Jira intake disabled)")
+    if offline:
+        return CheckResult(name, CheckStatus.OK, "Jira credentials are set (not verified)")
+    return checks.check_jira(settings.jira_base_url, settings.jira_email, settings.jira_api_token)
+
+
+def check_runtime_config(settings: Settings) -> CheckResult:
+    """Surface every problem ``Settings.validate_for_runtime`` knows about."""
+    problems = settings.validate_for_runtime()
+    if not problems:
+        return CheckResult(name="Runtime config", status=CheckStatus.OK, message="no configuration problems found")
+    return CheckResult(
+        name="Runtime config",
+        status=CheckStatus.FAIL,
+        message=f"{len(problems)} problem(s): " + " ".join(problems),
+        hint="Run `henchmen init` to fix these interactively.",
     )
 
 
@@ -282,16 +406,31 @@ def check_operative_image() -> CheckResult:
 # ---------------------------------------------------------------------------
 
 
-def run_doctor() -> list[CheckResult]:
-    """Run every registered check and return the list of results."""
-    return [
+def run_doctor(*, offline: bool = False) -> list[CheckResult]:
+    """Run every registered check and return the list of results.
+
+    With ``offline=True`` no network call is made: credentials are reported as
+    present/absent without being verified against the provider.
+    """
+    results = [
         check_python_version(),
         check_docker(),
         check_git_identity(),
         check_env_file(),
-        check_llm_credentials(),
-        check_operative_image(),
     ]
+    settings, settings_result = load_settings()
+    results.append(settings_result)
+    if settings is None:
+        return results
+
+    results.append(check_runtime_config(settings))
+    results.append(check_model_tiers(settings))
+    results.append(check_llm_credentials(settings, offline=offline))
+    results.append(check_github(settings, offline=offline))
+    results.append(check_slack(settings, offline=offline))
+    results.append(check_jira(settings, offline=offline))
+    results.append(check_operative_image())
+    return results
 
 
 def _format_result(result: CheckResult) -> str:
@@ -304,17 +443,28 @@ def _format_result(result: CheckResult) -> str:
     glyph = glyphs[result.status]
     out = f"  {glyph:6s} {result.name}: {result.message}"
     if result.hint:
-        hint_lines = result.hint.splitlines()
-        for hint_line in hint_lines:
+        for hint_line in result.hint.splitlines():
             out += f"\n         ↳ {hint_line}"
     return out
 
 
-def run_doctor_cli() -> int:
+def add_doctor_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register ``henchmen doctor`` flags."""
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Skip live credential probes; only report whether values are configured",
+    )
+
+
+def run_doctor_cli(args: argparse.Namespace | None = None) -> int:
     """Run all checks and print a formatted report. Returns exit code."""
-    results = run_doctor()
+    offline = bool(getattr(args, "offline", False))
+    results = run_doctor(offline=offline)
 
     print("henchmen doctor — self-check")
+    if offline:
+        print("(offline mode: credentials are not verified against providers)")
     print()
     for r in results:
         print(_format_result(r))

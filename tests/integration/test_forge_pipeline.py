@@ -10,14 +10,12 @@ provider-abstraction refactor.
 import base64
 import json
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from henchmen.forge.ci_orchestrator import CIOrchestrator
 from henchmen.forge.merge_queue import MergeQueue
-from henchmen.forge.pr_builder import PRBuilder
 from henchmen.forge.server import app as forge_app
 
 # ---------------------------------------------------------------------------
@@ -44,90 +42,6 @@ def _mock_document_store() -> AsyncMock:
     # Default update_if to success so MergeQueue CAS claims return the entry.
     store.update_if = AsyncMock(return_value=True)
     return store
-
-
-# ---------------------------------------------------------------------------
-# TestCIOrchestratorIntegration
-# ---------------------------------------------------------------------------
-
-
-class TestCIOrchestratorIntegration:
-    """CI orchestrator exercised with mocked CI provider and broker."""
-
-    @pytest.fixture(autouse=True)
-    def _setup(self, integration_settings):
-        self.settings = integration_settings
-        self.broker = _mock_broker()
-
-    # 1. Parse PR URL correctly
-    @pytest.mark.asyncio
-    async def test_run_ci_parses_pr_url_correctly(self):
-        """run_ci extracts repo='acme-org/sample-repo' and pr_number=42."""
-        orchestrator = CIOrchestrator(self.settings, broker=self.broker)
-        orchestrator.trigger_build = AsyncMock(return_value="build-42")
-        orchestrator.get_build_status = AsyncMock(return_value={"status": "success", "log_url": ""})
-
-        result = await orchestrator.run_ci("https://github.com/acme-org/sample-repo/pull/42", "req-123")
-
-        assert result["repo"] == "acme-org/sample-repo"
-        assert result["pr_number"] == 42
-
-    # 2. Trigger CI build with correct repo slug
-    @pytest.mark.asyncio
-    async def test_run_ci_triggers_cloud_build(self):
-        """run_ci calls trigger_build with the correct repo."""
-        orchestrator = CIOrchestrator(self.settings, broker=self.broker)
-        orchestrator.trigger_build = AsyncMock(return_value="build-007")
-        orchestrator.get_build_status = AsyncMock(return_value={"status": "success", "log_url": ""})
-
-        await orchestrator.run_ci("https://github.com/acme-org/sample-repo/pull/7", "req-007")
-
-        orchestrator.trigger_build.assert_called_once()
-        call_args = orchestrator.trigger_build.call_args
-        assert call_args.args[0] == "acme-org/sample-repo"
-
-    # 3. Publish result to forge-result topic via injected broker
-    @pytest.mark.asyncio
-    async def test_run_ci_publishes_result_to_forge_result_topic(self):
-        """run_ci publishes a message with the correct request_id via the broker."""
-        orchestrator = CIOrchestrator(self.settings, broker=self.broker)
-        orchestrator.trigger_build = AsyncMock(return_value="build-pub-test")
-        orchestrator.get_build_status = AsyncMock(return_value={"status": "success", "log_url": ""})
-
-        await orchestrator.run_ci("https://github.com/acme-org/sample-repo/pull/10", "req-pub-test")
-
-        self.broker.publish.assert_called_once()
-        call_args = self.broker.publish.call_args
-        topic = call_args.args[0]
-        assert "forge-result" in topic
-        published = json.loads(call_args.args[1].decode("utf-8"))
-        assert published["request_id"] == "req-pub-test"
-
-    # 4. Handle build trigger failure
-    @pytest.mark.asyncio
-    async def test_run_ci_handles_build_failure(self):
-        """When trigger_build raises, run_ci returns status='failed' and still publishes."""
-        orchestrator = CIOrchestrator(self.settings, broker=self.broker)
-        orchestrator.trigger_build = AsyncMock(side_effect=RuntimeError("CI quota exceeded"))
-
-        result = await orchestrator.run_ci("https://github.com/acme-org/sample-repo/pull/99", "req-fail")
-
-        assert result["status"] == "failed"
-        assert "CI quota exceeded" in result["error"]
-        self.broker.publish.assert_called_once()
-
-    # 5. Handle invalid PR URL
-    @pytest.mark.asyncio
-    async def test_run_ci_handles_invalid_pr_url(self):
-        """Malformed PR URL returns status='failed' and does not call trigger_build."""
-        orchestrator = CIOrchestrator(self.settings, broker=self.broker)
-        orchestrator.trigger_build = AsyncMock(return_value="should-not-be-called")
-
-        result = await orchestrator.run_ci("not-a-valid-url", "req-invalid")
-
-        assert result["status"] == "failed"
-        assert "request_id" in result
-        orchestrator.trigger_build.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -183,8 +97,10 @@ class TestMergeQueueIntegration:
 
         dequeued_urls: list[str] = []
         for entry in pending_entries:
-            # Each dequeue call: expire-stale → [], merging-check → [], pending-check → [entry]
-            store.query = AsyncMock(side_effect=[[], [], [entry]])
+            # Each dequeue call queries four times: expire-stale → [],
+            # merging-check → [], pending-check → [entry], and finally the
+            # post-claim confirmation that no rival replica also claimed → [].
+            store.query = AsyncMock(side_effect=[[], [], [entry], []])
             result = await queue.dequeue()
             assert result is not None
             dequeued_urls.append(result["pr_url"])
@@ -283,140 +199,6 @@ class TestMergeQueueIntegration:
         result = await queue.dequeue()
 
         assert result is None
-
-
-# ---------------------------------------------------------------------------
-# TestPRBuilderIntegration
-# ---------------------------------------------------------------------------
-
-
-class TestPRBuilderIntegration:
-    """PR creation with mocked PyGithub."""
-
-    @pytest.fixture(autouse=True)
-    def _setup(self, integration_settings):
-        self.settings = integration_settings
-
-    def _make_mock_github(self, pr_url, pr_number, title):
-        mock_pr = MagicMock()
-        mock_pr.html_url = pr_url
-        mock_pr.number = pr_number
-        mock_pr.title = title
-
-        mock_repo = MagicMock()
-        mock_repo.create_pull = MagicMock(return_value=mock_pr)
-
-        mock_g = MagicMock()
-        mock_g.get_repo = MagicMock(return_value=mock_repo)
-
-        return mock_g, mock_repo, mock_pr
-
-    # 1. create_pr returns correct structure
-    @pytest.mark.asyncio
-    async def test_create_pr_returns_correct_structure(self):
-        """create_pr returns a dict with pr_url, pr_number, and title."""
-        builder = PRBuilder(self.settings)
-        builder._get_token = MagicMock(return_value="fake-token")
-
-        mock_g, _, _ = self._make_mock_github(
-            pr_url="https://github.com/acme-org/sample-repo/pull/42",
-            pr_number=42,
-            title="Fix auth bug",
-        )
-
-        with patch("github.Github", return_value=mock_g):
-            result = await builder.create_pr(
-                repo="acme-org/sample-repo",
-                head_branch="fix/auth-bug",
-                base_branch="main",
-                title="Fix auth bug",
-                body="Fixes the 500 error on login.",
-                task_id="task-struct-test",
-            )
-
-        assert result["pr_url"] == "https://github.com/acme-org/sample-repo/pull/42"
-        assert result["pr_number"] == 42
-        assert result["title"] == "Fix auth bug"
-
-    # 2. create_pr adds henchmen label
-    @pytest.mark.asyncio
-    async def test_create_pr_adds_henchmen_label(self):
-        """create_pr calls add_to_labels('henchmen-operative') on the created PR."""
-        builder = PRBuilder(self.settings)
-        builder._get_token = MagicMock(return_value="fake-token")
-
-        mock_g, _, mock_pr = self._make_mock_github(
-            pr_url="https://github.com/acme-org/sample-repo/pull/43",
-            pr_number=43,
-            title="Add feature",
-        )
-
-        with patch("github.Github", return_value=mock_g):
-            await builder.create_pr(
-                repo="acme-org/sample-repo",
-                head_branch="feature/new-thing",
-                base_branch="main",
-                title="Add feature",
-                body="Adds a new thing.",
-                task_id="task-label-test",
-            )
-
-        mock_pr.add_to_labels.assert_called_once_with("henchmen-operative")
-
-    # 3. PR body includes task ID
-    @pytest.mark.asyncio
-    async def test_pr_body_includes_task_id(self):
-        """The PR body submitted to GitHub contains the task ID and Henchmen attribution."""
-        builder = PRBuilder(self.settings)
-        builder._get_token = MagicMock(return_value="fake-token")
-
-        mock_g, mock_repo, _ = self._make_mock_github(
-            pr_url="https://github.com/acme-org/sample-repo/pull/44",
-            pr_number=44,
-            title="Some PR",
-        )
-
-        with patch("github.Github", return_value=mock_g):
-            await builder.create_pr(
-                repo="acme-org/sample-repo",
-                head_branch="feature/task-id-test",
-                base_branch="main",
-                title="Some PR",
-                body="Original body.",
-                task_id="task-body-id-check",
-            )
-
-        submitted_body = mock_repo.create_pull.call_args.kwargs["body"]
-        assert "task-body-id-check" in submitted_body
-        assert "Henchmen" in submitted_body
-
-    # 4. PR body preserves the original content verbatim
-    @pytest.mark.asyncio
-    async def test_pr_body_includes_original_content(self):
-        """The original body text is preserved verbatim in the final PR body."""
-        builder = PRBuilder(self.settings)
-        builder._get_token = MagicMock(return_value="fake-token")
-
-        mock_g, mock_repo, _ = self._make_mock_github(
-            pr_url="https://github.com/acme-org/sample-repo/pull/45",
-            pr_number=45,
-            title="Preserve body test",
-        )
-
-        original_body = "This is the original description. It must survive."
-
-        with patch("github.Github", return_value=mock_g):
-            await builder.create_pr(
-                repo="acme-org/sample-repo",
-                head_branch="feature/body-preserve",
-                base_branch="main",
-                title="Preserve body test",
-                body=original_body,
-                task_id="task-preserve",
-            )
-
-        submitted_body = mock_repo.create_pull.call_args.kwargs["body"]
-        assert original_body in submitted_body
 
 
 # ---------------------------------------------------------------------------

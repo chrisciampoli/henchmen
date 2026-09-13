@@ -166,3 +166,56 @@ class TestFileScorer:
         )
         scores = {rel: score for score, rel in result}
         assert scores["docs/README.md"] > scores["src/random.py"]
+
+
+class TestRecencyAndStackTraceSignals:
+    """recently_changed_weight / stack_trace_weight used to be inert."""
+
+    def _score(self, **kwargs) -> dict[str, float]:
+        scorer = FileScorer()
+        result = scorer.score_files(
+            all_files=["src/a.py", "src/b.py"],
+            task_title="Something broke",
+            task_description="no file names here",
+            mentioned_files=set(),
+            rag_file_paths=set(),
+            analysis_keywords=set(),
+            **kwargs,
+        )
+        return {path: score for score, path in result}
+
+    def test_recently_changed_files_are_boosted(self):
+        baseline = self._score()
+        boosted = self._score(recently_changed={"src/a.py"})
+        assert boosted["src/a.py"] - baseline["src/a.py"] == FileScorerConfig().recently_changed_weight
+        assert boosted["src/b.py"] == baseline["src/b.py"]
+
+    def test_stack_trace_files_are_boosted(self):
+        baseline = self._score()
+        boosted = self._score(stack_trace_files={"b.py"})
+        assert boosted["src/b.py"] - baseline["src/b.py"] == FileScorerConfig().stack_trace_weight
+
+    def test_custom_weights_are_honoured(self):
+        scorer = FileScorer(FileScorerConfig(recently_changed_weight=99))
+        result = scorer.score_files(
+            all_files=["src/a.py"],
+            task_title="t",
+            task_description="d",
+            mentioned_files=set(),
+            rag_file_paths=set(),
+            analysis_keywords=set(),
+            recently_changed={"src/a.py"},
+        )
+        assert result[0][0] >= 99
+
+    def test_signals_default_to_no_effect(self):
+        scorer = FileScorer()
+        result = scorer.score_files(
+            all_files=["src/a.py"],
+            task_title="t",
+            task_description="d",
+            mentioned_files=set(),
+            rag_file_paths=set(),
+            analysis_keywords=set(),
+        )
+        assert result[0][0] < FileScorerConfig().recently_changed_weight

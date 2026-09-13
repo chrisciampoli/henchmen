@@ -1,58 +1,40 @@
 # ---------------------------------------------------------------------------
 # Log sink
+#
+# The destination bucket is created here: a sink pointing at a log bucket that
+# does not exist accepts the apply and then fails every export, and the sink's
+# writer identity needs roles/logging.bucketWriter or the export is denied.
 # ---------------------------------------------------------------------------
+
+resource "google_logging_project_bucket_config" "henchmen" {
+  project        = var.project_id
+  location       = var.region
+  bucket_id      = "henchmen-${var.environment}-logs"
+  retention_days = var.log_retention_days
+  description    = "Cloud Run revision and job logs for Henchmen ${var.environment}"
+}
 
 resource "google_logging_project_sink" "henchmen_logs" {
   project                = var.project_id
   name                   = "henchmen-${var.environment}-log-sink"
-  destination            = "logging.googleapis.com/projects/${var.project_id}/locations/${var.region}/buckets/henchmen-${var.environment}-logs"
+  destination            = "logging.googleapis.com/${google_logging_project_bucket_config.henchmen.id}"
   filter                 = "resource.type=\"cloud_run_revision\" OR resource.type=\"cloud_run_job\""
   unique_writer_identity = true
 }
 
-# ---------------------------------------------------------------------------
-# Custom metric descriptors
-# ---------------------------------------------------------------------------
-
-resource "google_monitoring_metric_descriptor" "lair_duration" {
-  project      = var.project_id
-  description  = "Duration of Lair (operative) executions"
-  display_name = "Lair Duration"
-  type         = "custom.googleapis.com/henchmen/lair_duration"
-  metric_kind  = "GAUGE"
-  value_type   = "DOUBLE"
-  unit         = "s"
-
-  labels {
-    key = "scheme_id"
-  }
-  labels {
-    key = "node_id"
-  }
-}
-
-resource "google_monitoring_metric_descriptor" "ci_pass_rate" {
-  project      = var.project_id
-  description  = "CI pass rate percentage"
-  display_name = "CI Pass Rate"
-  type         = "custom.googleapis.com/henchmen/ci_pass_rate"
-  metric_kind  = "GAUGE"
-  value_type   = "DOUBLE"
-  unit         = "%"
-}
-
-resource "google_monitoring_metric_descriptor" "task_throughput" {
-  project      = var.project_id
-  description  = "Tasks completed per hour"
-  display_name = "Task Throughput"
-  type         = "custom.googleapis.com/henchmen/task_throughput"
-  metric_kind  = "GAUGE"
-  value_type   = "INT64"
-  unit         = "1/h"
+resource "google_project_iam_member" "log_sink_writer" {
+  project = var.project_id
+  role    = "roles/logging.bucketWriter"
+  member  = google_logging_project_sink.henchmen_logs.writer_identity
 }
 
 # ---------------------------------------------------------------------------
 # Alert policies
+#
+# Every policy below is built on a metric Cloud Run or Pub/Sub emits on its
+# own. Henchmen writes no custom Cloud Monitoring time series (its metrics go
+# to Firestore), so custom.googleapis.com/* policies would never fire and are
+# deliberately absent.
 # ---------------------------------------------------------------------------
 
 resource "google_monitoring_alert_policy" "lair_timeout" {
@@ -111,24 +93,25 @@ resource "google_monitoring_alert_policy" "dead_letter_depth" {
   }
 }
 
-resource "google_monitoring_alert_policy" "ci_failure_rate" {
+# 5xx from any Henchmen service. Catches the failure mode the DLQ alert cannot
+# see: pushes that are rejected (401/500) faster than they dead-letter.
+resource "google_monitoring_alert_policy" "service_errors" {
   project      = var.project_id
-  display_name = "High CI Failure Rate Alert"
+  display_name = "Henchmen Service Error Rate Alert"
   combiner     = "OR"
 
   conditions {
-    display_name = "CI failure rate >50% over 1 hour"
+    display_name = "Cloud Run 5xx responses"
 
     condition_threshold {
-      # Alert when the custom ci_pass_rate metric drops below 50%
-      filter          = "resource.type = \"global\" AND metric.type = \"custom.googleapis.com/henchmen/ci_pass_rate\""
-      duration        = "3600s"
-      comparison      = "COMPARISON_LT"
-      threshold_value = 50
+      filter          = "resource.type = \"cloud_run_revision\" AND metric.type = \"run.googleapis.com/request_count\" AND metric.labels.response_code_class = \"5xx\" AND resource.labels.service_name = starts_with(\"henchmen-${var.environment}-\")"
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
 
       aggregations {
-        alignment_period   = "3600s"
-        per_series_aligner = "ALIGN_MEAN"
+        alignment_period   = "300s"
+        per_series_aligner = "ALIGN_RATE"
       }
     }
   }
@@ -136,7 +119,7 @@ resource "google_monitoring_alert_policy" "ci_failure_rate" {
   notification_channels = var.notification_channels
 
   alert_strategy {
-    auto_close = "7200s"
+    auto_close = "1800s"
   }
 }
 
@@ -156,16 +139,17 @@ resource "google_monitoring_dashboard" "henchmen" {
           width  = 6
           height = 4
           widget = {
-            title = "Task Throughput"
+            title = "Requests by service"
             xyChart = {
               dataSets = [{
                 timeSeriesQuery = {
                   timeSeriesFilter = {
-                    filter = "metric.type=\"custom.googleapis.com/henchmen/task_throughput\""
+                    filter = "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/request_count\" AND resource.labels.service_name=monitoring.regex.full_match(\"henchmen-${var.environment}-.*\")"
                     aggregation = {
-                      alignmentPeriod    = "3600s"
-                      perSeriesAligner   = "ALIGN_MEAN"
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_RATE"
                       crossSeriesReducer = "REDUCE_SUM"
+                      groupByFields      = ["resource.labels.service_name"]
                     }
                   }
                 }
@@ -178,16 +162,17 @@ resource "google_monitoring_dashboard" "henchmen" {
           width  = 6
           height = 4
           widget = {
-            title = "Lair Duration (p50/p95)"
+            title = "Request latency p95"
             xyChart = {
               dataSets = [{
                 timeSeriesQuery = {
                   timeSeriesFilter = {
-                    filter = "metric.type=\"custom.googleapis.com/henchmen/lair_duration\""
+                    filter = "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/request_latencies\" AND resource.labels.service_name=monitoring.regex.full_match(\"henchmen-${var.environment}-.*\")"
                     aggregation = {
                       alignmentPeriod    = "60s"
-                      perSeriesAligner   = "ALIGN_PERCENTILE_50"
+                      perSeriesAligner   = "ALIGN_PERCENTILE_95"
                       crossSeriesReducer = "REDUCE_MEAN"
+                      groupByFields      = ["resource.labels.service_name"]
                     }
                   }
                 }
@@ -200,16 +185,17 @@ resource "google_monitoring_dashboard" "henchmen" {
           width  = 6
           height = 4
           widget = {
-            title = "CI Pass Rate (%)"
+            title = "Lair executions by result"
             xyChart = {
               dataSets = [{
                 timeSeriesQuery = {
                   timeSeriesFilter = {
-                    filter = "metric.type=\"custom.googleapis.com/henchmen/ci_pass_rate\""
+                    filter = "resource.type=\"cloud_run_job\" AND metric.type=\"run.googleapis.com/job/completed_execution_count\""
                     aggregation = {
                       alignmentPeriod    = "3600s"
-                      perSeriesAligner   = "ALIGN_MEAN"
-                      crossSeriesReducer = "REDUCE_MEAN"
+                      perSeriesAligner   = "ALIGN_DELTA"
+                      crossSeriesReducer = "REDUCE_SUM"
+                      groupByFields      = ["metric.labels.result"]
                     }
                   }
                 }

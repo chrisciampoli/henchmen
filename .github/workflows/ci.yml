@@ -30,11 +30,14 @@ jobs:
       - name: Install dependencies (lint tooling only)
         run: pip install -e ".[dev]"
 
+      # evals/ is linted too: the harness under src/ is covered by src/, and
+      # the fixture repos under evals/ carry their own per-file-ignores in
+      # pyproject, so nothing keeps them clean unless CI looks at them.
       - name: Ruff check
-        run: ruff check src/ tests/
+        run: ruff check src/ tests/ evals/
 
       - name: Ruff format check
-        run: ruff format --check src/ tests/
+        run: ruff format --check src/ tests/ evals/
 
   typecheck:
     name: Type Check
@@ -50,8 +53,24 @@ jobs:
       - name: Install dependencies (full stack — mypy needs cloud SDKs to type-check imports)
         run: pip install -e ".[dev-integration]"
 
+      # evals/fixtures is excluded in pyproject — those repos are broken on
+      # purpose. Everything else under evals/ is checked.
       - name: mypy
-        run: mypy src/
+        run: mypy src/ evals/
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Same gitleaks version as the pre-commit hook, run from the official
+      # image so the CLI needs no marketplace action or license key. `dir`
+      # scans the checked-out tree, which is exactly the content the PR adds.
+      - name: gitleaks
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/repo" -w /repo \
+            zricethezav/gitleaks:v8.30.1 dir . --config .gitleaks.toml --redact --verbose
 
   test:
     name: Unit Tests
@@ -94,6 +113,29 @@ jobs:
           HENCHMEN_ENVIRONMENT: dev
         run: pytest tests/integration/ -v --tb=short
 
+  docker-build:
+    name: Build image (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [dispatch, mastermind, forge, operative]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # release.yml builds all four images on a tag push. Without this job the
+      # operative image — the one every task actually runs in — would first be
+      # built at release time, so a broken Dockerfile or requirements pin only
+      # surfaced when cutting a release.
+      - name: docker build
+        run: docker build -f "containers/${{ matrix.service }}/Dockerfile" -t "henchmen-${{ matrix.service }}:ci" .
+
+      - name: Smoke-import the package inside the image
+        run: |
+          docker run --rm --entrypoint python "henchmen-${{ matrix.service }}:ci" \
+            -c "import henchmen; print('henchmen', henchmen.__version__)"
+
   docker-compose-smoke:
     name: docker-compose smoke test
     runs-on: ubuntu-latest
@@ -116,6 +158,7 @@ jobs:
       # file depends on Ollama being healthy, so stub it out with a
       # tiny HTTP server that returns 200 on any path + a fake `ollama`
       # CLI that exits 0 (satisfying the `ollama list` healthcheck).
+      # Keep this tag in sync with docker-compose.yml.
       - name: Stub Ollama image (HTTP responder + fake CLI)
         run: |
           mkdir -p ci/stub-ollama
@@ -126,30 +169,60 @@ jobs:
           EXPOSE 11434
           CMD ["python", "/srv.py"]
           DEOF
-          docker build -t ollama/ollama:0.4.6 ci/stub-ollama
+          docker build -t ollama/ollama:0.34.0 ci/stub-ollama
 
       - name: docker compose up -d
         run: docker compose up -d --build
 
-      - name: Wait for services to become healthy
+      # Fail-closed health gate. `docker compose ps` without -a hides exited
+      # containers, and grepping for the word "healthy" anywhere in the output
+      # passed while a service was dead. Require EVERY service declared in the
+      # compose file to be running and healthy, and bail out immediately on a
+      # container that exited or died.
+      - name: Wait for every service to become healthy
         run: |
           set -euo pipefail
-          deadline=$((SECONDS + 120))
+          services=$(docker compose config --services)
+          expected=$(echo "$services" | wc -l)
+          echo "[smoke] expecting $expected healthy service(s): $(echo "$services" | tr '\n' ' ')"
+          deadline=$((SECONDS + 180))
           while [ $SECONDS -lt $deadline ]; do
-            state=$(docker compose ps --format '{{.Service}} {{.Status}}')
+            state=$(docker compose ps -a --format '{{.Service}} {{.State}} {{.Status}}')
             echo "[smoke] $state"
-            if ! echo "$state" | grep -E '(starting|unhealthy)'; then
-              if echo "$state" | grep -q 'healthy'; then
-                echo "[smoke] all services report healthy"
-                exit 0
+            if echo "$state" | grep -Eq '^[^ ]+ (exited|dead|paused|removing)\b'; then
+              echo "[smoke] FAIL: a service is not running"
+              docker compose ps -a
+              docker compose logs --tail=200
+              exit 1
+            fi
+            healthy=0
+            for svc in $services; do
+              if echo "$state" | grep -Eq "^${svc} running .*\(healthy\)"; then
+                healthy=$((healthy + 1))
               fi
+            done
+            if [ "$healthy" -eq "$expected" ]; then
+              echo "[smoke] all $expected services are running and healthy"
+              exit 0
             fi
             sleep 5
           done
-          echo "[smoke] timed out waiting for healthy status"
-          docker compose ps
-          docker compose logs --tail=50
+          echo "[smoke] FAIL: timed out waiting for all services to become healthy"
+          docker compose ps -a
+          docker compose logs --tail=200
           exit 1
+
+      # Proves the stack actually routes: the single-process server mounts
+      # Dispatch, Mastermind and Forge, so all three health endpoints must
+      # answer through the one published port.
+      - name: Probe mounted service endpoints
+        run: |
+          set -euo pipefail
+          for path in /health /dispatch/health /mastermind/health /forge/health; do
+            echo "[smoke] GET $path"
+            curl --fail --silent --show-error --max-time 10 "http://localhost:8000${path}" > /dev/null
+          done
+          echo "[smoke] dispatch, mastermind and forge all responded"
 
       - name: Dump logs on failure
         if: failure()

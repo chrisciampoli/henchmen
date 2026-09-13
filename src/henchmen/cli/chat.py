@@ -1,8 +1,13 @@
-"""`henchmen chat` — interactive task builder powered by a local LLM (Ollama).
+"""`henchmen chat` — interactive task builder powered by the configured LLM.
 
 Provides a conversational REPL where the user describes work in natural
 language and the LLM assembles a structured HenchmenTask. Settings-aware:
 pre-loads defaults (repo, org, env) so the user doesn't repeat themselves.
+
+The provider comes from ``ProviderRegistry`` like every other LLM consumer,
+so chat works on Vertex AI, OpenAI, Anthropic, Bedrock or Ollama. Ollama
+keeps its streaming path (tokens appear as they arrive); the other providers
+go through ``LLMProvider.generate()`` and print the whole reply at once.
 """
 
 from __future__ import annotations
@@ -12,16 +17,25 @@ import json
 import re
 import select
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from henchmen.config.settings import Settings, get_settings
+from henchmen.models.llm import Message, MessageRole, ModelTier
+
+if TYPE_CHECKING:
+    from henchmen.providers.interfaces.llm_provider import LLMProvider
 
 _TASK_PATTERN = re.compile(r"={2,}TASK={2,}\s*\n(.*?)\n={2,}END={2,}", re.DOTALL)
 _CHAT_TEMPERATURE = 0.7
-_LOCAL_DISPATCH_URL = "http://localhost:8000/dispatch/api/v1/tasks"
 _LOCAL_DISPATCH_TIMEOUT = 5.0
+_CHAT_MAX_TOKENS = 4096
+
+
+def _local_dispatch_url(settings: Settings) -> str:
+    """Where a locally running ``henchmen serve`` accepts CLI task creation."""
+    return f"http://localhost:{settings.local_serve_port}/dispatch/api/v1/tasks"
 
 
 def _read_multiline_input(prompt: str = "> ") -> str:
@@ -102,6 +116,28 @@ Rules:
 - The branch field must be an EXISTING branch (usually "main"). Never invent feature branch names."""
 
 
+def _is_ollama(provider: LLMProvider) -> bool:
+    """True when the resolved provider is the local Ollama backend."""
+    from henchmen.providers.local.ollama import OllamaProvider
+
+    return isinstance(provider, OllamaProvider)
+
+
+def _resolve_chat_model(settings: Settings, provider: LLMProvider) -> str:
+    """Model behind chat: the explicit override, else the provider's LIGHT tier.
+
+    Ollama keeps its dedicated override chain so an existing
+    ``HENCHMEN_LLM_OLLAMA_CHAT_MODEL`` keeps working.
+    """
+    from henchmen.providers.tiers import tier_models
+
+    if _is_ollama(provider):
+        return settings.llm_ollama_chat_model or settings.llm_chat_model or settings.llm_ollama_model
+    if settings.llm_chat_model:
+        return settings.llm_chat_model
+    return tier_models(settings).get(ModelTier.LIGHT, "") or ModelTier.LIGHT.value
+
+
 def _check_ollama(base_url: str, model: str) -> str | None:
     """Pre-flight check: verify Ollama is running and model is available.
 
@@ -154,7 +190,7 @@ def _parse_task_block(text: str) -> dict[str, str] | None:
     return fields
 
 
-def _print_welcome(settings: Settings, model: str) -> None:
+def _print_welcome(settings: Settings, model: str, provider_name: str) -> None:
     """Print the welcome banner."""
     org = settings.github_default_org
     repo = settings.github_default_repo
@@ -164,7 +200,7 @@ def _print_welcome(settings: Settings, model: str) -> None:
     print()
     print("henchmen chat -- interactive task builder")
     print()
-    print(f"  Model:   {model} (via Ollama)")
+    print(f"  Model:   {model} (via {provider_name})")
     print(f"  Repo:    {repo_display}")
     print(f"  Env:     {env}")
     print()
@@ -244,11 +280,41 @@ async def _call_ollama(
         return "".join(collected)
 
 
-async def _dispatch_task(task_data: dict[str, str], settings: Settings) -> dict[str, Any]:
-    """Dispatch task via local HTTP first, falling back to Pub/Sub broker.
+async def _complete(
+    provider: LLMProvider,
+    settings: Settings,
+    model: str,
+    system_prompt: str,
+    history: list[Message],
+) -> str:
+    """One assistant turn: stream from Ollama, or generate() for every other provider."""
+    if _is_ollama(provider):
+        wire = [{"role": "system", "content": system_prompt}]
+        wire += [{"role": m.role.value, "content": m.content} for m in history]
+        return await _call_ollama(settings.llm_ollama_base_url, model, wire)
 
-    Returns a dict with 'method' and 'result' keys.
+    response = await provider.generate(
+        messages=history,
+        model=model,
+        temperature=_CHAT_TEMPERATURE,
+        max_tokens=_CHAT_MAX_TOKENS,
+        system_prompt=system_prompt,
+    )
+    print()
+    print(response.content)
+    print()
+    return response.content
+
+
+async def _dispatch_task(task_data: dict[str, str], settings: Settings) -> dict[str, Any]:
+    """Dispatch a task to a local ``henchmen serve``, else to a durable broker.
+
+    Returns a dict with 'method' and 'result' keys. The in-memory broker is
+    process-local: publishing into it from the chat process would drop the
+    task on exit, so that combination raises instead of reporting success.
     """
+    from henchmen.providers.registry import ProviderRegistry
+
     # Build the payload matching TaskNormalizer.from_cli() contract
     org = settings.github_default_org
     repo = task_data.get("repo", settings.github_default_repo or "")
@@ -258,28 +324,34 @@ async def _dispatch_task(task_data: dict[str, str], settings: Settings) -> dict[
     payload: dict[str, Any] = {
         "title": task_data["title"],
         "description": task_data.get("description", ""),
+        "type": task_data.get("type", ""),
         "repo": repo,
         "branch": task_data.get("branch", "main"),
         "priority": task_data.get("priority", "normal"),
         "created_by": "chat",
     }
 
-    # Try local HTTP dispatch first
+    url = _local_dispatch_url(settings)
     try:
         async with httpx.AsyncClient(timeout=_LOCAL_DISPATCH_TIMEOUT) as client:
-            resp = await client.post(_LOCAL_DISPATCH_URL, json=payload)
+            resp = await client.post(url, json=payload)
             resp.raise_for_status()
             return {"method": "local", "result": resp.json()}
     except (httpx.ConnectError, httpx.ConnectTimeout):
         pass  # Fall through to broker
 
-    # Fallback: broker dispatch
+    registry = ProviderRegistry(settings)
+    if registry.resolve_provider_name("message_broker") == "local" and not settings.local_forward_base_url:
+        raise RuntimeError(
+            f"henchmen serve is not reachable at {url} and the local in-memory broker cannot deliver "
+            "tasks across processes. Start it with `henchmen serve` (set HENCHMEN_LOCAL_SERVE_PORT "
+            "if you use a non-default port)."
+        )
+
     from henchmen.dispatch.normalizer import TaskNormalizer
-    from henchmen.providers.registry import ProviderRegistry
 
     normalizer = TaskNormalizer()
     task = normalizer.from_cli(payload)
-    registry = ProviderRegistry(settings)
     broker = registry.get_message_broker()
     msg_id = await normalizer.publish_task(task, settings, broker)
     return {"method": "broker", "result": {"task_id": task.id, "message_id": msg_id}}
@@ -315,22 +387,34 @@ async def _confirm_and_dispatch(task_data: dict[str, str], settings: Settings) -
 
 async def _chat_loop() -> int:
     """Async REPL loop. Returns exit code."""
-    settings = get_settings()
-    model = settings.llm_ollama_chat_model or settings.llm_ollama_model
-    base_url = settings.llm_ollama_base_url
+    from henchmen.providers.registry import ProviderRegistry
+    from henchmen.providers.tiers import active_llm_provider
 
-    # Pre-flight check
-    error = _check_ollama(base_url, model)
-    if error:
-        print(f"ERROR: {error}", file=sys.stderr)
+    settings = get_settings()
+    try:
+        provider = ProviderRegistry(settings).get_llm_provider()
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print("Hint: run `henchmen init` to pick a provider.", file=sys.stderr)
         return 1
 
-    _print_welcome(settings, model)
+    provider_name = active_llm_provider(settings)
+    model = _resolve_chat_model(settings, provider)
+    if not model:
+        print(f"ERROR: no chat model configured for provider {provider_name!r}.", file=sys.stderr)
+        print("Hint: set HENCHMEN_LLM_CHAT_MODEL or run `henchmen init`.", file=sys.stderr)
+        return 1
+
+    if _is_ollama(provider):
+        error = _check_ollama(settings.llm_ollama_base_url, model)
+        if error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+
+    _print_welcome(settings, model, provider_name)
 
     system_prompt = _build_system_prompt(settings)
-    ollama_messages: list[dict[str, str]] = [
-        {"role": "system", "content": system_prompt},
-    ]
+    history: list[Message] = []
     # Track extracted fields for /status
     last_extracted: dict[str, str] = {}
 
@@ -356,7 +440,7 @@ async def _chat_loop() -> int:
                 continue
 
             if user_input == "/reset":
-                ollama_messages = [{"role": "system", "content": system_prompt}]
+                history = []
                 last_extracted = {}
                 print("Conversation reset. Start describing your task.")
                 continue
@@ -373,34 +457,30 @@ async def _chat_loop() -> int:
         if line_count > 1:
             print(f"(received {line_count} lines)")
 
-        # Add user message and call LLM
-        ollama_messages.append({"role": "user", "content": user_input})
+        history.append(Message(role=MessageRole.USER, content=user_input))
 
         try:
-            response = await _call_ollama(base_url, model, ollama_messages)
+            response = await _complete(provider, settings, model, system_prompt, history)
         except Exception as exc:
             print(f"LLM error: {exc}")
             # Remove the failed user message so conversation stays consistent
-            ollama_messages.pop()
+            history.pop()
             continue
 
         if not response.strip():
             print("(empty response -- try rephrasing)")
-            ollama_messages.pop()
+            history.pop()
             continue
 
-        # Add assistant response to history
-        ollama_messages.append({"role": "assistant", "content": response})
+        history.append(Message(role=MessageRole.ASSISTANT, content=response))
 
-        # Check for task block (streaming already printed the text)
+        # Check for task block (the reply has already been printed)
         task_data = _parse_task_block(response)
         if task_data:
             last_extracted = task_data
             dispatched = await _confirm_and_dispatch(task_data, settings)
             if dispatched:
                 return 0
-
-    return 0  # pragma: no cover
 
 
 def run_chat_cli() -> int:

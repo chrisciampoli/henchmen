@@ -91,10 +91,18 @@ terraform.rc
 tmp/
 temp/
 .cache/
+# SQLiteDocumentStore writes henchmen_{environment}.db (+ WAL/SHM side files)
+# into the working directory in provider=local mode. Runtime state, never
+# versioned — it carries task titles, descriptions and repo URLs.
+henchmen_*.db
+henchmen_*.db-shm
+henchmen_*.db-wal
+.henchmen/
 
 # Internal agent / workflow tooling (not for public distribution)
 .claude/
 .serena/
+.superpowers/
 
 # Internal AI-assisted development artifacts — not for public distribution
 docs/superpowers/

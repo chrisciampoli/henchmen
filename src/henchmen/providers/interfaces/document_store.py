@@ -16,7 +16,11 @@ class DocumentStore(Protocol):
         ...
 
     async def update(self, collection: str, document_id: str, data: dict[str, Any]) -> None:
-        """Partially update fields on an existing document."""
+        """Partially update fields on a document, creating it when missing.
+
+        Only the supplied fields are written; every other field is left
+        untouched. A missing document is created with exactly ``data``.
+        """
         ...
 
     async def delete(self, collection: str, document_id: str) -> None:
@@ -35,6 +39,9 @@ class DocumentStore(Protocol):
 
         Filters are tuples of (field, operator, value).
         Operators: ==, !=, <, <=, >, >=, in, not-in, array-contains.
+        An operator outside that set must raise ``ValueError`` rather than
+        being ignored — silently dropping a filter returns unfiltered rows,
+        which is a fail-open result that differs between providers.
         """
         ...
 

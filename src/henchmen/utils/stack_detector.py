@@ -68,10 +68,13 @@ def _python_stack() -> Stack:
 
 
 def _node_pnpm_stack(is_monorepo: bool) -> Stack:
+    # ``--if-present`` makes a missing script a clean exit 0 instead of an
+    # error, so the CI handlers never have to mask the real exit code with
+    # a shell ``|| echo SKIP`` (which hid genuine lint/test failures).
     return Stack(
         name="node-pnpm",
-        test_command=["pnpm", "run", "test"],
-        lint_command=["pnpm", "run", "lint"],
+        test_command=["pnpm", "run", "--if-present", "test"],
+        lint_command=["pnpm", "run", "--if-present", "lint"],
         install_command=["pnpm", "install", "--frozen-lockfile"],
         is_monorepo=is_monorepo,
     )
@@ -80,8 +83,8 @@ def _node_pnpm_stack(is_monorepo: bool) -> Stack:
 def _node_npm_stack() -> Stack:
     return Stack(
         name="node-npm",
-        test_command=["npm", "test", "--", "--passWithNoTests"],
-        lint_command=["npm", "run", "lint"],
+        test_command=["npm", "run", "--if-present", "test", "--", "--passWithNoTests"],
+        lint_command=["npm", "run", "--if-present", "lint"],
         install_command=["npm", "ci"],
     )
 

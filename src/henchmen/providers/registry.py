@@ -12,6 +12,7 @@ from henchmen.providers.interfaces import (
     MessageBroker,
     ObjectStore,
 )
+from henchmen.providers.tiers import CANONICAL_LLM_PROVIDERS, LLM_PROVIDER_ALIASES, normalize_llm_provider
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -32,7 +33,9 @@ class ProviderRegistry:
     """Resolves provider settings to concrete implementations.
 
     Uses HENCHMEN_PROVIDER as default, with per-service overrides like
-    HENCHMEN_LLM_PROVIDER=ollama.
+    HENCHMEN_LLM_PROVIDER=anthropic. LLM provider names accept the aliases
+    in :data:`henchmen.providers.tiers.LLM_PROVIDER_ALIASES` (``ollama`` for
+    ``local``, ``vertex`` for ``gcp``, ``bedrock`` for ``aws``).
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -42,7 +45,10 @@ class ProviderRegistry:
         """Determine which provider to use for a given service."""
         override_field = _SERVICE_OVERRIDE_FIELDS.get(service, "")
         override = getattr(self._settings, override_field, "") if override_field else ""
-        return override if override else self._settings.provider
+        name = str(override) if override else self._settings.provider
+        if service == "llm":
+            return normalize_llm_provider(name)
+        return name
 
     def get_message_broker(self) -> MessageBroker:
         """Create the configured MessageBroker implementation."""
@@ -58,7 +64,7 @@ class ProviderRegistry:
         if name == "local":
             from henchmen.providers.local.memory import InMemoryMessageBroker
 
-            return InMemoryMessageBroker()
+            return InMemoryMessageBroker(self._settings)
         raise ValueError(f"Unknown provider for message_broker: {name!r}. Valid: {_VALID_PROVIDERS}")
 
     def get_document_store(self) -> DocumentStore:
@@ -135,7 +141,9 @@ class ProviderRegistry:
             from henchmen.providers.anthropic import AnthropicProvider
 
             return AnthropicProvider(self._settings)
-        raise ValueError(f"Unknown provider for llm: {name!r}. Valid: {_VALID_PROVIDERS | {'openai', 'anthropic'}}")
+        valid = ", ".join(CANONICAL_LLM_PROVIDERS)
+        aliases = ", ".join(sorted(LLM_PROVIDER_ALIASES))
+        raise ValueError(f"Unknown provider for llm: {name!r}. Valid: {valid} (aliases: {aliases})")
 
     def get_ci_provider(self) -> CIProvider:
         """Create the configured CIProvider implementation."""

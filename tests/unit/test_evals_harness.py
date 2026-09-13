@@ -10,13 +10,16 @@ from pathlib import Path
 
 import pytest
 
-from evals.harness import (
+from henchmen.evals import harness as harness_module
+from henchmen.evals.harness import (
     DimensionScores,
     EvalReport,
     FixtureMeta,
     FixtureResult,
     FixtureScore,
+    _apply_patch,
     compute_dimensions,
+    run_all_fixtures,
     run_fixture,
     score_result,
 )
@@ -314,7 +317,6 @@ class TestComputeDimensions:
             workspace=tmp_path,
             steps=2,
             total_tokens=1000,
-            wall_clock=1.5,
             meta=meta,
             error=None,
             finished=True,
@@ -338,7 +340,6 @@ class TestComputeDimensions:
             workspace=tmp_path,
             steps=1,
             total_tokens=100,
-            wall_clock=0.5,
             meta=meta,
             error="RuntimeError: boom",
             finished=False,
@@ -362,7 +363,6 @@ class TestComputeDimensions:
             workspace=tmp_path,
             steps=3,
             total_tokens=1000,
-            wall_clock=1.0,
             meta=meta,
             error=None,
             finished=True,
@@ -380,7 +380,6 @@ class TestComputeDimensions:
             workspace=tmp_path,
             steps=6,
             total_tokens=2000,
-            wall_clock=2.0,
             meta=meta,
             error=None,
             finished=True,
@@ -400,9 +399,144 @@ class TestComputeDimensions:
             workspace=tmp_path,
             steps=1,
             total_tokens=100,
-            wall_clock=0.5,
             meta=meta,
             error=None,
             finished=True,
         )
         assert dims.precision < 1.0
+
+
+# ---------------------------------------------------------------------------
+# apply_patch containment (model-supplied paths must stay in the workspace)
+# ---------------------------------------------------------------------------
+
+
+class TestApplyPatchContainment:
+    """``_apply_patch`` writes model output — it must never escape the workspace."""
+
+    @pytest.mark.parametrize(
+        "escape",
+        [
+            "../escaped.txt",
+            "a/../../escaped.txt",
+            "/etc/escaped.txt",
+            "C:/Windows/Temp/escaped.txt",
+            r"C:\Windows\Temp\escaped.txt",
+            r"\\server\share\escaped.txt",
+            r"\rooted\escaped.txt",
+            "D:relative.txt",
+            "",
+            "   ",
+        ],
+    )
+    def test_refuses_paths_outside_workspace(self, tmp_path: Path, escape: str) -> None:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        before = set(tmp_path.rglob("*"))
+
+        _apply_patch(workspace, {"path": escape, "contents": "pwned"})
+
+        assert set(tmp_path.rglob("*")) == before, f"{escape!r} wrote outside the workspace"
+
+    def test_accepts_ordinary_relative_paths(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        _apply_patch(workspace, {"path": "pkg/module.py", "contents": "x = 1\n"})
+        assert (workspace / "pkg" / "module.py").read_text(encoding="utf-8") == "x = 1\n"
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed scoring when a declared runner cannot run
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerFailClosed:
+    """A missing or hung test runner must score as a failure, never as 'not applicable'."""
+
+    def test_missing_test_runner_scores_false_with_reason(self, tmp_path: Path) -> None:
+        fixture, ws = _init_fake_fixture(
+            tmp_path,
+            {
+                "must_contain_file_change": ["sample.py"],
+                "must_fix_tests": True,
+                "expected_substrings_in_changed_code": ["return 2"],
+                "test_command": ["definitely-not-a-real-runner", "-q"],
+            },
+        )
+        (ws / "sample.py").write_text("def f():\n    return 2\n", encoding="utf-8")
+
+        score = score_result(fixture, ws)
+
+        assert score.tests_pass is False
+        assert score.test_runner_error is not None
+        assert "not found" in score.test_runner_error
+        assert score.overall_score < 1.0
+
+    def test_timed_out_test_runner_scores_false(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        def boom(*args: object, **kwargs: object) -> None:
+            raise subprocess.TimeoutExpired(cmd="pytest", timeout=120)
+
+        monkeypatch.setattr(harness_module.subprocess, "run", boom)
+        verdict, reason = harness_module._run_fixture_tests(tmp_path, {"test_command": ["pytest", "-q"]})
+
+        assert verdict is False
+        assert reason is not None and "timed out" in reason
+
+    def test_no_test_command_is_not_applicable(self, tmp_path: Path) -> None:
+        assert harness_module._run_fixture_tests(tmp_path, {"test_command": None}) == (None, None)
+
+    def test_missing_linter_scores_zero_conventions(self, tmp_path: Path) -> None:
+        assert harness_module._compute_conventions(tmp_path, ["definitely-not-a-real-linter"]) == 0.0
+
+    def test_no_lint_command_scores_full_conventions(self, tmp_path: Path) -> None:
+        assert harness_module._compute_conventions(tmp_path, None) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Fixture discovery and malformed fixtures
+# ---------------------------------------------------------------------------
+
+
+class TestFixtureDiscovery:
+    def test_discover_skips_directories_without_task_json(self, tmp_path: Path) -> None:
+        (tmp_path / "__pycache__").mkdir()
+        good = tmp_path / "bugfix_x"
+        good.mkdir()
+        (good / "task.json").write_text("{}", encoding="utf-8")
+
+        assert harness_module.discover_fixtures(tmp_path) == [good]
+
+    @pytest.mark.asyncio
+    async def test_malformed_fixture_returns_error_result_instead_of_raising(self, tmp_path: Path) -> None:
+        broken = tmp_path / "broken_fixture"
+        broken.mkdir()
+        (broken / "task.json").write_text(json.dumps({"title": "t"}), encoding="utf-8")
+        # No expected/diff_patterns.json and no repo/ — _load_fixture raises.
+
+        result = await run_fixture(broken, _MockLLMProvider(), workspace_root=tmp_path, provider_name="openai")
+
+        assert result.error is not None
+        assert result.fixture_id == "broken_fixture"
+        assert result.provider == "openai"
+        assert result.score.overall_score == pytest.approx(0.0)
+
+    @pytest.mark.asyncio
+    async def test_one_bad_fixture_does_not_abort_the_run(self, tmp_path: Path) -> None:
+        broken = tmp_path / "a_broken"
+        broken.mkdir()
+        (broken / "task.json").write_text(json.dumps({"title": "t"}), encoding="utf-8")
+        good, _ = _init_fake_fixture(tmp_path, {"must_contain_file_change": [], "test_command": None})
+
+        report = await run_all_fixtures(tmp_path, _MockLLMProvider(), provider_name="local")
+
+        assert {r.fixture_id for r in report.results} == {"a_broken", good.name}
+        assert report.provider == "local"
+        assert all(r.provider == "local" for r in report.results)
+
+
+class TestProviderLabel:
+    @pytest.mark.asyncio
+    async def test_provider_name_defaults_to_class_derived_label(self, tmp_path: Path) -> None:
+        fixture, _ = _init_fake_fixture(tmp_path, {"must_contain_file_change": [], "test_command": None})
+        result = await run_fixture(fixture, _MockLLMProvider(), workspace_root=tmp_path)
+        assert result.provider == "_mockllm"

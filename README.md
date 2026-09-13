@@ -25,53 +25,53 @@ Henchmen receives tasks from **Slack, GitHub, Jira, and CLI**, dispatches AI cod
 | Requirement | Why |
 |---|---|
 | **Python 3.12+** | Runtime for all services |
-| **Docker** | Local mode runs agents as containers |
+| **Docker** | Operatives run as containers, in local mode too |
 | **Git** | Operatives clone, branch, and push |
-| **GitHub App** | Henchmen creates branches and PRs on your repo ([setup guide](#-github-app-setup)) |
+| **A GitHub token** | A classic PAT with the `repo` scope, from an account that can push to your target repo |
+| **An LLM key** | Anthropic, OpenAI, Vertex AI, Bedrock, or a local Ollama server |
 
 ---
 
 ## Quick Start
 
-### Option A: Docker Compose (recommended)
-
 ```bash
 git clone https://github.com/chrisciampoli/henchmen.git
 cd henchmen
-pip install -e ".[dev]"
-cp .env.example .env.local
-docker compose up
+pip install -e ".[local,dev]"
+
+henchmen init              # interactive setup — writes .env.local
+henchmen doctor            # verify everything it just configured
+henchmen build-operative   # build the operative image (first run, ~3 min)
+henchmen serve             # Dispatch + Mastermind + Forge in one process
 ```
 
-Then submit your first task:
+`henchmen init` walks you through deployment mode, LLM provider and per-tier
+models, GitHub, Slack and Jira. It checks each credential against the real API
+before writing it, lists the models your key can actually reach, and shows your
+Slack channels so you can pick the one the bot should join. Re-run it any time;
+existing values become the defaults, and `--section llm` changes just one part.
+
+Then describe a task in your own words:
 
 ```bash
-curl -X POST http://localhost:8001/tasks \
-  -H "Content-Type: application/json" \
-  -d '{
+henchmen chat
+```
+
+or post one directly:
+
+```bash
+curl -X POST http://localhost:8000/dispatch/api/v1/tasks   -H "Content-Type: application/json"   -d '{
     "title": "Fix the login bug",
-    "description": "Users cannot log in after password reset",
-    "source": "cli",
+    "description": "Users cannot log in after a password reset",
     "repo": "your-org/your-repo"
   }'
 ```
 
-> **Note:** For the full PR workflow (branch, push, create PR), you need a GitHub App configured. Without one, you can still test task intake, LLM reasoning, and scheme execution in dry-run mode.
+### Docker Compose
 
-### Option B: Single Process (no Docker)
-
-```bash
-pip install -e "."
-henchmen serve
-```
-
-This runs Dispatch + Mastermind + Forge in one process with in-memory queues and SQLite. You'll need [Ollama](https://ollama.com) running locally for LLM inference:
-
-```bash
-# In another terminal
-ollama serve
-ollama pull llama3.2
-```
+`docker compose up` runs the same single-process server plus an Ollama
+sidecar. It mounts the Docker socket so the server can launch operative
+containers. Configure `.env.local` first — `henchmen init` is the easy way.
 
 ---
 
@@ -116,9 +116,9 @@ graph LR
 | **Mastermind** | `src/henchmen/mastermind/` | Orchestrator. State machine, scheme selection, operative dispatch. Fail-closed CI gates. |
 | **Dispatch** | `src/henchmen/dispatch/` | Intake router. Normalizes tasks from all sources into a unified Task model. |
 | **Operative** | `src/henchmen/operative/` | Coding agent. Ephemeral container. Executes scheme nodes with Arsenal tools. |
-| **Arsenal** | `src/henchmen/arsenal/` | Tool registry. `code_edit`, `code_intel`, `git_ops`, `test_runner`, `github`. |
+| **Arsenal** | `src/henchmen/arsenal/` | Tool registry, in-process inside the Operative. `code_edit`, `code_intel`, `context`, `git_ops`, `github`, `jira`, `slack`, `test_runner`. |
 | **Forge** | `src/henchmen/forge/` | CI + merge queue. Runs lint/tests, builds PRs, detects silent failures. |
-| **Dossier** | `src/henchmen/dossier/` | Context builder. Rules, RAG semantic search, task analysis. Caches to object store. |
+| **Dossier** | `src/henchmen/dossier/` | Context builder. Rules, semantic code search via Vertex AI RAG Engine, task analysis. Caches to object store. |
 | **Schemes** | `src/henchmen/schemes/` | DAG workflow blueprints: `bugfix_standard`, `feature_standard`, `goal_decomposition`. |
 
 ---
@@ -167,105 +167,139 @@ HENCHMEN_LLM_PROVIDER=openai   # Use OpenAI for LLM, GCP for everything else
 ## Installation
 
 ```bash
-pip install -e "."                  # Core only (no cloud SDKs)
-pip install -e ".[gcp]"            # + GCP providers
-pip install -e ".[aws]"            # + AWS providers
-pip install -e ".[openai]"         # + OpenAI LLM
-pip install -e ".[anthropic]"      # + Anthropic LLM
-pip install -e ".[all]"            # Everything
-pip install -e ".[dev]"            # Everything + test/lint tools
+pip install -e ".[local]"            # Anthropic + OpenAI + Slack + evals
+pip install -e ".[local,dev]"        # the above plus pytest/ruff/mypy
+pip install -e ".[gcp]"              # Vertex AI, Pub/Sub, Firestore, GCS, Cloud Run
+pip install -e ".[aws]"              # Bedrock, SNS/SQS, DynamoDB, S3, ECS
+pip install -e ".[all]"              # every backend
+pip install -e ".[dev-integration]"  # everything, for the integration suite
 ```
+
+`dev` is tooling only. Layer it on whichever runtime extra you need.
 
 ---
 
 ## Configuration
 
-All settings use the `HENCHMEN_` prefix. Copy the example to get started:
+`henchmen init` writes `.env.local` for you. To edit by hand, copy the template:
 
 ```bash
 cp .env.example .env.local
 ```
 
-Key settings:
+Every setting uses the `HENCHMEN_` prefix. The credential settings also accept
+the bare names a Cloud Run secret mount injects (`GITHUB_TOKEN`,
+`SLACK_BOT_TOKEN`, ...), with the prefixed name winning when both are set.
 
 | Variable | Description | Default |
 |---|---|---|
-| `HENCHMEN_PROVIDER` | Default cloud provider | `gcp` |
-| `HENCHMEN_ENVIRONMENT` | Deployment environment | `dev` |
-| `HENCHMEN_GITHUB_DEFAULT_REPO` | Target repository (owner/repo) | *(required)* |
-| `HENCHMEN_GIT_AUTHOR_EMAIL` | Git author for operative commits | `henchmen-operative@noreply.local` |
-| `HENCHMEN_LLM_OLLAMA_MODEL` | Default Ollama model (local mode) | `llama3.2` |
+| `HENCHMEN_PROVIDER` | `local`, `gcp`, or `aws` | `gcp` |
+| `HENCHMEN_ENVIRONMENT` | `dev`, `staging`, or `prod` | `dev` |
+| `HENCHMEN_LLM_PROVIDER` | `anthropic`, `openai`, `local`, `gcp`, `aws` | follows `HENCHMEN_PROVIDER` |
+| `HENCHMEN_GITHUB_TOKEN` | Classic PAT with the `repo` scope | *(required for PRs)* |
+| `HENCHMEN_GITHUB_DEFAULT_REPO` | Target repository, `owner/repo` | *(required)* |
+| `HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD` | Spend allowed per task | `6.0` |
 
-See [`src/henchmen/config/settings.py`](src/henchmen/config/settings.py) for the full reference.
+See [`.env.example`](.env.example) for every setting with commentary, or
+[`src/henchmen/config/settings.py`](src/henchmen/config/settings.py) for the
+authoritative list.
+
+### Model tiers
+
+Scheme nodes name a tier, never a model. The configured LLM provider resolves
+it, so the same scheme runs unchanged on any provider.
+
+| Tier | Used by | Anthropic | OpenAI | Vertex AI |
+|---|---|---|---|---|
+| `default/complex` | `implement_fix`, `implement_feature` | `claude-sonnet-5` | `gpt-4.1` | `gemini-2.5-pro` |
+| `default/light` | planning, classification | `claude-haiku-4-5` | `gpt-4.1-mini` | `gemini-2.5-flash` |
+| `default/reasoning` | `fix_tests`, `analyze_goal` | `claude-opus-5` | `o3` | `gemini-3.1-pro` |
+
+Override any cell with the matching setting, for example
+`HENCHMEN_ANTHROPIC_MODEL_COMPLEX` or `HENCHMEN_VERTEX_AI_MODEL_REASONING`.
+On Ollama each tier falls back to `HENCHMEN_LLM_OLLAMA_MODEL` unless you set
+`HENCHMEN_LLM_OLLAMA_MODEL_COMPLEX` and friends.
 
 ---
 
 <details>
-<summary><strong>GitHub App Setup</strong></summary>
+<summary><strong>GitHub setup</strong></summary>
 
-Henchmen needs a GitHub App to create branches and pull requests on your target repo.
+Henchmen pushes branches and opens pull requests with a **classic personal
+access token**, not a GitHub App.
 
-1. Go to **Settings > Developer settings > GitHub Apps > New GitHub App**
-2. Set these permissions:
-   - **Repository permissions:**
-     - Contents: Read & Write
-     - Pull requests: Read & Write
-     - Issues: Read
-3. Install the app on your target repository
-4. Generate a private key and download the `.pem` file
-5. Set in your `.env.local`:
+1. Create one at **Settings > Developer settings > Personal access tokens >
+   Tokens (classic)** with the **`repo`** scope.
+2. Use an account that can push to the target repository. A token without push
+   access reaches the repo but cannot open a PR, and `henchmen doctor` says so.
+3. Set it:
 
 ```bash
-HENCHMEN_GITHUB_APP_ID=123456
-HENCHMEN_GITHUB_APP_PRIVATE_KEY_SECRET=/path/to/private-key.pem
-HENCHMEN_GITHUB_DEFAULT_ORG=your-org
+HENCHMEN_GITHUB_TOKEN=ghp_your_token
 HENCHMEN_GITHUB_DEFAULT_REPO=your-org/your-repo
 ```
 
+To receive GitHub webhooks (issues labelled `henchmen`, `@henchmen` PR
+comments, CI-failure events), point the repo's webhook at
+`https://your-dispatch-url/webhooks/github` and set
+`HENCHMEN_GITHUB_WEBHOOK_SECRET` to the same secret. Only comments from users
+with a trusted association (owner, member, collaborator) can start a run.
+
+`HENCHMEN_GITHUB_APP_ID` and `HENCHMEN_GITHUB_APP_PRIVATE_KEY_SECRET` exist in
+settings but are reserved for a future GitHub App intake path; nothing reads
+them today.
+
 </details>
 
 <details>
-<summary><strong>Slack App Setup</strong></summary>
+<summary><strong>Slack setup</strong></summary>
 
-Henchmen uses Slack Socket Mode to receive tasks from Slack messages. When someone @mentions the bot, Dispatch normalizes the message into a task.
+The Slack bot runs inside the Dispatch process over Socket Mode, so it needs
+no public URL. When someone @mentions it, Dispatch turns the message into a
+task; status updates come back in the same thread.
 
-1. Go to [api.slack.com/apps](https://api.slack.com/apps) and create a new app **From scratch**
-2. Under **Socket Mode**, enable it and generate an **App-Level Token** with `connections:write` scope
-3. Under **OAuth & Permissions**, add these **Bot Token Scopes:**
+1. Create an app at [api.slack.com/apps](https://api.slack.com/apps),
+   **From scratch**.
+2. Enable **Socket Mode** and generate an **App-Level Token** with
+   `connections:write`.
+3. Under **OAuth & Permissions**, add these **Bot Token Scopes**:
    - `app_mentions:read` — receive @mentions
-   - `chat:write` — post status updates back to channels
+   - `chat:write` — post status updates
    - `channels:history` — read thread context for richer task descriptions
-4. Under **Event Subscriptions**, enable events and subscribe to:
-   - `app_mention` — triggers task creation when someone @mentions the bot
-5. Install the app to your workspace
-6. Set in your `.env.local`:
+   - `channels:read`, `groups:read` — list channels during `henchmen init`
+   - `channels:join` — join the notification channel on startup
+4. Under **Event Subscriptions**, subscribe to the bot event `app_mention`.
+5. Install the app to your workspace.
+6. Run `henchmen init --section slack`, or set them yourself:
 
 ```bash
-HENCHMEN_SLACK_BOT_TOKEN_SECRET=xoxb-your-bot-token
-HENCHMEN_SLACK_APP_TOKEN_SECRET=xapp-your-app-level-token
+HENCHMEN_SLACK_BOT_TOKEN=xoxb-your-bot-token
+HENCHMEN_SLACK_APP_TOKEN=xapp-your-app-level-token
 HENCHMEN_SLACK_SIGNING_SECRET=your-signing-secret
-HENCHMEN_SLACK_NOTIFICATION_CHANNEL=C0123CHANNEL  # Channel ID for status updates
+HENCHMEN_SLACK_NOTIFICATION_CHANNEL=C0123CHANNEL
 ```
 
-> **How it works:** A user posts `@Henchmen fix the login bug in auth.py` in any channel the bot is in. Dispatch picks up the mention, pulls thread context if available, normalizes it into a Task with `source=slack`, and publishes it to the message broker. Mastermind takes it from there.
+The bot joins `HENCHMEN_SLACK_NOTIFICATION_CHANNEL` when it starts. Private
+channels cannot be self-joined — invite the bot with `/invite @YourBot`.
 
 </details>
 
 <details>
-<summary><strong>Jira Integration Setup</strong></summary>
+<summary><strong>Jira setup</strong></summary>
 
-Henchmen can receive tasks from Jira webhooks when issues are created or transitioned.
-
-1. In your Jira project, go to **Settings > Webhooks > Create Webhook**
-2. Set the URL to your Dispatch endpoint: `https://your-dispatch-url/webhooks/jira`
-3. Select events: **Issue created**, **Issue updated**
-4. Set in your `.env.local`:
+1. In your Jira project, go to **Settings > Webhooks > Create Webhook**.
+2. Point it at `https://your-dispatch-url/webhooks/jira`.
+3. Select the issue events you want to trigger work.
+4. Create an API token at
+   [id.atlassian.com](https://id.atlassian.com/manage-profile/security/api-tokens)
+   and set:
 
 ```bash
 HENCHMEN_JIRA_BASE_URL=https://your-org.atlassian.net
 HENCHMEN_JIRA_EMAIL=your-service-account@your-org.com
-HENCHMEN_JIRA_API_TOKEN_SECRET=your-jira-api-token
+HENCHMEN_JIRA_API_TOKEN=your-jira-api-token
 HENCHMEN_JIRA_PROJECT_KEY=PROJ
+HENCHMEN_JIRA_WEBHOOK_SECRET=shared-secret
 ```
 
 </details>
@@ -275,40 +309,50 @@ HENCHMEN_JIRA_PROJECT_KEY=PROJ
 ## Development
 
 ```bash
-ruff check src/ tests/          # Lint
+ruff check --fix src/ tests/   # Auto-fix lint
+ruff check src/ tests/          # Verify clean
 ruff format src/ tests/         # Format
 mypy src/                       # Type check
 pytest tests/unit/              # Unit tests
 ```
 
-All four must pass before submitting a PR.
+All five must pass before submitting a PR. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
 ## Troubleshooting
 
+Start with `henchmen doctor`. It builds the same `Settings` the services use,
+so it sees your `.env.local`, and it probes each configured credential against
+the real API. `henchmen doctor --offline` skips the network calls.
+
 **`henchmen-operative:local` image build fails**
-Check that Docker Desktop is running and has at least 4GB of RAM allocated. Try `henchmen build-operative --no-cache` to force a clean rebuild. On slow networks, first build can take 5–10 minutes.
+Check that Docker Desktop is running with at least 4GB of RAM. Try
+`henchmen build-operative --no-cache`. The first build takes 5–10 minutes on a
+slow connection.
 
 **Task dispatched but nothing happens**
-Check the server terminal for errors. Verify Docker is running: `docker ps`. Make sure `GITHUB_TOKEN` is set in `.env.local` and has `repo` scope (classic PAT, not fine-grained).
+Check the server terminal. Verify Docker is running with `docker ps`, and that
+`HENCHMEN_GITHUB_TOKEN` is set and has the `repo` scope (classic PAT, not
+fine-grained).
 
-**`401 Unauthorized` when creating PR**
-Your `GITHUB_TOKEN` is missing the `repo` scope or has expired. Create a new classic token at https://github.com/settings/tokens with `repo` checked.
+**`401 Unauthorized` when creating a PR**
+The token is missing the `repo` scope or has expired. `henchmen doctor` reports
+both, including whether the token can actually push to your default repo.
 
-**Operative container runs but PR is empty / wrong files**
-Likely an LLM tool-calling failure. If you're using Ollama with a model smaller than 14B, switch to OpenAI/Anthropic or pull a larger Ollama model. See `HENCHMEN_LLM_PROVIDER` in `.env.local`.
+**Operative runs but the PR is empty or touches the wrong files**
+Usually an LLM tool-calling failure. Ollama models below about 14B routinely
+fail the multi-step tool loop; switch to Anthropic or OpenAI, or pull a larger
+model.
 
 **`Connection refused` to Ollama**
-The operative container calls Ollama at `http://host.docker.internal:11434`. Make sure `ollama serve` is running on the host. Verify with `curl http://localhost:11434/api/tags`.
+The operative container reaches the host at `http://host.docker.internal:11434`.
+Confirm `ollama serve` is running: `curl http://localhost:11434/api/tags`.
 
-**Linux: `permission denied` on Docker socket**
-Add your user to the `docker` group: `sudo usermod -aG docker $USER`, then log out and back in.
+**Linux: `permission denied` on the Docker socket**
+`sudo usermod -aG docker $USER`, then log out and back in.
 
-**PR was opened but CI steps were skipped**
-Expected in local mode. Mastermind detects the target repo's stack and runs the appropriate test/lint commands locally, but Forge runs the authoritative CI on the created PR via the full pipeline. Local mode short-circuits this to let you see the PR faster.
-
-See [docs/troubleshooting.md](docs/troubleshooting.md) for the full 15-scenario guide.
+See [docs/troubleshooting.md](docs/troubleshooting.md) for the full guide.
 
 ---
 
@@ -344,11 +388,11 @@ account, run the eval harness:
 
 ```bash
 # Run a single fixture against the provider of your choice.
-henchmen eval --provider openai --fixture bugfix_off_by_one
+henchmen eval run --provider openai --fixture bugfix_off_by_one
 
 # Run the whole fixture set (3 fixtures by default — add your own in
 # evals/fixtures/).
-henchmen eval --provider ollama --all
+henchmen eval run --provider ollama
 ```
 
 Results go to `evals/baseline.json`. A stub file ships in the repo with

@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import os
 import shutil
 import tempfile
 
@@ -38,25 +37,18 @@ class DossierBuilder:
     async def build(self, task: HenchmenTask, requirement: DossierRequirement) -> Dossier:
         """Build a dossier based on task and requirements.
 
-        Under ``HENCHMEN_PROVIDER=local``, RAG-dependent steps are skipped
-        entirely (see L7 fix). This lets developers run the dossier pipeline
-        without a Vertex AI RAG Engine corpus, falling back to grep-only
-        context. Steps that only require GitHub API access (related PRs,
-        related issues, code search) still run when a GitHub token is present.
+        Every fetch step degrades gracefully: a missing GitHub token, a clone
+        failure or an API error yields empty context rather than an exception,
+        so a partial dossier is always better than none.
         """
         dossier = Dossier(task_id=task.id)
-        local_mode = (self.settings.provider or "").lower() == "local"
-        if local_mode:
-            logger.info(
-                "DossierBuilder running in local mode — Vertex AI RAG Engine "
-                "steps are skipped; context will be grep-only."
-            )
 
         if requirement.fetch_files:
             dossier.relevant_files = await self._fetch_relevant_files(task)
 
-        if requirement.fetch_rules:
-            dossier.rule_files = await self._fetch_rule_files(task)
+        # One shallow clone serves both rule-file discovery and convention
+        # detection (this used to clone the repo twice per task).
+        dossier.rule_files, dossier.conventions = await self._scan_repo(task, fetch_rules=requirement.fetch_rules)
 
         if requirement.fetch_related_prs:
             dossier.related_prs = await self._fetch_related_prs(task)
@@ -64,56 +56,62 @@ class DossierBuilder:
         if requirement.fetch_related_issues:
             dossier.related_issues = await self._fetch_related_issues(task)
 
-        if requirement.code_search_symbols and not local_mode:
+        if requirement.code_search_symbols:
             dossier.code_search_results = await self._code_search(task, requirement.code_search_symbols)
-        elif requirement.code_search_symbols and local_mode:
-            logger.info("Skipping code_search in local mode; grep-based context only.")
 
-        # Detect project conventions (runs in its own shallow clone if rules
-        # were not already fetched; lightweight — only reads config files)
-        dossier.conventions = await self._detect_conventions(task)
-
-        # Serialize and upload to GCS
-        dossier.artifact_uri = await self._upload_artifact(dossier)
+        dossier.artifact_uri = await self.upload_artifact(dossier)
         return dossier
 
     # ------------------------------------------------------------------
     # Private fetch methods
     # ------------------------------------------------------------------
 
-    async def _detect_conventions(self, task: HenchmenTask) -> RepoConventions | None:
-        """Detect project conventions from a shallow clone of the repo.
+    async def _scan_repo(self, task: HenchmenTask, fetch_rules: bool) -> tuple[list[RuleFile], RepoConventions | None]:
+        """Clone the repo once and extract rule files plus project conventions.
 
-        Uses the same clone-and-scan pattern as ``_fetch_rule_files``. Returns
-        ``None`` on any failure so the dossier pipeline is never blocked.
+        Returns ``([], None)`` on any failure so the dossier pipeline is never
+        blocked.
         """
         repo = task.context.repo
         if not repo:
-            return None
+            return [], None
 
-        github_token = _get_github_token(self.settings)
+        github_token = self.settings.github_token
         branch = task.context.branch or "main"
 
-        tmp_dir = tempfile.mkdtemp(prefix="henchmen-conventions-")
+        tmp_dir = tempfile.mkdtemp(prefix="henchmen-dossier-")
         try:
             try:
-                await clone_repo(
-                    repo,
-                    branch,
-                    tmp_dir,
-                    token=github_token or None,
-                    depth=1,
-                )
+                await clone_repo(repo, branch, tmp_dir, token=github_token or None, depth=1)
             except RuntimeError as exc:
-                logger.warning("Failed to clone repo for convention detection: %s", exc)
-                return None
+                logger.warning("Failed to clone repo for dossier scan: %s", exc)
+                return [], None
 
-            return detect_conventions(tmp_dir)
+            rule_files: list[RuleFile] = []
+            if fetch_rules:
+                rule_files = await RuleFileLoader.load_rules(tmp_dir, self._rule_target_paths(task))
+
+            # detect_conventions walks the tree synchronously — keep it off
+            # the event loop.
+            conventions = await asyncio.to_thread(detect_conventions, tmp_dir)
+            return rule_files, conventions
         except Exception as exc:
-            logger.warning("Convention detection failed: %s", exc)
-            return None
+            logger.warning("Repo scan for dossier failed: %s", exc)
+            return [], None
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @staticmethod
+    def _rule_target_paths(task: HenchmenTask) -> list[str] | None:
+        """Paths touched by the task, used to pick up directory-scoped rules."""
+        if not task.context.pr_diff:
+            return None
+        paths = [
+            line[6:].strip()
+            for line in task.context.pr_diff.splitlines()
+            if line.startswith("+++ b/") and line[6:].strip() != "/dev/null"
+        ]
+        return paths or None
 
     async def _fetch_relevant_files(self, task: HenchmenTask) -> list[str]:
         """Identify file paths relevant to the task from context."""
@@ -130,60 +128,6 @@ class DossierBuilder:
 
         return relevant
 
-    async def _fetch_rule_files(self, task: HenchmenTask) -> list[RuleFile]:
-        """Fetch rule files from a shallow clone of the repo."""
-        repo = task.context.repo
-        if not repo:
-            return []
-
-        github_token = _get_github_token(self.settings)
-        branch = task.context.branch or "main"
-
-        tmp_dir = tempfile.mkdtemp(prefix="henchmen-rules-")
-        try:
-            try:
-                await clone_repo(
-                    repo,
-                    branch,
-                    tmp_dir,
-                    token=github_token or None,
-                    depth=1,
-                    no_checkout=True,
-                )
-            except RuntimeError as exc:
-                logger.warning("Failed to clone repo for rules: %s", exc)
-                return []
-
-            # Sparse-checkout only rule files
-            await (
-                await asyncio.create_subprocess_exec(
-                    "git",
-                    "-C",
-                    tmp_dir,
-                    "checkout",
-                    branch,
-                    "--",
-                    *RuleFileLoader.RULE_FILE_NAMES,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-            ).communicate()
-
-            target_paths: list[str] | None = None
-            if task.context.pr_diff:
-                target_paths = [
-                    line[6:].strip()
-                    for line in task.context.pr_diff.splitlines()
-                    if line.startswith("+++ b/") and line[6:].strip() != "/dev/null"
-                ]
-
-            return await RuleFileLoader.load_rules(tmp_dir, target_paths)
-        except Exception as exc:
-            logger.warning("Error fetching rule files: %s", exc)
-            return []
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
     async def _fetch_related_prs(self, task: HenchmenTask) -> list[RelatedPR]:
         """Fetch related pull requests from GitHub."""
         try:
@@ -191,9 +135,9 @@ class DossierBuilder:
             if not repo:
                 return []
 
-            github_token = _get_github_token(self.settings)
+            github_token = self.settings.github_token
             if not github_token:
-                logger.warning("No GitHub token; cannot fetch related PRs")
+                logger.warning("No GitHub token (HENCHMEN_GITHUB_TOKEN); cannot fetch related PRs")
                 return []
 
             query = task.title
@@ -227,9 +171,9 @@ class DossierBuilder:
             if not repo:
                 return []
 
-            github_token = _get_github_token(self.settings)
+            github_token = self.settings.github_token
             if not github_token:
-                logger.warning("No GitHub token; cannot fetch related issues")
+                logger.warning("No GitHub token (HENCHMEN_GITHUB_TOKEN); cannot fetch related issues")
                 return []
 
             url = "https://api.github.com/search/issues"
@@ -262,9 +206,9 @@ class DossierBuilder:
             if not repo:
                 return []
 
-            github_token = _get_github_token(self.settings)
+            github_token = self.settings.github_token
             if not github_token:
-                logger.warning("No GitHub token; cannot perform code search")
+                logger.warning("No GitHub token (HENCHMEN_GITHUB_TOKEN); cannot perform code search")
                 return []
 
             results: list[CodeSearchResult] = []
@@ -291,29 +235,33 @@ class DossierBuilder:
             logger.warning("Code search failed: %s", exc)
             return []
 
-    async def _upload_artifact(self, dossier: Dossier) -> str:
-        """Serialise the dossier to JSON and upload via ObjectStore. Returns the GCS URI."""
+    def _artifact_scheme(self) -> str:
+        """URI scheme for dossier artifacts, matching the object-store provider."""
+        name = (self.settings.object_store_provider or self.settings.provider or "").lower()
+        return "s3" if name == "aws" else "gs"
+
+    async def upload_artifact(self, dossier: Dossier) -> str | None:
+        """Serialise the dossier to JSON and upload via ObjectStore.
+
+        Returns the artifact URI, or ``None`` when no bucket is configured or
+        the upload failed. Upload failures must never discard the context that
+        was already gathered, so they are logged rather than raised.
+        """
         bucket_name = self.settings.gcs_bucket_dossier
         if not bucket_name:
-            logger.warning("gcs_bucket_dossier not configured; skipping upload")
-            return ""
+            logger.info("No dossier bucket configured (HENCHMEN_GCS_BUCKET_DOSSIER); skipping dossier upload")
+            return None
 
         blob_key = f"dossiers/{dossier.task_id}/dossier.json"
         data = dossier.model_dump_json(indent=2).encode("utf-8")
 
-        object_store = self._get_object_store()
-        await object_store.put(bucket_name, blob_key, data)
+        try:
+            object_store = self._get_object_store()
+            await object_store.put(bucket_name, blob_key, data)
+        except Exception as exc:
+            logger.warning("Dossier upload failed (non-fatal): %s", exc)
+            return None
 
-        uri = f"gs://{bucket_name}/{blob_key}"
+        uri = f"{self._artifact_scheme()}://{bucket_name}/{blob_key}"
         logger.info("Dossier uploaded to %s", uri)
         return uri
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _get_github_token(settings: Settings) -> str:
-    """Return a plain GitHub token, preferring settings over env var."""
-    return settings.github_token or os.environ.get("GITHUB_TOKEN", "")

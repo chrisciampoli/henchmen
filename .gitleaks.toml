@@ -1,5 +1,11 @@
 title = "Henchmen gitleaks config"
 
+# gitleaks REPLACES its built-in ruleset when a repo-level config is present.
+# Without this [extend] block the config below would load zero rules and the
+# pre-commit hook / CI job would silently pass on every commit (fail-open).
+[extend]
+useDefault = true
+
 [allowlist]
 description = "Test fixtures and example values"
 paths = [
@@ -9,7 +15,9 @@ paths = [
 ]
 regexTarget = "line"
 regexes = [
-    '''test-project''',
-    '''local-dev''',
-    '''fake-.*-key''',
+    # Anchored to the exact placeholder values used in docs/compose so the
+    # allowlist cannot swallow an unrelated finding that merely mentions them.
+    '''\btest-project\b''',
+    '''\blocal-dev\b''',
+    '''\bfake-[A-Za-z0-9_-]*-key\b''',
 ]

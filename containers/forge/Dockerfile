@@ -15,6 +15,10 @@ RUN pip install --no-cache-dir --prefix=/install -e .
 # --- Runtime stage ---
 FROM python:3.12.8-slim-bookworm@sha256:2199a62885a12290dc9c5be3ca0681d367576ab7bf037da120e564723292a2f0
 
+# git: clone the PR branch and fetch its base for the changed-file diff.
+# ruff + pytest (from requirements.txt) are the CI runners themselves.
+# No Node toolchain here: CIRunner reports Node test suites as *skipped*
+# (never as passed) when npm is absent.
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
 # Copy Python packages from builder

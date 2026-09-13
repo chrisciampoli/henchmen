@@ -15,6 +15,16 @@ logger = logging.getLogger(__name__)
 HENCHMEN_LABEL = "henchmen"
 HENCHMEN_COMMENT_TRIGGER = "@henchmen"
 
+# Only people with a write-ish relationship to the repository may launch an
+# operative run from a comment. Without this gate any GitHub account can spend
+# the deployment's LLM budget (and use its GitHub token) on a public repo.
+ALLOWED_COMMENT_AUTHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+
+# check_suite conclusions that mean "CI is red" for the purposes of the
+# fix_tests feedback loop. ``cancelled``/``neutral``/``skipped`` are not
+# failures; ``stale`` means a newer run supersedes this one.
+CI_FAILURE_CONCLUSIONS = frozenset({"failure", "timed_out", "startup_failure", "action_required"})
+
 
 def _is_henchmen_issue_labeled(payload: dict[str, Any]) -> bool:
     """Return True if this is an issue labeled with 'henchmen'."""
@@ -24,11 +34,29 @@ def _is_henchmen_issue_labeled(payload: dict[str, Any]) -> bool:
     return bool(label == HENCHMEN_LABEL)
 
 
-def _is_henchmen_pr_comment(payload: dict[str, Any]) -> bool:
-    """Return True if this is a PR review comment containing @henchmen."""
-    comment = payload.get("comment", {})
-    body: str = comment.get("body", "")
-    return HENCHMEN_COMMENT_TRIGGER in body and "pull_request" in payload
+def _is_henchmen_comment(payload: dict[str, Any]) -> bool:
+    """Return True if this is a newly created comment containing @henchmen.
+
+    Covers both ``pull_request_review_comment`` (inline diff comments, which
+    carry a top-level ``pull_request``) and ``issue_comment`` (the PR
+    "Conversation" tab and plain issues, which carry ``issue``). ``edited``
+    and ``deleted`` deliveries are ignored so fixing a typo in a comment does
+    not dispatch a second operative.
+    """
+    if payload.get("action") != "created":
+        return False
+    comment = payload.get("comment") or {}
+    body: str = comment.get("body", "") or ""
+    if HENCHMEN_COMMENT_TRIGGER not in body:
+        return False
+    return "pull_request" in payload or "issue" in payload
+
+
+def _is_authorized_commenter(payload: dict[str, Any]) -> bool:
+    """Return True if the comment author may trigger a run (fail-closed)."""
+    comment = payload.get("comment") or {}
+    association = comment.get("author_association", "")
+    return isinstance(association, str) and association.upper() in ALLOWED_COMMENT_AUTHOR_ASSOCIATIONS
 
 
 async def handle_github_webhook(
@@ -36,23 +64,28 @@ async def handle_github_webhook(
     normalizer: TaskNormalizer,
     settings: "Settings",
     broker: MessageBroker | None = None,
+    dedup_key: str | None = None,
 ) -> dict[str, Any]:
     """Process GitHub webhook events.
 
     Handles:
     - Issue labeled 'henchmen'
-    - PR review comment containing '@henchmen fix this'
+    - PR review / issue comment containing '@henchmen fix this'
     - check_suite failure on henchmen/* branches (CI feedback loop)
     - Push to default branch (embedding update)
     """
     if _is_henchmen_issue_labeled(payload):
-        task = normalizer.from_github(payload)
-        msg_id = await normalizer.publish_task(task, settings, broker=broker)
+        task = normalizer.from_github(payload, settings)
+        msg_id = await normalizer.publish_task(task, settings, broker=broker, dedup_key=dedup_key)
         return {"task_id": task.id, "message_id": msg_id, "status": "dispatched", "trigger": "issue_labeled"}
 
-    if _is_henchmen_pr_comment(payload):
-        task = normalizer.from_github(payload)
-        msg_id = await normalizer.publish_task(task, settings, broker=broker)
+    if _is_henchmen_comment(payload):
+        if not _is_authorized_commenter(payload):
+            author = (payload.get("comment") or {}).get("user", {}).get("login", "unknown")
+            logger.warning("[github] Ignoring @henchmen comment from unauthorized author %s", author)
+            return {"status": "ignored", "reason": "unauthorized commenter"}
+        task = normalizer.from_github(payload, settings)
+        msg_id = await normalizer.publish_task(task, settings, broker=broker, dedup_key=dedup_key)
         return {"task_id": task.id, "message_id": msg_id, "status": "dispatched", "trigger": "pr_comment"}
 
     if _is_ci_failure_on_henchmen_branch(payload):
@@ -73,11 +106,12 @@ def _is_push_to_default_branch(payload: dict[str, Any]) -> bool:
 
 
 def _is_ci_failure_on_henchmen_branch(payload: dict[str, Any]) -> bool:
-    """Return True if this is a check_suite completion with failure on a henchmen/* branch."""
+    """Return True if this is a red check_suite completion on a henchmen/* branch."""
     if payload.get("action") != "completed":
         return False
     suite = payload.get("check_suite", {})
-    if suite.get("conclusion") != "failure":
+    conclusion: str = suite.get("conclusion") or ""
+    if conclusion.lower() not in CI_FAILURE_CONCLUSIONS:
         return False
     branch: str = suite.get("head_branch", "")
     return bool(branch.startswith("henchmen/"))
@@ -94,6 +128,7 @@ async def handle_ci_failure_webhook(
     branch = suite.get("head_branch", "")
     check_suite_id = suite.get("id", 0)
     head_sha = suite.get("head_sha", "")
+    conclusion = suite.get("conclusion") or ""
     task_id_prefix = branch.replace("henchmen/", "", 1)
 
     if broker is None:
@@ -108,6 +143,7 @@ async def handle_ci_failure_webhook(
             "branch": branch,
             "check_suite_id": check_suite_id,
             "head_sha": head_sha,
+            "conclusion": conclusion,
         }
     ).encode("utf-8")
     await broker.publish(settings.pubsub_topic_ci_failure, data)
@@ -117,6 +153,7 @@ async def handle_ci_failure_webhook(
         "task_id_prefix": task_id_prefix,
         "repo": repo,
         "check_suite_id": check_suite_id,
+        "conclusion": conclusion,
     }
 
 
@@ -127,8 +164,10 @@ async def handle_push_embed(
 ) -> dict[str, Any]:
     """Handle a GitHub push event by requesting an embedding update.
 
-    Publishes a message to the embed-request Pub/Sub topic so the
-    embedding pipeline can incrementally update the Pinecone index.
+    Publishes a message to the embed-request Pub/Sub topic. The topic is the
+    integration point for incremental RAG indexing; there is no subscriber in
+    this repository yet, so the message is currently a no-op hook rather than
+    a live pipeline.
     """
     repo = payload.get("repository", {}).get("full_name", "")
     commit_sha = payload.get("after", "")

@@ -1,13 +1,17 @@
-# Staging GCS backend. The bucket must exist before `terraform init` and
-# cannot be managed by terraform itself (chicken-and-egg). Create it once:
-#   gcloud storage buckets create gs://henchmen-tfstate-staging \
-#     --location=us-central1 --uniform-bucket-level-access
+# Staging GCS backend.
 #
-# Then run:
-#   terraform init -backend-config=bucket=henchmen-tfstate-staging
+# The bucket name is deliberately NOT hardcoded: GCS bucket names are globally
+# unique, so a fixed `henchmen-tfstate-staging` can only ever belong to
+# whoever created it first. Supply it at init time instead:
+#
+#   gcloud storage buckets create gs://henchmen-tfstate-$PROJECT_ID-staging \
+#     --location=us-central1 --uniform-bucket-level-access
+#   terraform init -backend-config=bucket=henchmen-tfstate-$PROJECT_ID-staging
+#
+# Reconfiguring an existing deployment onto its current bucket is the same
+# command with the old name.
 terraform {
   backend "gcs" {
-    bucket = "henchmen-tfstate-staging"
     prefix = "terraform/state"
   }
 }

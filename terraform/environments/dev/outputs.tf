@@ -41,6 +41,16 @@ output "database_id" {
   value       = module.henchmen.database_id
 }
 
+output "dossier_bucket_name" {
+  description = "The GCS bucket holding dossier artifacts"
+  value       = module.henchmen.dossier_bucket_name
+}
+
+output "snapshots_bucket_name" {
+  description = "The GCS bucket holding operative snapshots"
+  value       = module.henchmen.snapshots_bucket_name
+}
+
 output "topic_ids" {
   description = "Map of logical topic name to Pub/Sub topic ID"
   value       = module.henchmen.topic_ids
@@ -67,8 +77,13 @@ output "service_urls" {
 }
 
 output "service_names" {
-  description = "Map of component name to fully-qualified Cloud Run service resource name"
+  description = "Map of component name to Cloud Run service name"
   value       = module.henchmen.service_names
+}
+
+output "pubsub_audiences" {
+  description = "Map of component name to the OIDC audience the service verifies"
+  value       = module.henchmen.pubsub_audiences
 }
 
 output "lair_template_job_name" {
@@ -96,6 +111,11 @@ output "log_sink_name" {
   value       = module.henchmen.log_sink_name
 }
 
+output "log_bucket_id" {
+  description = "The resource ID of the log bucket the sink writes to"
+  value       = module.henchmen.log_bucket_id
+}
+
 output "dashboard_id" {
   description = "The resource name of the Henchmen monitoring dashboard"
   value       = module.henchmen.dashboard_id
@@ -106,11 +126,6 @@ output "alert_policy_ids" {
   value       = module.henchmen.alert_policy_ids
 }
 
-output "vertex_ai_agent_id" {
-  description = "The resource ID of the Mastermind Vertex AI Agent Engine instance"
-  value       = module.henchmen.vertex_ai_agent_id
-}
-
 output "cleanup_job_name" {
   description = "The name of the stale-task-cleanup Cloud Scheduler job (null when scheduler disabled)"
   value       = module.henchmen.cleanup_job_name
@@ -119,4 +134,14 @@ output "cleanup_job_name" {
 output "merge_queue_job_name" {
   description = "The name of the merge-queue-processor Cloud Scheduler job (null when scheduler disabled)"
   value       = module.henchmen.merge_queue_job_name
+}
+
+output "watchdog_job_name" {
+  description = "The name of the watchdog Cloud Scheduler job (null when scheduler disabled)"
+  value       = module.henchmen.watchdog_job_name
+}
+
+output "dlq_check_job_name" {
+  description = "The name of the DLQ check Cloud Scheduler job (null when scheduler disabled)"
+  value       = module.henchmen.dlq_check_job_name
 }

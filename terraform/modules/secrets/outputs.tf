@@ -23,6 +23,11 @@ output "jira_api_token_secret_id" {
   value       = google_secret_manager_secret.jira_api_token.secret_id
 }
 
+output "metrics_auth_token_secret_id" {
+  description = "Secret Manager secret ID for the /metrics bearer token"
+  value       = google_secret_manager_secret.metrics_auth_token.secret_id
+}
+
 output "secret_ids" {
   description = "Map of logical secret name to Secret Manager secret ID"
   value = {
@@ -31,5 +36,6 @@ output "secret_ids" {
     slack_signing_secret = google_secret_manager_secret.slack_signing_secret.secret_id
     slack_app_token      = google_secret_manager_secret.slack_app_token.secret_id
     jira_api_token       = google_secret_manager_secret.jira_api_token.secret_id
+    metrics_auth_token   = google_secret_manager_secret.metrics_auth_token.secret_id
   }
 }

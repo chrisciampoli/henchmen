@@ -12,32 +12,20 @@ import logging
 import os
 import re
 
-from pydantic import Field
-
-from henchmen.models._base import StrictBase
+from henchmen.models.dossier import RepoConventions
 
 logger = logging.getLogger(__name__)
+
+# ``RepoConventions`` is a cross-component data contract, so it lives in
+# ``henchmen.models.dossier`` alongside ``Dossier``. It is re-exported here
+# because this module is where it is produced.
+__all__ = ["RepoConventions", "conventions_to_prompt", "detect_conventions"]
 
 # Maximum source files to sample for convention detection
 _MAX_SAMPLE_FILES = 10
 
 # Extensions to sample for style detection
 _SOURCE_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java"}
-
-
-class RepoConventions(StrictBase):
-    """Detected conventions for a repository."""
-
-    test_framework: str | None = Field(default=None, description="Detected test framework: pytest, jest, mocha, etc.")
-    import_style: str | None = Field(default=None, description="Import style: absolute, relative")
-    error_handling: str | None = Field(
-        default=None, description="Error handling pattern: try/except, Result type, etc."
-    )
-    type_system: str | None = Field(default=None, description="Type checking system: mypy, typescript strict, etc.")
-    naming_convention: str | None = Field(default=None, description="Naming convention: snake_case, camelCase")
-    indentation: str | None = Field(default=None, description="Indentation style: 2-space, 4-space, tabs")
-    lint_config: str | None = Field(default=None, description="Lint tool: ruff, eslint, flake8, etc.")
-    package_manager: str | None = Field(default=None, description="Package manager: pip, pnpm, npm, poetry, etc.")
 
 
 def detect_conventions(workspace_dir: str) -> RepoConventions:

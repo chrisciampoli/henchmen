@@ -15,10 +15,12 @@ Henchmen is an AI agent factory. It receives tasks from Slack, Jira, GitHub, and
 ## Quick Start
 
 ```bash
-pip install -e ".[dev]"     # Install with dev dependencies
-pytest tests/unit/           # Run unit tests
-ruff check src/ tests/       # Lint
-mypy src/                    # Type check
+pip install -e ".[local,dev]"   # Runtime extras + tooling
+henchmen init                    # Interactive setup — writes .env.local
+henchmen doctor                  # Verify the environment
+pytest tests/unit/               # Run unit tests
+ruff check src/ tests/           # Lint
+mypy src/                        # Type check
 ```
 
 ## Architecture
@@ -28,9 +30,9 @@ Seven components, all villain-themed:
 - **Mastermind** (`src/henchmen/mastermind/`) — Orchestrator. Cloud Run service. Manages task lifecycle via state machine, selects Schemes, dispatches Operatives. Fail-closed CI gates: never creates PRs when checks fail.
 - **Dispatch** (`src/henchmen/dispatch/`) — Intake router. Cloud Run service. Receives tasks from Slack (Socket Mode), Jira, GitHub, CLI. Normalizes to Task model. Publishes to message broker.
 - **Operative** (`src/henchmen/operative/`) — Coding agent. Cloud Run Job. Bootstraps into ephemeral environment, executes Scheme nodes, uses Arsenal tools, reports results. TIMED_OUT stays TIMED_OUT (never upgraded to COMPLETED).
-- **Arsenal** (`src/henchmen/arsenal/`) — Tool registry. Runs inside Operative (NOT a separate service). Provides tools: `code_edit`, `code_intel`, `github`, `git_ops`, `test_runner`.
+- **Arsenal** (`src/henchmen/arsenal/`) — Tool registry. Runs inside Operative (NOT a separate service). Tool categories: `code_edit`, `code_intel`, `context`, `git_ops`, `github`, `jira`, `slack`, `test_runner`.
 - **Forge** (`src/henchmen/forge/`) — CI/merge queue. Cloud Run service. Orchestrates CI, builds PRs, manages merge queue, detects silent failures.
-- **Dossier** (`src/henchmen/dossier/`) — Context builder. Library. Gathers rules, RAG via Pinecone (index: `henchmen-code`), task analysis. Caches to object store.
+- **Dossier** (`src/henchmen/dossier/`) — Context builder. Library. Gathers rules, semantic code search via Vertex AI RAG Engine (corpus: `henchmen-code`), task analysis. Caches to object store.
 - **Schemes** (`src/henchmen/schemes/`) — DAG workflow blueprints. Library. Defines execution plans: `bugfix_standard`, `feature_standard`, `goal_decomposition`.
 
 Shared data contracts live in **Models** (`src/henchmen/models/`) — Pydantic v2 models for `Task`, `Operative`, `Scheme`, `Dossier`.
@@ -47,14 +49,31 @@ Source → Dispatch → Pub/Sub (tasks.created) → Mastermind → Dossier (cont
 
 **HARD RULE: No Claude models on Vertex AI. Gemini only.**
 
-- `implement_fix` / `implement_feature` → Gemini 2.5 Pro (`gemini-2.5-pro`) — core coding
-- `fix_tests` → Gemini 3.1 Pro (`gemini-3.1-pro`) — needs reasoning
-- `verify_changes` / `plan_implementation` → Gemini 2.5 Flash (`gemini-2.5-flash`) — 95% cheaper
-- `fix_lint` → DETERMINISTIC (`eslint --fix` / `ruff --fix`) — zero LLM cost, no Cloud Run Job
+Scheme nodes name a *tier*, never a concrete model. The configured LLM provider
+resolves it through `henchmen.providers.tiers.resolve_model_name`, so one scheme
+runs unchanged on every provider. Never hardcode a model name in a scheme, a
+provider, or a price table.
+
+| Tier | Used by | Anthropic | OpenAI | Vertex AI |
+|---|---|---|---|---|
+| `default/complex` | `implement_fix`, `implement_feature` | `claude-sonnet-5` | `gpt-4.1` | `gemini-2.5-pro` |
+| `default/light` | planning, classification | `claude-haiku-4-5` | `gpt-4.1-mini` | `gemini-2.5-flash` |
+| `default/reasoning` | `fix_tests`, `analyze_goal` | `claude-opus-5` | `o3` | `gemini-3.1-pro` |
+
+Each cell is a `Settings` field (`anthropic_model_complex`,
+`vertex_ai_model_reasoning`, ...). Ollama tiers fall back to
+`llm_ollama_model`; Bedrock has its own `bedrock_model_*` fields.
+
+`fix_lint` is DETERMINISTIC (`ruff --fix` / `eslint --fix`) — no LLM, no
+container.
+
+Token pricing lives in exactly one place: `src/henchmen/providers/pricing.py`.
+Cost is always computed with `estimate_cost` / `estimate_cost_for_settings`
+from that module.
 
 ## GCP Services
 
-Cloud Run (services: Dispatch, Mastermind, Forge), Cloud Run Jobs (Operative), Pub/Sub (8 env-prefixed topics with OIDC audience auth), Firestore (state + metrics), GCS (artifacts, TF state), Vertex AI (Gemini only — no Claude), Pinecone (RAG semantic search), Secret Manager, Artifact Registry, Terraform for IaC.
+Cloud Run (services: Dispatch, Mastermind, Forge), Cloud Run Jobs (Operative), Pub/Sub (10 env-prefixed topics with OIDC audience auth), Firestore (state + metrics), GCS (artifacts, TF state), Vertex AI (Gemini for inference, RAG Engine for semantic code search — no Claude on Vertex), Secret Manager, Artifact Registry, Terraform for IaC.
 
 ## Language & Stack
 
@@ -62,8 +81,8 @@ Cloud Run (services: Dispatch, Mastermind, Forge), Cloud Run Jobs (Operative), P
 - FastAPI for HTTP services
 - Pydantic v2 with `Field(...)` descriptors for all models
 - pydantic-settings with `HENCHMEN_` env prefix, `@lru_cache` singletons
-- pytest + pytest-asyncio (`asyncio_mode = "auto"`)
-- Ruff for linting/formatting (E, F, I, N, W, UP rules, 120 char line length)
+- pytest + pytest-asyncio (`asyncio_mode = "strict"` — every async test needs `@pytest.mark.asyncio`)
+- Ruff for linting/formatting (E, F, I, N, W, UP, B, SIM, RET, ASYNC, T20, C4 rules, 120 char line length)
 - mypy strict mode for type checking
 - Terraform HCL for infrastructure
 
@@ -72,10 +91,16 @@ Cloud Run (services: Dispatch, Mastermind, Forge), Cloud Run Jobs (Operative), P
 - `str | None` not `Optional[str]`
 - `str(uuid4())` for IDs
 - `datetime.now(timezone.utc)` for timestamps
-- `str, Enum` pattern for string enums
+- `StrEnum` for string enums
 - Module-level docstrings on all files
 - snake_case variables/functions, PascalCase classes
 - Pydantic models for all data crossing component boundaries — never raw dicts
+- Read config from `Settings`, never `os.environ`. The exception is the operative
+  runtime contract the Lair injects: `TASK_ID`, `NODE_ID`, `SCHEME_ID`,
+  `MODEL_NAME`, `REPO_URL`, `BRANCH`, `TASK_TITLE`, `TASK_DESCRIPTION`,
+  `DOSSIER_URI`, `WORKSPACE_DIR`, `OPERATIVE_ID`, `LAIR_ID`
+- Credential settings accept both `HENCHMEN_X` and the bare name a Cloud Run
+  secret mount injects (`GITHUB_TOKEN`, `SLACK_BOT_TOKEN`, ...) via `AliasChoices`
 
 ## Task Completion Checklist
 
@@ -94,17 +119,23 @@ pytest tests/unit/              # 5. Unit tests
 ```
 henchmen/
 ├── src/henchmen/              # Main package
-│   ├── arsenal/               # MCP tool registry + tools/
+│   ├── arsenal/               # Tool registry + tools/ (runs inside the operative)
+│   ├── cli/                   # init wizard, doctor, chat, serve, eval
 │   ├── config/settings.py     # Pydantic settings (HENCHMEN_ prefix)
-│   ├── dispatch/              # Intake router + handlers/
+│   ├── dispatch/              # Intake router + handlers/ + slack_bot.py
 │   ├── dossier/               # Context builder
+│   ├── evals/                 # Offline eval harness + SQLite history
 │   ├── forge/                 # CI + merge queue
-│   ├── mastermind/            # Orchestrator
-│   ├── models/                # Pydantic data models (task, operative, scheme, dossier)
+│   ├── mastermind/            # Orchestrator + scheme_executor/
+│   ├── models/                # Pydantic data models (task, operative, scheme, dossier, llm, evaluation)
+│   ├── observability/         # Cost tracking, metrics API, tracing
 │   ├── operative/             # Coding agent
-│   └── schemes/               # DAG workflow blueprints
+│   ├── providers/             # gcp/ aws/ local/ + anthropic, openai, registry, tiers, pricing
+│   ├── schemes/               # DAG workflow blueprints
+│   └── utils/                 # git, retry, redaction, stack detection
 ├── containers/                # Dockerfiles (dispatch, forge, mastermind, operative)
-├── terraform/                 # IaC (environments, modules, shared)
+├── evals/fixtures/            # Eval fixtures + baseline.json
+├── terraform/                 # IaC (environments, modules)
 ├── tests/                     # unit/ and integration/, conftest.py
 └── pyproject.toml             # Build + tool config
 ```
@@ -115,6 +146,11 @@ Every error/exception path in the scheme executor returns `condition: "fail"`, n
 - Max retry exhaustion → fail + escalate
 - Clone failures, missing repo, CI exceptions → fail
 - Lair provisioning failure → fail in prod/staging (simulated pass only in dev)
+- Missing repo or GitHub token in `create_pr` → fail, never a fabricated PR URL
+- A deterministic node with no registered handler → fail
+- An undetectable project stack in a CI gate → fail, not "skipped"
+- A CI command that cannot run must surface its real exit code; never swallow
+  it with `2>/dev/null || echo SKIP`
 - Lint checks only run on files changed by the operative (`git diff --name-only origin/main`)
 
 ## Container Build & Deploy
@@ -137,17 +173,23 @@ gcloud run jobs update henchmen-${ENV}-lair-template \
 
 ## What NOT To Do
 
-- Don't hardcode LLM model names — use `HENCHMEN_` settings or scheme node `model_name`
+- Don't hardcode LLM model names — scheme nodes name a `ModelTier`, providers resolve it from `Settings`
 - Don't put logic in Dispatch — it normalizes and publishes, nothing more
 - Don't use raw dicts across components — use the Pydantic models
 - Don't use `Optional[X]` — use `X | None`
 - Don't use naive datetimes — always UTC
 - Don't skip the checklist — ruff, mypy, pytest must all pass
 - Don't commit secrets — use Secret Manager via settings
+- Don't read `os.environ` for anything that has a `Settings` field — the only
+  exception is the operative runtime contract listed under Key Conventions
+- Don't add a second price table — `providers/pricing.py` is the only one
 - Don't commit or push without explicit user permission
 - Don't return `condition: "pass"` on errors — always fail-closed
 - Don't upgrade TIMED_OUT to COMPLETED — timed out means verification wasn't done
 - Don't run `eslint --max-warnings=0` on the whole repo — only lint changed files
-- Don't forget OIDC `audience` on Pub/Sub push subscriptions — causes silent 403s
+- Don't forget OIDC `audience` on Pub/Sub push subscriptions, and inject
+  `HENCHMEN_PUBSUB_OIDC_AUDIENCE` to match — a mismatch rejects every push with 401
+- Don't let a test reach a live API — `integration_settings` blanks every
+  credential on purpose; keep it that way
 - Don't use Claude as the git author — all commits must be authored by the human developer
 - Don't add Co-Authored-By lines attributing Claude to commits

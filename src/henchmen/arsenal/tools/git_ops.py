@@ -8,26 +8,36 @@ Security notes
 - :func:`git_commit` validates every staged file against the workspace root
   after normalizing absolute paths — this prevents an LLM from staging files
   outside the operative's sandbox.
-- :func:`git_force_push` is gated by the ``HENCHMEN_ALLOW_FORCE_PUSH``
-  environment variable (default OFF) and additionally refuses to target any
-  protected branch (``main``, ``master``, ``develop``, ``trunk``, ``release*``).
-  The intent is that force-push is never needed for a healthy Henchmen
-  workflow; leaving it off by default protects the target repo's history from
-  hallucinated agent actions.
+- :func:`git_push` and :func:`git_force_push` validate the push target before
+  handing it to git. The destination side of a ``src:dst`` refspec is checked
+  against the protected list (``main``, ``master``, ``develop``, ``trunk``,
+  ``release*``), and option-like values (``--mirror``) or force refspecs
+  (``+branch:main``) are rejected outright — Henchmen delivers work through
+  human-reviewable pull requests, never by pushing to a protected branch.
+- :func:`git_force_push` additionally requires ``settings.allow_force_push``
+  (``HENCHMEN_ALLOW_FORCE_PUSH``, default OFF). Force-push is never needed for
+  a healthy Henchmen workflow; leaving it off protects the target repo's
+  history from hallucinated or prompt-injected agent actions.
 """
 
-import asyncio
 import os
+import re
 from typing import Any
 
-from henchmen.arsenal._workspace import ensure_in_workspace
+from henchmen.arsenal._process import run_command
+from henchmen.arsenal._workspace import current_workspace_dir, ensure_in_workspace
 from henchmen.arsenal.registry import tool
 
-# Branches that MUST NEVER be force-pushed, even when HENCHMEN_ALLOW_FORCE_PUSH
-# is set. Match is case-insensitive and applied after stripping ``origin/`` and
-# any leading ``refs/heads/``.
+# Branches that MUST NEVER be pushed to by an operative. Match is
+# case-insensitive and applied after stripping ``origin/`` and any leading
+# ``refs/heads/``.
 _PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "trunk"})
 _PROTECTED_PREFIXES = ("release", "rel/", "stable")
+
+# A branch name git will treat as a ref rather than an option. Rejects an
+# empty value, a leading ``-`` (parsed as a git option), a leading ``+``
+# (force refspec), whitespace, and shell-significant characters.
+_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 
 
 def _resolve_working_dir(working_dir: str) -> str:
@@ -42,13 +52,19 @@ def _resolve_working_dir(working_dir: str) -> str:
 
 
 def _branch_is_protected(branch: str | None) -> bool:
-    """Return True if ``branch`` is a protected name that must never be force-pushed."""
+    """Return True if ``branch`` names a protected branch.
+
+    Accepts a bare name, an ``origin/``- or ``refs/heads/``-prefixed ref, or a
+    ``src:dst`` refspec — for a refspec only the destination side matters,
+    since that is the ref the remote would end up writing.
+    """
     if not branch:
         # HEAD / current branch — we can't tell without consulting git, so
         # conservatively refuse. Callers that legitimately want to force-push
         # MUST pass the explicit ``henchmen/*`` branch name.
         return True
-    name = branch.strip().lower()
+    name = branch.strip().lower().split(":")[-1]
+    name = name.lstrip("+")
     if name.startswith("origin/"):
         name = name[len("origin/") :]
     if name.startswith("refs/heads/"):
@@ -58,22 +74,35 @@ def _branch_is_protected(branch: str | None) -> bool:
     return any(name.startswith(prefix) for prefix in _PROTECTED_PREFIXES)
 
 
+def _push_target_error(branch: str) -> str | None:
+    """Return an error message if ``branch`` is not a safe push target.
+
+    Rejects git options, force refspecs, multi-colon refspecs and anything
+    outside the conservative branch-name character set, then applies the
+    protected-branch check to the destination side.
+    """
+    if not branch or branch != branch.strip():
+        return "branch must be a non-empty name without surrounding whitespace"
+    parts = branch.split(":")
+    if len(parts) > 2:
+        return f"invalid push target '{branch}': expected 'branch' or 'src:dst'"
+    for part in parts:
+        if not _BRANCH_RE.fullmatch(part):
+            return (
+                f"invalid push target '{branch}': branch names must match "
+                "[A-Za-z0-9][A-Za-z0-9._/-]* (no options, force refspecs, or whitespace)"
+            )
+    if _branch_is_protected(parts[-1]):
+        return (
+            f"refusing to push to protected branch '{parts[-1]}'. Henchmen delivers work "
+            "through pull requests — push the task's henchmen/* branch instead."
+        )
+    return None
+
+
 async def _run_git(*args: str, working_dir: str = "") -> dict[str, Any]:
     """Run a git command and return stdout/stderr/returncode."""
-    kwargs: dict[str, Any] = {
-        "stdout": asyncio.subprocess.PIPE,
-        "stderr": asyncio.subprocess.PIPE,
-    }
-    if working_dir:
-        kwargs["cwd"] = working_dir
-    proc = await asyncio.create_subprocess_exec("git", *args, **kwargs)
-    stdout, stderr = await proc.communicate()
-    return {
-        "stdout": stdout.decode("utf-8"),
-        "stderr": stderr.decode("utf-8"),
-        "return_code": proc.returncode,
-        "success": proc.returncode == 0,
-    }
+    return await run_command("git", *args, cwd=working_dir)
 
 
 @tool(
@@ -83,14 +112,15 @@ async def _run_git(*args: str, working_dir: str = "") -> dict[str, Any]:
 )
 async def git_branch_create(branch_name: str, base_branch: str = "main", working_dir: str = "") -> dict[str, Any]:
     """Create a new branch based on base_branch and check it out."""
+    for value, label in ((branch_name, "branch_name"), (base_branch, "base_branch")):
+        if not value or not _BRANCH_RE.fullmatch(value):
+            return {"error": f"invalid {label} '{value}': not a valid git branch name", "success": False}
     try:
         safe_working_dir = _resolve_working_dir(working_dir)
     except PermissionError as exc:
         return {"error": f"access denied: {exc}", "success": False}
-    fetch_result = await _run_git("fetch", "origin", base_branch, working_dir=safe_working_dir)
-    if not fetch_result["success"]:
-        # Continue even if fetch fails (local-only repo)
-        pass
+    # A failed fetch is tolerated: the repo may be local-only.
+    await _run_git("fetch", "origin", base_branch, working_dir=safe_working_dir)
     result = await _run_git("checkout", "-b", branch_name, f"origin/{base_branch}", working_dir=safe_working_dir)
     if not result["success"]:
         # Try without origin/ prefix
@@ -110,23 +140,27 @@ async def git_commit(message: str, files: list[str] | str | None = None, working
     Every supplied file path is validated against the workspace root. A file
     that escapes the workspace causes the entire stage to abort — we do not
     silently skip paths, because a half-staged commit is a worse outcome than
-    a clear access-denied error.
+    a clear access-denied error. Likewise, when explicit staging fails we
+    return that failure rather than falling back to ``git add -A``: staging
+    files the model did not ask for is a silently wrong commit.
     """
     import json as _json
 
-    from henchmen.arsenal._workspace import get_workspace_root
+    if not message or not message.strip():
+        return {"error": "commit message must be a non-empty string", "success": False}
 
     try:
         safe_working_dir = _resolve_working_dir(working_dir)
     except PermissionError as exc:
         return {"error": f"access denied: {exc}", "success": False}
 
-    # When the caller did not supply a working_dir, default to the workspace
-    # root rather than the test runner's cwd. This makes git_commit
-    # consistent regardless of where the operative happens to be invoked
-    # from and avoids accidentally writing into the host repository.
+    # When the caller did not supply a working_dir, run where the operative
+    # is working — it chdirs into the clone at ``<root>/<task id>``, which is
+    # the git repository. The workspace root itself is only the parent and has
+    # no ``.git``, so defaulting to it makes every git_commit fail with
+    # "not a git repository".
     if not safe_working_dir:
-        safe_working_dir = get_workspace_root()
+        safe_working_dir = current_workspace_dir()
 
     # Normalize files: models sometimes pass a JSON string instead of a list
     file_list: list[str] | None = None
@@ -147,22 +181,13 @@ async def git_commit(message: str, files: list[str] | str | None = None, working
         base_dir = safe_working_dir
         for f in file_list:
             # Resolve absolute against workspace, relative against working_dir.
-            if os.path.isabs(f):
-                try:
-                    resolved = ensure_in_workspace(f)
-                except PermissionError as exc:
-                    return {"error": f"staged file '{f}' is outside workspace: {exc}", "success": False}
-                cleaned.append(os.path.relpath(resolved, base_dir))
-            else:
-                try:
-                    resolved = ensure_in_workspace(os.path.join(base_dir, f))
-                except PermissionError as exc:
-                    return {"error": f"staged file '{f}' is outside workspace: {exc}", "success": False}
-                cleaned.append(os.path.relpath(resolved, base_dir))
+            candidate = f if os.path.isabs(f) else os.path.join(base_dir, f)
+            try:
+                resolved = ensure_in_workspace(candidate)
+            except PermissionError as exc:
+                return {"error": f"staged file '{f}' is outside workspace: {exc}", "success": False}
+            cleaned.append(os.path.relpath(resolved, base_dir))
         add_result = await _run_git("add", "--", *cleaned, working_dir=safe_working_dir)
-        # If specific file staging fails, fall back to staging all changes
-        if not add_result["success"]:
-            add_result = await _run_git("add", "-A", working_dir=safe_working_dir)
     else:
         add_result = await _run_git("add", "-A", working_dir=safe_working_dir)
     if not add_result["success"]:
@@ -176,20 +201,23 @@ async def git_commit(message: str, files: list[str] | str | None = None, working
 @tool(
     name="git_push",
     category="git_ops",
-    description="Push the current branch to the remote.",
+    description=(
+        "Push the current branch to the remote, setting upstream. Refuses to target a "
+        "protected branch (main/master/develop/trunk/release*) — Henchmen delivers work "
+        "through pull requests."
+    ),
 )
 async def git_push(branch: str | None = None, working_dir: str = "") -> dict[str, Any]:
     """Push to the remote. Force-push is intentionally NOT exposed by default."""
+    if branch:
+        target_error = _push_target_error(branch)
+        if target_error:
+            return {"error": target_error, "success": False}
     try:
         safe_working_dir = _resolve_working_dir(working_dir)
     except PermissionError as exc:
         return {"error": f"access denied: {exc}", "success": False}
-    args = ["push", "origin"]
-    if branch:
-        args.append(branch)
-    else:
-        args.extend(["--set-upstream", "origin", "HEAD"])
-    return await _run_git(*args, working_dir=safe_working_dir)
+    return await _run_git("push", "--set-upstream", "origin", branch or "HEAD", working_dir=safe_working_dir)
 
 
 @tool(
@@ -206,12 +234,14 @@ async def git_push(branch: str | None = None, working_dir: str = "") -> dict[str
 async def git_force_push(branch: str | None = None, working_dir: str = "") -> dict[str, Any]:
     """Destructive force-push. Gated and branch-restricted by design.
 
-    Refuses to run unless ``HENCHMEN_ALLOW_FORCE_PUSH`` is set to a truthy
-    value. Refuses to target any protected branch. Refuses to operate on an
-    implicit ``HEAD`` — an explicit branch name must be supplied so operators
-    can audit what was force-pushed from the command line alone.
+    Refuses to run unless ``settings.allow_force_push`` is enabled. Refuses to
+    target any protected branch. Refuses to operate on an implicit ``HEAD`` —
+    an explicit branch name must be supplied so operators can audit what was
+    force-pushed from the command line alone.
     """
-    if os.environ.get("HENCHMEN_ALLOW_FORCE_PUSH", "").lower() not in ("1", "true", "yes", "on"):
+    from henchmen.config.settings import get_settings
+
+    if not get_settings().allow_force_push:
         return {
             "error": (
                 "git_force_push is disabled. Set HENCHMEN_ALLOW_FORCE_PUSH=1 in the "
@@ -221,14 +251,17 @@ async def git_force_push(branch: str | None = None, working_dir: str = "") -> di
             ),
             "success": False,
         }
-    if _branch_is_protected(branch) or branch is None:
+    if not branch:
         return {
             "error": (
-                f"refusing to force-push to protected branch '{branch or 'HEAD'}'. "
-                "Supply an explicit henchmen/* branch name if this is legitimately required."
+                "refusing to force-push the implicit current branch. Supply an explicit "
+                "henchmen/* branch name if this is legitimately required."
             ),
             "success": False,
         }
+    target_error = _push_target_error(branch)
+    if target_error:
+        return {"error": target_error, "success": False}
     try:
         safe_working_dir = _resolve_working_dir(working_dir)
     except PermissionError as exc:
@@ -265,7 +298,8 @@ async def git_log(max_count: int = 10, working_dir: str = "") -> dict[str, Any]:
         safe_working_dir = _resolve_working_dir(working_dir)
     except PermissionError as exc:
         return {"error": f"access denied: {exc}", "success": False}
-    return await _run_git("log", f"--max-count={max_count}", "--oneline", "--decorate", working_dir=safe_working_dir)
+    count = max(1, min(int(max_count), 200))
+    return await _run_git("log", f"--max-count={count}", "--oneline", "--decorate", working_dir=safe_working_dir)
 
 
 @tool(

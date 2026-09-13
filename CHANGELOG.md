@@ -12,7 +12,158 @@ we hit `1.0.0`, standard semver rules apply.
 
 ## [Unreleased]
 
-_No changes yet._
+The full-review release. A sixteen-dimension audit of the whole repository
+produced 490 findings; every critical and high one was independently verified
+before being fixed. Three root causes account for most of them: scheme nodes
+had been migrated to model *tiers* that only two of five providers resolved,
+roughly sixty raw `os.environ` reads bypassed `Settings` so `.env.local` was
+silently ignored, and the Dispatch container never ran its own HTTP app.
+
+### Added
+- `henchmen init` (alias `henchmen setup`) — an interactive setup wizard. It
+  picks the deployment mode, LLM provider and per-tier models from the model
+  list your key can actually reach, validates GitHub, Slack and Jira
+  credentials against their APIs, lists your Slack channels and joins the one
+  you choose, then writes `.env.local` atomically with a backup. Flags:
+  `--yes`, `--dry-run`, `--section`, `--env-file`.
+- `src/henchmen/providers/tiers.py` — one tier resolver shared by every
+  provider, the cost tracker and the CLI. Accepts the friendly provider
+  aliases `ollama`, `vertex` and `bedrock`.
+- `src/henchmen/providers/pricing.py` — the single token price table, with
+  vendor model-id normalisation (dated snapshots, Vertex `@` forms, Bedrock
+  ids) and cache-read/cache-write aware cost estimation.
+- Per-tier model settings for every provider: `vertex_ai_model_reasoning`
+  (Vertex previously had no reasoning tier), `llm_ollama_model_{complex,light,reasoning}`,
+  and `bedrock_model_{complex,light,reasoning}`.
+- `Settings.operative_env()` — the `HENCHMEN_*` variables an operative
+  container needs, so operator-configured limits and tier models actually
+  reach it.
+- `Settings.validate_for_runtime()` — reports missing API keys, empty tier
+  models, non-positive limits, and a missing OIDC audience or metrics token in
+  staging and prod, without raising.
+- New settings: `llm_chat_model`, `allow_force_push`, `local_serve_port`,
+  `local_forward_base_url`, `metrics_auth_token`, `lair_service_account`.
+- `henchmen doctor` now builds real `Settings` and probes live credentials
+  (GitHub token and repo push access, Slack tokens and channel membership,
+  Ollama reachability and pulled models, Anthropic/OpenAI keys, Jira), prints
+  the resolved model tiers, and takes `--offline`.
+- Slack Socket Mode now starts inside the Dispatch process and joins
+  `slack_notification_channel` on startup.
+
+### Changed
+- **Credential settings accept two spellings.** `github_token`,
+  `slack_bot_token`, `slack_app_token`, `slack_signing_secret`,
+  `jira_base_url`, `jira_email` and `jira_api_token` accept both the
+  `HENCHMEN_`-prefixed name and the bare name a Cloud Run secret mount injects
+  (`GITHUB_TOKEN`, `SLACK_BOT_TOKEN`, ...), with the prefixed name winning.
+  The old `*_secret` fields are gone; their env names still work.
+- **The Dispatch container runs the FastAPI app.** `containers/dispatch/entrypoint.sh`
+  now execs uvicorn instead of a stub health server, so `/api/v1/tasks`,
+  `/webhooks/{slack,github,jira}` and `/pubsub/*` exist in every deployment.
+  The Slack bot starts from the app lifespan.
+- **Vertex light tier defaults to `gemini-2.5-flash`** (was `gemini-2.5-pro`,
+  which made the "95% cheaper" light tier cost the same as complex).
+- **Anthropic tier defaults are current model ids**: `claude-sonnet-5`,
+  `claude-haiku-4-5`, `claude-opus-5`.
+- `MODEL_NAME` for an operative defaults to `default/complex` rather than a
+  Gemini model name, so a node without an explicit model works on any provider.
+- `Settings` validates provider names at construction; a typo fails immediately
+  with the valid list instead of deep inside a container.
+- The default Ollama model is `qwen2.5-coder:7b` — `llama3.2` cannot reliably
+  drive the operative's tool loop.
+- `docker-compose.yml` runs a single `henchmen serve` container with the Docker
+  socket mounted, so the stack can actually execute a task.
+- `henchmen serve` no longer overrides values from `.env.local`.
+- `henchmen eval` accepts the documented short form again
+  (`henchmen eval --provider X`), plus `--all`, and provider aliases.
+- The eval harness moved to `src/henchmen/evals/` so it works from an installed
+  wheel; `evals/` keeps re-export shims and the fixtures.
+- `pytest`, `ruff` and the `[local]` extra are installed in the mastermind and
+  operative images so cloud-mode CI checks and direct-LLM operatives work.
+- `src/henchmen/__init__.py` reads `__version__` from package metadata.
+
+### Fixed
+- **Tier names reached provider APIs unresolved.** Vertex AI, OpenAI and
+  Bedrock were sent the literal string `default/complex` as a model id, so
+  every agentic node failed on those providers.
+- **Circular imports** made `henchmen.dossier`, `henchmen.models.dossier` and
+  `henchmen.mastermind.server` unimportable in a fresh interpreter — the
+  Mastermind container crashed on start.
+- **The local CI gate could not fail.** A command suffixed with
+  `2>/dev/null || echo SKIP` always exited 0, so lint and test failures were
+  reported as passes.
+- **`create_pr` fabricated a PR URL** and returned `condition: "pass"` when the
+  GitHub token was missing, finalising the task and triggering CI on a PR that
+  did not exist. It now fails closed, as do unknown deterministic nodes and
+  undetectable project stacks.
+- **`CloudRunOrchestrator` dropped the `secrets` argument**, so `GITHUB_TOKEN`
+  never reached an operative on GCP, and `get_status` compared against
+  condition names that do not exist, so it could only ever report
+  `PROVISIONING`.
+- **A local operative published its report to its own in-process broker**, so
+  Mastermind never received it. The broker now forwards to the host when
+  `local_forward_base_url` is set.
+- Cost was priced at Anthropic rates for every provider once schemes used tier
+  names, over-counting Gemini by up to 9x and tripping the ceiling early.
+- `symbol_lookup` relied on a GNU word-boundary extension and silently returned
+  zero matches on grep builds that ignore it in `-E` mode.
+- The GitHub PR-comment trigger had no authorization: any commenter could start
+  a paid operative run. It now requires a trusted `author_association`.
+- Terraform: Mastermind's `run.developer` role was conditioned to services, not
+  jobs, so every lair provisioning was denied; it had no Firestore role; and
+  neither `HENCHMEN_FIRESTORE_DATABASE` nor `HENCHMEN_PUBSUB_OIDC_AUDIENCE` was
+  injected, so services opened the wrong database and rejected every Pub/Sub
+  push with 401.
+- The Slack bot published from a Bolt worker thread via
+  `asyncio.get_event_loop()`, which raises on Python 3.12+; fetched thread
+  context was dropped by the normalizer; and mention stripping matched a
+  literal `<@henchmen>` that Slack never sends.
+- Jira webhook signatures are verified against `X-Hub-Signature`, the header
+  Jira Cloud actually sends.
+- `henchmen doctor` ignored `.env.local` entirely because it read `os.environ`.
+- Integration tests no longer authenticate with the developer's real
+  credentials; `integration_settings` blanks them.
+
+### Removed
+- `src/henchmen/arsenal/server.py` (the FastMCP tool server) and the `mcp`
+  dependency — Arsenal runs in-process inside the operative.
+- `src/henchmen/forge/ci_orchestrator.py` and `pr_builder.py` — dead code that
+  nothing imported; Forge runs CI in `server.py` and Mastermind opens PRs.
+- The `henchmen_dev.db` SQLite database and its WAL/SHM files are no longer
+  tracked in git.
+
+### Security
+- Secret redaction now applies to the whole `henchmen` logger tree and formats
+  the record before matching, so `%s` arguments are redacted too. Anthropic
+  `sk-ant-` keys were added to the pattern.
+- `/metrics` requires a bearer token when `metrics_auth_token` is set, and
+  returns 401 in staging and prod when it is not. It no longer returns raw task
+  payloads.
+- `git_push` and `git_force_push` parse `src:dst` refspecs, so a push to a
+  protected branch cannot be disguised; force-push additionally requires
+  `allow_force_push`.
+- Arsenal subprocesses have timeouts and decode with replacement characters
+  rather than raising on invalid bytes.
+- `.gitleaks.toml` loads the default rule set; the hook was scanning with zero
+  rules.
+
+## [0.2.1] - 2026-04-12
+
+Direct-LLM providers and the interactive task builder.
+
+### Added
+- `henchmen chat` — an interactive REPL that turns a conversation into a
+  structured task and dispatches it.
+- A separate chat model setting so the task builder need not use the operative
+  model.
+
+### Fixed
+- Anthropic provider: tool and assistant message conversion, orphaned
+  `tool_result` cleanup, tier resolution inside `generate()`, and corrected
+  model ids.
+- Local mode: CI checks run inside Docker, `github_token` reads were unified,
+  scheme selection priority and datetime serialization were corrected, and a
+  task branch missing on the remote falls back to main.
 
 ## [0.1.1] - 2026-04-10
 

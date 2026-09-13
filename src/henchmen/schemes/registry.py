@@ -2,9 +2,13 @@
 
 import importlib
 import pkgutil
+import sys
 
 from henchmen.models.scheme import SchemeDefinition
 from henchmen.schemes.base import SchemeGraph
+
+# Modules in this package that never define a scheme, so auto_discover skips them.
+_NON_SCHEME_MODULES = frozenset({"base", "registry"})
 
 
 class SchemeRegistry:
@@ -47,12 +51,12 @@ class SchemeRegistry:
         package_path = schemes_pkg.__path__
         package_name = schemes_pkg.__name__
 
-        import sys
-
         for module_info in pkgutil.iter_modules(package_path):
             module_name = f"{package_name}.{module_info.name}"
-            # Skip the base and registry modules themselves
-            if module_info.name in ("base", "registry"):
+            # Skip the machinery and the private helper modules (shared prompt
+            # templates, pipeline factories) — they register nothing, and
+            # reloading them would rebuild constants the scheme modules hold.
+            if module_info.name in _NON_SCHEME_MODULES or module_info.name.startswith("_"):
                 continue
             if module_name in sys.modules:
                 # Module already loaded — reload to re-execute module-level registrations

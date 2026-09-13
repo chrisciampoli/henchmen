@@ -2,24 +2,85 @@
 
 Exposes two surfaces:
 
-1. ``/metrics/summary`` and ``/metrics/tasks`` -- JSON endpoints used by the
-   built-in dashboard and self-hosters polling from scripts. ``ci_pass_rate``
-   is returned as ``null`` (``None``) rather than ``0.0`` when there is no
-   decided data, so alerting rules like ``ci_pass_rate < 0.5`` do not page on
-   empty windows.
+1. ``/metrics/summary``, ``/metrics/tasks`` and ``/metrics/tasks/{id}`` -- JSON
+   endpoints used by the built-in dashboard and self-hosters polling from
+   scripts. ``ci_pass_rate`` is returned as ``null`` (``None``) rather than
+   ``0.0`` when there is no decided data, so alerting rules like
+   ``ci_pass_rate < 0.5`` do not page on empty windows.
 2. ``/metrics/prometheus`` -- OpenMetrics text format for Prometheus scrapers.
    Requires the ``observability`` extras (``prometheus-client``). Returns 503
    with a helpful message when the dependency is missing so operators discover
    the gap immediately rather than silently getting no data.
+
+Security
+--------
+Task execution documents hold the original task payload (Slack thread
+messages, Jira fields), interrupted-operative reports (git diffs) and per-node
+lint/test output. None of that leaves this router: every task response is
+projected onto :data:`_PUBLIC_TASK_FIELDS`, which is ids, statuses, timestamps
+and numeric telemetry only.
+
+Access is gated on ``HENCHMEN_METRICS_AUTH_TOKEN``. When the token is set every
+request must carry ``Authorization: Bearer <token>``. When it is empty the
+endpoints stay open in DEV (with a startup warning) and fail closed with 401 in
+STAGING/PROD.
 """
 
 import logging
-from typing import Any
+import secrets
+from collections.abc import Callable, Coroutine
+from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 
+from henchmen.observability.tracker import SUCCESS_STATUSES
+
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
+
 logger = logging.getLogger(__name__)
+
+# Fields safe to hand to any caller that can reach the metrics port. Everything
+# omitted here is either free-form task content or operative output.
+_PUBLIC_TASK_FIELDS: tuple[str, ...] = (
+    "task_id",
+    "scheme_id",
+    "source",
+    "created_at",
+    "completed_at",
+    "last_heartbeat",
+    "final_status",
+    "execution_state",
+    "current_node_id",
+    "escalation_node",
+    "pr_url",
+    "pr_number",
+    "ci_passed",
+    "ci_fix_attempts",
+    "ci_fix_in_progress",
+    "recovery_attempts",
+    "nodes_executed",
+    "node_metrics",
+    "total_input_tokens",
+    "total_output_tokens",
+    "total_model_calls",
+    "total_tool_calls",
+    "estimated_cost_usd",
+    "wall_clock_seconds",
+    "rag_chunks_retrieved",
+    "confidence_score",
+    "evaluation_scores",
+)
+
+
+def _public_task_view(task: dict[str, Any]) -> dict[str, Any]:
+    """Project a task execution document onto the non-sensitive fields."""
+    view = {field: task[field] for field in _PUBLIC_TASK_FIELDS if field in task}
+    files_changed = task.get("files_changed")
+    if isinstance(files_changed, list):
+        view["files_changed_count"] = len(files_changed)
+    return view
 
 
 def _compute_summary(tasks: list[dict[str, Any]], days: int) -> dict[str, Any]:
@@ -36,8 +97,10 @@ def _compute_summary(tasks: list[dict[str, Any]], days: int) -> dict[str, Any]:
     total_conf = sum(t.get("confidence_score", 0) for t in tasks)
     count = len(tasks)
 
-    tasks_completed = sum(1 for t in tasks if t.get("final_status") in ("completed", "COMPLETED"))
-    tasks_escalated = sum(1 for t in tasks if t.get("final_status") in ("escalated", "ESCALATED"))
+    # ``pr_created`` is the happy path of the bugfix/feature schemes; counting
+    # only ``completed`` reported every successful task as not-completed.
+    tasks_completed = sum(1 for t in tasks if str(t.get("final_status") or "").lower() in SUCCESS_STATUSES)
+    tasks_escalated = sum(1 for t in tasks if str(t.get("final_status") or "").lower() == "escalated")
 
     by_scheme: dict[str, dict[str, Any]] = {}
     for t in tasks:
@@ -89,9 +152,70 @@ def _compute_summary(tasks: list[dict[str, Any]], days: int) -> dict[str, Any]:
     }
 
 
-def create_metrics_router(tracker: Any) -> APIRouter:
+def build_metrics_auth_dependency(settings: "Settings") -> Callable[..., Coroutine[Any, Any, None]]:
+    """Return the FastAPI dependency guarding the /metrics router.
+
+    Fail-closed: an unset token means "open" only in DEV, never in STAGING or
+    PROD. The token itself is never logged.
+    """
+    from henchmen.config.settings import Environment
+
+    token = (settings.metrics_auth_token or "").strip()
+    environment = settings.environment
+
+    if not token:
+        if environment in (Environment.STAGING, Environment.PROD):
+
+            async def _deny() -> None:
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "HENCHMEN_METRICS_AUTH_TOKEN is not configured; "
+                        f"the /metrics endpoints are disabled in {environment.value}."
+                    ),
+                )
+
+            logger.error(
+                "[metrics] HENCHMEN_METRICS_AUTH_TOKEN is empty in %s — /metrics endpoints will return 401",
+                environment.value,
+            )
+            return _deny
+
+        logger.warning(
+            "[metrics] HENCHMEN_METRICS_AUTH_TOKEN is empty — /metrics endpoints are unauthenticated in %s",
+            environment.value,
+        )
+
+        async def _allow() -> None:
+            return None
+
+        return _allow
+
+    expected = f"Bearer {token}"
+
+    async def _require_bearer(authorization: str = Header(default="")) -> None:
+        if not secrets.compare_digest(authorization.strip(), expected):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or missing bearer token for /metrics.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    return _require_bearer
+
+
+def create_metrics_router(tracker: Any, settings: "Settings | None" = None) -> APIRouter:
     """Create a metrics API router bound to the given TaskTracker."""
-    router = APIRouter(prefix="/metrics", tags=["metrics"])
+    if settings is None:
+        from henchmen.config.settings import get_settings
+
+        settings = get_settings()
+
+    router = APIRouter(
+        prefix="/metrics",
+        tags=["metrics"],
+        dependencies=[Depends(build_metrics_auth_dependency(settings))],
+    )
 
     @router.get("/summary")
     async def get_summary(days: int = Query(default=7, ge=1, le=90)) -> dict[str, Any]:
@@ -101,25 +225,28 @@ def create_metrics_router(tracker: Any) -> APIRouter:
 
     @router.get("/tasks")
     async def get_tasks(days: int = Query(default=7, ge=1, le=90)) -> dict[str, Any]:
-        """List recent task execution records."""
+        """List recent task execution records (telemetry only, no task content)."""
         tasks = await tracker.get_recent_tasks(days)
-        return {"period_days": days, "tasks": tasks}
+        return {"period_days": days, "tasks": [_public_task_view(t) for t in tasks]}
 
     @router.get("/tasks/{task_id}")
     async def get_task(task_id: str) -> dict[str, Any]:
-        """Retrieve a single task execution record by ID."""
+        """Retrieve a single task execution record (telemetry only) by ID."""
         task_data = await tracker.get_task(task_id)
         if task_data is None:
-            from fastapi import HTTPException
-
             raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-        return dict(task_data)
+        return _public_task_view(dict(task_data))
 
     @router.get("/prometheus")
     async def get_prometheus(
         days: int = Query(default=7, ge=1, le=90),
     ) -> PlainTextResponse:
         """Expose a minimal OpenMetrics surface for Prometheus scrapers.
+
+        Every series is a Gauge describing the trailing ``days`` window. They
+        are deliberately *not* counters: the values are recomputed from a
+        sliding window on each scrape, so they go down as old tasks age out and
+        ``rate()``/``increase()`` over them would report phantom resets.
 
         Falls back to a 503 if ``prometheus-client`` is not installed so
         operators learn about the missing extras instead of silently getting
@@ -129,7 +256,6 @@ def create_metrics_router(tracker: Any) -> APIRouter:
             from prometheus_client import (
                 CONTENT_TYPE_LATEST,
                 CollectorRegistry,
-                Counter,
                 Gauge,
                 generate_latest,
             )
@@ -146,43 +272,47 @@ def create_metrics_router(tracker: Any) -> APIRouter:
         tasks = await tracker.get_recent_tasks(days)
         summary = _compute_summary(tasks, days)
 
-        # Use a fresh registry per request so the gauge/counter values reflect
-        # the current window without leaking state across scrapes. Prometheus
-        # counters here are effectively snapshots: Henchmen's persistent store
-        # already owns the source of truth, so we expose derived totals.
+        # A fresh registry per request: the persistent store owns the source of
+        # truth, this endpoint only exposes a derived snapshot of the window.
         registry = CollectorRegistry()
+        window = str(days)
 
-        tasks_completed_total = Counter(
-            "henchmen_tasks_completed_total",
-            "Total tasks that reached a completed terminal state in the window.",
+        tasks_completed_window = Gauge(
+            "henchmen_tasks_completed_window",
+            "Tasks that reached a successful terminal state within the window.",
+            ["window_days"],
             registry=registry,
         )
-        tasks_escalated_total = Counter(
-            "henchmen_tasks_escalated_total",
-            "Total tasks that escalated in the window.",
+        tasks_escalated_window = Gauge(
+            "henchmen_tasks_escalated_window",
+            "Tasks that escalated within the window.",
+            ["window_days"],
             registry=registry,
         )
-        ci_pass_rate_gauge = Gauge(
-            "henchmen_ci_pass_rate",
-            "Fraction of decided CI runs that passed. Unset when no data.",
-            registry=registry,
-        )
-        cost_usd_gauge = Gauge(
-            "henchmen_cost_usd_total",
+        cost_usd_window = Gauge(
+            "henchmen_cost_usd_window",
             "Total estimated LLM spend (USD) over the window.",
+            ["window_days"],
             registry=registry,
         )
 
-        tasks_completed_total.inc(summary["tasks_completed"])
-        tasks_escalated_total.inc(summary["tasks_escalated"])
-        cost_usd_gauge.set(summary["total_cost_usd"])
+        tasks_completed_window.labels(window_days=window).set(summary["tasks_completed"])
+        tasks_escalated_window.labels(window_days=window).set(summary["tasks_escalated"])
+        cost_usd_window.labels(window_days=window).set(summary["total_cost_usd"])
 
-        # When there is no decided CI data the gauge is intentionally left
-        # unset rather than being pinned to 0. Prometheus will render this as
-        # "no sample", which is the right signal for "we do not know yet".
+        # With no decided CI data the gauge is not registered at all. An
+        # unlabelled Gauge exports its initial 0.0 even when ``set()`` is never
+        # called, which would page every alert of the form
+        # ``henchmen_ci_pass_rate < 0.5`` on an empty window.
         ci_pass_rate = summary["ci_pass_rate"]
         if ci_pass_rate is not None:
-            ci_pass_rate_gauge.set(ci_pass_rate)
+            ci_pass_rate_gauge = Gauge(
+                "henchmen_ci_pass_rate",
+                "Fraction of decided CI runs that passed. Absent when no data.",
+                ["window_days"],
+                registry=registry,
+            )
+            ci_pass_rate_gauge.labels(window_days=window).set(ci_pass_rate)
 
         return PlainTextResponse(
             content=generate_latest(registry).decode("utf-8"),

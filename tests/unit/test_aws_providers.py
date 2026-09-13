@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -154,7 +155,7 @@ class TestSNSMessageBroker:
         assert captured["MessageAttributes"]["source"]["StringValue"] == "cli"
 
     @pytest.mark.asyncio
-    async def test_publish_with_ordering_key(self):
+    async def test_publish_with_ordering_key_on_fifo_topic(self):
         mock_client = MagicMock()
         captured: dict = {}
 
@@ -168,9 +169,30 @@ class TestSNSMessageBroker:
         from henchmen.providers.aws.sns import SNSMessageBroker
 
         broker = SNSMessageBroker(_mock_settings())
-        await broker.publish("t", b"data", ordering_key="group-1")
+        await broker.publish("t.fifo", b"data", ordering_key="group-1")
 
         assert captured.get("MessageGroupId") == "group-1"
+
+    @pytest.mark.asyncio
+    async def test_publish_omits_message_group_id_on_standard_topic(self):
+        """Standard SNS topics reject MessageGroupId with InvalidParameter."""
+        mock_client = MagicMock()
+        captured: dict = {}
+
+        def capture_publish(**kwargs):
+            captured.update(kwargs)
+            return {"MessageId": "msg-005"}
+
+        mock_client.publish.side_effect = capture_publish
+        self._boto3.client.return_value = mock_client
+
+        from henchmen.providers.aws.sns import SNSMessageBroker
+
+        broker = SNSMessageBroker(_mock_settings())
+        msg_id = await broker.publish("t", b"data", ordering_key="group-1")
+
+        assert msg_id == "msg-005"
+        assert "MessageGroupId" not in captured
 
 
 # ---------------------------------------------------------------------------
@@ -270,31 +292,42 @@ class TestDynamoDBDocumentStore:
         assert stored["status"] == "done"
 
     @pytest.mark.asyncio
-    async def test_update_merges_with_existing(self):
-        existing_data = {"status": "pending", "priority": 1}
-        get_calls = [0]
+    async def test_update_writes_only_the_given_fields_atomically(self):
+        """update() must not read-modify-write: that clobbers concurrent increments."""
         mock_table = MagicMock()
+        captured: dict = {}
 
-        def mock_get_item(**kwargs):
-            get_calls[0] += 1
-            if get_calls[0] == 1:
-                return {"Item": {"pk": "tasks", "sk": "t-4", "data": json.dumps(existing_data)}}
+        def capture_update(**kwargs):
+            captured.update(kwargs)
             return {}
 
-        mock_table.get_item.side_effect = mock_get_item
-        put_captured: dict = {}
-
-        def capture_put(**kwargs):
-            put_captured.update(kwargs)
-            return {}
-
-        mock_table.put_item.side_effect = capture_put
+        mock_table.update_item.side_effect = capture_update
         store = self._make_store(mock_table)
         await store.update("tasks", "t-4", {"status": "running"})
 
-        stored = json.loads(put_captured["Item"]["data"])
-        assert stored["status"] == "running"
-        assert stored["priority"] == 1
+        mock_table.get_item.assert_not_called()
+        mock_table.put_item.assert_not_called()
+        assert captured["Key"] == {"pk": "tasks", "sk": "t-4"}
+        assert captured["UpdateExpression"].startswith("SET ")
+        assert list(captured["ExpressionAttributeNames"].values()) == ["status"]
+        assert list(captured["ExpressionAttributeValues"].values()) == ["running"]
+
+    @pytest.mark.asyncio
+    async def test_update_converts_datetime_and_float(self):
+        mock_table = MagicMock()
+        captured: dict = {}
+
+        def capture_update(**kwargs):
+            captured.update(kwargs)
+            return {}
+
+        mock_table.update_item.side_effect = capture_update
+        store = self._make_store(mock_table)
+        moment = datetime(2026, 3, 29, 12, 0, tzinfo=UTC)
+        await store.update("queue", "e1", {"claimed_at": moment, "score": 0.5})
+
+        values = set(captured["ExpressionAttributeValues"].values())
+        assert values == {moment.isoformat(), Decimal("0.5")}
 
     @pytest.mark.asyncio
     async def test_delete_calls_delete_item(self):
@@ -364,7 +397,9 @@ class TestDynamoDBDocumentStore:
         assert len(name_map) == 2
         assert len(value_map) == 2
         # The value placeholders should contain the numeric deltas
-        assert set(value_map.values()) == {50, 0.25}
+        # Floats must be Decimal: boto3 raises "Float types are not supported".
+        assert set(value_map.values()) == {50, Decimal("0.25")}
+        assert all(not isinstance(v, float) for v in value_map.values())
 
     @pytest.mark.asyncio
     async def test_update_if_calls_update_item_with_condition(self):
@@ -1001,13 +1036,13 @@ class TestCodeBuildCIProvider:
         assert provider is not None
         self._boto3.client.assert_called_once_with("codebuild", region_name="us-east-1")
 
-    def test_init_without_settings(self):
+    def test_project_name_comes_from_settings_prefix(self):
         self._boto3.client.return_value = MagicMock()
 
         from henchmen.providers.aws.codebuild import CodeBuildCIProvider
 
-        provider = CodeBuildCIProvider()
-        assert provider is not None
+        provider = CodeBuildCIProvider(_mock_settings(aws_resource_prefix="acme"))
+        assert provider._project_name == "acme-ci"
 
     def test_buildspec_generation(self):
         from henchmen.providers.aws.codebuild import _build_buildspec

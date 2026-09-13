@@ -2,13 +2,27 @@
 
 ## Model Pricing Table
 
-Prices are per 1 million tokens, sourced from the `_PRICE_MAP` in `src/henchmen/observability/tracker.py`. These are placeholders -- check Google's Vertex AI pricing page for current rates.
+Prices are per 1 million tokens and come from `PRICE_TABLE` in
+`src/henchmen/providers/pricing.py`, the one place Henchmen prices tokens.
+They are list prices captured at the time of writing — check each vendor's
+pricing page for current rates.
 
-| Model | Input ($/1M tokens) | Output ($/1M tokens) | Used For |
-|-------|---------------------|----------------------|----------|
-| Gemini 3.1 Pro (`gemini-3.1-pro`) | ~$2.00 | ~$12.00 | `fix_tests` |
-| Gemini 2.5 Pro (`gemini-2.5-pro`) | ~$1.25 | ~$10.00 | `implement_fix`, `implement_feature`, `vertex_ai_model_complex` |
-| Gemini 2.5 Flash (`gemini-2.5-flash`) | ~$0.075 | ~$0.30 | `verify_changes`, `plan_implementation` |
+| Tier | Model | Input ($/1M) | Output ($/1M) |
+|------|-------|--------------|---------------|
+| `default/reasoning` | `gemini-3.1-pro` | 2.00 | 12.00 |
+| `default/complex` | `gemini-2.5-pro` | 1.25 | 10.00 |
+| `default/light` | `gemini-2.5-flash` | 0.30 | 2.50 |
+| `default/reasoning` | `claude-opus-5` | 5.00 | 25.00 |
+| `default/complex` | `claude-sonnet-5` | 2.00 | 10.00 |
+| `default/light` | `claude-haiku-4-5` | 1.00 | 5.00 |
+| `default/reasoning` | `o3` | 2.00 | 8.00 |
+| `default/complex` | `gpt-4.1` | 2.00 | 8.00 |
+| `default/light` | `gpt-4.1-mini` | 0.40 | 1.60 |
+
+Cached input is billed at a discount the table encodes per vendor: 10% of the
+input rate for Anthropic prompt caching, 25% for Gemini context caching. Cost
+is always computed with `estimate_cost` / `estimate_cost_for_settings` — never
+a second table.
 
 ## Per-Task Cost Breakdown by Node
 

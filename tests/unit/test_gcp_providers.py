@@ -313,58 +313,224 @@ class TestGCSObjectStore:
             assert keys == ["prefix/a.json", "prefix/b.json"]
 
 
+def _vertex_provider(mock_settings, **overrides):
+    """Build a VertexAIProvider with a fully populated tier mapping."""
+    mock_settings.vertex_ai_model_complex = overrides.get("complex", "gemini-2.5-pro")
+    mock_settings.vertex_ai_model_light = overrides.get("light", "gemini-2.5-flash")
+    mock_settings.vertex_ai_model_reasoning = overrides.get("reasoning", "gemini-3.1-pro")
+    with patch("henchmen.providers.gcp.vertex_ai.genai", MagicMock()):
+        from henchmen.providers.gcp.vertex_ai import VertexAIProvider
+
+        return VertexAIProvider(mock_settings)
+
+
+def _vertex_response(parts, *, prompt_tokens=100, output_tokens=20, cached=0, finish_reason="STOP"):
+    usage = MagicMock()
+    usage.prompt_token_count = prompt_tokens
+    usage.candidates_token_count = output_tokens
+    usage.cached_content_token_count = cached
+
+    candidate = MagicMock()
+    candidate.content.parts = parts
+    candidate.finish_reason = finish_reason
+
+    response = MagicMock()
+    response.candidates = [candidate]
+    response.usage_metadata = usage
+    return response
+
+
+def _text_part(text):
+    part = MagicMock()
+    part.text = text
+    part.function_call = None
+    return part
+
+
 class TestVertexAIProvider:
     def test_resolve_tier(self, mock_settings):
-        with patch("henchmen.providers.gcp.vertex_ai.genai", MagicMock()):
-            from henchmen.models.llm import ModelTier
-            from henchmen.providers.gcp.vertex_ai import VertexAIProvider
+        from henchmen.models.llm import ModelTier
 
-            provider = VertexAIProvider(mock_settings)
-            assert provider.resolve_tier(ModelTier.COMPLEX) == "gemini-2.5-pro"
-            assert provider.resolve_tier(ModelTier.LIGHT) == "gemini-2.5-flash"
+        provider = _vertex_provider(mock_settings)
+        assert provider.resolve_tier(ModelTier.COMPLEX) == "gemini-2.5-pro"
+        assert provider.resolve_tier(ModelTier.LIGHT) == "gemini-2.5-flash"
+
+    def test_resolve_tier_reasoning_uses_its_own_setting(self, mock_settings):
+        """REASONING used to silently alias COMPLEX, downgrading fix_tests/analyze_goal."""
+        from henchmen.models.llm import ModelTier
+
+        provider = _vertex_provider(mock_settings)
+        assert provider.resolve_tier(ModelTier.REASONING) == "gemini-3.1-pro"
 
     def test_resolve_tier_unknown_passthrough(self, mock_settings):
-        with patch("henchmen.providers.gcp.vertex_ai.genai", MagicMock()):
-            from henchmen.providers.gcp.vertex_ai import VertexAIProvider
+        provider = _vertex_provider(mock_settings)
+        assert provider.resolve_tier("gemini-2.5-pro") == "gemini-2.5-pro"
 
-            provider = VertexAIProvider(mock_settings)
-            assert provider.resolve_tier("gemini-2.5-pro") == "gemini-2.5-pro"
+    def test_resolve_tier_unconfigured_raises(self, mock_settings):
+        from henchmen.models.llm import ModelTier
 
-    def test_supported_models(self, mock_settings):
-        with patch("henchmen.providers.gcp.vertex_ai.genai", MagicMock()):
-            from henchmen.providers.gcp.vertex_ai import VertexAIProvider
+        provider = _vertex_provider(mock_settings, reasoning="")
+        with pytest.raises(ValueError, match="No model configured"):
+            provider.resolve_tier(ModelTier.REASONING)
 
-            provider = VertexAIProvider(mock_settings)
-            models = provider.supported_models()
-            assert "gemini-2.5-pro" in models
-            assert "gemini-2.5-flash" in models
+    def test_supported_models_comes_from_settings(self, mock_settings):
+        provider = _vertex_provider(mock_settings, complex="gemini-4-pro")
+        models = provider.supported_models()
+        assert models == ["gemini-4-pro", "gemini-2.5-flash", "gemini-3.1-pro"]
 
-    def test_estimate_cost(self, mock_settings):
-        with patch("henchmen.providers.gcp.vertex_ai.genai", MagicMock()):
-            from henchmen.providers.gcp.vertex_ai import VertexAIProvider
+    @pytest.mark.asyncio
+    async def test_generate_resolves_tier_name(self, mock_settings):
+        from henchmen.models.llm import Message, MessageRole, ModelTier
 
-            provider = VertexAIProvider(mock_settings)
-            cost = provider._estimate_cost("gemini-2.5-pro", 1_000_000, 1_000_000, 0)
-            assert cost == pytest.approx(1.25 + 10.0)
+        provider = _vertex_provider(mock_settings)
+        generate = AsyncMock(return_value=_vertex_response([_text_part("hi")]))
+        provider._client.aio.models.generate_content = generate
 
-    def test_estimate_cost_with_cache(self, mock_settings):
-        with patch("henchmen.providers.gcp.vertex_ai.genai", MagicMock()):
-            from henchmen.providers.gcp.vertex_ai import VertexAIProvider
+        result = await provider.generate(
+            messages=[Message(role=MessageRole.USER, content="Hi")],
+            model=ModelTier.REASONING.value,
+        )
 
-            provider = VertexAIProvider(mock_settings)
-            # 500k cached, 500k non-cached input, 100k output — gemini-2.5-pro
-            cost = provider._estimate_cost("gemini-2.5-pro", 1_000_000, 100_000, 500_000)
-            expected = (500_000 / 1_000_000) * 1.25 + (500_000 / 1_000_000) * 1.25 * 0.25 + (100_000 / 1_000_000) * 10.0
-            assert cost == pytest.approx(expected)
+        assert generate.call_args.kwargs["model"] == "gemini-3.1-pro"
+        assert result.model == "gemini-3.1-pro"
+        assert result.content == "hi"
+        assert result.finish_reason == "stop"
 
-    def test_estimate_cost_unknown_model_defaults(self, mock_settings):
-        with patch("henchmen.providers.gcp.vertex_ai.genai", MagicMock()):
-            from henchmen.providers.gcp.vertex_ai import VertexAIProvider
+    @pytest.mark.asyncio
+    async def test_generate_costs_via_shared_price_table(self, mock_settings):
+        from henchmen.models.llm import Message, MessageRole
+        from henchmen.providers.pricing import estimate_cost
 
-            provider = VertexAIProvider(mock_settings)
-            # Unknown model falls back to gemini-2.5-pro pricing
-            cost = provider._estimate_cost("unknown-model", 1_000_000, 0, 0)
-            assert cost == pytest.approx(1.25)
+        provider = _vertex_provider(mock_settings)
+        provider._client.aio.models.generate_content = AsyncMock(
+            return_value=_vertex_response(
+                [_text_part("hi")], prompt_tokens=1_000_000, output_tokens=100_000, cached=500_000
+            )
+        )
+
+        result = await provider.generate(
+            messages=[Message(role=MessageRole.USER, content="Hi")],
+            model="gemini-2.5-pro",
+        )
+
+        assert result.usage.input_tokens == 1_000_000
+        assert result.usage.cached_tokens == 500_000
+        assert result.usage.estimated_cost_usd == pytest.approx(
+            estimate_cost("gemini-2.5-pro", 1_000_000, 100_000, cached_input_tokens=500_000)
+        )
+
+    @pytest.mark.asyncio
+    async def test_generate_normalizes_max_tokens_finish_reason(self, mock_settings):
+        from henchmen.models.llm import Message, MessageRole
+
+        provider = _vertex_provider(mock_settings)
+        provider._client.aio.models.generate_content = AsyncMock(
+            return_value=_vertex_response([_text_part("hi")], finish_reason="FinishReason.MAX_TOKENS")
+        )
+
+        result = await provider.generate(
+            messages=[Message(role=MessageRole.USER, content="Hi")],
+            model="gemini-2.5-pro",
+        )
+        assert result.finish_reason == "max_tokens"
+
+    @pytest.mark.asyncio
+    async def test_generate_normalizes_safety_block_as_refusal(self, mock_settings):
+        from henchmen.models.llm import Message, MessageRole
+
+        provider = _vertex_provider(mock_settings)
+        provider._client.aio.models.generate_content = AsyncMock(
+            return_value=_vertex_response([_text_part("")], finish_reason="SAFETY")
+        )
+
+        result = await provider.generate(
+            messages=[Message(role=MessageRole.USER, content="Hi")],
+            model="gemini-2.5-pro",
+        )
+        assert result.finish_reason == "refusal"
+
+    def test_build_contents_emits_function_calls_and_responses(self, mock_settings):
+        """Tool-only assistant turns must not become empty text parts (400 INVALID_ARGUMENT)."""
+        from google.genai import types
+
+        from henchmen.models.llm import Message, MessageRole, ToolCall
+
+        provider = _vertex_provider(mock_settings)
+        contents = provider._build_contents(
+            [
+                Message(role=MessageRole.USER, content="Edit main.py"),
+                Message(
+                    role=MessageRole.ASSISTANT,
+                    content="",
+                    tool_calls=[ToolCall(id="call_1", name="file_edit", arguments={"path": "main.py"})],
+                ),
+                Message(role=MessageRole.TOOL, content="edited", tool_call_id="call_1"),
+            ],
+            types,
+        )
+
+        assert [c.role for c in contents] == ["user", "model", "user"]
+        model_parts = contents[1].parts
+        assert len(model_parts) == 1
+        assert model_parts[0].text is None
+        assert model_parts[0].function_call.name == "file_edit"
+        tool_part = contents[2].parts[0]
+        assert tool_part.function_response.name == "file_edit"
+        assert tool_part.function_response.response == {"result": "edited"}
+
+    def test_build_contents_merges_consecutive_same_role_turns(self, mock_settings):
+        from google.genai import types
+
+        from henchmen.models.llm import Message, MessageRole, ToolCall
+
+        provider = _vertex_provider(mock_settings)
+        contents = provider._build_contents(
+            [
+                Message(
+                    role=MessageRole.ASSISTANT,
+                    content="",
+                    tool_calls=[
+                        ToolCall(id="call_1", name="a", arguments={}),
+                        ToolCall(id="call_2", name="b", arguments={}),
+                    ],
+                ),
+                Message(role=MessageRole.TOOL, content="ra", tool_call_id="call_1"),
+                Message(role=MessageRole.TOOL, content="rb", tool_call_id="call_2"),
+            ],
+            types,
+        )
+
+        assert [c.role for c in contents] == ["model", "user"]
+        assert len(contents[1].parts) == 2
+
+    @pytest.mark.asyncio
+    async def test_generate_forwards_enum_and_array_items(self, mock_settings):
+        from henchmen.models.llm import Message, MessageRole, ToolDefinition, ToolParameter
+
+        provider = _vertex_provider(mock_settings)
+        generate = AsyncMock(return_value=_vertex_response([_text_part("hi")]))
+        provider._client.aio.models.generate_content = generate
+
+        await provider.generate(
+            messages=[Message(role=MessageRole.USER, content="Hi")],
+            model="gemini-2.5-pro",
+            tools=[
+                ToolDefinition(
+                    name="file_edit",
+                    description="Edit",
+                    parameters=[
+                        ToolParameter(name="mode", type="string", description="m", enum=["a", "b"]),
+                        ToolParameter(name="paths", type="array", description="p"),
+                    ],
+                )
+            ],
+        )
+
+        declaration = generate.call_args.kwargs["config"].tools[0].function_declarations[0]
+        schema = declaration.parameters
+        assert schema.properties["mode"].enum == ["a", "b"]
+        # Gemini rejects an ARRAY with no item type.
+        assert schema.properties["paths"].items is not None
 
 
 class TestCloudRunOrchestrator:
@@ -382,10 +548,13 @@ class TestCloudRunOrchestrator:
 
             orch = CloudRunOrchestrator(mock_settings)
 
+            # Mirrors the real Cloud Run v2 shape: Condition.type_ is the
+            # condition name ("Completed"), Condition.state is an enum whose
+            # member name carries the outcome ("CONDITION_SUCCEEDED").
             mock_exec_client = AsyncMock()
             mock_condition = MagicMock()
-            mock_condition.type_ = "CONDITION_SUCCEEDED"
-            mock_condition.state.name = "CONDITION_TRUE"
+            mock_condition.type_ = "Completed"
+            mock_condition.state.name = "CONDITION_SUCCEEDED"
             mock_execution = MagicMock()
             mock_execution.conditions = [mock_condition]
             mock_exec_client.get_execution = AsyncMock(return_value=mock_execution)

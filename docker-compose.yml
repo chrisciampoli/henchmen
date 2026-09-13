@@ -1,28 +1,38 @@
 # Henchmen local development stack.
 #
-# This docker-compose file is an alternative entry point for users who want
-# service isolation -- each Henchmen component (dispatch, mastermind, forge)
-# runs in its own container and talks to the others over the compose network,
-# with Ollama as a shared LLM sidecar.
+# One container runs `henchmen serve` — Dispatch, Mastermind and Forge mounted
+# in a single process behind one port — plus an Ollama sidecar for local LLM
+# inference.
 #
-# The recommended quickstart for most users is the single-process CLI:
+# Why one container and not three: in provider=local mode each process gets its
+# own InMemoryMessageBroker. Three containers means three brokers, and a task
+# published by Dispatch would never reach Mastermind. `henchmen serve` wires the
+# shared broker and its topic->URL forward map in one process, so this is the
+# only local topology that can actually carry a task end to end.
 #
-#     henchmen serve
+# The Docker socket is mounted because Mastermind dispatches Operatives as
+# sibling containers (`docker run henchmen-operative:local`). Build that image
+# first on the host:
 #
-# which runs the same services in one Python process with an in-memory HTTP
-# forwarder. Use docker-compose when you want to match the production
-# topology more closely, debug a single component in isolation, or develop
-# against a long-lived Ollama container.
+#     henchmen build-operative
+#
+# Operatives clone the target repo themselves — no workspace bind mount — and
+# report back over http://host.docker.internal:8000, which is why port 8000 is
+# published rather than kept on the compose network.
 #
 # Usage:
 #     cp .env.example .env.local
+#     henchmen build-operative
 #     docker compose up
+#     curl -X POST http://localhost:8000/dispatch/tasks -H 'content-type: application/json' -d '{...}'
 
 services:
   ollama:
-    image: ollama/ollama:0.4.6
+    image: ollama/ollama:0.34.0
     container_name: henchmen-ollama
     ports:
+      # Published on the host so both the henchmen container and the operative
+      # containers it launches can reach it at host.docker.internal:11434.
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
@@ -33,66 +43,40 @@ services:
       retries: 10
       start_period: 30s
 
-  dispatch:
-    build:
-      context: .
-      dockerfile: containers/dispatch/Dockerfile
-    container_name: henchmen-dispatch
-    ports:
-      - "8001:8080"
-    env_file: .env.local
-    environment:
-      HENCHMEN_PROVIDER: local
-      HENCHMEN_ENVIRONMENT: dev
-    depends_on:
-      ollama:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=2).status==200 else 1)\""]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-
-  mastermind:
+  henchmen:
     build:
       context: .
       dockerfile: containers/mastermind/Dockerfile
-    container_name: henchmen-mastermind
+    container_name: henchmen
+    # Needs write access to /var/run/docker.sock to launch operatives; the
+    # image's unprivileged `henchmen` user is not in the host's docker group.
+    user: root
+    command: ["henchmen", "serve", "--host", "0.0.0.0", "--port", "8000"]
     ports:
-      - "8002:8080"
+      - "8000:8000"
     env_file: .env.local
     environment:
       HENCHMEN_PROVIDER: local
       HENCHMEN_ENVIRONMENT: dev
-    command: ["uvicorn", "henchmen.mastermind.server:app", "--host", "0.0.0.0", "--port", "8080"]
+      HENCHMEN_LOCAL_SERVE_PORT: "8000"
+      # Where an operative container posts its completion envelope back to.
+      HENCHMEN_LOCAL_FORWARD_BASE_URL: http://host.docker.internal:8000
+      # host.docker.internal (not http://ollama:11434): operatives run on the
+      # default bridge network and cannot resolve compose service names.
+      HENCHMEN_LLM_OLLAMA_BASE_URL: http://host.docker.internal:11434
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # SQLite document store lives on a named volume so state survives
+      # `docker compose up --build` and never lands in the repo checkout.
+      - henchmen_state:/state
+    working_dir: /state
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       ollama:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=2).status==200 else 1)\""]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-
-  forge:
-    build:
-      context: .
-      dockerfile: containers/forge/Dockerfile
-    container_name: henchmen-forge
-    ports:
-      - "8003:8080"
-    env_file: .env.local
-    environment:
-      HENCHMEN_PROVIDER: local
-      HENCHMEN_ENVIRONMENT: dev
-    command: ["uvicorn", "henchmen.forge.server:app", "--host", "0.0.0.0", "--port", "8080"]
-    depends_on:
-      ollama:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=2).status==200 else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=2).status==200 else 1)\""]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -100,3 +84,4 @@ services:
 
 volumes:
   ollama_data:
+  henchmen_state:

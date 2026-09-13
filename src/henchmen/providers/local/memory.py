@@ -1,16 +1,43 @@
-"""In-memory MessageBroker for local development."""
+"""In-memory MessageBroker for local development.
+
+Two deployment shapes use this broker:
+
+* ``henchmen serve`` runs Dispatch, Mastermind and Forge in one process. A
+  single shared instance (see :func:`set_shared_broker`) forwards each
+  publish as an HTTP POST to the mounted sub-application, simulating Pub/Sub
+  push delivery. The topic-to-URL map is :func:`default_forward_map`.
+* A local operative container is a *separate* process. It cannot share the
+  host's instance, so when ``HENCHMEN_LOCAL_FORWARD_BASE_URL`` is set in its
+  environment the broker forwards to the host (normally
+  ``http://host.docker.internal:<port>``). Without this the operative's
+  completion report would never leave the container.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
+
 logger = logging.getLogger(__name__)
+
+# In local mode the "push subscription" handler runs the whole scheme inline,
+# so a forwarded POST legitimately stays open for as long as an operative run.
+_FORWARD_TIMEOUT_SECONDS = 1800.0
+# Transient transport failures (the target service still starting up) are
+# retried; an HTTP response — even a 5xx — is not, the handler already saw it.
+_FORWARD_RETRIES = 3
+_FORWARD_RETRY_BACKOFF_SECONDS = 0.5
+# Published messages are kept only for test inspection; cap them so a
+# long-running `henchmen serve` does not grow without bound.
+_MESSAGE_HISTORY = 1000
 
 # Module-level singleton for single-process mode. When set, all calls to
 # InMemoryMessageBroker() return this instance so Dispatch, Mastermind,
@@ -29,29 +56,51 @@ def get_shared_broker() -> InMemoryMessageBroker | None:
     return _shared_instance
 
 
+def default_forward_map(settings: Settings, base_url: str) -> dict[str, str]:
+    """Canonical topic -> push-endpoint map for local mode.
+
+    ``base_url`` is where the single-process server is reachable from the
+    publisher: ``http://localhost:<port>`` inside ``henchmen serve`` itself,
+    ``http://host.docker.internal:<port>`` from an operative container.
+    """
+    base = base_url.rstrip("/")
+    return {
+        settings.pubsub_topic_task_intake: f"{base}/mastermind/pubsub/task-intake",
+        settings.pubsub_topic_operative_complete: f"{base}/mastermind/pubsub/operative-complete",
+        settings.pubsub_topic_forge_request: f"{base}/forge/pubsub/forge-request",
+        settings.pubsub_topic_forge_result: f"{base}/mastermind/pubsub/forge-result",
+        settings.pubsub_topic_ci_failure: f"{base}/mastermind/pubsub/ci-failure",
+    }
+
+
 class InMemoryMessageBroker:
     """MessageBroker backed by in-process async queues.
 
     Optionally forwards publishes as HTTP POSTs to simulate Pub/Sub push
-    delivery when running all services in a single process.
+    delivery when running all services in a single process, or to reach the
+    host process from an operative container.
     """
 
-    def __new__(cls) -> InMemoryMessageBroker:
+    def __new__(cls, settings: Settings | None = None) -> InMemoryMessageBroker:
         if _shared_instance is not None:
             return _shared_instance
         return super().__new__(cls)
 
-    def __init__(self) -> None:
+    def __init__(self, settings: Settings | None = None) -> None:
         if hasattr(self, "_initialized"):
             return
         self._initialized = True
-        self._messages: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self._messages: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=_MESSAGE_HISTORY))
         self._subscribers: dict[str, list[Callable[..., Any]]] = defaultdict(list)
         self._forward_map: dict[str, str] = {}
         # Strong references to in-flight forward tasks. Without this, the asyncio
         # event loop only holds weak references and background tasks can be
         # garbage collected mid-run (silent message loss in local dev).
         self._background_tasks: set[asyncio.Task[None]] = set()
+        # Operative containers: forward to the host when explicitly configured.
+        if settings is not None and settings.local_forward_base_url:
+            self.set_forward_map(default_forward_map(settings, settings.local_forward_base_url))
+            logger.info("[broker] Forwarding local publishes to %s", settings.local_forward_base_url)
 
     async def drain(self) -> None:
         """Wait for all in-flight forward tasks to complete.
@@ -91,7 +140,13 @@ class InMemoryMessageBroker:
         return msg_id
 
     async def _forward_to_http(self, url: str, msg_id: str, data: bytes, attributes: dict[str, str]) -> None:
-        """POST a Pub/Sub-style envelope to a local HTTP endpoint."""
+        """POST a Pub/Sub-style envelope to a local HTTP endpoint.
+
+        Real Pub/Sub push retries a delivery that never reached the handler,
+        so a connection failure (the target service is still booting) is
+        retried here too. A non-2xx *response* is reported at WARNING and not
+        retried — the handler already consumed the message.
+        """
         import httpx
 
         envelope = {
@@ -102,12 +157,28 @@ class InMemoryMessageBroker:
             },
             "subscription": "local-dev",
         }
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(url, json=envelope, timeout=1800)
-                logger.debug("Forwarded %s to %s (status=%d)", msg_id, url, resp.status_code)
-        except Exception as exc:
-            logger.warning("HTTP forward failed for %s -> %s: %s", msg_id, url, exc)
+        for attempt in range(1, _FORWARD_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(url, json=envelope, timeout=_FORWARD_TIMEOUT_SECONDS)
+                if resp.status_code >= 400:
+                    logger.warning("HTTP forward of %s to %s returned %d", msg_id, url, resp.status_code)
+                else:
+                    logger.debug("Forwarded %s to %s (status=%d)", msg_id, url, resp.status_code)
+                return
+            except Exception as exc:
+                if attempt >= _FORWARD_RETRIES:
+                    logger.warning("HTTP forward failed for %s -> %s: %s", msg_id, url, exc)
+                    return
+                logger.debug(
+                    "HTTP forward attempt %d/%d for %s -> %s failed: %s",
+                    attempt,
+                    _FORWARD_RETRIES,
+                    msg_id,
+                    url,
+                    exc,
+                )
+                await asyncio.sleep(_FORWARD_RETRY_BACKOFF_SECONDS * attempt)
 
     async def pull_dlq(
         self,
@@ -128,8 +199,8 @@ class InMemoryMessageBroker:
         self._subscribers[topic].append(callback)
 
     def get_messages(self, topic: str) -> list[dict[str, Any]]:
-        """Return all messages published to a topic (for test inspection)."""
-        return self._messages[topic]
+        """Return the retained messages published to a topic (for test inspection)."""
+        return list(self._messages[topic])
 
     def clear(self) -> None:
         """Clear all stored messages and subscribers."""

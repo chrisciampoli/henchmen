@@ -8,6 +8,14 @@ from henchmen.models.dossier import RuleFile
 
 logger = logging.getLogger(__name__)
 
+# Rule file text is injected verbatim into the operative's system prompt and
+# counted by the dispatch cost estimator, so it must be bounded. Without a cap
+# a single oversized rules.md can push the estimate past the task cost ceiling
+# (blocking dispatch) or crowd out file context.
+MAX_RULE_FILE_CHARS: int = 32_000
+MAX_TOTAL_RULE_CHARS: int = 128_000
+_TRUNCATION_MARKER = "\n\n[truncated by Henchmen: rule file exceeds the per-file size cap]"
+
 
 class RuleFileLoader:
     """Loads .cursorrules / CLAUDE.md style rule files scoped to directories."""
@@ -62,13 +70,31 @@ class RuleFileLoader:
                 ordered_dirs.append(d)
 
         rule_files: list[RuleFile] = []
+        total_chars = 0
         for directory in ordered_dirs:
             for name in RuleFileLoader.RULE_FILE_NAMES:
                 candidate = directory / name
-                if candidate.is_file():
+                if not candidate.is_file():
+                    continue
+                rel_path = str(candidate.relative_to(root))
+                if total_chars >= MAX_TOTAL_RULE_CHARS:
+                    logger.warning(
+                        "Rule file budget of %d chars exhausted; skipping %s", MAX_TOTAL_RULE_CHARS, rel_path
+                    )
+                    continue
+                try:
                     content = await _read_file(candidate)
-                    scope = str(directory.relative_to(root)) if directory != root else "/"
-                    rule_files.append(RuleFile(path=str(candidate.relative_to(root)), scope=scope, content=content))
+                except (OSError, UnicodeDecodeError) as exc:
+                    logger.warning("Could not read rule file %s: %s", rel_path, exc)
+                    continue
+                if len(content) > MAX_RULE_FILE_CHARS:
+                    logger.warning(
+                        "Rule file %s is %d chars; truncating to %d", rel_path, len(content), MAX_RULE_FILE_CHARS
+                    )
+                    content = content[:MAX_RULE_FILE_CHARS] + _TRUNCATION_MARKER
+                total_chars += len(content)
+                scope = str(directory.relative_to(root)) if directory != root else "/"
+                rule_files.append(RuleFile(path=rel_path, scope=scope, content=content))
 
         return rule_files
 
@@ -110,5 +136,4 @@ class RuleFileLoader:
 
 async def _read_file(path: Path) -> str:
     """Asynchronously read a text file, returning its contents."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, path.read_text, "utf-8")
+    return await asyncio.to_thread(path.read_text, encoding="utf-8")

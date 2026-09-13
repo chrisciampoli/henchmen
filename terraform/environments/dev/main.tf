@@ -1,6 +1,9 @@
 # The actual module composition lives in ../root. This file is just a thin
 # wrapper that points the root module at the dev environment. Per-environment
-# values (min_instances, lair sizing, allowlists, etc.) live in dev.auto.tfvars.
+# values (lair sizing, scheduler, retention, etc.) live in dev.auto.tfvars;
+# the identity values that cannot be committed (project_id, github_owner,
+# github_default_repo) go in terraform.tfvars — copy
+# dev.auto.tfvars.example to get started.
 #
 # See ./README.md for the init/apply workflow.
 
@@ -25,11 +28,22 @@ module "henchmen" {
   github_repo         = var.github_repo
   github_default_repo = var.github_default_repo
   container_image_tag = var.container_image_tag
+  container_images    = var.container_images
+
+  # Intake configuration.
+  jira_base_url           = var.jira_base_url
+  jira_email              = var.jira_email
+  dispatch_public_ingress = var.dispatch_public_ingress
+  internal_only_ingress   = var.internal_only_ingress
 
   # Per-environment overrides (values in dev.auto.tfvars).
-  lair_cpu           = var.lair_cpu
-  lair_memory        = var.lair_memory
-  allowlist_cidrs    = var.allowlist_cidrs
-  scheduler_enabled  = var.scheduler_enabled
-  enable_cloud_build = var.enable_cloud_build
+  lair_cpu                         = var.lair_cpu
+  lair_memory                      = var.lair_memory
+  lair_timeout                     = var.lair_timeout
+  scheduler_enabled                = var.scheduler_enabled
+  enable_cloud_build               = var.enable_cloud_build
+  enable_cloud_build_notifications = var.enable_cloud_build_notifications
+  seed_secret_placeholders         = var.seed_secret_placeholders
+  log_retention_days               = var.log_retention_days
+  artifact_retention_days          = var.artifact_retention_days
 }

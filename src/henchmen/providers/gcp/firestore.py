@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from google.api_core.exceptions import NotFound
 from google.cloud import firestore
 
 if TYPE_CHECKING:
@@ -33,8 +34,18 @@ class FirestoreDocumentStore:
         await self._client.collection(collection).document(document_id).set(data)
 
     async def update(self, collection: str, document_id: str, data: dict[str, Any]) -> None:
-        """Partially update a document (merge fields)."""
-        await self._client.collection(collection).document(document_id).update(data)
+        """Partially update a document (merge fields), creating it when missing.
+
+        ``DocumentReference.update`` raises ``NotFound`` for a document that
+        does not exist yet; the DocumentStore contract (and the SQLite and
+        DynamoDB providers) treat that as a create, so fall back to a merging
+        ``set``.
+        """
+        doc_ref = self._client.collection(collection).document(document_id)
+        try:
+            await doc_ref.update(data)
+        except NotFound:
+            await doc_ref.set(data, merge=True)
 
     async def delete(self, collection: str, document_id: str) -> None:
         """Delete a document."""
@@ -75,11 +86,18 @@ class FirestoreDocumentStore:
 
         Unlike a read-modify-write loop, the Increment transform is
         server-side and safe under any number of concurrent writers.
+        Missing documents are created (the contract treats a missing field
+        or document as zero), which ``update`` alone would reject with
+        ``NotFound``.
         """
         if not field_deltas:
             return
         payload: dict[str, Any] = {field: firestore.Increment(delta) for field, delta in field_deltas.items()}
-        await self._client.collection(collection).document(document_id).update(payload)
+        doc_ref = self._client.collection(collection).document(document_id)
+        try:
+            await doc_ref.update(payload)
+        except NotFound:
+            await doc_ref.set(payload, merge=True)
 
     async def update_if(
         self,

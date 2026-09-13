@@ -15,6 +15,48 @@ from henchmen.arsenal._workspace import ensure_in_workspace
 from henchmen.arsenal.registry import tool
 
 
+def _normalize(text: str) -> str:
+    """Normalize whitespace and the unicode characters LLMs most often mangle."""
+    # Normalize line endings and trailing whitespace
+    text = "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").split("\n"))
+    # Normalize common unicode characters that LLMs get wrong
+    text = text.replace("—", "-").replace("–", "-")  # em dash, en dash -> hyphen
+    text = text.replace("“", '"').replace("”", '"')  # smart double quotes
+    text = text.replace("‘", "'").replace("’", "'")  # smart single quotes
+    text = text.replace("…", "...")  # ellipsis
+    return text.replace(" ", " ")  # non-breaking space
+
+
+def _splice_normalized(original: str, old_text: str, new_text: str) -> str | None:
+    """Replace the line span matching ``old_text`` under normalization.
+
+    Returns the updated file content, or ``None`` when no span matches. Only
+    the matched lines are rewritten — every other byte of ``original`` is
+    preserved, so a targeted edit can never silently normalize unrelated
+    strings, docs or fixtures elsewhere in the file.
+    """
+    orig_lines = original.splitlines(keepends=True)
+    norm_lines = [_normalize(line) for line in original.splitlines()]
+    old_lines = [_normalize(line) for line in old_text.replace("\r\n", "\n").strip("\n").split("\n")]
+    if not old_lines:
+        return None
+
+    span = len(old_lines)
+    for start in range(len(norm_lines) - span + 1):
+        if norm_lines[start : start + span] != old_lines:
+            continue
+        newline = "\r\n" if "\r\n" in original else "\n"
+        ends_with_newline = orig_lines[start + span - 1].endswith("\n")
+        new_lines = new_text.replace("\r\n", "\n").split("\n")
+        if new_lines and new_lines[-1] == "":
+            new_lines.pop()
+        block = newline.join(new_lines)
+        if block and ends_with_newline:
+            block += newline
+        return "".join(orig_lines[:start]) + block + "".join(orig_lines[start + span :])
+    return None
+
+
 @tool(
     name="file_write",
     category="code_edit",
@@ -44,7 +86,18 @@ async def file_write(path: str, content: str) -> dict[str, Any]:
     ),
 )
 async def file_edit(path: str, old_text: str, new_text: str) -> dict[str, Any]:
-    """Replace text in a file with fuzzy whitespace matching."""
+    """Replace text in a file with fuzzy whitespace matching.
+
+    The normalized fallback rewrites only the matched line span: normalizing
+    the whole file would silently change em dashes, smart quotes and trailing
+    whitespace in unrelated code, docs and fixtures, and report success.
+    """
+    if not old_text or not old_text.strip():
+        return {
+            "error": "old_text must be a non-empty string. Use file_write to create or overwrite a file.",
+            "path": path,
+            "hint": "use file_write to overwrite the whole file",
+        }
     try:
         safe_path = ensure_in_workspace(path)
     except PermissionError as exc:
@@ -60,28 +113,11 @@ async def file_edit(path: str, old_text: str, new_text: str) -> dict[str, Any]:
                 fh.write(updated)
             return {"path": path, "success": True, "replacements": 1}
 
-        # Try with normalized whitespace AND unicode characters
-        def normalize(s: str) -> str:
-            # Normalize line endings and trailing whitespace
-            s = "\n".join(line.rstrip() for line in s.replace("\r\n", "\n").split("\n"))
-            # Normalize common unicode characters that LLMs get wrong
-            s = s.replace("\u2014", "-").replace("\u2013", "-")  # em dash, en dash → hyphen
-            s = s.replace("\u201c", '"').replace("\u201d", '"')  # smart double quotes
-            s = s.replace("\u2018", "'").replace("\u2019", "'")  # smart single quotes
-            s = s.replace("\u2026", "...")  # ellipsis
-            return s.replace("\u00a0", " ")  # non-breaking space
-
-        norm_original = normalize(original)
-        norm_old = normalize(old_text)
-
-        if norm_old in norm_original:
-            # Find the position in normalized text, then replace in original
-            updated = original.replace(old_text.rstrip(), new_text, 1)
-            if updated == original:
-                # Fallback: replace in normalized form
-                updated = norm_original.replace(norm_old, new_text, 1)
+        # Then a whitespace/unicode-normalized match, spliced into that span only.
+        spliced = _splice_normalized(original, old_text, new_text)
+        if spliced is not None:
             with open(safe_path, "w", encoding="utf-8") as fh:
-                fh.write(updated)
+                fh.write(spliced)
             return {"path": path, "success": True, "replacements": 1, "note": "matched with whitespace normalization"}
 
         # Try matching just the first line of old_text as an anchor
@@ -141,7 +177,12 @@ async def file_create(path: str, content: str) -> dict[str, Any]:
     ),
 )
 async def file_insert_at_line(path: str, line_number: int, text: str) -> dict[str, Any]:
-    """Insert text at a specific line number (1-indexed). Existing content shifts down."""
+    """Insert text at a specific line number (1-indexed). Existing content shifts down.
+
+    Out-of-range line numbers are rejected rather than clamped: silently
+    appending at EOF while reporting the requested line leaves the model with
+    a wrong picture of the file for every subsequent edit.
+    """
     try:
         safe_path = ensure_in_workspace(path)
     except PermissionError as exc:
@@ -149,8 +190,13 @@ async def file_insert_at_line(path: str, line_number: int, text: str) -> dict[st
     try:
         with open(safe_path, encoding="utf-8") as fh:
             lines = fh.readlines()
-        # Clamp line_number to valid range
-        idx = max(0, min(line_number - 1, len(lines)))
+        if line_number < 1 or line_number > len(lines) + 1:
+            return {
+                "error": f"line_number {line_number} is out of range 1..{len(lines) + 1} for {path}",
+                "path": path,
+                "total_lines": len(lines),
+            }
+        idx = line_number - 1
         # Ensure text ends with newline
         if text and not text.endswith("\n"):
             text += "\n"

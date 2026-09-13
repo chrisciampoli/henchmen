@@ -332,6 +332,32 @@ class TestSchemeExecution:
         mock_lm.create_lair = AsyncMock(return_value="mock-lair-id")
         return mock_lm
 
+    @staticmethod
+    def stub_pr_creation(pr_url: str = "https://github.com/acme-org/sample-repo/pull/1"):
+        """Patch out the GitHub calls in ``create_pr``.
+
+        These tests are about the DAG walk, not about GitHub. Without this the
+        handler either fails closed for want of a token or — worse, if the
+        developer has one exported — opens a real pull request.
+        """
+        import contextlib
+
+        github_repo = MagicMock()
+        github_repo.get_pulls.return_value = []
+        github_repo.create_pull.return_value = MagicMock(html_url=pr_url, number=1)
+        client = MagicMock()
+        client.get_repo.return_value = github_repo
+
+        @contextlib.contextmanager
+        def _ctx():
+            with (
+                patch.object(scheme_handlers, "get_github_token", return_value="test-token"),
+                patch("github.Github", return_value=client),
+            ):
+                yield github_repo
+
+        return _ctx()
+
     @pytest.mark.asyncio
     async def test_linear_deterministic_execution(self):
         """SchemeExecutor walks a linear deterministic DAG and reports both node results."""
@@ -339,7 +365,8 @@ class TestSchemeExecution:
         dossier = Dossier(task_id=task.id)
         executor = SchemeExecutor(make_simple_scheme(), self.make_mock_lair_manager(), self.settings)
 
-        report = await executor.execute(task, dossier)
+        with self.stub_pr_creation():
+            report = await executor.execute(task, dossier)
 
         assert "create_branch" in report["node_results"]
         assert "create_pr" in report["node_results"]
@@ -373,7 +400,10 @@ class TestSchemeExecution:
         async def fake_run_tests(executor_, node, task_, dossier_):
             return {"condition": "pass", "message": "Tests passed"}
 
-        with patch.dict(scheme_handlers._HANDLERS, {"run_tests": fake_run_tests}):
+        with (
+            patch.dict(scheme_handlers._HANDLERS, {"run_tests": fake_run_tests}),
+            self.stub_pr_creation(),
+        ):
             report = await executor.execute(task, dossier)
 
         assert "create_pr" in report["node_results"]

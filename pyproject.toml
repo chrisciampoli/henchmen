@@ -16,8 +16,11 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
+    # Only 3.12 is exercised: CI pins python-version 3.12, mypy
+    # python_version = "3.12", ruff target-version = "py312", and every
+    # container image is built on python:3.12-slim. Add a classifier here
+    # only together with a CI matrix entry that actually runs it.
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Code Generators",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Typing :: Typed",
@@ -30,8 +33,6 @@ dependencies = [
     "uvicorn",
     "httpx",
     "PyGithub",
-    "jinja2",
-    "mcp",
 ]
 
 [project.urls]
@@ -50,7 +51,7 @@ henchmen = "henchmen.cli:main"
 # contributors running locally with Ollama or OpenAI do not have to download
 # ~300MB of GCP and AWS SDKs. Pick the extras you actually need:
 #
-#   pip install -e ".[local]"            # single-process local mode (OpenAI / Anthropic / Ollama)
+#   pip install -e ".[local]"            # single-process local mode (OpenAI / Anthropic / Ollama / Slack / eval history)
 #   pip install -e ".[gcp]"              # GCP backends (Pub/Sub, Firestore, GCS, Vertex)
 #   pip install -e ".[aws]"              # AWS backends
 #   pip install -e ".[all]"              # everything (power users)
@@ -66,15 +67,15 @@ gcp = [
     "google-cloud-storage",
     "google-cloud-run",
     "google-cloud-build",
-    "google-cloud-secret-manager",
-    "google-cloud-logging",
     "google-cloud-aiplatform",
     "vertexai",
     "google-genai",
-    "google-adk",
 ]
 aws = [
     "boto3>=1.34",
+    # providers/aws/codebuild.py imports yaml at module scope; boto3 does not
+    # pull it in, so `pip install henchmen[aws]` alone would ImportError.
+    "pyyaml>=6.0",
 ]
 openai = [
     "openai>=1.0",
@@ -95,25 +96,37 @@ observability = [
     "opentelemetry-instrumentation-fastapi>=0.44b0",
     "prometheus-client>=0.19",
 ]
-# Minimal runtime extras to run Henchmen locally in single-process mode with
-# Ollama (no extra deps beyond base) or a direct-LLM provider like OpenAI /
-# Anthropic. Deliberately excludes GCP and AWS SDKs.
+# Everything a self-hoster needs to run Henchmen locally in single-process
+# mode: a direct-LLM provider (OpenAI / Anthropic; Ollama needs no extra
+# deps), Slack intake, and the SQLite eval-history store. Deliberately
+# excludes GCP and AWS SDKs.
 local = [
-    "henchmen[openai,anthropic]",
+    "henchmen[openai,anthropic,slack,evals]",
+]
+# SQLite backend for `henchmen eval run/history/compare`
+# (src/henchmen/evals/storage.py).
+evals = [
+    "aiosqlite",
 ]
 all = [
-    "henchmen[gcp,aws,openai,anthropic,slack,jira,observability]",
+    "henchmen[gcp,aws,local,jira,observability]",
 ]
-# Developer tooling only. Layer this on top of whichever runtime extras you
-# installed, e.g. `pip install -e ".[local,dev]"`.
+# Developer tooling only — no runtime dependencies. Layer this on top of
+# whichever runtime extras you installed, e.g. `pip install -e ".[local,dev]"`.
+#
+# ruff is pinned to the minor line the pre-commit hook and CI both use: the
+# formatter style changes between minor releases, so an unpinned ruff makes
+# `ruff format --check` in CI disagree with the hook that formatted the code.
 dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
     "pytest-randomly",
-    "ruff",
+    "ruff>=0.15.4,<0.16",
     "mypy",
-    "aiosqlite",
+    # tests/unit/test_eval_storage.py imports evals.storage, which imports
+    # aiosqlite at module scope — without it the unit suite fails to collect.
+    "henchmen[evals]",
 ]
 # Full stack + dev tooling. Needed to run the integration test suite because
 # tests/integration/conftest.py imports google.cloud.{pubsub_v1,firestore,storage}
@@ -123,6 +136,9 @@ dev-integration = [
 ]
 
 [tool.setuptools.packages.find]
+# The eval harness lives at src/henchmen/evals/ precisely so it ships with the
+# distribution; `evals/` at the repo root holds only fixtures and baseline.json
+# (data read from the checkout, never imported).
 where = ["src"]
 
 [tool.ruff]
@@ -134,34 +150,36 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "RET", "ASYNC", "T20", "C4"
 ignore = []
 
 [tool.ruff.lint.per-file-ignores]
-# CLI and Slack bot intentionally use print() for user-facing output.
-# structured_logging.py writes JSON lines to stdout for Cloud Run log ingestion.
-"src/henchmen/cli.py" = ["T201"]
+# The CLI intentionally uses print() for user-facing output (and its wizard
+# prompts run past 120 columns). structured_logging.py writes JSON lines to
+# stdout for Cloud Run log ingestion.
 "src/henchmen/cli/*.py" = ["T201", "E501"]
-"src/henchmen/dispatch/slack_bot.py" = ["T201"]
 "src/henchmen/observability/structured_logging.py" = ["T201"]
 # Arsenal file-system tools deliberately use blocking I/O for simplicity —
 # operatives run in single-use Cloud Run Jobs so async file access would
 # add complexity without latency benefit.
+# Each entry lists only the codes that actually fire today, so a newly
+# introduced blocking call is reported instead of being silently masked.
 "src/henchmen/arsenal/tools/code_edit.py" = ["ASYNC230", "ASYNC240"]
 "src/henchmen/arsenal/tools/code_intel.py" = ["ASYNC230", "ASYNC240"]
-"src/henchmen/arsenal/tools/test_runner.py" = ["ASYNC230", "ASYNC240", "ASYNC221"]
-"src/henchmen/arsenal/tools/git_ops.py" = ["ASYNC230", "ASYNC240"]
-"src/henchmen/mastermind/scheme_executor/handlers.py" = ["ASYNC230", "ASYNC240"]
+"src/henchmen/arsenal/tools/test_runner.py" = ["ASYNC240"]
+"src/henchmen/arsenal/tools/git_ops.py" = ["ASYNC240"]
+"src/henchmen/mastermind/scheme_executor/handlers.py" = ["ASYNC240"]
 "src/henchmen/operative/bootstrap.py" = ["ASYNC230", "ASYNC240"]
 "src/henchmen/operative/agent_builder.py" = ["ASYNC230", "ASYNC240"]
-"src/henchmen/forge/ci_runner.py" = ["ASYNC230", "ASYNC240"]
+"src/henchmen/forge/ci_runner.py" = ["ASYNC240"]
 "src/henchmen/dossier/cache.py" = ["ASYNC240"]
 "src/henchmen/dossier/rules.py" = ["ASYNC240"]
-"src/henchmen/utils/git.py" = ["ASYNC221"]
 # `timeout` kwarg on MastermindAgent.handle_task_with_timeout is a
 # wrapper-level budget, not a synchronous timeout — ASYNC109 is a false
 # positive there.
 "src/henchmen/mastermind/agent.py" = ["ASYNC109"]
 # Tests get a relaxed ruleset — assert-raises-Exception, print-for-debug,
 # and blocking-IO-in-async-tests are all idiomatic.
-# Eval harness uses blocking subprocess.run and print() for user-facing output.
-"evals/**/*.py" = ["T201", "ASYNC230", "ASYNC240"]
+# Eval harness prints its report for the operator; fixture repos under
+# evals/ are deliberately unpolished sample code.
+"src/henchmen/evals/*.py" = ["T201", "ASYNC240"]
+"evals/**/*.py" = ["T201"]
 "tests/**/*.py" = ["T201", "B017", "ASYNC230", "ASYNC240", "ASYNC221", "SIM105"]
 
 [tool.pytest.ini_options]
@@ -180,6 +198,9 @@ markers = [
 python_version = "3.12"
 strict = true
 ignore_missing_imports = true
+# Eval fixtures are deliberately broken sample repos (that is the point of the
+# harness) — type-checking them would always fail.
+exclude = ["^evals/fixtures/"]
 # Third-party libraries without py.typed markers (yaml, google-auth, etc.)
 # are tolerated globally instead of requiring per-file ``# type: ignore``
 # markers that become stale when CI and dev environments differ in which

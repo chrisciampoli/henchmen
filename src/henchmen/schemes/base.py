@@ -2,7 +2,8 @@
 
 from collections import defaultdict, deque
 
-from henchmen.models.scheme import SchemeDefinition, SchemeEdge, SchemeNode
+from henchmen.models.llm import ModelTier
+from henchmen.models.scheme import NodeType, SchemeDefinition, SchemeEdge, SchemeNode
 
 
 class SchemeGraph:
@@ -21,22 +22,66 @@ class SchemeGraph:
         for edge in self.definition.edges:
             self._adjacency.setdefault(edge.from_node, []).append(edge)
 
+    def _validate_nodes(self) -> list[str]:
+        """Validate per-node invariants that the graph shape cannot express.
+
+        An agentic node is dispatched to an Operative, so it must carry the two
+        things the Operative needs: a system instruction and a model to run it
+        on. A deterministic node runs a registered handler inline and never
+        calls an LLM, so a ``model_name`` or ``instruction_template`` on one is
+        silently ignored — and a node carrying both while declared
+        deterministic (or vice versa) is exactly how ``fix_lint`` ended up
+        spending LLM tokens while every doc promised it was free.
+        """
+        errors: list[str] = []
+        seen: set[str] = set()
+
+        for node in self.definition.nodes:
+            if node.id in seen:
+                # ``_node_map`` would silently keep only the last one.
+                errors.append(f"Duplicate node id: '{node.id}'")
+            seen.add(node.id)
+
+            if node.node_type == NodeType.AGENTIC:
+                if not (node.instruction_template or "").strip():
+                    errors.append(f"Agentic node '{node.id}' has no instruction_template")
+                if not (node.model_name or "").strip():
+                    errors.append(
+                        f"Agentic node '{node.id}' has no model_name "
+                        f"(expected a model tier such as '{ModelTier.COMPLEX.value}')"
+                    )
+            else:
+                if node.model_name is not None:
+                    errors.append(
+                        f"Deterministic node '{node.id}' must not set model_name "
+                        f"(got '{node.model_name}') — deterministic nodes never call an LLM"
+                    )
+                if node.instruction_template is not None:
+                    errors.append(
+                        f"Deterministic node '{node.id}' must not set instruction_template "
+                        "— deterministic nodes never call an LLM"
+                    )
+
+        return errors
+
     def validate(self) -> list[str]:
-        """Validate the DAG: no cycles, all edge references valid, exactly one root node, all nodes reachable.
+        """Validate the scheme: node invariants, no cycles, valid edge references, one reachable root.
 
         Returns list of error strings, empty if valid.
         """
-        errors: list[str] = []
+        errors: list[str] = self._validate_nodes()
 
         # Check all edge node references are valid
+        edge_reference_errors: list[str] = []
         for edge in self.definition.edges:
             if edge.from_node not in self._node_map:
-                errors.append(f"Edge references unknown from_node: '{edge.from_node}'")
+                edge_reference_errors.append(f"Edge references unknown from_node: '{edge.from_node}'")
             if edge.to_node not in self._node_map:
-                errors.append(f"Edge references unknown to_node: '{edge.to_node}'")
+                edge_reference_errors.append(f"Edge references unknown to_node: '{edge.to_node}'")
+        errors.extend(edge_reference_errors)
 
         # If there are bad references, further graph checks are unreliable
-        if errors:
+        if edge_reference_errors:
             return errors
 
         # Reject fan-out on the same (node_id, condition) key. The SchemeExecutor

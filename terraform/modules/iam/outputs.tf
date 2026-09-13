@@ -28,16 +28,6 @@ output "operative_sa_id" {
   value       = google_service_account.operative.id
 }
 
-output "arsenal_sa_email" {
-  description = "Email of the Arsenal service account"
-  value       = google_service_account.arsenal.email
-}
-
-output "arsenal_sa_id" {
-  description = "ID of the Arsenal service account"
-  value       = google_service_account.arsenal.id
-}
-
 output "forge_sa_email" {
   description = "Email of the Forge service account"
   value       = google_service_account.forge.email
@@ -48,24 +38,24 @@ output "forge_sa_id" {
   value       = google_service_account.forge.id
 }
 
-output "dossier_sa_email" {
-  description = "Email of the Dossier service account"
-  value       = google_service_account.dossier.email
+output "pubsub_push_sa_email" {
+  description = "Email of the Pub/Sub push (OIDC caller) service account"
+  value       = google_service_account.pubsub_push.email
 }
 
-output "dossier_sa_id" {
-  description = "ID of the Dossier service account"
-  value       = google_service_account.dossier.id
+output "scheduler_sa_email" {
+  description = "Email of the Cloud Scheduler (OIDC caller) service account"
+  value       = google_service_account.scheduler.email
 }
 
 output "service_account_emails" {
   description = "Map of service name to service account email"
   value = {
-    mastermind = google_service_account.mastermind.email
-    dispatch   = google_service_account.dispatch.email
-    operative  = google_service_account.operative.email
-    arsenal    = google_service_account.arsenal.email
-    forge      = google_service_account.forge.email
-    dossier    = google_service_account.dossier.email
+    mastermind  = google_service_account.mastermind.email
+    dispatch    = google_service_account.dispatch.email
+    operative   = google_service_account.operative.email
+    forge       = google_service_account.forge.email
+    pubsub_push = google_service_account.pubsub_push.email
+    scheduler   = google_service_account.scheduler.email
   }
 }

@@ -3,12 +3,12 @@
 Replaces the inline scoring logic in ``operative.bootstrap._build_file_context``
 with a reusable, configurable scorer. Scoring signals include:
 
-- Direct mention in task text or task analysis (+30)
+- Direct mention in task text or task analysis (+50 exact, +25 partial)
 - Appearance in RAG semantic search results (+25)
-- Import neighbor of a mentioned file (+20)
-- Recently changed according to git log (+15)
-- Appears in a stack trace (+10)
-- Keyword overlap with path components (+1 per match)
+- Same directory as a mentioned file, an import-neighbour proxy (+15)
+- Recently changed according to git log (+15, caller supplies the set)
+- Appears in a stack trace (+10, caller supplies the set)
+- Keyword overlap with path components (+0.5 per match, +1 per analysis keyword)
 
 Files are selected up to a configurable context window (default 80K chars)
 at 60% fill to leave room for system prompt and tool output.
@@ -55,6 +55,8 @@ class FileScorer:
         rag_file_paths: set[str],
         analysis_keywords: set[str],
         max_context_chars: int = 80_000,
+        recently_changed: set[str] | None = None,
+        stack_trace_files: set[str] | None = None,
     ) -> list[tuple[float, str]]:
         """Return files scored and sorted by relevance, capped by context budget.
 
@@ -75,6 +77,10 @@ class FileScorer:
         max_context_chars:
             Maximum context window size in characters. Files are selected to
             fill 60% of this budget.
+        recently_changed:
+            Lowercased paths/basenames changed recently according to git log.
+        stack_trace_files:
+            Lowercased paths/basenames appearing in a stack trace.
 
         Returns
         -------
@@ -94,6 +100,8 @@ class FileScorer:
                 analysis_keywords=analysis_keywords,
                 mentioned_patterns=mentioned_patterns,
                 keywords=keywords,
+                recently_changed=recently_changed or set(),
+                stack_trace_files=stack_trace_files or set(),
             )
             scored.append((score, rel))
 
@@ -126,6 +134,8 @@ class FileScorer:
         analysis_keywords: set[str],
         mentioned_patterns: list[str],
         keywords: set[str],
+        recently_changed: set[str] | None = None,
+        stack_trace_files: set[str] | None = None,
     ) -> float:
         """Compute a relevance score for a single file path."""
         score = 0.0
@@ -152,6 +162,14 @@ class FileScorer:
         # Boost files that appear in RAG semantic search results
         if rel_lower in rag_file_paths or basename in rag_file_paths:
             score += self.config.rag_weight
+
+        # Recently changed according to git log
+        if recently_changed and (rel_lower in recently_changed or basename in recently_changed):
+            score += self.config.recently_changed_weight
+
+        # Named in a stack trace attached to the task
+        if stack_trace_files and (rel_lower in stack_trace_files or basename in stack_trace_files):
+            score += self.config.stack_trace_weight
 
         # Top-level config / readme
         if os.path.basename(rel) in _TOP_LEVEL_FILES and "/" not in rel:

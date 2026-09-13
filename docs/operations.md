@@ -143,16 +143,21 @@ All settings are managed via `src/henchmen/config/settings.py` using `pydantic-s
 | `HENCHMEN_LAIR_DEFAULT_TIMEOUT` | No | `1800` | Default operative timeout (seconds) |
 | `HENCHMEN_GITHUB_DEFAULT_REPO` | No | `` | Default target repository (owner/repo format) |
 
-### Runtime Secrets (not in Settings)
+### Runtime Secrets
 
-These are injected directly as environment variables by Cloud Run secret references:
+Cloud Run mounts these from Secret Manager under their bare names. They are
+**not** a separate configuration path: `Settings` accepts each bare name as an
+alias for the corresponding `HENCHMEN_` field, so the same code reads a Cloud
+Run secret mount in production and a `HENCHMEN_`-prefixed value from
+`.env.local` locally. When both are present the `HENCHMEN_` name wins.
 
-| Variable | Used By | Source |
-|----------|---------|--------|
-| `GITHUB_TOKEN` | Mastermind, Forge, Operative | Secret Manager |
-| `SLACK_BOT_TOKEN` | Mastermind, Dispatch | Secret Manager |
-| `SLACK_SIGNING_SECRET` | Dispatch | Secret Manager |
-| `SLACK_APP_TOKEN` | Dispatch | Secret Manager |
+| Mounted variable | Settings field | Used by |
+|------------------|----------------|---------|
+| `GITHUB_TOKEN` | `github_token` | Mastermind, Forge, Operative |
+| `SLACK_BOT_TOKEN` | `slack_bot_token` | Mastermind, Dispatch |
+| `SLACK_SIGNING_SECRET` | `slack_signing_secret` | Dispatch |
+| `SLACK_APP_TOKEN` | `slack_app_token` | Dispatch |
+| `JIRA_API_TOKEN` | `jira_api_token` | Dispatch, Operative |
 
 ### Operative-Specific Variables (injected by LairManager)
 

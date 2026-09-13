@@ -12,8 +12,10 @@ from henchmen.config.settings import Settings
 from henchmen.models.llm import LLMResponse, Message, MessageRole, ToolCall, ToolDefinition, ToolParameter
 from henchmen.models.operative import OperativeConfig
 from henchmen.operative.failure_classifier import classify_tool_failure, get_recovery_strategy
-from henchmen.operative.nudge_detector import NudgeDetector
+from henchmen.operative.git_helpers import detect_base_ref, parse_porcelain_names, run_git
+from henchmen.operative.nudge_detector import EDIT_TOOLS, NudgeDetector
 from henchmen.providers.interfaces import LLMProvider
+from henchmen.providers.tiers import resolve_model_name
 
 if TYPE_CHECKING:
     from henchmen.observability.cost_accumulator import TaskCostAccumulator
@@ -29,9 +31,14 @@ _MAX_MESSAGE_CHARS = 64_000
 # Maximum characters for a single tool result (30K → 10K to reduce context bloat)
 _MAX_TOOL_RESULT_CHARS = 10_000
 
-# Context window: keep first N and last N messages to limit token accumulation.
-# The first messages contain the task description; the last messages are most relevant.
+# Context window: keep the seeded preamble + last N messages to limit token
+# accumulation. The preamble carries the dossier and the task description; the
+# last messages are the most relevant recent history.
 _CONTEXT_WINDOW_KEEP_LAST = 16  # ~8 turns (assistant + user pairs)
+
+# Consecutive provider failures tolerated before the node is declared blocked.
+# Fail-closed: a dead provider must never be reported as a COMPLETED node.
+_MAX_CONSECUTIVE_MODEL_ERRORS = 3
 
 # NOTE: The regex-based sanitizer below is a best-effort defence only. The
 # PRIMARY defence against prompt injection is the untrusted-data XML wrapping
@@ -49,14 +56,38 @@ _INJECTION_DISCLAIMER: str = (
     "untrusted-data XML wrapping in OperativeAgent.run()."
 )
 
-# Patterns that suggest prompt injection attempts — stripped from task descriptions
+# Patterns that suggest prompt injection attempts — stripped from task descriptions.
+# ``system:`` is anchored to the start of a line: unanchored it mangled ordinary
+# prose such as "the build system: it fails on Windows" or "Operating system: macOS".
 _INJECTION_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"ignore\s+(all\s+)?previous\s+instructions?", re.IGNORECASE),
     re.compile(r"disregard\s+(all\s+)?(above|prior|previous)\s+instructions?", re.IGNORECASE),
     re.compile(r"you\s+are\s+now\s+(?:a|an)\s+", re.IGNORECASE),
-    re.compile(r"system:\s*", re.IGNORECASE),
+    re.compile(r"^\s*system\s*:\s*", re.IGNORECASE | re.MULTILINE),
     re.compile(r"<\|(?:im_start|im_end|system|endoftext)\|>", re.IGNORECASE),
 ]
+
+# The XML wrapper is the primary defence, so untrusted content must not be able
+# to close (or forge) one of the delimiters and escape the block.
+_WRAPPER_TAGS = ("user_task_input", "untrusted_dossier_context", "untrusted_file_body")
+_WRAPPER_TAG_PATTERN = re.compile(
+    r"<\s*/?\s*(?:" + "|".join(_WRAPPER_TAGS) + r")\s*/?\s*>",
+    re.IGNORECASE,
+)
+
+
+def neutralize_wrapper_tags(text: str) -> str:
+    """Escape any untrusted-data delimiter so payloads cannot close the wrapper."""
+    if not text:
+        return text
+
+    def _escape(match: re.Match[str]) -> str:
+        return match.group(0).replace("<", "&lt;").replace(">", "&gt;")
+
+    neutralized = _WRAPPER_TAG_PATTERN.sub(_escape, text)
+    if neutralized != text:
+        logger.warning("[sanitize] Neutralised untrusted-data delimiter in supplied content")
+    return neutralized
 
 
 def sanitize_task_input(text: str) -> str:
@@ -65,7 +96,8 @@ def sanitize_task_input(text: str) -> str:
     This is a best-effort sanitizer; the primary defence is the untrusted-data
     XML wrapping in :meth:`OperativeAgent.run`. The regex catches a handful of
     literal English phrases and will not stop paraphrased or obfuscated
-    injection attempts. See :data:`_INJECTION_DISCLAIMER` for details.
+    injection attempts. See :data:`_INJECTION_DISCLAIMER` for details. Closing
+    delimiters are always neutralised so the wrapper itself cannot be escaped.
     """
     cleaned = text
     for pattern in _INJECTION_PATTERNS:
@@ -73,11 +105,11 @@ def sanitize_task_input(text: str) -> str:
         if match:
             logger.warning("[sanitize] Removed injection pattern: %r", match.group())
             cleaned = pattern.sub("[REMOVED]", cleaned)
-    return cleaned
+    return neutralize_wrapper_tags(cleaned)
 
 
 class OperativeAgent:
-    """Runs an agentic loop against Vertex AI, using Arsenal tools directly."""
+    """Runs an agentic loop through an :class:`LLMProvider`, using Arsenal tools directly."""
 
     def __init__(
         self,
@@ -89,7 +121,7 @@ class OperativeAgent:
         dossier_context: str,
         workspace_dir: str,
         settings: Settings,
-        llm_provider: LLMProvider | None = None,
+        llm_provider: LLMProvider,
         document_store: "DocumentStore | None" = None,
         shutdown_event: asyncio.Event | None = None,
     ) -> None:
@@ -109,9 +141,12 @@ class OperativeAgent:
         self.messages: list[dict[str, Any]] = []
         self._timeout = node.timeout_seconds
         self._blocked_reason: str | None = None
-        self._cached_content_name: str | None = None  # Gemini context cache name
-        self._cache_input_tokens: int = 0  # Tokens served from cache (75% discount)
+        self._cache_input_tokens: int = 0  # Tokens served from provider prompt cache
         self._interrupted: bool = False  # Set when SIGTERM triggers graceful shutdown
+        self._guardrails: OperativeGuardrails | None = None
+        # Scheme nodes name a tier ("default/complex"); providers need a concrete
+        # model id. Resolve once here and use it for every call and every report.
+        self.model_name: str = resolve_model_name(settings, config.model_name)
 
     async def run(self) -> dict[str, Any]:
         """Execute the agent loop and return result dict."""
@@ -148,7 +183,11 @@ class OperativeAgent:
             allowed_tool_names,
             max_steps=self.max_steps,
             task_cost_accumulator=task_cost_accumulator,
+            step_budget=self.node.get_effective_budget(),
+            settings=self.settings,
+            model_name=self.model_name,
         )
+        self._guardrails = guardrails
 
         # Build initial system prompt — hard cap at max_system_tokens to prevent
         # context explosion. Token-based budgeting replaces the old 80K char heuristic.
@@ -209,7 +248,7 @@ class OperativeAgent:
         if self.dossier_context:
             dossier_budget_tokens = max_system_tokens  # separate budget from system prompt
             dossier_budget_chars = dossier_budget_tokens * 4
-            trimmed_dossier = self.dossier_context[:dossier_budget_chars]
+            trimmed_dossier = neutralize_wrapper_tags(self.dossier_context[:dossier_budget_chars])
             self.messages.append(
                 {
                     "role": "user",
@@ -242,25 +281,23 @@ class OperativeAgent:
             }
         )
 
-        # Create Gemini context cache if enabled and system prompt is large enough
-        await self._create_context_cache(system_instruction)
+        # The trimmer must never drop the seeded preamble (dossier + task).
+        guardrails.set_preamble_len(len(self.messages))
 
+        # Leave 120s buffer for branch push after agent finishes
+        agent_timeout = max(60, self._timeout - 120)
         try:
-            # Leave 120s buffer for branch push after agent finishes
-            agent_timeout = max(60, self._timeout - 120)
             result = await asyncio.wait_for(
                 self._agent_loop(system_instruction, guardrails),
                 timeout=agent_timeout,
             )
         except TimeoutError as exc:
+            # Telemetry stays reachable via ``get_telemetry`` so the timed-out
+            # report still carries tokens, cost and steps.
             raise TimeoutError(f"Agent exceeded timeout of {agent_timeout}s") from exc
-        finally:
-            await self._delete_context_cache()
 
         result["usage"] = guardrails.get_usage_report()
-        telemetry = guardrails.get_telemetry()
-        telemetry["cached_input_tokens"] = self._cache_input_tokens
-        result["telemetry"] = telemetry
+        result["telemetry"] = self.get_telemetry()
         if self._blocked_reason:
             result["blocked"] = True
             result["block_reason"] = self._blocked_reason
@@ -268,83 +305,13 @@ class OperativeAgent:
             result["interrupted"] = True
         return result
 
-    async def _create_context_cache(self, system_instruction: str) -> None:
-        """Create a Gemini context cache for the system instruction + tools.
-
-        Only caches when: (a) enabled in settings, (b) model is Gemini,
-        (c) system prompt meets minimum token threshold (32K default).
-        """
-        if "claude" in self.config.model_name:
-            return  # Claude has its own caching via cache_control
-        if not self.settings.vertex_ai_context_cache_enabled:
-            return
-
-        from henchmen.operative.tokenizer import estimate_tokens
-
-        system_tokens = estimate_tokens(system_instruction)
-        if system_tokens < self.settings.vertex_ai_context_cache_min_tokens:
-            logger.info(
-                "System prompt too small for caching (%d < %d tokens)",
-                system_tokens,
-                self.settings.vertex_ai_context_cache_min_tokens,
-            )
-            return
-
-        try:
-            from google import genai
-            from google.genai import types
-
-            model_name = self.config.model_name
-            client = genai.Client(
-                vertexai=True,
-                project=self.settings.gcp_project_id,
-                location="global" if "gemini-3" in model_name else self.settings.gcp_region,
-            )
-
-            # Build tool declarations for cache
-            func_decls = []
-            for t in self.tools:
-                func_decls.append(
-                    types.FunctionDeclaration(
-                        name=t["name"],
-                        description=t.get("description", ""),
-                        parameters=t.get("parameters", {}),
-                    )
-                )
-            cached_tools = [types.Tool(function_declarations=func_decls)] if func_decls else None
-
-            cache = client.caches.create(
-                model=model_name,
-                config=types.CreateCachedContentConfig(
-                    system_instruction=system_instruction,
-                    tools=cached_tools,
-                    ttl=f"{self._timeout}s",
-                ),
-            )
-            self._cached_content_name = cache.name
-            logger.info("Created context cache: %s (~%d tokens)", cache.name, system_tokens)
-            logger.info("[OPERATIVE] Context cache created: %s", cache.name)
-        except Exception as exc:
-            logger.warning("Failed to create context cache (will send inline): %s", exc)
-            self._cached_content_name = None
-
-    async def _delete_context_cache(self) -> None:
-        """Delete the Gemini context cache if one was created."""
-        if not self._cached_content_name:
-            return
-        try:
-            from google import genai
-
-            model_name = self.config.model_name
-            client = genai.Client(
-                vertexai=True,
-                project=self.settings.gcp_project_id,
-                location="global" if "gemini-3" in model_name else self.settings.gcp_region,
-            )
-            client.caches.delete(name=self._cached_content_name)
-            logger.info("Deleted context cache: %s", self._cached_content_name)
-        except Exception as exc:
-            logger.debug("Failed to delete context cache (will expire via TTL): %s", exc)
+    def get_telemetry(self) -> dict[str, Any]:
+        """Telemetry accumulated so far — safe to call after a timeout or crash."""
+        if self._guardrails is None:
+            return {}
+        telemetry = self._guardrails.get_telemetry()
+        telemetry["cached_input_tokens"] = self._cache_input_tokens
+        return telemetry
 
     async def _agent_loop(
         self,
@@ -357,12 +324,10 @@ class OperativeAgent:
         confidence = 0.5
         has_committed = False
         has_edited = False
-        read_only_steps = 0  # consecutive steps with only read/search tools
-        lint_passed = False  # Pre-commit gate: lint must pass before commit is allowed
-        _last_lint_result: dict[str, Any] = {}  # Track last lint result
-        type_check_passed = False  # Track whether type_check has ever passed
+        lint_passed = False  # Advisory only: logged before a commit, never enforced
         consecutive_text_only = 0  # consecutive steps with no tool calls
         total_text_only = 0  # total text-only steps across the entire run
+        consecutive_model_errors = 0  # consecutive provider failures
 
         # Failure classification tracking (L6 fix): abort the loop when three
         # consecutive tool calls fail with the same classification. The
@@ -388,8 +353,20 @@ class OperativeAgent:
                 break
 
             if guardrails.check_step_limit():
-                logger.warning("Step limit reached (%d/%d)", self.step_count, self.max_steps)
-                break
+                # Adaptive budget: visible progress (edits without a commit yet)
+                # earns an extension before we give up.
+                if has_edited and not has_committed and guardrails.grant_extension():
+                    logger.info(
+                        "[agent] Step budget extended at step %d (edits made, no commit yet)",
+                        self.step_count,
+                    )
+                else:
+                    logger.warning("Step limit reached (%d/%d)", self.step_count, guardrails.effective_max_steps)
+                    # Fail-closed: an exhausted budget without a commit is not success.
+                    self._blocked_reason = self._blocked_reason or (
+                        f"Step limit reached ({self.step_count} steps) without a successful git_commit"
+                    )
+                    break
 
             if guardrails.check_cost_ceiling():
                 logger.warning(
@@ -401,12 +378,20 @@ class OperativeAgent:
 
                 emit_cost_exceeded(
                     self.config.task_id,
-                    guardrails._estimated_cost_usd,
-                    guardrails._cost_ceiling_usd,
+                    guardrails.estimated_cost_usd,
+                    guardrails.cost_ceiling_usd,
+                )
+                # Fail-closed: a budget breach must not be reported as COMPLETED.
+                self._blocked_reason = (
+                    f"Cost ceiling exceeded (${guardrails.estimated_cost_usd:.2f} >= "
+                    f"${guardrails.cost_ceiling_usd:.2f})"
                 )
                 break
 
-            # Centralized stuck detection via NudgeDetector
+            # Centralized stuck detection via NudgeDetector — computed once per
+            # iteration so the text-only branch cannot append a second nudge for
+            # the same state (which double-counted nudges and repeated itself).
+            nudged_this_step = False
             stuck_state = nudge_detector.check_stuck(self.step_count)
             if stuck_state is not None:
                 nudge_msg = nudge_detector.get_nudge_message(stuck_state, self.step_count)
@@ -416,8 +401,8 @@ class OperativeAgent:
                     self.step_count,
                     stuck_state.value,
                 )
-                guardrails._nudge_count += 1
-                read_only_steps = 0  # reset so we don't spam
+                guardrails.record_nudge()
+                nudged_this_step = True
 
             # Pre-model hook
             messages_to_send = guardrails.before_model_call(list(self.messages))
@@ -426,6 +411,23 @@ class OperativeAgent:
             response = await self._call_model(system_instruction, messages_to_send)
             guardrails.after_model_response(response)
             self.step_count += 1
+
+            # Fail-closed on provider outages: an unreachable model must not be
+            # nudged into a text-only "summary" that reads as a completed node.
+            provider_error = response.get("_error")
+            if provider_error:
+                consecutive_model_errors += 1
+                logger.error(
+                    "[agent] LLM provider call failed (%d/%d): %s",
+                    consecutive_model_errors,
+                    _MAX_CONSECUTIVE_MODEL_ERRORS,
+                    provider_error,
+                )
+                if consecutive_model_errors >= _MAX_CONSECUTIVE_MODEL_ERRORS:
+                    self._blocked_reason = f"LLM provider unavailable: {provider_error}"
+                    break
+                continue
+            consecutive_model_errors = 0
 
             content = response.get("content", [])
             tool_calls = [part for part in content if part.get("type") == "tool_use"]
@@ -450,9 +452,6 @@ class OperativeAgent:
 
             if not tool_calls:
                 # Model returned text without tool calls.
-                if has_committed:
-                    break
-
                 consecutive_text_only += 1
                 total_text_only += 1
                 nudge_detector.record_text_only_response()
@@ -472,20 +471,21 @@ class OperativeAgent:
                     )
                     break
 
-                # Use NudgeDetector for text-only nudges
-                text_stuck = nudge_detector.check_stuck(self.step_count)
-                if text_stuck is not None:
-                    nudge = nudge_detector.get_nudge_message(text_stuck, self.step_count)
-                else:
-                    remaining = self.max_steps - self.step_count
-                    nudge = (
-                        f"You have {remaining} steps remaining. "
-                        f"Use file_edit or file_write to make the code change, then call git_commit. "
-                        f"Do not analyze — call a tool."
-                    )
-                self.messages.append({"role": "user", "content": nudge})
-                guardrails._nudge_count += 1
-                read_only_steps = 0
+                # Only nudge if we did not already nudge at the top of this
+                # iteration — otherwise the same stuck state is repeated twice.
+                if not nudged_this_step:
+                    text_stuck = nudge_detector.check_stuck(self.step_count)
+                    if text_stuck is not None:
+                        nudge = nudge_detector.get_nudge_message(text_stuck, self.step_count)
+                    else:
+                        remaining = guardrails.effective_max_steps - self.step_count
+                        nudge = (
+                            f"You have {remaining} steps remaining. "
+                            f"Use file_edit or file_write to make the code change, then call git_commit. "
+                            f"Do not analyze — call a tool."
+                        )
+                    self.messages.append({"role": "user", "content": nudge})
+                    guardrails.record_nudge()
                 continue
 
             # Execute tool calls
@@ -512,8 +512,9 @@ class OperativeAgent:
                     raw = await self._execute_tool(tool_name, tool_args)
 
                     # Classify the tool result so the loop can react to sustained
-                    # failures differently based on kind (L6 fix).
-                    classification = classify_tool_failure(raw)
+                    # failures differently based on kind (L6 fix). The tool name
+                    # must be passed explicitly — handlers do not include it.
+                    classification = classify_tool_failure(raw, tool_name)
                     if classification != "none":
                         step_had_failure = True
                         step_failure_class = classification
@@ -532,26 +533,10 @@ class OperativeAgent:
                     else:
                         nudge_detector.record_tool_call(tool_name, success=True)
 
-                    # Track lint results for the pre-commit gate
-                    if tool_name == "run_lint":
-                        _last_lint_result = raw if isinstance(raw, dict) else {}
-                        rc = _last_lint_result.get("return_code", 1)
-                        if rc == 0:
-                            lint_passed = True
-                            logger.info("[OPERATIVE] lint PASSED — commit gate unlocked")
-                        else:
-                            lint_passed = False
-                            logger.warning("[OPERATIVE] lint FAILED — commit gate locked")
-
-                    # Track type_check results
-                    if tool_name == "type_check":
-                        tc_result = raw if isinstance(raw, dict) else {}
-                        if tc_result.get("return_code", 1) == 0:
-                            type_check_passed = True
-                            logger.info("[OPERATIVE] type_check PASSED")
-                        else:
-                            type_check_passed = False
-                            logger.warning("[OPERATIVE] type_check FAILED")
+                    # Track lint results for the pre-commit advisory log
+                    if tool_name == "run_lint" and isinstance(raw, dict):
+                        lint_passed = raw.get("return_code", 1) == 0
+                        logger.info("[OPERATIVE] lint %s", "PASSED" if lint_passed else "FAILED")
 
                     raw_str = json.dumps(raw)
                     # Truncate large tool results to prevent context blowup
@@ -619,19 +604,13 @@ class OperativeAgent:
                 consecutive_failure_class = None
                 consecutive_failure_count = 0
 
-            # Track whether this step was read-only or included edits
-            edit_tools = {"file_edit", "file_write", "file_create", "file_insert_at_line", "file_delete"}
+            # Track whether this step included edits (shared tool-name set so the
+            # loop and the NudgeDetector can never disagree)
             tool_names_used = {tc.get("name", "") for tc in tool_calls}
-            if tool_names_used & edit_tools:
+            if tool_names_used & EDIT_TOOLS:
                 has_edited = True
-                read_only_steps = 0
-                # Reset lint/type gates — code changed, must re-check before commit
-                if lint_passed:
-                    lint_passed = False
-                if type_check_passed:
-                    type_check_passed = False
-            else:
-                read_only_steps += 1
+                # Code changed — a previous lint pass no longer applies.
+                lint_passed = False
 
         # Collect git diff from workspace
         git_diff = await self._get_git_diff()
@@ -645,20 +624,8 @@ class OperativeAgent:
         }
 
     async def _call_model(self, system_instruction: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
-        """Call LLM via provider interface when available, or fall back to direct SDK calls."""
-        model_name = self.config.model_name
-
-        if self.llm_provider is not None:
-            return await self._call_via_provider(system_instruction, messages, model_name)
-
-        # Legacy direct SDK paths (no provider injected)
-        if "claude" in model_name:
-            result = await self._call_claude(system_instruction, messages, model_name)
-            if result.get("_fallback_to_gemini"):
-                logger.warning("[OPERATIVE] Claude unavailable, falling back to Gemini")
-                return await self._call_gemini(system_instruction, messages, "gemini-2.5-pro")
-            return result
-        return await self._call_gemini(system_instruction, messages, model_name)
+        """Call the LLM through the injected provider using the resolved model name."""
+        return await self._call_via_provider(system_instruction, messages, self.model_name)
 
     async def _call_via_provider(
         self, system_instruction: str, messages: list[dict[str, Any]], model_name: str
@@ -667,9 +634,9 @@ class OperativeAgent:
 
         Converts the internal dict-based message format to provider Message objects,
         calls generate(), then converts the LLMResponse back to the internal format.
+        Failures are returned with an ``_error`` key so the loop can fail closed
+        instead of treating the error text as a model answer.
         """
-        assert self.llm_provider is not None
-
         # Convert internal tools list → ToolDefinition objects
         tool_defs: list[ToolDefinition] | None = None
         if self.tools:
@@ -684,13 +651,14 @@ class OperativeAgent:
                 model=model_name,
                 tools=tool_defs,
                 temperature=0.0,
-                max_tokens=8192,
+                max_tokens=self.settings.operative_max_output_tokens,
                 system_prompt=system_instruction,
             )
         except Exception as exc:
             logger.error("LLM provider call failed: %s", exc)
             return {
-                "content": [{"type": "text", "text": f"Model call error: {exc}"}],
+                "_error": str(exc),
+                "content": [],
                 "usage": {"input": 0, "output": 0, "cached_input": 0},
             }
 
@@ -712,333 +680,19 @@ class OperativeAgent:
         if cached_input:
             self._cache_input_tokens += cached_input
 
+        # Carry the provider's own figures through: it knows the concrete model
+        # it billed and the exact cache read/write split, so guardrails must not
+        # re-derive the cost from a tier name.
         return {
             "content": content_parts,
+            "model": response.model or model_name,
             "usage": {
                 "input": response.usage.input_tokens,
                 "output": response.usage.output_tokens,
                 "cached_input": cached_input,
+                "cost_usd": response.usage.estimated_cost_usd,
             },
         }
-
-    async def _call_claude(
-        self, system_instruction: str, messages: list[dict[str, Any]], model_name: str
-    ) -> dict[str, Any]:
-        """Call Claude on Vertex AI."""
-        try:
-            from anthropic import AnthropicVertex
-
-            client = AnthropicVertex(
-                region=getattr(self.settings, "vertex_ai_claude_region", "us-east5"),
-                project_id=self.settings.gcp_project_id,
-            )
-
-            claude_tools = [
-                {
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "input_schema": t.get("parameters", {"type": "object", "properties": {}}),
-                }
-                for t in self.tools
-            ]
-
-            claude_messages = []
-            for msg in messages:
-                role = msg["role"]
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    claude_messages.append({"role": role, "content": content})
-                elif isinstance(content, list):
-                    blocks = []
-                    for part in content:
-                        if part.get("type") == "text":
-                            blocks.append({"type": "text", "text": part["text"]})
-                        elif part.get("type") == "tool_use":
-                            blocks.append(
-                                {
-                                    "type": "tool_use",
-                                    "id": part["id"],
-                                    "name": part["name"],
-                                    "input": part.get("input", {}),
-                                }
-                            )
-                        elif part.get("type") == "tool_result":
-                            blocks.append(
-                                {
-                                    "type": "tool_result",
-                                    "tool_use_id": part["tool_use_id"],
-                                    "content": part.get("content", ""),
-                                }
-                            )
-                    if blocks:
-                        claude_messages.append({"role": role, "content": blocks})
-
-            # Use prompt caching for system instruction — pays full price once,
-            # then 90% discount on subsequent calls within the 5-min TTL.
-            # This saves ~$1-2/task on 20+ step operatives.
-            cached_system = [
-                {
-                    "type": "text",
-                    "text": system_instruction,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ]
-
-            response = client.messages.create(
-                model=model_name,
-                max_tokens=8192,
-                system=cached_system,  # type: ignore[arg-type]
-                messages=claude_messages,  # type: ignore[arg-type]
-                tools=claude_tools if claude_tools else None,  # type: ignore[arg-type]
-            )
-
-            content_parts: list[dict[str, Any]] = []
-            for block in response.content:
-                if block.type == "text":
-                    content_parts.append({"type": "text", "text": block.text})
-                elif block.type == "tool_use":
-                    content_parts.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
-
-            # Track cache metrics if available
-            usage_data: dict[str, Any] = {
-                "input": response.usage.input_tokens,
-                "output": response.usage.output_tokens,
-            }
-            cache_creation = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
-            cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
-            if cache_creation or cache_read:
-                usage_data["cache_creation_input_tokens"] = cache_creation
-                usage_data["cache_read_input_tokens"] = cache_read
-                logger.info(
-                    "[OPERATIVE] Cache: created=%d, read=%d, input=%d",
-                    cache_creation,
-                    cache_read,
-                    response.usage.input_tokens,
-                )
-
-            return {
-                "content": content_parts,
-                "usage": usage_data,
-            }
-
-        except Exception as exc:
-            from henchmen.utils.retry import _is_retryable
-
-            if _is_retryable(exc):
-                logger.warning("Claude rate limited, retrying with backoff...")
-                try:
-                    from henchmen.utils.retry import retry_with_backoff
-
-                    async def _claude_retry() -> Any:
-                        return client.messages.create(
-                            model=model_name,
-                            max_tokens=8192,
-                            system=cached_system,  # type: ignore[arg-type]
-                            messages=claude_messages,  # type: ignore[arg-type]
-                            tools=claude_tools if claude_tools else None,  # type: ignore[arg-type]
-                        )
-
-                    response = await retry_with_backoff(_claude_retry, max_retries=3, base_delay=5.0)
-                    claude_retry_parts: list[dict[str, Any]] = []
-                    for block in response.content:
-                        if block.type == "text":
-                            claude_retry_parts.append({"type": "text", "text": block.text})
-                        elif block.type == "tool_use":
-                            claude_retry_parts.append(
-                                {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
-                            )
-                    return {
-                        "content": claude_retry_parts,
-                        "usage": {"input": response.usage.input_tokens, "output": response.usage.output_tokens},
-                    }
-                except Exception:
-                    pass
-
-            # Signal fallback to Gemini
-            logger.warning("Claude call failed (%s), will fallback to Gemini", exc)
-            return {"_fallback_to_gemini": True, "content": [], "usage": {"input": 0, "output": 0}}
-
-    async def _call_gemini(
-        self, system_instruction: str, messages: list[dict[str, Any]], model_name: str
-    ) -> dict[str, Any]:
-        """Call Gemini on Vertex AI using the google-genai SDK."""
-        try:
-            from google import genai
-            from google.genai import types
-
-            client = genai.Client(
-                vertexai=True,
-                project=self.settings.gcp_project_id,
-                location="global" if "gemini-3" in model_name else self.settings.gcp_region,
-            )
-
-            # Build tool declarations
-            genai_tools = None
-            if self.tools:
-                func_decls = []
-                for t in self.tools:
-                    func_decls.append(
-                        types.FunctionDeclaration(
-                            name=t["name"],
-                            description=t.get("description", ""),
-                            parameters=t.get("parameters", {}),
-                        )
-                    )
-                genai_tools = [types.Tool(function_declarations=func_decls)]
-
-                # Add Google Search grounding tool if enabled for this node
-                if self.node.grounding_enabled and self.settings.vertex_ai_grounding_enabled:
-                    genai_tools.append(types.Tool(google_search=types.GoogleSearch()))
-                    logger.info("Google Search grounding enabled for node %s", self.node.id)
-
-            # Build contents
-            contents = []
-            for msg in messages:
-                role = msg["role"]
-                raw = msg.get("content", "")
-                if isinstance(raw, str):
-                    contents.append(types.Content(role=role, parts=[types.Part.from_text(text=raw)]))
-                elif isinstance(raw, list):
-                    parts = []
-                    for part in raw:
-                        if part.get("type") == "text":
-                            parts.append(types.Part.from_text(text=part["text"]))
-                        elif part.get("type") == "tool_result":
-                            # Function response
-                            parts.append(
-                                types.Part.from_function_response(
-                                    name=part["tool_name"],
-                                    response={"result": part.get("content", "")},
-                                )
-                            )
-                    if parts:
-                        contents.append(types.Content(role=role, parts=parts))
-
-            # Safety settings — defense-in-depth for untrusted Slack/Jira/GitHub input
-            safety_settings = [
-                types.SafetySetting(
-                    category="HARM_CATEGORY_DANGEROUS_CONTENT",  # type: ignore[arg-type]
-                    threshold=self.settings.vertex_ai_safety_threshold,  # type: ignore[arg-type]
-                ),
-                types.SafetySetting(
-                    category="HARM_CATEGORY_HARASSMENT",  # type: ignore[arg-type]
-                    threshold=self.settings.vertex_ai_safety_threshold,  # type: ignore[arg-type]
-                ),
-            ]
-
-            # Use context cache if available (75% discount on cached input tokens)
-            if self._cached_content_name:
-                config = types.GenerateContentConfig(
-                    cached_content=self._cached_content_name,
-                    tools=genai_tools,  # type: ignore[arg-type]
-                    safety_settings=safety_settings,
-                )
-            else:
-                config = types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    tools=genai_tools,  # type: ignore[arg-type]
-                    safety_settings=safety_settings,
-                )
-
-            response = client.models.generate_content(
-                model=model_name,
-                # google-genai version-dependent: some versions accept
-                # list[Content], some require a covariant Sequence.
-                contents=contents,  # type: ignore[arg-type, unused-ignore]
-                config=config,
-            )
-
-            # Check for safety-blocked response
-            if response.candidates and response.candidates[0].finish_reason == "SAFETY":
-                logger.warning("[safety] Response blocked by safety filter (task=%s)", self.config.task_id)
-                return {
-                    "content": [{"type": "text", "text": "Response blocked by safety filter. Adjusting approach."}],
-                    "usage": {"input": 0, "output": 0, "cached_input": 0},
-                }
-
-            # Normalize response
-            content_parts: list[dict[str, Any]] = []
-            candidate = response.candidates[0] if response.candidates else None
-            parts = getattr(getattr(candidate, "content", None), "parts", None) or []
-            if parts:
-                for part in parts:
-                    if part.function_call:
-                        fc = part.function_call
-                        content_parts.append(
-                            {
-                                "type": "tool_use",
-                                "id": f"call_{fc.name}_{self.step_count}",
-                                "name": fc.name,
-                                "input": dict(fc.args) if fc.args else {},
-                            }
-                        )
-                    elif part.text:
-                        content_parts.append({"type": "text", "text": part.text})
-
-            um = response.usage_metadata
-            cached_tokens = getattr(um, "cached_content_token_count", 0) or 0
-            if cached_tokens:
-                self._cache_input_tokens += cached_tokens
-            return {
-                "content": content_parts,
-                "usage": {
-                    "input": getattr(um, "prompt_token_count", 0),
-                    "output": getattr(um, "candidates_token_count", 0),
-                    "cached_input": cached_tokens,
-                },
-            }
-
-        except Exception as exc:
-            from henchmen.utils.retry import _is_retryable
-
-            if _is_retryable(exc):
-                logger.warning("Gemini rate limited, retrying with backoff...")
-                try:
-                    from henchmen.utils.retry import retry_with_backoff
-
-                    async def _retry_call() -> Any:
-                        return client.models.generate_content(
-                            model=model_name,
-                            contents=contents,  # type: ignore[arg-type, unused-ignore]
-                            config=config,
-                        )
-
-                    response = await retry_with_backoff(_retry_call, max_retries=3, base_delay=5.0)
-                    retry_parts: list[dict[str, Any]] = []
-                    if response.candidates:
-                        for part in response.candidates[0].content.parts:  # type: ignore[union-attr]
-                            if part.function_call:
-                                fc = part.function_call
-                                retry_parts.append(
-                                    {
-                                        "type": "tool_use",
-                                        "id": f"call_{fc.name}_{self.step_count}",
-                                        "name": fc.name,
-                                        "input": dict(fc.args) if fc.args else {},
-                                    }
-                                )
-                            elif part.text:
-                                retry_parts.append({"type": "text", "text": part.text})
-                    um = response.usage_metadata
-                    cached_tokens = getattr(um, "cached_content_token_count", 0) or 0
-                    if cached_tokens:
-                        self._cache_input_tokens += cached_tokens
-                    return {
-                        "content": retry_parts,
-                        "usage": {
-                            "input": getattr(um, "prompt_token_count", 0),
-                            "output": getattr(um, "candidates_token_count", 0),
-                            "cached_input": cached_tokens,
-                        },
-                    }
-                except Exception as retry_exc:
-                    logger.error("Gemini retry exhausted: %s", retry_exc)
-
-            logger.error("Model call failed: %s", exc)
-            return {
-                "content": [{"type": "text", "text": f"Model call error: {exc}"}],
-                "usage": {"input": 0, "output": 0, "cached_input": 0},
-            }
 
     async def _execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         """Execute a tool locally using Arsenal handlers."""
@@ -1051,6 +705,10 @@ class OperativeAgent:
             arguments["path"] = os.path.join(self.workspace_dir, arguments["path"])
         if "directory" in arguments and not os.path.isabs(arguments["directory"]):
             arguments["directory"] = os.path.join(self.workspace_dir, arguments["directory"])
+        # Tools that accept a working_dir (git/test/lint) must run inside the
+        # cloned repository, not wherever the process happens to be.
+        if not arguments.get("working_dir") and _accepts_working_dir(handler):
+            arguments["working_dir"] = self.workspace_dir
 
         try:
             logger.info(
@@ -1060,61 +718,63 @@ class OperativeAgent:
             )
             result = await handler(**arguments)
             logger.info("[TOOL] %s -> %s", tool_name, json.dumps(result)[:200])
-            # Detect blocked conditions from tool errors
-            error_msg = str(result.get("error", "")).lower() if isinstance(result, dict) else ""
-            if error_msg and any(
-                kw in error_msg
-                for kw in ("permission", "access denied", "not found", "rate limit", "resource exhausted")
-            ):
-                self._blocked_reason = f"Tool '{tool_name}' blocked: {result.get('error', '')}"
-                logger.warning("[agent] Blocked condition detected from tool '%s': %s", tool_name, self._blocked_reason)
+            # NOTE: a single tool error never blocks the node. "File not found"
+            # and "old_text not found" are the most common *recoverable* errors
+            # in an agent run; only the consecutive same-class failure abort in
+            # ``_agent_loop`` sets ``_blocked_reason``.
             return result
         except Exception as exc:
             logger.error("Tool execution failed (%s): %s", tool_name, exc)
             return {"error": str(exc)}
 
     async def _get_git_diff(self) -> str | None:
-        """Return the git diff of all staged/unstaged changes in the workspace."""
+        """Return the diff of this node's work: committed changes plus the working tree.
+
+        ``git diff HEAD`` alone is empty once the agent commits, which used to
+        make every successful run report an empty diff.
+        """
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                "diff",
-                "HEAD",
-                cwd=self.workspace_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            diff = stdout.decode("utf-8", errors="replace").strip()
-            return diff if diff else None
+            base_ref = await detect_base_ref(self.workspace_dir)
+            committed, _, rc = await run_git(self.workspace_dir, "diff", f"{base_ref}...HEAD")
+            if rc != 0:
+                committed = ""
+            uncommitted, _, _ = await run_git(self.workspace_dir, "diff", "HEAD")
+            diff = "\n".join(part for part in (committed, uncommitted) if part).strip()
+            return diff or None
         except Exception as exc:
             logger.warning("Could not get git diff: %s", exc)
             return None
 
     async def _get_files_changed(self) -> list[str]:
-        """Return list of files changed relative to HEAD."""
+        """Return files changed by this node: committed against the base ref plus uncommitted."""
+        files: list[str] = []
         try:
-            # Use git status --porcelain instead of git diff (handles large repos better)
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                "status",
-                "--porcelain",
-                cwd=self.workspace_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                logger.warning("git status failed: %s", stderr.decode())
-                return []
-            lines = stdout.decode("utf-8", errors="replace").strip().splitlines()
-            # Porcelain format: "XY filename" — extract filenames
-            files = [line[3:].strip().strip('"') for line in lines if len(line) > 3]
-            logger.info("[OPERATIVE] Files changed: %s", files)
-            return files
+            base_ref = await detect_base_ref(self.workspace_dir)
+            committed, _, rc = await run_git(self.workspace_dir, "diff", "--name-only", f"{base_ref}...HEAD")
+            if rc == 0 and committed:
+                files.extend(committed.splitlines())
+
+            porcelain, stderr, rc = await run_git(self.workspace_dir, "status", "--porcelain")
+            if rc != 0:
+                logger.warning("git status failed: %s", stderr)
+            else:
+                files.extend(parse_porcelain_names(porcelain))
+
+            # Preserve order, drop duplicates
+            unique = list(dict.fromkeys(name for name in (f.strip() for f in files) if name))
+            logger.info("[OPERATIVE] Files changed: %s", unique)
+            return unique
         except Exception as exc:
             logger.warning("Could not get changed files: %s", exc)
             return []
+
+
+def _accepts_working_dir(handler: Any) -> bool:
+    """Return True when an Arsenal handler takes a ``working_dir`` parameter."""
+    try:
+        return "working_dir" in inspect.signature(handler).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def _tool_dicts_to_definitions(tools: list[dict[str, Any]]) -> list[ToolDefinition]:
@@ -1215,7 +875,7 @@ async def build_operative_agent(
     config: OperativeConfig,
     workspace_dir: str,
     settings: Settings,
-    llm_provider: LLMProvider | None = None,
+    llm_provider: LLMProvider,
     document_store: "DocumentStore | None" = None,
     shutdown_event: asyncio.Event | None = None,
 ) -> OperativeAgent:

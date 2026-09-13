@@ -5,32 +5,28 @@ that have changes relative to ``origin/main`` so the operative is not
 penalised for pre-existing issues in unrelated packages.
 """
 
-import asyncio
 import logging
 import os
 from typing import Any
 
+from henchmen.arsenal._process import DEFAULT_TIMEOUT_SECONDS, TEST_TIMEOUT_SECONDS, run_command
 from henchmen.arsenal.registry import tool
 
 logger = logging.getLogger(__name__)
 
 
-async def _run_subprocess(*args: str, working_dir: str = "") -> dict[str, Any]:
-    """Run an arbitrary subprocess and capture output."""
-    kwargs: dict[str, Any] = {
-        "stdout": asyncio.subprocess.PIPE,
-        "stderr": asyncio.subprocess.PIPE,
-    }
-    if working_dir:
-        kwargs["cwd"] = working_dir
-    proc = await asyncio.create_subprocess_exec(*args, **kwargs)
-    stdout, stderr = await proc.communicate()
-    return {
-        "stdout": stdout.decode("utf-8"),
-        "stderr": stderr.decode("utf-8"),
-        "return_code": proc.returncode,
-        "success": proc.returncode == 0,
-    }
+async def _run_subprocess(
+    *args: str,
+    working_dir: str = "",
+    timeout_seconds: float = TEST_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Run an arbitrary subprocess and capture output.
+
+    Delegates to :func:`henchmen.arsenal._process.run_command` so a test or
+    lint command that never exits is killed and reported as a failure instead
+    of holding the operative until its wall clock expires.
+    """
+    return await run_command(*args, cwd=working_dir, timeout_seconds=timeout_seconds)
 
 
 def _detect_project_type(working_dir: str) -> str:
@@ -60,22 +56,12 @@ async def _get_affected_packages(working_dir: str) -> list[str]:
     or changes span the root (meaning we should fall back to linting everything).
     """
     wd = working_dir or "."
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "diff",
-            "--name-only",
-            "origin/main",
-            cwd=wd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        diff_out, _ = await proc.communicate()
-        if proc.returncode != 0:
-            return []
-        changed_files = [f.strip() for f in diff_out.decode().strip().split("\n") if f.strip()]
-    except Exception:
+    result = await run_command(
+        "git", "diff", "--name-only", "origin/main", cwd=wd, timeout_seconds=DEFAULT_TIMEOUT_SECONDS
+    )
+    if not result["success"]:
         return []
+    changed_files = [f.strip() for f in str(result["stdout"]).strip().split("\n") if f.strip()]
 
     if not changed_files:
         return []

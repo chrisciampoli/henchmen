@@ -12,6 +12,27 @@ from enum import StrEnum
 
 logger = logging.getLogger(__name__)
 
+# Canonical Arsenal tool-name sets, defined once and imported by the agent loop
+# so the detector and ``_agent_loop`` can never disagree about what counts as
+# an edit. Kept in sync with ``henchmen.arsenal.tools.code_edit`` /
+# ``code_intel`` / ``context``.
+EDIT_TOOLS: frozenset[str] = frozenset({"file_write", "file_edit", "file_create", "file_insert_at_line", "file_delete"})
+
+READ_TOOLS: frozenset[str] = frozenset(
+    {
+        "file_read",
+        "file_search",
+        "grep_search",
+        "symbol_lookup",
+        "ast_analysis",
+        "semantic_search",
+        "find_related",
+        "git_diff",
+        "git_log",
+        "git_status",
+    }
+)
+
 
 class StuckState(StrEnum):
     """Detected patterns indicating the agent is stuck."""
@@ -43,13 +64,13 @@ class NudgeDetector:
         """Record a tool call for pattern detection."""
         self._tool_history.append(tool_name)
 
-        if tool_name in ("file_edit", "file_write"):
+        if tool_name in EDIT_TOOLS:
             self._edit_count += 1
             self._has_edited = True
             self._read_only_steps = 0
         elif tool_name == "git_commit":
             self._commit_count += 1
-        elif tool_name in ("grep_search", "file_read", "code_search", "find_file"):
+        elif tool_name in READ_TOOLS:
             self._search_count += 1
             self._read_only_steps += 1
         else:
@@ -88,8 +109,7 @@ class NudgeDetector:
         # Check search loop (repeated searches without progress) — before read_only_loop
         # because search_loop is more specific
         recent = self._tool_history[-6:] if len(self._tool_history) >= 6 else []
-        search_tools = {"grep_search", "file_read", "code_search", "find_file"}
-        if len(recent) >= 6 and all(t in search_tools for t in recent):
+        if len(recent) >= 6 and all(t in READ_TOOLS for t in recent):
             return StuckState.SEARCH_LOOP
 
         # Check read-only loop (only reading files, not editing)
@@ -103,7 +123,7 @@ class NudgeDetector:
             return StuckState.HIGH_BUDGET_NO_COMMIT
 
         # Check repeated edits to the same area
-        recent_edits = [t for t in self._tool_history[-8:] if t in ("file_edit", "file_write")]
+        recent_edits = [t for t in self._tool_history[-8:] if t in EDIT_TOOLS]
         if len(recent_edits) >= 5:
             return StuckState.REPEATED_EDIT
 

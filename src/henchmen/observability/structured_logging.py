@@ -18,7 +18,7 @@ and can drive log-based metrics and alerting policies in Cloud Monitoring.
 Usage:
     from henchmen.observability.structured_logging import emit_metric
 
-    emit_metric("task.completed", {"task_id": "abc", "cost_usd": 0.35, "model": "claude-sonnet-4@20250514"})
+    emit_metric("task.completed", {"task_id": "abc", "cost_usd": 0.35, "model": "gemini-2.5-pro"})
 """
 
 import json
@@ -80,6 +80,30 @@ def emit_metric(
         logger.debug("Failed to emit metric %s", metric_name)
 
 
+def primary_model_name(task_data: dict[str, Any]) -> str:
+    """The model that ran most of a task, read from its per-node metrics.
+
+    ``record_node_result`` stores the concrete model (tier names are resolved
+    through the configured provider before they land), so this is safe to use
+    as a Cloud Monitoring / experiment label.
+    """
+    node_metrics = task_data.get("node_metrics") or {}
+    if not isinstance(node_metrics, dict):
+        return "unknown"
+    best_model = ""
+    best_calls = -1.0
+    for node in node_metrics.values():
+        if not isinstance(node, dict):
+            continue
+        model = str(node.get("model_name") or "")
+        if not model:
+            continue
+        calls = float(node.get("model_calls") or 0)
+        if calls > best_calls:
+            best_model, best_calls = model, calls
+    return best_model or "unknown"
+
+
 def emit_task_completed(
     task_id: str,
     scheme_id: str,
@@ -88,7 +112,11 @@ def emit_task_completed(
     wall_clock_seconds: float,
     model_name: str = "",
 ) -> None:
-    """Emit a structured metric for task completion."""
+    """Emit a structured metric for task completion.
+
+    ``model_name`` should be the concrete model (see :func:`primary_model_name`)
+    so Cloud Monitoring can break spend down by model.
+    """
     emit_metric(
         "task.completed",
         labels={

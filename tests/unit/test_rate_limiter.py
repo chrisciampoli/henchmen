@@ -163,3 +163,111 @@ async def test_rate_limiter_bookkeeping_direct():
     middleware._requests["5.5.5.5"] = [time.monotonic()] * 60
     resp = await middleware.dispatch(request, call_next)
     assert resp.status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# Regressions: mounted apps, proxied clients, bucket eviction, /pubsub scope
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rate_limiter_applies_when_app_is_mounted():
+    """``henchmen serve`` mounts the app at /dispatch; the limiter must still fire.
+
+    ``request.url.path`` carries the mount prefix, so matching on it made the
+    limiter inert under ``henchmen serve``. The route-relative path is used
+    instead.
+    """
+    inner = _make_app()
+    root = FastAPI()
+    root.mount("/dispatch", inner)
+
+    transport = ASGITransport(app=_SpoofClientIPMiddleware(root, "7.7.7.7"))  # type: ignore[arg-type]
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        for _ in range(60):
+            resp = await client.post("/dispatch/api/v1/tasks")
+            assert resp.status_code == 200
+        resp = await client.post("/dispatch/api/v1/tasks")
+        assert resp.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_rate_limiter_covers_pubsub_paths():
+    """Pub/Sub push endpoints are inside the limiter's scope."""
+    app = FastAPI()
+    app.add_middleware(RateLimitMiddleware)
+
+    @app.post("/pubsub/task-planned")
+    async def task_planned() -> dict[str, str]:
+        return {"ok": "yes"}
+
+    transport = ASGITransport(app=_SpoofClientIPMiddleware(app, "8.8.8.8"))  # type: ignore[arg-type]
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        for _ in range(60):
+            assert (await client.post("/pubsub/task-planned")).status_code == 200
+        assert (await client.post("/pubsub/task-planned")).status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_forwarded_for_separates_clients_behind_a_proxy():
+    """Behind Cloud Run every request has the same peer address."""
+    app = _make_app()
+    transport = ASGITransport(app=_SpoofClientIPMiddleware(app, "169.254.1.1"))  # type: ignore[arg-type]
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        for _ in range(60):
+            resp = await client.post("/webhooks/test", headers={"X-Forwarded-For": "203.0.113.1, 169.254.1.1"})
+            assert resp.status_code == 200
+        resp = await client.post("/webhooks/test", headers={"X-Forwarded-For": "203.0.113.1, 169.254.1.1"})
+        assert resp.status_code == 429
+
+        # A different real client still has its own budget.
+        resp = await client.post("/webhooks/test", headers={"X-Forwarded-For": "203.0.113.2, 169.254.1.1"})
+        assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_idle_buckets_are_evicted():
+    """The per-IP dict must not grow for the life of the process."""
+    app = FastAPI()
+    middleware = RateLimitMiddleware(app, window_seconds=0)
+
+    async def call_next(_request: Request) -> Response:
+        return JSONResponse({"ok": True}, status_code=200)
+
+    for i in range(25):
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/webhooks/foo",
+            "root_path": "",
+            "headers": [],
+            "query_string": b"",
+            "client": (f"10.1.0.{i}", 1234),
+        }
+        resp = await middleware.dispatch(Request(scope), call_next)  # type: ignore[arg-type]
+        assert resp.status_code == 200
+
+    # With a zero-length window every previous bucket is stale by the next call.
+    assert len(middleware._requests) <= 1
+
+
+@pytest.mark.asyncio
+async def test_limits_are_configurable():
+    app = FastAPI()
+    middleware = RateLimitMiddleware(app, limit=2, window_seconds=60)
+
+    async def call_next(_request: Request) -> Response:
+        return JSONResponse({"ok": True}, status_code=200)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/webhooks/foo",
+        "root_path": "",
+        "headers": [],
+        "query_string": b"",
+        "client": ("6.6.6.6", 1234),
+    }
+    assert (await middleware.dispatch(Request(scope), call_next)).status_code == 200  # type: ignore[arg-type]
+    assert (await middleware.dispatch(Request(scope), call_next)).status_code == 200  # type: ignore[arg-type]
+    assert (await middleware.dispatch(Request(scope), call_next)).status_code == 429  # type: ignore[arg-type]

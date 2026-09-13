@@ -40,7 +40,15 @@ class ContainerOrchestrator(Protocol):
         service_account: str | None = None,
         secrets: dict[str, str] | None = None,
     ) -> str:
-        """Launch a container job. Returns execution ID."""
+        """Launch a container job. Returns execution ID.
+
+        ``secrets`` maps an environment variable name to a provider-specific
+        secret reference (a Secret Manager resource on GCP, a Secrets Manager
+        ARN on AWS). Implementations must inject them by reference so the
+        values never reach a job spec, a log line, or this process.
+        ``timeout_seconds`` must be enforced: an execution that outlives it
+        is killed and reported as :attr:`JobStatus.TIMED_OUT`.
+        """
         ...
 
     async def get_status(self, execution_id: str) -> JobResult:

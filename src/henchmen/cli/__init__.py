@@ -1,4 +1,4 @@
-"""Henchmen CLI — single-process server for local development."""
+"""Henchmen CLI — setup wizard, diagnostics, evals and a single-process dev server."""
 
 from __future__ import annotations
 
@@ -13,7 +13,57 @@ import uvicorn
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from evals.harness import EvalReport, FixtureResult
+    from henchmen.config.settings import Settings
+    from henchmen.evals.harness import EvalReport, FixtureResult
+
+_LOG_LEVELS = ("critical", "error", "warning", "info", "debug")
+_BASELINE_REGRESSION_THRESHOLD = 0.05
+_BASELINE_SCHEMA_VERSION = 2
+
+
+def _add_eval_run_arguments(parser: argparse.ArgumentParser, *, provider_required: bool) -> None:
+    """Register the ``eval run`` flags.
+
+    Applied to both the ``eval`` parser and its ``run`` sub-parser so the
+    documented short form (``henchmen eval --provider openai``) and the
+    explicit form (``henchmen eval run --provider openai``) both parse.
+    """
+    parser.add_argument(
+        "--provider",
+        required=provider_required,
+        default=None,
+        help="LLM provider to evaluate: gcp, aws, local, openai, anthropic (aliases: vertex, bedrock, ollama)",
+    )
+    parser.add_argument(
+        "--fixture",
+        default=None,
+        help="Run a single fixture by directory name (default: run all fixtures)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Run every fixture (the default; accepted for explicitness)",
+    )
+    parser.add_argument(
+        "--fixtures-dir",
+        default="evals/fixtures",
+        help="Path to the fixtures directory (default: evals/fixtures)",
+    )
+    parser.add_argument(
+        "--baseline-path",
+        default="evals/baseline.json",
+        help="Path to baseline.json (default: evals/baseline.json)",
+    )
+    parser.add_argument(
+        "--write-baseline",
+        action="store_true",
+        help="Overwrite the baseline for this provider with the current run",
+    )
+    parser.add_argument(
+        "--compare-baseline",
+        action="store_true",
+        help="Compare current run to baseline; exit non-zero on >5%% regression",
+    )
 
 
 def main() -> None:
@@ -22,55 +72,48 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command")
 
     serve_parser = subparsers.add_parser("serve", help="Run all services in a single process (local dev)")
-    serve_parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
-    serve_parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
-    serve_parser.add_argument("--log-level", default="info", help="Log level")
+    serve_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host to bind to (default: 127.0.0.1; pass 0.0.0.0 to expose on the network)",
+    )
+    serve_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port to bind to (default: HENCHMEN_LOCAL_SERVE_PORT, itself 8000)",
+    )
+    serve_parser.add_argument("--log-level", default="info", choices=_LOG_LEVELS, help="Log level")
 
     build_parser = subparsers.add_parser("build-operative", help="Build the local operative Docker image")
     build_parser.add_argument("--no-cache", action="store_true", help="Build without Docker cache")
 
-    subparsers.add_parser(
+    doctor_parser = subparsers.add_parser(
         "doctor",
-        help="Diagnose the local environment (Docker, git, LLM credentials, operative image, ...)",
+        help="Diagnose the local environment (settings, Docker, git, LLM/GitHub/Slack/Jira credentials, ...)",
     )
+    from henchmen.cli.doctor import add_doctor_arguments
 
-    subparsers.add_parser("chat", help="Interactive task builder (powered by local LLM)")
+    add_doctor_arguments(doctor_parser)
+
+    subparsers.add_parser("chat", help="Interactive task builder REPL (uses the configured LLM provider)")
+
+    init_parser = subparsers.add_parser(
+        "init",
+        aliases=["setup"],
+        help="Interactive setup: choose providers and models, connect GitHub/Slack/Jira, write .env.local",
+    )
+    from henchmen.cli.init import add_init_arguments
+
+    add_init_arguments(init_parser)
 
     eval_parser = subparsers.add_parser("eval", help="Run the offline evaluation harness")
+    _add_eval_run_arguments(eval_parser, provider_required=False)
     eval_subparsers = eval_parser.add_subparsers(dest="eval_command")
 
     # --- henchmen eval run ---
     eval_run_parser = eval_subparsers.add_parser("run", help="Run eval fixtures and save results to SQLite")
-    eval_run_parser.add_argument(
-        "--provider",
-        required=True,
-        help="LLM provider to evaluate (openai, anthropic, vertex, ollama, local)",
-    )
-    eval_run_parser.add_argument(
-        "--fixture",
-        default=None,
-        help="Run a single fixture by directory name (default: run all fixtures)",
-    )
-    eval_run_parser.add_argument(
-        "--fixtures-dir",
-        default="evals/fixtures",
-        help="Path to the fixtures directory (default: evals/fixtures)",
-    )
-    eval_run_parser.add_argument(
-        "--baseline-path",
-        default="evals/baseline.json",
-        help="Path to baseline.json (default: evals/baseline.json)",
-    )
-    eval_run_parser.add_argument(
-        "--write-baseline",
-        action="store_true",
-        help="Overwrite the baseline for this provider with the current run",
-    )
-    eval_run_parser.add_argument(
-        "--compare-baseline",
-        action="store_true",
-        help="Compare current run to baseline; exit non-zero on >5%% regression",
-    )
+    _add_eval_run_arguments(eval_run_parser, provider_required=True)
 
     # --- henchmen eval compare ---
     eval_compare_parser = eval_subparsers.add_parser("compare", help="Compare two eval runs dimension-by-dimension")
@@ -93,57 +136,117 @@ def main() -> None:
     elif args.command == "doctor":
         from henchmen.cli import doctor
 
-        sys.exit(doctor.run_doctor_cli())
+        sys.exit(doctor.run_doctor_cli(args))
     elif args.command == "chat":
         from henchmen.cli import chat
 
         sys.exit(chat.run_chat_cli())
+    elif args.command in ("init", "setup"):
+        from henchmen.cli.init import run_init_cli
+
+        sys.exit(run_init_cli(args))
     else:
         parser.print_help()
         sys.exit(1)
 
 
-def _check_operative_image() -> bool:
-    """Check if the local operative Docker image exists."""
-    import subprocess
+# ---------------------------------------------------------------------------
+# Environment defaults
+# ---------------------------------------------------------------------------
 
-    result = subprocess.run(
-        ["docker", "image", "inspect", "henchmen-operative:local"],
-        capture_output=True,
-    )
-    return result.returncode == 0
+
+def _dotenv_keys() -> set[str]:
+    """Keys defined in the dotenv files ``Settings`` itself reads.
+
+    ``os.environ`` outranks the dotenv files in pydantic-settings, so a
+    ``setdefault`` would silently override a value the user put in
+    ``.env.local``. Commands seed defaults only for keys absent from both.
+    """
+    from dotenv import dotenv_values
+
+    from henchmen.config.settings import Settings
+
+    configured = Settings.model_config.get("env_file") or ()
+    env_files: list[object] = list(configured) if isinstance(configured, tuple | list) else [configured]
+
+    keys: set[str] = set()
+    for env_file in env_files:
+        try:
+            keys.update(str(key).upper() for key in dotenv_values(str(env_file)))
+        except OSError:  # pragma: no cover - unreadable dotenv
+            continue
+    return keys
+
+
+def _default_env(key: str, value: str, *, file_keys: set[str]) -> None:
+    """Seed ``key`` only when neither the process env nor a dotenv file defines it."""
+    if key not in os.environ and key not in file_keys:
+        os.environ[key] = value
+
+
+def _build_settings_or_exit() -> Settings:
+    """Build ``Settings``, turning a validation error into an actionable exit."""
+    from henchmen.config.settings import get_settings
+
+    try:
+        return get_settings()
+    except ValueError as exc:  # pydantic ValidationError subclasses ValueError
+        first = (str(exc).strip().splitlines() or ["invalid settings"])[0]
+        print(f"ERROR: invalid configuration: {first}", file=sys.stderr)
+        print("Hint: run `henchmen init` to (re)write .env.local.", file=sys.stderr)
+        sys.exit(2)
 
 
 def _build_operative(args: argparse.Namespace) -> None:
     """Build the local operative Docker image."""
     import subprocess
+    from pathlib import Path
 
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("henchmen")
+
+    dockerfile = Path("containers/operative/Dockerfile")
+    if not dockerfile.is_file():
+        print(
+            f"ERROR: {dockerfile} not found — run `henchmen build-operative` from the Henchmen repo root.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     logger.info("Building henchmen-operative:local image...")
     cmd = [
         "docker",
         "build",
         "-f",
-        "containers/operative/Dockerfile",
+        str(dockerfile),
         "-t",
         "henchmen-operative:local",
         ".",
     ]
     if getattr(args, "no_cache", False):
         cmd.insert(2, "--no-cache")
-    result = subprocess.run(cmd)
+    try:
+        result = subprocess.run(cmd)
+    except FileNotFoundError:
+        print("ERROR: docker CLI not found on PATH — install Docker Desktop first.", file=sys.stderr)
+        sys.exit(2)
     if result.returncode != 0:
         print("ERROR: Failed to build operative image", file=sys.stderr)
         sys.exit(1)
     print("Successfully built henchmen-operative:local")
 
 
-_BASELINE_REGRESSION_THRESHOLD = 0.05
+# ---------------------------------------------------------------------------
+# henchmen eval
+# ---------------------------------------------------------------------------
 
 
 def _dispatch_eval(args: argparse.Namespace, eval_parser: argparse.ArgumentParser) -> None:
-    """Route eval sub-subcommands to their handlers."""
+    """Route eval sub-subcommands to their handlers.
+
+    A bare ``henchmen eval --provider X`` (no sub-subcommand) is treated as
+    ``run`` — the form every doc and the evals workflow use.
+    """
     cmd = getattr(args, "eval_command", None)
     if cmd == "run":
         _eval_run(args)
@@ -151,14 +254,11 @@ def _dispatch_eval(args: argparse.Namespace, eval_parser: argparse.ArgumentParse
         _eval_compare(args)
     elif cmd == "history":
         _eval_history(args)
+    elif getattr(args, "provider", None):
+        _eval_run(args)
     else:
-        # Backward compat: bare `henchmen eval --provider X` (no subcommand)
-        # still works if --provider was passed directly on the eval parser.
-        if getattr(args, "provider", None):
-            _eval_run(args)
-        else:
-            eval_parser.print_help()
-            sys.exit(1)
+        eval_parser.print_help()
+        sys.exit(1)
 
 
 def _eval_run(args: argparse.Namespace) -> None:
@@ -167,19 +267,36 @@ def _eval_run(args: argparse.Namespace) -> None:
     from pathlib import Path
     from uuid import uuid4
 
-    from henchmen.config.settings import get_settings
+    from henchmen.providers.tiers import normalize_llm_provider
 
     logging.basicConfig(level=logging.INFO)
+
+    provider = normalize_llm_provider(args.provider or "")
+    if not provider:
+        print("ERROR: --provider is required.", file=sys.stderr)
+        sys.exit(2)
+    if args.fixture and getattr(args, "all", False):
+        print("ERROR: --fixture and --all are mutually exclusive.", file=sys.stderr)
+        sys.exit(2)
+    if args.fixture and (args.write_baseline or args.compare_baseline):
+        print(
+            "ERROR: --write-baseline / --compare-baseline describe a full run; drop --fixture.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     fixtures_dir = Path(args.fixtures_dir).resolve()
     baseline_path = Path(args.baseline_path).resolve()
     if not fixtures_dir.is_dir():
         print(f"ERROR: fixtures dir not found: {fixtures_dir}", file=sys.stderr)
+        print("Hint: run `henchmen eval` from the Henchmen repo root, or pass --fixtures-dir.", file=sys.stderr)
         sys.exit(2)
 
-    # Force the provider override before building settings so get_settings() picks it up.
-    os.environ["HENCHMEN_LLM_PROVIDER"] = args.provider
-    settings = get_settings()
+    # The harness needs an LLM only: default the base provider to local so
+    # Settings does not demand GCP credentials, without overriding .env.local.
+    _default_env("HENCHMEN_PROVIDER", "local", file_keys=_dotenv_keys())
+    os.environ["HENCHMEN_LLM_PROVIDER"] = provider
+    settings = _build_settings_or_exit()
 
     from henchmen.providers.registry import ProviderRegistry
 
@@ -190,50 +307,59 @@ def _eval_run(args: argparse.Namespace) -> None:
         print(f"ERROR: failed to resolve LLM provider {args.provider!r}: {exc}", file=sys.stderr)
         sys.exit(2)
 
-    from evals.harness import run_all_fixtures, run_fixture
+    from henchmen.evals.harness import run_all_fixtures, run_fixture
 
     if args.fixture:
         target = fixtures_dir / args.fixture
         if not target.is_dir():
             print(f"ERROR: fixture not found: {target}", file=sys.stderr)
             sys.exit(2)
-        result = asyncio.run(run_fixture(target, llm_provider, settings=settings))
+        result = asyncio.run(run_fixture(target, llm_provider, settings=settings, provider_name=provider))
         _print_fixture_result(result)
-
-        # Save single-fixture run to SQLite.
-        _save_single_fixture_run(result, args.provider, str(uuid4()))
-
+        _save_single_fixture_run(result, str(uuid4()))
         if result.error:
             sys.exit(1)
         return
 
-    report = asyncio.run(run_all_fixtures(fixtures_dir, llm_provider, settings=settings))
+    report = asyncio.run(run_all_fixtures(fixtures_dir, llm_provider, settings=settings, provider_name=provider))
     _print_eval_report(report)
 
-    # Save full run to SQLite history.
+    # Save full run to SQLite history (before the guard, so failed runs show up
+    # in `henchmen eval history`).
     run_id = str(uuid4())
     _save_report_to_storage(report, run_id)
-    print(f"Run saved: {run_id}")
+
+    errored = [r.fixture_id for r in report.results if r.error or r.score.test_runner_error]
+    if not report.results or errored:
+        detail = "no fixtures ran" if not report.results else f"{len(errored)} fixture(s) errored: {', '.join(errored)}"
+        print(f"ERROR: {detail}; refusing to write or compare the baseline.", file=sys.stderr)
+        sys.exit(1)
 
     if args.write_baseline:
-        _write_baseline(baseline_path, args.provider, report)
+        _write_baseline(baseline_path, provider, report, fixtures_dir)
         print(f"Baseline updated: {baseline_path}")
         return
 
     if args.compare_baseline:
-        exit_code = _compare_baseline(baseline_path, args.provider, report)
-        sys.exit(exit_code)
+        sys.exit(_compare_baseline(baseline_path, provider, report))
 
-    # Default: fail if any fixture errored.
-    if any(r.error for r in report.results):
-        sys.exit(1)
+
+def _require_storage_or_exit() -> None:
+    """Exit with an install hint when the optional ``aiosqlite`` dependency is absent."""
+    from henchmen.evals.storage import AiosqliteMissingError, require_aiosqlite
+
+    try:
+        require_aiosqlite()
+    except AiosqliteMissingError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
 
 
 def _save_report_to_storage(report: EvalReport, run_id: str) -> None:
-    """Persist an EvalReport to the SQLite history store."""
+    """Persist an EvalReport to the SQLite history store (best effort)."""
     import asyncio
 
-    from evals.storage import EvalRun, FixtureResultRow, save_run
+    from henchmen.evals.storage import AiosqliteMissingError, EvalRun, FixtureResultRow, save_run
 
     fixture_rows: list[FixtureResultRow] = []
     for r in report.results:
@@ -260,14 +386,19 @@ def _save_report_to_storage(report: EvalReport, run_id: str) -> None:
         aggregate_score=report.aggregate_score,
         fixture_results=fixture_rows,
     )
-    asyncio.run(save_run(eval_run))
+    try:
+        asyncio.run(save_run(eval_run))
+    except AiosqliteMissingError as exc:
+        print(f"WARNING: run not saved to history — {exc}", file=sys.stderr)
+        return
+    print(f"Run saved: {run_id}")
 
 
-def _save_single_fixture_run(result: FixtureResult, provider: str, run_id: str) -> None:
-    """Persist a single-fixture result to the SQLite history store."""
+def _save_single_fixture_run(result: FixtureResult, run_id: str) -> None:
+    """Persist a single-fixture result to the SQLite history store (best effort)."""
     import asyncio
 
-    from evals.storage import EvalRun, FixtureResultRow, save_run
+    from henchmen.evals.storage import AiosqliteMissingError, EvalRun, FixtureResultRow, save_run
 
     dims = result.score.dimensions
     row = FixtureResultRow(
@@ -283,18 +414,22 @@ def _save_single_fixture_run(result: FixtureResult, provider: str, run_id: str) 
     )
     eval_run = EvalRun(
         id=run_id,
-        provider=provider,
+        provider=result.provider,
         aggregate_score=result.score.overall_score,
         fixture_results=[row],
     )
-    asyncio.run(save_run(eval_run))
+    try:
+        asyncio.run(save_run(eval_run))
+    except AiosqliteMissingError as exc:
+        print(f"WARNING: run not saved to history — {exc}", file=sys.stderr)
 
 
 def _eval_compare(args: argparse.Namespace) -> None:
     """Compare two eval runs dimension-by-dimension."""
     import asyncio
 
-    from evals.storage import compare_runs
+    _require_storage_or_exit()
+    from henchmen.evals.storage import compare_runs
 
     logging.basicConfig(level=logging.INFO)
 
@@ -318,11 +453,15 @@ def _eval_history(args: argparse.Namespace) -> None:
     """Show past eval runs from SQLite history."""
     import asyncio
 
-    from evals.storage import list_runs
+    from henchmen.providers.tiers import normalize_llm_provider
+
+    _require_storage_or_exit()
+    from henchmen.evals.storage import list_runs
 
     logging.basicConfig(level=logging.INFO)
 
-    runs = asyncio.run(list_runs(provider=args.provider, limit=args.limit))
+    provider = normalize_llm_provider(args.provider) if args.provider else None
+    runs = asyncio.run(list_runs(provider=provider, limit=args.limit))
 
     if not runs:
         print("No eval runs found.")
@@ -343,11 +482,15 @@ def _print_fixture_result(result: FixtureResult) -> None:
         f"Score:     {s.overall_score:.2f}  (diff_nonempty={s.diff_non_empty}, "
         f"files={s.touched_expected_files}, tests={tests}, substrings={s.contains_expected_substrings})"
     )
+    if s.dimensions is not None:
+        print(f"Weighted:  {s.dimensions.compute_weighted_score():.2f}  (five-dimension composite)")
     print(
         f"Wall:      {result.wall_clock_seconds:.2f}s  "
         f"tokens={result.total_input_tokens}/{result.total_output_tokens}  "
         f"cost=${result.estimated_cost_usd:.4f}"
     )
+    if s.test_runner_error:
+        print(f"TESTS:     {s.test_runner_error}")
     if result.error:
         print(f"ERROR:     {result.error}")
 
@@ -360,32 +503,51 @@ def _print_eval_report(report: EvalReport) -> None:
     for r in report.results:
         s = r.score
         tests = "-" if s.tests_pass is None else ("P" if s.tests_pass else "F")
-        flag = " ERR" if r.error else ""
+        weighted = s.dimensions.compute_weighted_score() if s.dimensions else 0.0
+        flag = " ERR" if (r.error or s.test_runner_error) else ""
         print(
-            f"  {r.fixture_id:32s}  score={s.overall_score:.2f}  tests={tests}  "
+            f"  {r.fixture_id:32s}  score={s.overall_score:.2f}  weighted={weighted:.2f}  tests={tests}  "
             f"{r.wall_clock_seconds:5.2f}s  ${r.estimated_cost_usd:.4f}{flag}"
         )
     print("=" * 60)
 
 
-def _write_baseline(path: Path, provider: str, report: EvalReport) -> None:
+def _write_baseline(path: Path, provider: str, report: EvalReport, fixtures_dir: Path) -> None:
+    """Merge this run into ``baseline.json`` under the canonical provider key.
+
+    The provider entry is *updated*, never replaced, so the hand-written
+    ``how_to_populate`` / ``notes`` guidance in the stub survives a run.
+    """
     import json
-    from datetime import date
     from typing import Any
 
     data: dict[str, Any] = {}
     if path.is_file():
-        data = json.loads(path.read_text(encoding="utf-8"))
-    data.setdefault("version", 1)
-    data["last_updated"] = date.today().isoformat()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            print(f"ERROR: {path} is not valid JSON: {exc}", file=sys.stderr)
+            sys.exit(2)
+
+    tiers = sorted({r.model_tier for r in report.results if r.model_tier})
     providers: dict[str, Any] = data.setdefault("providers", {})
-    providers[provider] = {
-        "aggregate_score": report.aggregate_score,
-        "commit_sha": report.commit_sha,
-        "timestamp": report.timestamp.isoformat(),
-        "per_fixture": {r.fixture_id: r.score.overall_score for r in report.results},
-        "note": "auto-written by `henchmen eval --write-baseline`",
-    }
+    entry: dict[str, Any] = dict(providers.get(provider) or {})
+    entry.update(
+        {
+            "aggregate_score": report.aggregate_score,
+            "fixtures": {r.fixture_id: r.score.overall_score for r in report.results},
+            "model_tier": ", ".join(tiers) or None,
+            "runs": int(entry.get("runs") or 0) + 1,
+            "last_run": report.timestamp.isoformat(),
+            "commit_sha": report.commit_sha,
+        }
+    )
+    providers[provider] = entry
+
+    data["version"] = _BASELINE_SCHEMA_VERSION
+    data["last_updated"] = report.timestamp.date().isoformat()
+    if fixtures_dir.is_dir():
+        data["fixtures"] = sorted(p.name for p in fixtures_dir.iterdir() if (p / "task.json").is_file())
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -395,7 +557,11 @@ def _compare_baseline(path: Path, provider: str, report: EvalReport) -> int:
     if not path.is_file():
         print(f"ERROR: baseline not found: {path}", file=sys.stderr)
         return 2
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: {path} is not valid JSON: {exc}", file=sys.stderr)
+        return 2
     entry = (data.get("providers") or {}).get(provider) or {}
     baseline_score = entry.get("aggregate_score")
     if baseline_score is None:
@@ -415,40 +581,53 @@ def _compare_baseline(path: Path, provider: str, report: EvalReport) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# henchmen serve
+# ---------------------------------------------------------------------------
+
+
 def _serve(args: argparse.Namespace) -> None:
     """Run Dispatch + Mastermind + Forge in a single process."""
     # pydantic-settings loads .env.local then .env automatically via the
-    # Settings.model_config env_file tuple — no manual parsing needed here.
-
-    os.environ.setdefault("HENCHMEN_PROVIDER", "local")
-    os.environ.setdefault("HENCHMEN_ENVIRONMENT", "dev")
-    os.environ.setdefault("HENCHMEN_GCP_PROJECT_ID", "local-dev")
+    # Settings.model_config env_file tuple. Only seed defaults for keys the
+    # user has not set anywhere — os.environ outranks the dotenv files.
+    _default_env("HENCHMEN_PROVIDER", "local", file_keys=_dotenv_keys())
+    if args.port is not None:
+        os.environ["HENCHMEN_LOCAL_SERVE_PORT"] = str(args.port)
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
     logger = logging.getLogger("henchmen")
-    logger.info("Starting Henchmen in single-process mode (provider=local)")
+
+    from henchmen.providers.local.memory import InMemoryMessageBroker, default_forward_map, set_shared_broker
+    from henchmen.providers.tiers import active_llm_provider
+
+    settings = _build_settings_or_exit()
+    port = int(settings.local_serve_port)
+
+    llm = active_llm_provider(settings)
+    if (settings.provider == "gcp" or llm == "gcp") and not settings.gcp_project_id:
+        print(
+            "ERROR: HENCHMEN_GCP_PROJECT_ID is required when the provider is gcp (Vertex AI).",
+            file=sys.stderr,
+        )
+        print("Hint: run `henchmen init`, or set HENCHMEN_PROVIDER=local for a fully local run.", file=sys.stderr)
+        sys.exit(2)
+
+    logger.info(
+        "Starting Henchmen in single-process mode (provider=%s, llm=%s, environment=%s)",
+        settings.provider,
+        llm,
+        settings.environment.value,
+    )
 
     # Create a shared InMemoryMessageBroker so all mounted services publish
     # and consume from the same instance. The forward map simulates Pub/Sub
     # push subscriptions by HTTP-POSTing envelopes between services.
-    from henchmen.config.settings import get_settings
-    from henchmen.providers.local.memory import InMemoryMessageBroker, set_shared_broker
-
     shared_broker = InMemoryMessageBroker()
-    settings = get_settings()
-    env = settings.environment.value
-    base = f"http://localhost:{args.port}"
-    shared_broker.set_forward_map(
-        {
-            f"henchmen-{env}-task-intake": f"{base}/mastermind/pubsub/task-intake",
-            f"henchmen-{env}-operative-complete": f"{base}/mastermind/pubsub/operative-complete",
-            f"henchmen-{env}-forge-request": f"{base}/forge/pubsub/forge-request",
-            f"henchmen-{env}-forge-result": f"{base}/mastermind/pubsub/forge-result",
-            f"henchmen-{env}-ci-failure": f"{base}/mastermind/pubsub/ci-failure",
-        }
-    )
+    forward_map = default_forward_map(settings, f"http://localhost:{port}")
+    shared_broker.set_forward_map(forward_map)
     set_shared_broker(shared_broker)
-    logger.info("Shared broker configured with forward map for %d topics", len(shared_broker._forward_map))
+    logger.info("Shared broker configured with forward map for %d topics", len(forward_map))
 
     from collections.abc import AsyncIterator
     from contextlib import asynccontextmanager
@@ -486,6 +665,7 @@ def _serve(args: argparse.Namespace) -> None:
         get_agent()
         logger.info("All services initialized")
         yield
+        await shared_broker.drain()
         logger.info("Shutting down")
 
     app = FastAPI(title="Henchmen (Local Dev)", version="0.1.0", lifespan=lifespan)
@@ -497,4 +677,4 @@ def _serve(args: argparse.Namespace) -> None:
     async def health() -> dict[str, object]:
         return {"status": "ok", "mode": "local", "services": ["dispatch", "mastermind", "forge"]}
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+    uvicorn.run(app, host=args.host, port=port, log_level=args.log_level)

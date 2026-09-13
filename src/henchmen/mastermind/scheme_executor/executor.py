@@ -3,15 +3,14 @@
 import asyncio
 import contextlib
 import logging
-import os
 from typing import TYPE_CHECKING, Any
 
 from henchmen.mastermind.lair_manager import LairManager
 from henchmen.models.dossier import Dossier
+from henchmen.models.llm import ModelTier
 from henchmen.models.operative import OperativeStatus
 from henchmen.models.scheme import NodeType, SchemeNode
 from henchmen.models.task import HenchmenTask
-from henchmen.observability.tracker import estimate_cost
 from henchmen.schemes.base import SchemeGraph
 
 if TYPE_CHECKING:
@@ -19,9 +18,37 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Default per-task cost ceiling in USD — prevents runaway agent spend.
-# Override via HENCHMEN_COST_CEILING_USD env var.
-_DEFAULT_COST_CEILING_USD = 2.0
+# Conservative per-call output estimate for the pre-dispatch cost gate. The
+# operative rarely emits anything close to ``operative_max_output_tokens`` on
+# a tool-calling step, and over-estimating here blocks legitimate work.
+_ESTIMATED_OUTPUT_TOKENS_PER_CALL = 2_000
+
+# Nodes whose task description is enriched with the preceding check's output.
+_FIX_NODES = frozenset({"fix_lint", "fix_tests"})
+
+# Cap on the error text spliced into the fix node's task description.
+_MAX_ERROR_CONTEXT_CHARS = 4_000
+
+
+def validate_deterministic_handlers(scheme_graph: SchemeGraph) -> list[str]:
+    """Return a problem message per deterministic node that has no handler.
+
+    A deterministic node without a handler is a fail-closed hazard: the gate it
+    represents (lint, tests, verification) would never actually run. Callers
+    surface this at startup and refuse to execute the scheme.
+    """
+    from henchmen.mastermind.scheme_executor.handlers import get_handler
+
+    problems: list[str] = []
+    for node in scheme_graph.definition.nodes:
+        if node.node_type != NodeType.DETERMINISTIC:
+            continue
+        if get_handler(node.id) or get_handler(node.name):
+            continue
+        problems.append(
+            f"Scheme '{scheme_graph.definition.id}' has deterministic node '{node.id}' with no registered handler"
+        )
+    return problems
 
 
 class SchemeExecutor:
@@ -36,6 +63,7 @@ class SchemeExecutor:
         self._retry_counts: dict[str, int] = {}  # node_id -> execution count
         self._max_node_retries = 2  # Max times a single node can be re-executed
         self._freshly_executed: set[str] = set()  # nodes executed in this session (excludes checkpoint-restored)
+        self._resume_skipped: set[str] = set()  # checkpoint-restored nodes already replayed once
         self._visited_states: set[tuple[str, int]] = set()  # (node_id, retry_count) for cycle detection
         self._escalation_node: str | None = None  # node that caused escalation
 
@@ -55,31 +83,42 @@ class SchemeExecutor:
         while current_node:
             node_key = current_node.id
 
-            # ---- Cycle detection: (node_id, retry_count) as visited state ----
-            exec_count = self._retry_counts.get(node_key, 0)
-            state_key = (node_key, exec_count)
-            if state_key in self._visited_states:
-                logger.error(
-                    "[SCHEME] Cycle detected: node %s with retry_count=%d already visited",
-                    node_key,
-                    exec_count,
-                )
-                self._escalation_node = node_key
-                self.node_results[node_key] = {
-                    "condition": None,
-                    "message": f"Cycle detected at {node_key} — escalating",
-                    "escalated": True,
-                }
-                self._freshly_executed.add(node_key)
-                break
-            self._visited_states.add(state_key)
-
-            # ---- Resume: skip nodes already completed from checkpoint ----
+            # ---- Resume: replay nodes already completed from checkpoint ----
+            # A restored node is replayed at most once, and the replay is not a
+            # visited state (nothing executed), so a loop-back such as run_tests
+            # after fix_tests re-executes instead of replaying a stale result.
+            # ``_retry_counts`` is restored alongside ``node_results`` on resume,
+            # so keying the skip off it (as this used to) replayed nothing and
+            # re-ran the whole scheme.
             existing = self.node_results.get(node_key)
-            if existing is not None and node_key not in self._retry_counts:
+            is_replay = (
+                existing is not None and node_key not in self._freshly_executed and node_key not in self._resume_skipped
+            )
+
+            if is_replay:
                 logger.info("Skipping already-completed node %s (resume from checkpoint)", node_key)
-                result = existing
+                self._resume_skipped.add(node_key)
+                result = existing if existing is not None else {}
             else:
+                # ---- Cycle detection: (node_id, retry_count) as visited state ----
+                exec_count = self._retry_counts.get(node_key, 0)
+                state_key = (node_key, exec_count)
+                if state_key in self._visited_states:
+                    logger.error(
+                        "[SCHEME] Cycle detected: node %s with retry_count=%d already visited",
+                        node_key,
+                        exec_count,
+                    )
+                    self._escalation_node = node_key
+                    self.node_results[node_key] = {
+                        "condition": None,
+                        "message": f"Cycle detected at {node_key} — escalating",
+                        "escalated": True,
+                    }
+                    self._freshly_executed.add(node_key)
+                    break
+                self._visited_states.add(state_key)
+
                 logger.info("Executing node %s (%s)", current_node.id, current_node.node_type.value)
                 # Check if this node has been retried too many times (prevents infinite loops)
                 if exec_count >= self._max_node_retries:
@@ -112,9 +151,11 @@ class SchemeExecutor:
             condition = result.get("condition")  # "pass", "fail", or None
             next_nodes = self.scheme_graph.get_next_nodes(current_node.id, condition)
 
-            # If a condition was returned but no matching conditional edge
-            # exists, try unconditional edges as a fallback.
-            if not next_nodes and condition is not None:
+            # A passing node with no explicit "pass" edge continues along the
+            # scheme's unconditional edge (that is how implement_fix reaches
+            # verify_changes). A FAILING node never falls back that way: doing
+            # so routed a failed gate straight down the happy path to create_pr.
+            if not next_nodes and condition == "pass":
                 next_nodes = self.scheme_graph.get_next_nodes(current_node.id, None)
 
             if not next_nodes:
@@ -146,27 +187,42 @@ class SchemeExecutor:
         handler = get_handler(node.id) or get_handler(node.name)
         if handler:
             return await handler(self, node, task, dossier)
-        return {"condition": "pass", "message": f"No handler for deterministic node {node.id}"}
+        # Fail-closed: a missing handler means the gate this node represents
+        # (lint, tests, verification) never ran, so it must not report success.
+        logger.error("[SCHEME] No handler registered for deterministic node %s (name=%r)", node.id, node.name)
+        return {"condition": "fail", "message": f"No handler for deterministic node {node.id}"}
 
     def _estimate_dispatch_cost(self, node: SchemeNode, dossier: Dossier) -> float:
-        """Estimate the maximum cost of dispatching an agentic node."""
-        try:
-            from henchmen.operative.tokenizer import estimate_tokens
+        """Estimate the cost of dispatching an agentic node.
 
-            dossier_text = dossier.model_dump_json()
-            estimated_input_tokens_per_call = max(estimate_tokens(dossier_text), 2000)
-            estimated_output_per_call = 500
-            max_calls = int(node.max_steps)
-            model_name = str(node.model_name or "gemini-2.5-pro")
-            total_input = estimated_input_tokens_per_call * max_calls
-            total_output = estimated_output_per_call * max_calls
-            return estimate_cost(model_name, total_input, total_output)
+        Bounded by what the operative actually sends: it trims every prompt to
+        the configured system/message token budgets, so the old
+        ``max_steps x full-dossier-JSON`` figure over-estimated by an order of
+        magnitude and blocked realistic fix/implement nodes.
+        """
+        try:
+            from henchmen.providers.pricing import estimate_cost_for_settings
+
+            per_call_input = int(self.settings.operative_max_system_tokens) + int(
+                self.settings.operative_max_message_tokens
+            )
+            per_call_output = min(int(self.settings.operative_max_output_tokens), _ESTIMATED_OUTPUT_TOKENS_PER_CALL)
+            max_calls = max(1, int(node.get_effective_budget().max_steps))
+            model_name = node.model_name or ModelTier.COMPLEX.value
+            return estimate_cost_for_settings(
+                self.settings,
+                model_name,
+                per_call_input * max_calls,
+                per_call_output * max_calls,
+            )
         except Exception as exc:
             logger.warning("Cost estimation failed for node %s: %s", getattr(node, "id", "?"), exc)
             return 0.0
 
     def _get_cumulative_cost(self) -> float:
         """Sum the cost_usd from all completed agentic node reports."""
+        from henchmen.providers.pricing import estimate_cost_for_settings
+
         total = 0.0
         for _node_id, result in self.node_results.items():
             report_data = result.get("report")
@@ -174,7 +230,7 @@ class SchemeExecutor:
                 model_name = report_data.get("model_name", "")
                 input_tokens = report_data.get("total_input_tokens", 0)
                 output_tokens = report_data.get("total_output_tokens", 0)
-                total += estimate_cost(model_name, input_tokens, output_tokens)
+                total += estimate_cost_for_settings(self.settings, model_name, input_tokens, output_tokens)
         return total
 
     async def _heartbeat_during_wait(self, task_id: str, interval: int = 120) -> None:
@@ -187,6 +243,28 @@ class SchemeExecutor:
             if self.tracker:
                 await self.tracker.update_heartbeat(task_id)
 
+    def _enrich_for_fix_node(self, node: SchemeNode, task: HenchmenTask) -> HenchmenTask:
+        """Prepend the failing check's output to a fix node's task description.
+
+        The error block goes first so that it survives the environment-variable
+        cap applied when the description is handed to the container — the fix
+        node is useless without it.
+        """
+        if node.id not in _FIX_NODES:
+            return task
+        prior_node = "run_lint" if node.id == "fix_lint" else "run_tests"
+        prior_result = self.node_results.get(prior_node, {})
+        error_output = prior_result.get("output", prior_result.get("message", ""))
+        if not error_output:
+            return task
+        enriched = task.model_copy()
+        enriched.description = (
+            f"--- {prior_node.upper()} OUTPUT (FIX THESE ERRORS) ---\n"
+            f"{str(error_output)[:_MAX_ERROR_CONTEXT_CHARS]}\n\n"
+            f"--- ORIGINAL TASK ---\n{task.description}"
+        )
+        return enriched
+
     async def _execute_agentic(self, node: SchemeNode, task: HenchmenTask, dossier: Dossier) -> dict[str, Any]:
         """Execute an agentic node by provisioning a Lair and running an Operative.
 
@@ -194,8 +272,7 @@ class SchemeExecutor:
         so the rest of the pipeline can be tested end-to-end.
         """
         # Pre-dispatch cost budget validation
-        ceiling_env = os.environ.get("HENCHMEN_COST_CEILING_USD", "")
-        cost_ceiling = float(ceiling_env) if ceiling_env else _DEFAULT_COST_CEILING_USD
+        cost_ceiling = float(self.settings.operative_task_cost_ceiling_usd)
         cumulative_cost = self._get_cumulative_cost()
         estimated_node_cost = self._estimate_dispatch_cost(node, dossier)
 
@@ -216,30 +293,20 @@ class SchemeExecutor:
                 "condition": "fail",
                 "message": (
                     f"Cost budget exceeded: cumulative ${cumulative_cost:.3f} + "
-                    f"estimated ${estimated_node_cost:.3f} > ceiling ${cost_ceiling:.2f}"
+                    f"estimated ${estimated_node_cost:.3f} > ceiling ${cost_ceiling:.2f} "
+                    f"(raise HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD)"
                 ),
             }
 
         # For fix nodes, enrich the task with the previous check's error output
         # so the operative knows exactly what to fix.
-        enriched_task = task
-        if node.id in ("fix_lint", "fix_tests"):
-            prior_node = "run_lint" if node.id == "fix_lint" else "run_tests"
-            prior_result = self.node_results.get(prior_node, {})
-            error_output = prior_result.get("output", prior_result.get("message", ""))
-            if error_output:
-                enriched_task = task.model_copy()
-                enriched_task.description = (
-                    f"{task.description}\n\n"
-                    f"--- {prior_node.upper()} OUTPUT (FIX THESE ERRORS) ---\n"
-                    f"{str(error_output)[:2000]}"
-                )
+        enriched_task = self._enrich_for_fix_node(node, task)
 
         logger.info("[SCHEME] Dispatching agentic node '%s' to Lair for task %s", node.id, task.id)
 
         try:
             lair_id = await self.lair_manager.create_lair(
-                enriched_task, node, scheme_id=self.scheme_graph.definition.id
+                enriched_task, node, scheme_id=self.scheme_graph.definition.id, dossier=dossier
             )
             logger.info("[SCHEME] Lair %s created, waiting for completion...", lair_id)
 
@@ -275,7 +342,7 @@ class SchemeExecutor:
             # skipping them means broken code gets promoted to PR.
             is_dev = getattr(self.settings, "environment", None)
             is_dev = is_dev and getattr(is_dev, "value", str(is_dev)) == "dev"
-            is_fix_node = node.id in ("fix_lint", "fix_tests")
+            is_fix_node = node.id in _FIX_NODES
 
             if is_dev and not is_fix_node:
                 logger.warning(

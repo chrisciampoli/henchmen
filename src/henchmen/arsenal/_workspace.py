@@ -65,9 +65,10 @@ def ensure_in_workspace(path: str | os.PathLike[str]) -> str:
         raise PermissionError("workspace path must be a non-empty string")
 
     root = get_workspace_root()
-    # ``Path(path).expanduser()`` blocks accidental tilde expansion into the
-    # operator's home directory, which would escape the workspace on a
-    # misconfigured container.
+    # ``expanduser()`` resolves a leading ``~`` so a tilde path is checked
+    # against the real home directory (and rejected by the boundary check
+    # below) rather than being treated as a workspace-relative directory
+    # literally named ``~``.
     candidate = Path(os.fspath(path)).expanduser()
 
     # Resolve relative paths against the workspace root — the agent should
@@ -87,3 +88,19 @@ def ensure_in_workspace(path: str | os.PathLike[str]) -> str:
     if common != root:
         raise PermissionError(f"Path '{path}' (resolved: '{resolved}') escapes workspace root '{root}'")
     return resolved
+
+
+def current_workspace_dir() -> str:
+    """Return the directory Arsenal tools should operate in by default.
+
+    The Operative clones into ``<workspace root>/<task id>`` and chdirs there,
+    so the process cwd — not the workspace root — is the repository. This
+    returns that cwd when it lies inside the workspace, and falls back to the
+    workspace root when the process happens to run elsewhere (for example a
+    unit test whose cwd is the henchmen checkout). Callers get a directory
+    that always satisfies :func:`ensure_in_workspace`.
+    """
+    try:
+        return ensure_in_workspace(os.getcwd())
+    except (PermissionError, OSError):
+        return get_workspace_root()

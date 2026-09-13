@@ -7,26 +7,16 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from henchmen.models.llm import LLMResponse, Message, MessageRole, ModelTier, TokenUsage, ToolCall, ToolDefinition
+from henchmen.providers.llm_common import json_schema, normalize_finish_reason, resolve_provider_model
+from henchmen.providers.pricing import estimate_cost
+from henchmen.providers.tiers import tier_models
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
-# Bedrock model IDs for each tier
-_TIER_MODELS: dict[str, str] = {
-    ModelTier.COMPLEX: "anthropic.claude-sonnet-4-20250514-v1:0",
-    ModelTier.REASONING: "anthropic.claude-sonnet-4-20250514-v1:0",
-    ModelTier.LIGHT: "anthropic.claude-haiku-4-5-20251001-v1:0",
-}
-
-_SUPPORTED_MODELS: list[str] = [
-    "anthropic.claude-sonnet-4-20250514-v1:0",
-    "anthropic.claude-haiku-4-5-20251001-v1:0",
-    "anthropic.claude-3-5-sonnet-20241022-v2:0",
-    "anthropic.claude-3-haiku-20240307-v1:0",
-    "amazon.titan-text-express-v1",
-]
+PROVIDER_NAME = "aws"
 
 
 class BedrockProvider:
@@ -35,19 +25,35 @@ class BedrockProvider:
     def __init__(self, settings: Settings) -> None:
         import boto3
 
+        self._settings = settings
         region = getattr(settings, "aws_region", "us-east-1")
         self._client: Any = boto3.client("bedrock-runtime", region_name=region)
+        models = tier_models(settings, PROVIDER_NAME)
+        logger.info(
+            "BedrockProvider tier mapping: complex=%s light=%s reasoning=%s",
+            models.get(ModelTier.COMPLEX, ""),
+            models.get(ModelTier.LIGHT, ""),
+            models.get(ModelTier.REASONING, ""),
+        )
 
     def resolve_tier(self, tier: str) -> str:
-        """Map a ModelTier to a concrete Bedrock model ID."""
-        return _TIER_MODELS.get(tier, tier)
+        """Map a ModelTier to the configured Bedrock model ID; concrete IDs pass through."""
+        return resolve_provider_model(self._settings, tier, PROVIDER_NAME)
 
     def supported_models(self) -> list[str]:
-        """Return list of supported Bedrock model IDs."""
-        return list(_SUPPORTED_MODELS)
+        """Return the configured tier model IDs, deduped and in tier order."""
+        models = tier_models(self._settings, PROVIDER_NAME)
+        seen: set[str] = set()
+        out: list[str] = []
+        for tier in (ModelTier.COMPLEX, ModelTier.LIGHT, ModelTier.REASONING):
+            name = models.get(tier, "")
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
 
     async def count_tokens(self, text: str, model: str) -> int:
-        """Approximate token count using 4 chars/token heuristic."""
+        """Approximate token count using a 4-chars-per-token heuristic (model-independent)."""
         return len(text) // 4
 
     async def generate(
@@ -60,6 +66,7 @@ class BedrockProvider:
         system_prompt: str | None = None,
     ) -> LLMResponse:
         """Send a request to Bedrock via the Converse API."""
+        model = self.resolve_tier(model)
         converse_messages = self._build_messages(messages)
         kwargs: dict[str, Any] = {
             "modelId": model,
@@ -79,35 +86,49 @@ class BedrockProvider:
 
     @staticmethod
     def _build_messages(messages: list[Message]) -> list[dict[str, Any]]:
-        """Convert henchmen Message list to Bedrock Converse format."""
+        """Convert henchmen messages to Bedrock Converse format.
+
+        Tool calls become ``toolUse`` blocks and tool results ``toolResult``
+        blocks; blank text blocks are dropped and consecutive same-role turns
+        are merged, both of which Converse rejects with a ValidationException.
+        """
         result: list[dict[str, Any]] = []
         for msg in messages:
             if msg.role == MessageRole.SYSTEM:
                 continue
-            role = "assistant" if msg.role == MessageRole.ASSISTANT else "user"
-            result.append({"role": role, "content": [{"text": msg.content}]})
+            blocks: list[dict[str, Any]] = []
+            if msg.role == MessageRole.TOOL:
+                blocks.append(
+                    {
+                        "toolResult": {
+                            "toolUseId": msg.tool_call_id or "unknown",
+                            "content": [{"text": msg.content}],
+                        }
+                    }
+                )
+                role = "user"
+            else:
+                role = "assistant" if msg.role == MessageRole.ASSISTANT else "user"
+                if msg.content.strip():
+                    blocks.append({"text": msg.content})
+                for tc in msg.tool_calls or []:
+                    blocks.append({"toolUse": {"toolUseId": tc.id, "name": tc.name, "input": tc.arguments}})
+            if not blocks:
+                continue
+            if result and result[-1]["role"] == role:
+                result[-1]["content"].extend(blocks)
+            else:
+                result.append({"role": role, "content": blocks})
         return result
 
     @staticmethod
     def _convert_tool(tool: ToolDefinition) -> dict[str, Any]:
         """Convert a ToolDefinition to Bedrock toolSpec format."""
-        properties: dict[str, Any] = {}
-        required: list[str] = []
-        for p in tool.parameters:
-            properties[p.name] = {"type": p.type, "description": p.description}
-            if p.required:
-                required.append(p.name)
         return {
             "toolSpec": {
                 "name": tool.name,
                 "description": tool.description,
-                "inputSchema": {
-                    "json": {
-                        "type": "object",
-                        "properties": properties,
-                        "required": required,
-                    }
-                },
+                "inputSchema": {"json": json_schema(tool)},
             }
         }
 
@@ -133,11 +154,12 @@ class BedrockProvider:
                 )
 
         usage_data = response.get("usage", {})
-        input_tokens = int(usage_data.get("inputTokens", 0))
-        output_tokens = int(usage_data.get("outputTokens", 0))
-
-        stop_reason = response.get("stopReason", "end_turn")
-        finish_reason = "tool_use" if tool_calls else ("max_tokens" if stop_reason == "max_tokens" else "stop")
+        # Bedrock reports cache tokens separately from inputTokens (as Anthropic
+        # does); TokenUsage.input_tokens is the total prompt.
+        cache_read = int(usage_data.get("cacheReadInputTokens", 0) or 0)
+        cache_write = int(usage_data.get("cacheWriteInputTokens", 0) or 0)
+        input_tokens = int(usage_data.get("inputTokens", 0) or 0) + cache_read + cache_write
+        output_tokens = int(usage_data.get("outputTokens", 0) or 0)
 
         return LLMResponse(
             content=content_text,
@@ -145,9 +167,17 @@ class BedrockProvider:
             usage=TokenUsage(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                cached_tokens=cache_read,
+                cache_write_tokens=cache_write,
                 total_tokens=input_tokens + output_tokens,
-                estimated_cost_usd=0.0,
+                estimated_cost_usd=estimate_cost(
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens=cache_read,
+                    cache_write_tokens=cache_write,
+                ),
             ),
             model=model,
-            finish_reason=finish_reason,
+            finish_reason=normalize_finish_reason(response.get("stopReason"), has_tool_calls=bool(tool_calls)),
         )

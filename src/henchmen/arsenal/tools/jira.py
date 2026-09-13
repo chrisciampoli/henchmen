@@ -1,22 +1,26 @@
-"""Jira tools - issue status transitions, comments, and lookups."""
+"""Jira tools - issue status transitions, comments, and lookups.
+
+Credentials come from :class:`~henchmen.config.settings.Settings`, which
+accepts both the ``HENCHMEN_JIRA_*`` names and the bare ``JIRA_SERVER`` /
+``JIRA_EMAIL`` / ``JIRA_API_TOKEN`` names.
+"""
 
 import asyncio
-import os
 from typing import Any
 
 from henchmen.arsenal.registry import tool
 
 
 def _get_jira_client() -> Any:
-    """Return an authenticated Jira client using environment variables."""
+    """Return an authenticated Jira client using the configured credentials."""
     from jira import JIRA
 
-    server = os.environ.get("JIRA_SERVER", "")
-    email = os.environ.get("JIRA_EMAIL", "")
-    api_token = os.environ.get("JIRA_API_TOKEN", "")
-    if not server:
-        raise ValueError("JIRA_SERVER environment variable is not set")
-    return JIRA(server=server, basic_auth=(email, api_token))
+    from henchmen.config.settings import get_settings
+
+    settings = get_settings()
+    if not settings.jira_base_url:
+        raise ValueError("No Jira base URL configured (set HENCHMEN_JIRA_BASE_URL)")
+    return JIRA(server=settings.jira_base_url, basic_auth=(settings.jira_email, settings.jira_api_token))
 
 
 @tool(

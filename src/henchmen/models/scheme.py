@@ -1,9 +1,9 @@
 """Scheme models - defines workflow graphs that operatives execute."""
 
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, get_args
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from henchmen.models._base import StrictBase
 
@@ -13,12 +13,31 @@ class NodeType(StrEnum):
     AGENTIC = "agentic"
 
 
+# Arsenal tool categories. Every value here must be registered by a module in
+# ``henchmen.arsenal.tools`` — ``ToolRegistry.get_tools_for_requirement`` returns
+# an empty list (silently, no tools) for a category nothing registers, so an
+# invented category would hand the operative a toolless node.
+ArsenalToolSet = Literal[
+    "code_edit",
+    "code_intel",
+    "context",
+    "git_ops",
+    "github",
+    "jira",
+    "slack",
+    "test_runner",
+]
+
+ARSENAL_TOOL_SETS: frozenset[str] = frozenset(get_args(ArsenalToolSet))
+
+
 class ArsenalRequirement(StrictBase):
     """Specifies which tool sets an operative node requires from the Arsenal MCP server."""
 
-    tool_sets: list[
-        Literal["code_intel", "code_edit", "git_ops", "test_runner", "github", "jira", "slack", "gcp", "context"]
-    ] = Field(default_factory=list, description="List of required Arsenal tool sets")
+    tool_sets: list[ArsenalToolSet] = Field(
+        default_factory=list,
+        description="Required Arsenal tool categories (must match a category registered by henchmen.arsenal.tools)",
+    )
     allow_destructive: bool = Field(default=False, description="Whether destructive operations are permitted")
 
 
@@ -42,21 +61,29 @@ class StepBudget(StrictBase):
     and early exit when the agent commits before hitting the limit.
     """
 
-    base_steps: int = Field(default=20, description="Initial step budget")
-    min_steps: int = Field(default=10, description="Minimum steps before early exit is allowed")
-    max_steps: int = Field(default=30, description="Absolute maximum including extensions")
-    extension_steps: int = Field(default=10, description="Steps granted per extension")
-    max_extensions: int = Field(default=2, description="Maximum number of extensions")
+    base_steps: int = Field(default=20, ge=1, description="Initial step budget")
+    min_steps: int = Field(default=10, ge=1, description="Minimum steps before early exit is allowed")
+    max_steps: int = Field(default=30, ge=1, description="Absolute maximum including extensions")
+    extension_steps: int = Field(default=10, ge=0, description="Steps granted per extension")
+    max_extensions: int = Field(default=2, ge=0, description="Maximum number of extensions")
     early_exit_on_commit: bool = Field(default=True, description="Allow early exit when git_commit succeeds")
 
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "StepBudget":
+        if self.base_steps > self.max_steps:
+            raise ValueError(f"base_steps ({self.base_steps}) must not exceed max_steps ({self.max_steps})")
+        return self
 
-# Default budgets per node type
+
+# Default budgets for the agentic nodes shipped with Henchmen. Keys MUST be
+# agentic node ids — a deterministic node never runs an agent loop, so a budget
+# keyed on one is dead weight that drifts silently (see the test in
+# tests/unit/test_schemes.py that pins this against the registered schemes).
 STEP_BUDGET_DEFAULTS: dict[str, StepBudget] = {
-    "fix_lint": StepBudget(base_steps=10, min_steps=5, max_steps=15, extension_steps=5, max_extensions=1),
-    "verify_changes": StepBudget(base_steps=15, min_steps=10, max_steps=20, extension_steps=5, max_extensions=1),
     "implement_fix": StepBudget(base_steps=30, min_steps=15, max_steps=50, extension_steps=10, max_extensions=2),
     "implement_feature": StepBudget(base_steps=50, min_steps=20, max_steps=70, extension_steps=10, max_extensions=2),
-    "fix_tests": StepBudget(base_steps=40, min_steps=15, max_steps=60, extension_steps=10, max_extensions=2),
+    "fix_tests": StepBudget(base_steps=15, min_steps=5, max_steps=25, extension_steps=5, max_extensions=2),
+    "analyze_goal": StepBudget(base_steps=5, min_steps=3, max_steps=10, extension_steps=5, max_extensions=1),
 }
 
 
@@ -72,23 +99,32 @@ class SchemeNode(StrictBase):
     dossier_requirement: DossierRequirement | None = Field(
         default=None, description="Dossier context requirements for this node"
     )
-    acceptance_check: str | None = Field(
-        default=None,
-        description="Dotted Python path to an acceptance check function (e.g. 'henchmen.schemes.checks.tests_pass')",
-    )
-    max_steps: int = Field(default=20, description="Maximum agentic steps before forced termination")
+    max_steps: int = Field(default=20, ge=1, description="Maximum agentic steps before forced termination")
     step_budget: StepBudget | None = Field(
         default=None, description="Adaptive step budget (overrides max_steps when set)"
     )
-    timeout_seconds: int = Field(default=300, description="Node execution timeout in seconds")
+    timeout_seconds: int = Field(default=300, ge=1, description="Node execution timeout in seconds")
     instruction_template: str | None = Field(
-        default=None, description="Jinja2 template string for the operative's system instruction"
+        default=None,
+        description=(
+            "Static system-instruction text for the operative. Used verbatim — there is no "
+            "templating engine; task text is appended separately as untrusted input."
+        ),
     )
     model_name: str | None = Field(
-        default=None, description="Override Vertex AI model for this node (falls back to OperativeConfig)"
+        default=None,
+        description=(
+            "Model tier (a ModelTier value such as 'default/complex') or a concrete model id. "
+            "Resolved per provider by henchmen.providers.tiers.resolve_model_name; "
+            "falls back to the COMPLEX tier when unset."
+        ),
     )
     grounding_enabled: bool = Field(
-        default=False, description="Enable Google Search grounding for real error resolution"
+        default=False,
+        description=(
+            "Request Google Search grounding for this node. Only the Vertex AI (Gemini) "
+            "direct-SDK path honours it; every other provider ignores it."
+        ),
     )
 
     def get_effective_budget(self) -> StepBudget:
