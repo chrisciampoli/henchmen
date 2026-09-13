@@ -1179,6 +1179,53 @@ class TestEmbeddingPipelineGuards:
         assert args[1] == "develop"
         assert kwargs["token"] == "ghp-from-settings"
 
+    @pytest.mark.asyncio
+    async def test_failed_upsert_does_not_advance_last_indexed_commit(self, monkeypatch, tmp_path):
+        """A partial upsert must not mark the commit indexed.
+
+        The next incremental run only diffs from the last-indexed commit, so
+        advancing it past chunks that failed to upload strands them forever.
+        """
+        import subprocess
+
+        from henchmen.dispatch.handlers import cli as cli_handlers
+        from henchmen.dossier.embedder import UpsertResult
+
+        settings = _mock_settings()
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "main.py").write_text("def hello():\n    return 1\n", encoding="utf-8")
+        # A real repo, because the pipeline reads HEAD with `git rev-parse`.
+        for cmd in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "t@example.com"],
+            ["git", "config", "user.name", "t"],
+            ["git", "add", "-A"],
+            ["git", "commit", "-qm", "seed"],
+        ):
+            subprocess.run(cmd, cwd=repo_dir, check=True, capture_output=True)
+
+        monkeypatch.setattr(cli_handlers, "_resolve_default_branch", AsyncMock(return_value="main"))
+        monkeypatch.setattr(cli_handlers, "clone_repo", AsyncMock())
+        monkeypatch.setattr(cli_handlers.tempfile, "mkdtemp", lambda **kw: str(repo_dir))
+        # The pipeline imports these inside the function body, so they are
+        # attributes of the embedder module, not of the handler module.
+        from henchmen.dossier import embedder
+
+        monkeypatch.setattr(
+            embedder,
+            "upsert_chunks",
+            AsyncMock(return_value=UpsertResult(uploaded=2, failed=5)),
+        )
+        set_commit = AsyncMock()
+        monkeypatch.setattr(embedder, "set_last_indexed_commit", set_commit)
+
+        result = await cli_handlers.run_embedding_pipeline(repo="acme/api", mode="full", settings=settings)
+
+        assert result["status"] == "failed"
+        assert result["chunks_failed"] == 5
+        set_commit.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # Webhook signature verification (fail-closed intake)
