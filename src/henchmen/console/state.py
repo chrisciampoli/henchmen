@@ -1,0 +1,90 @@
+"""Persisted progress through the Console's setup guide.
+
+The state file holds only non-secret progress (which steps are done, which
+provider was chosen). Credentials go to the data directory's henchmen.env and
+secrets/ directory, never here.
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+from datetime import UTC, datetime
+from enum import StrEnum
+from pathlib import Path
+
+from pydantic import BaseModel, Field, ValidationError
+
+
+class SetupStep(StrEnum):
+    """Steps of the setup guide, in display order."""
+
+    WELCOME = "welcome"
+    AI_PROVIDER = "ai_provider"
+    GITHUB = "github"
+    SLACK = "slack"
+    JIRA = "jira"
+    FIRST_TASK = "first_task"
+
+
+REQUIRED_STEPS: frozenset[SetupStep] = frozenset({SetupStep.AI_PROVIDER, SetupStep.GITHUB})
+
+
+class SetupState(BaseModel):
+    """Where the user is in the setup guide."""
+
+    current_step: SetupStep = Field(default=SetupStep.WELCOME, description="Step the guide should show")
+    completed_steps: list[SetupStep] = Field(default_factory=list, description="Steps finished successfully")
+    skipped_steps: list[SetupStep] = Field(default_factory=list, description="Optional steps the user skipped")
+    choices: dict[str, str] = Field(default_factory=dict, description="Non-secret selections, e.g. llm_provider")
+    completed: bool = Field(default=False, description="True once setup was applied and run mode enabled")
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC), description="Last write time (UTC)")
+
+    def missing_required_steps(self) -> list[SetupStep]:
+        """Required steps not yet completed, in guide order."""
+        done = set(self.completed_steps)
+        return [step for step in SetupStep if step in REQUIRED_STEPS and step not in done]
+
+
+class SetupStateStore:
+    """Load and atomically save :class:`SetupState` as JSON."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def load(self) -> SetupState:
+        """Return the saved state, or a fresh one when no file exists.
+
+        A present-but-unreadable file raises instead of silently restarting
+        setup, which would let a corrupted volume re-run the guide over a
+        working configuration.
+        """
+        if not self.path.is_file():
+            return SetupState()
+        try:
+            return SetupState.model_validate_json(self.path.read_text(encoding="utf-8"))
+        except (ValidationError, ValueError) as exc:
+            raise ValueError(f"{self.path.name} is unreadable: {exc}") from exc
+
+    def save(self, state: SetupState) -> SetupState:
+        """Write ``state`` atomically and return what was written."""
+        stamped = state.model_copy(update={"updated_at": datetime.now(UTC)})
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=self.path.name + ".", suffix=".tmp", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(stamped.model_dump_json(indent=2))
+            os.replace(tmp_name, self.path)
+        except BaseException:
+            if os.path.exists(tmp_name):
+                os.remove(tmp_name)
+            raise
+        return stamped
+
+    def mark_completed(self) -> SetupState:
+        """Mark setup complete; refuses while a required step is missing."""
+        state = self.load()
+        missing = state.missing_required_steps()
+        if missing:
+            raise ValueError("Setup is missing required steps: " + ", ".join(step.value for step in missing))
+        return self.save(state.model_copy(update={"completed": True}))
