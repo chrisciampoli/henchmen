@@ -157,7 +157,7 @@ class ConsoleAuth:
         if not value or "." not in value:
             return False
         issued_raw, signature = value.split(".", 1)
-        if not issued_raw.isdigit():
+        if not (issued_raw.isascii() and issued_raw.isdigit() and 1 <= len(issued_raw) <= 12):
             return False
         issued_at = int(issued_raw)
         try:

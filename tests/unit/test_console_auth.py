@@ -91,6 +91,19 @@ def test_non_ascii_session_signature_is_rejected_not_raised() -> None:
     assert not auth.verify_session("not-a-number.abc", now=1_000.0)
 
 
+def test_non_ascii_digit_timestamp_is_rejected_not_raised() -> None:
+    # "\xb2" is the superscript-two digit: str.isdigit() is True for it, but
+    # int() rejects it, so the check must also require plain ASCII digits.
+    auth = ConsoleAuth(setup_token="t", signing_key=b"k" * 32)
+    assert not auth.verify_session("\xb2.abc", now=1_000.0)
+
+
+def test_oversized_timestamp_is_rejected_not_raised() -> None:
+    huge_timestamp = "1" * 5000
+    auth = ConsoleAuth(setup_token="t", signing_key=b"k" * 32)
+    assert not auth.verify_session(f"{huge_timestamp}.abc", now=1_000.0)
+
+
 def test_load_creates_and_reuses_the_signing_key(tmp_path: Path) -> None:
     first = ConsoleAuth.load(tmp_path / "secrets", setup_token=None)
     second = ConsoleAuth.load(tmp_path / "secrets", setup_token="given")
@@ -217,6 +230,20 @@ async def test_guard_rejects_non_ascii_cookie_without_raising() -> None:
     scope = _http_scope(
         path="/console/api/private",
         headers={"host": "127.0.0.1:8000", "cookie": "henchmen_console=1000.\xe9"},
+    )
+    events = await _run_asgi(guard, scope)
+    assert events[0]["status"] == 401
+
+
+@pytest.mark.asyncio
+async def test_guard_rejects_superscript_digit_timestamp_without_raising() -> None:
+    # Cookie byte 0xB2 decodes (latin-1) to the superscript-two digit "\xb2":
+    # str.isdigit() is True for it but int() rejects it with ValueError.
+    auth = ConsoleAuth(setup_token="t", signing_key=b"k" * 32)
+    guard = ConsoleGuard(_ok_app, auth=auth, public_paths=frozenset())
+    scope = _http_scope(
+        path="/console/api/private",
+        headers={"host": "127.0.0.1:8000", "cookie": "henchmen_console=\xb2.abc"},
     )
     events = await _run_asgi(guard, scope)
     assert events[0]["status"] == 401
