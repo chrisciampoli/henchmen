@@ -28,6 +28,7 @@ from henchmen.models.task import HenchmenTask
 from henchmen.observability.tracker import TaskTracker
 from henchmen.providers.interfaces.container_orchestrator import ContainerOrchestrator
 from henchmen.providers.interfaces.document_store import DocumentStore
+from henchmen.providers.interfaces.llm_provider import LLMProvider
 from henchmen.providers.interfaces.message_broker import MessageBroker
 from henchmen.schemes.base import SchemeGraph
 from henchmen.schemes.registry import SchemeRegistry
@@ -38,6 +39,9 @@ logger = logging.getLogger(__name__)
 # Maximum number of in-flight task IDs to retain in the local tracking set.
 # Used only for in-memory dedup hints — authoritative state is in Firestore.
 _MAX_ACTIVE_TASKS = 200
+
+# Semantic chunks kept after LLM reranking of the vector-search results.
+_RERANK_TOP_K = 10
 
 # Scheme selection keywords. Matched on word boundaries so "address" does not
 # read as "add", "prefix" as "fix", and "debug" as "bug".
@@ -89,9 +93,13 @@ class MastermindAgent:
         broker: MessageBroker | None = None,
         document_store: DocumentStore | None = None,
         container_orchestrator: ContainerOrchestrator | None = None,
+        llm_provider: LLMProvider | None = None,
     ):
         self.settings = settings or get_settings()
         self._broker = broker
+        # Used only to rerank semantic chunks; resolved lazily so a Mastermind
+        # without LLM credentials still starts and still retrieves context.
+        self._llm_provider = llm_provider
         self.lair_manager = LairManager(
             self.settings,
             container_orchestrator=container_orchestrator,
@@ -110,6 +118,14 @@ class MastermindAgent:
 
             self._broker = PubSubMessageBroker(self.settings)
         return self._broker
+
+    def _get_llm_provider(self) -> LLMProvider:
+        """Lazy-init the configured LLMProvider when not injected."""
+        if self._llm_provider is None:
+            from henchmen.providers.registry import ProviderRegistry
+
+            self._llm_provider = ProviderRegistry(self.settings).get_llm_provider()
+        return self._llm_provider
 
     def _cleanup_in_memory_state(self) -> None:
         """Evict stale entries from in-memory dicts to prevent unbounded growth.
@@ -435,9 +451,9 @@ class MastermindAgent:
         base_branch = task.context.branch or "main"
         if repo and github_token:
             try:
-                from github import Github
+                from github import Auth, Github
 
-                g = Github(github_token)
+                g = Github(auth=Auth.Token(github_token))
                 github_repo = g.get_repo(repo)
                 tree = github_repo.get_git_tree(base_branch, recursive=True)
                 file_paths = [item.path for item in tree.tree if item.type == "blob"]
@@ -518,6 +534,42 @@ class MastermindAgent:
 
         return dossier
 
+    async def _rerank_semantic_chunks(self, task: HenchmenTask, chunks: list[Any]) -> list[Any]:
+        """Rerank vector-search chunks with the LLM when enabled.
+
+        Reranking is a quality improvement, never a dependency: when it is
+        disabled, or the LLM provider cannot be built, the vector-search order
+        is kept. ``rerank_semantic_chunks`` itself never raises on LLM failure.
+        """
+        # getattr keeps this working before the ``dossier_semantic_rerank``
+        # Settings field lands; it defaults to enabled.
+        if not getattr(self.settings, "dossier_semantic_rerank", True):
+            return chunks
+        try:
+            # attr-defined ignore: rerank_semantic_chunks arrives with the dossier
+            # reranker change; drop the ignore once both branches are merged.
+            from henchmen.dossier.reranker import (  # type: ignore[attr-defined, unused-ignore]
+                rerank_semantic_chunks,
+            )
+
+            llm_provider = self._get_llm_provider()
+        except Exception as exc:
+            logger.warning("[DOSSIER] Semantic rerank skipped: %s", exc)
+            return chunks
+        try:
+            reranked: list[Any] = await rerank_semantic_chunks(
+                chunks,
+                f"{task.title}\n{task.description}",
+                llm_provider,
+                top_k=_RERANK_TOP_K,
+                settings=self.settings,
+            )
+        except Exception as exc:
+            logger.warning("[DOSSIER] Semantic rerank failed, keeping vector-search order: %s", exc)
+            return chunks
+        logger.info("[DOSSIER] Reranked %d semantic chunks down to %d", len(chunks), len(reranked))
+        return reranked
+
     async def _fetch_semantic_chunks(self, task: HenchmenTask) -> list[Any]:
         """Query RAG Engine for semantically relevant code chunks.
 
@@ -538,9 +590,13 @@ class MastermindAgent:
                 region=self.settings.rag_corpus_region,
                 top_k=20,
             )
-            if chunks:
-                logger.info("[DOSSIER] Retrieved %d semantic chunks from RAG Engine", len(chunks))
-            return chunks
         except Exception as exc:
             logger.warning("[DOSSIER] Semantic search failed (non-fatal): %s", exc)
             return []
+
+        if not chunks:
+            return []
+        logger.info("[DOSSIER] Retrieved %d semantic chunks from RAG Engine", len(chunks))
+        # Outside the search try-block: a rerank problem must not discard the
+        # chunks retrieval already produced.
+        return await self._rerank_semantic_chunks(task, chunks)

@@ -967,42 +967,98 @@ class TestFetchSemanticChunks:
         assert result == []
         query.assert_not_awaited()
 
-    @pytest.mark.asyncio
-    async def test_returns_chunks_when_configured(self):
+    @staticmethod
+    def _chunks() -> list:
         from henchmen.models.dossier import SemanticChunk
 
-        agent = self._make_agent()
-        task = self._make_task()
-
-        mock_chunks = [
+        return [
             SemanticChunk(
-                file_path="src/auth.py",
+                file_path=f"src/auth_{i}.py",
                 start_line=1,
                 end_line=10,
                 symbol_name="login",
                 language="python",
                 content="def login(): ...",
-                relevance_score=0.9,
+                relevance_score=0.9 - i / 10,
             )
+            for i in range(3)
         ]
 
-        with (
-            patch("henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock, return_value=mock_chunks),
-        ):
+    @staticmethod
+    def _patch_rerank(monkeypatch, rerank: AsyncMock) -> None:
+        """Install a rerank double; the real function may not exist on every branch."""
+        import henchmen.dossier.reranker as reranker_module
+
+        monkeypatch.setattr(reranker_module, "rerank_semantic_chunks", rerank, raising=False)
+
+    def _agent_with_rerank(self, enabled: bool):
+        llm = MagicMock(name="llm_provider")
+        settings = _mock_settings(dossier_semantic_rerank=enabled)
+        with patch("henchmen.mastermind.agent.LairManager"):
+            agent = _make_agent(settings, llm_provider=llm)
+        return agent, llm
+
+    @pytest.mark.asyncio
+    async def test_reranks_retrieved_chunks_when_enabled(self, monkeypatch):
+        agent, llm = self._agent_with_rerank(enabled=True)
+        task = self._make_task()
+        chunks = self._chunks()
+        reranked = list(reversed(chunks))[:2]
+        rerank = AsyncMock(return_value=reranked)
+        self._patch_rerank(monkeypatch, rerank)
+
+        with patch("henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock, return_value=chunks):
             result = await agent._fetch_semantic_chunks(task)
 
-        assert len(result) == 1
-        assert result[0].file_path == "src/auth.py"
+        assert result == reranked
+        rerank.assert_awaited_once()
+        args, kwargs = rerank.await_args
+        assert args == (chunks, f"{task.title}\n{task.description}", llm)
+        assert kwargs == {"top_k": 10, "settings": agent.settings}
+
+    @pytest.mark.asyncio
+    async def test_skips_rerank_when_disabled(self, monkeypatch):
+        agent, _llm = self._agent_with_rerank(enabled=False)
+        chunks = self._chunks()
+        rerank = AsyncMock()
+        self._patch_rerank(monkeypatch, rerank)
+
+        with patch("henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock, return_value=chunks):
+            result = await agent._fetch_semantic_chunks(self._make_task())
+
+        assert result == chunks
+        rerank.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_rerank_for_empty_results(self, monkeypatch):
+        agent, _llm = self._agent_with_rerank(enabled=True)
+        rerank = AsyncMock()
+        self._patch_rerank(monkeypatch, rerank)
+
+        with patch("henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock, return_value=[]):
+            result = await agent._fetch_semantic_chunks(self._make_task())
+
+        assert result == []
+        rerank.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rerank_failure_keeps_vector_search_order(self, monkeypatch):
+        agent, _llm = self._agent_with_rerank(enabled=True)
+        chunks = self._chunks()
+        self._patch_rerank(monkeypatch, AsyncMock(side_effect=RuntimeError("llm down")))
+
+        with patch("henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock, return_value=chunks):
+            result = await agent._fetch_semantic_chunks(self._make_task())
+
+        assert result == chunks
 
     @pytest.mark.asyncio
     async def test_graceful_on_exception(self):
         agent = self._make_agent()
         task = self._make_task()
 
-        with (
-            patch(
-                "henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock, side_effect=Exception("boom")
-            ),
+        with patch(
+            "henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock, side_effect=Exception("boom")
         ):
             result = await agent._fetch_semantic_chunks(task)
 
