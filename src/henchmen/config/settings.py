@@ -475,7 +475,7 @@ class Settings(BaseSettings):
     # Local single-process mode (`henchmen serve`)
     local_sqlite_path: str = Field(
         default="",
-        description="SQLite file for the local DocumentStore; empty means <cwd>/.henchmen/henchmen_<environment>.db",
+        description="SQLite file for the local DocumentStore; empty means ~/.henchmen/henchmen_<environment>.db",
     )
     local_storage_dir: str = Field(
         default="",

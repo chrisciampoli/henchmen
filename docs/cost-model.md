@@ -132,9 +132,9 @@ coding on `gemini-2.5-pro` instead of `gemini-3.1-pro` saves ~38% on input and
 
 ### 2. Deterministic Gates (Implemented)
 
-`fix_lint` runs the linter's own fixer (`ruff check --fix`, `npx eslint . --fix`,
-or `pnpm run lint:fix` in a turbo monorepo) and `verify_changes` checks the
-branch with git — neither calls an LLM. Auto-fixers handle the majority of lint
+`fix_lint` runs the linter's own fixer (`ruff check --fix` or `eslint --fix`) on
+the files the operative changed, and `verify_changes` checks the branch with
+git — neither calls an LLM. Auto-fixers handle the majority of lint
 issues (whitespace, import ordering, trailing commas) deterministically.
 
 **Cost without this optimization:** An agentic lint-fix node on the reasoning tier would cost ~$0.15-$0.30 per invocation.
@@ -155,9 +155,10 @@ when files in that language changed. A branch with no changed files of the
 stack's language passes without running a linter; a diff that cannot be
 computed fails the gate.
 
-`fix_lint` itself still runs the fixer over the whole workspace
-(`ruff check . --fix`, `npx eslint . --fix`, `pnpm run lint:fix`), so it can
-commit fixes to files the operative did not touch.
+`fix_lint` uses the same scope: it runs `ruff check --fix` on changed `.py` files
+or `eslint --fix` on changed JS/TS files, reverts any fix the tool made outside
+that set, and stages only in-scope files. Stacks without a deterministic
+auto-fixer (Go, Rust, Java) skip the fix and go straight to the lint retry.
 
 ### 4. Tool Result Truncation (Implemented)
 
