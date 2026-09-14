@@ -60,21 +60,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # arm64 images are required: Apple Silicon Macs run the local image,
+      # and amd64-only images would run under slow emulation or not at all.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
       - name: Build and push container images
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME#v}"
-          # GHCR rejects uppercase paths and github.repository preserves the
-          # owner's login case, so forks with a mixed-case login would fail on
-          # `docker build -t` without this.
           REPO="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           for svc in dispatch mastermind forge operative; do
-            docker build -f containers/${svc}/Dockerfile \
-              -t "${REPO}/${svc}:${TAG}" \
-              -t "${REPO}/${svc}:latest" .
-            docker push "${REPO}/${svc}:${TAG}"
-            docker push "${REPO}/${svc}:latest"
+            docker buildx build --platform linux/amd64,linux/arm64 \
+              -f "containers/${svc}/Dockerfile" \
+              -t "${REPO}/${svc}:${TAG}" -t "${REPO}/${svc}:latest" \
+              --push .
           done
+          # The local all-in-one image the Henchmen Desktop app runs.
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            -f containers/mastermind/Dockerfile --target local \
+            -t "${REPO}/local:${TAG}" -t "${REPO}/local:latest" \
+            --push .
 
   # The GitHub Release is created last: publishing it before the images meant a
   # failed `docker push` left a release advertising images that do not exist,
