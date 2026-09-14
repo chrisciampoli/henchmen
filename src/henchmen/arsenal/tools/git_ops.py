@@ -108,17 +108,31 @@ async def _run_git(*args: str, working_dir: str = "") -> dict[str, Any]:
 @tool(
     name="git_branch_create",
     category="git_ops",
-    description="Create and checkout a new git branch from a base branch.",
+    description=(
+        "Create and checkout a new git branch from a base branch. Omit base_branch to branch "
+        "from the repository's default branch (which is not always 'main')."
+    ),
 )
-async def git_branch_create(branch_name: str, base_branch: str = "main", working_dir: str = "") -> dict[str, Any]:
-    """Create a new branch based on base_branch and check it out."""
-    for value, label in ((branch_name, "branch_name"), (base_branch, "base_branch")):
-        if not value or not _BRANCH_RE.fullmatch(value):
-            return {"error": f"invalid {label} '{value}': not a valid git branch name", "success": False}
+async def git_branch_create(branch_name: str, base_branch: str = "", working_dir: str = "") -> dict[str, Any]:
+    """Create a new branch based on base_branch and check it out.
+
+    An empty ``base_branch`` resolves to the repository's own default branch,
+    so a ``master``- or ``develop``-based repo does not branch from a ref that
+    does not exist.
+    """
+    if not branch_name or not _BRANCH_RE.fullmatch(branch_name):
+        return {"error": f"invalid branch_name '{branch_name}': not a valid git branch name", "success": False}
     try:
         safe_working_dir = _resolve_working_dir(working_dir)
     except PermissionError as exc:
         return {"error": f"access denied: {exc}", "success": False}
+    if not base_branch:
+        # Imported lazily: ``henchmen.operative`` pulls in the whole agent runtime.
+        from henchmen.operative.git_helpers import detect_base_branch
+
+        base_branch = await detect_base_branch(safe_working_dir or current_workspace_dir())
+    if not _BRANCH_RE.fullmatch(base_branch):
+        return {"error": f"invalid base_branch '{base_branch}': not a valid git branch name", "success": False}
     # A failed fetch is tolerated: the repo may be local-only.
     await _run_git("fetch", "origin", base_branch, working_dir=safe_working_dir)
     result = await _run_git("checkout", "-b", branch_name, f"origin/{base_branch}", working_dir=safe_working_dir)
