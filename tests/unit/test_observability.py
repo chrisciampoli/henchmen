@@ -14,8 +14,17 @@ class TestEstimateCost:
     def test_claude_sonnet_cost(self):
         from henchmen.observability.tracker import estimate_cost
 
-        cost = estimate_cost("claude-sonnet-4@20250514", 100_000, 5_000)
+        # First-party dash ID: the ``claude-*@date`` spelling is the Vertex AI
+        # form, and Claude is never run on Vertex AI.
+        cost = estimate_cost("claude-sonnet-4-20250514", 100_000, 5_000)
         assert cost == pytest.approx(0.375, abs=0.001)
+
+    def test_claude_haiku_4_5_uses_the_current_rate(self):
+        """Haiku 4.5 is $1 / $5 per MTok, not the retired Haiku 3.5 rate of $0.80 / $4."""
+        from henchmen.observability.tracker import estimate_cost
+
+        assert estimate_cost("claude-haiku-4-5", 1_000_000, 0) == pytest.approx(1.0, abs=0.001)
+        assert estimate_cost("claude-haiku-4-5", 0, 1_000_000) == pytest.approx(5.0, abs=0.001)
 
     def test_gemini_cost(self):
         from henchmen.observability.tracker import estimate_cost
@@ -32,7 +41,7 @@ class TestEstimateCost:
     def test_zero_tokens(self):
         from henchmen.observability.tracker import estimate_cost
 
-        cost = estimate_cost("claude-sonnet-4@20250514", 0, 0)
+        cost = estimate_cost("claude-sonnet-4-20250514", 0, 0)
         assert cost == 0.0
 
 
@@ -370,7 +379,7 @@ class TestGetMetricsSummary:
                 "total_input_tokens": 0,
                 "total_output_tokens": 0,
                 "node_metrics": {
-                    "implement_fix": {"model_name": "claude-sonnet-4@20250514", "cost_usd": 0.30},
+                    "implement_fix": {"model_name": "claude-sonnet-5", "cost_usd": 0.30},
                     "verify_changes": {"model_name": "gemini-2.5-flash", "cost_usd": 0.05},
                 },
             },
@@ -380,14 +389,14 @@ class TestGetMetricsSummary:
                 "total_input_tokens": 0,
                 "total_output_tokens": 0,
                 "node_metrics": {
-                    "implement_fix": {"model_name": "claude-sonnet-4@20250514", "cost_usd": 0.35},
+                    "implement_fix": {"model_name": "claude-sonnet-5", "cost_usd": 0.35},
                 },
             },
         ]
         tracker = self._make_tracker(tasks)
         result = await tracker.get_metrics_summary(days=7)
         cbm = result["cost_by_model"]
-        assert cbm["claude-sonnet-4@20250514"] == pytest.approx(0.65, abs=0.001)
+        assert cbm["claude-sonnet-5"] == pytest.approx(0.65, abs=0.001)
         assert cbm["gemini-2.5-flash"] == pytest.approx(0.05, abs=0.001)
 
     @pytest.mark.asyncio
@@ -529,7 +538,7 @@ class TestMetricsSummaryEndpoint:
             "avg_cost_usd": 0.25,
             "total_cost_usd": 0.75,
             "total_tokens": {"input": 150000, "output": 7500},
-            "cost_by_model": {"claude-sonnet-4@20250514": 0.60},
+            "cost_by_model": {"claude-sonnet-5": 0.60},
             "escalation_reasons": {"Stalled": 1},
             "days": 7,
         }
@@ -545,7 +554,7 @@ class TestMetricsSummaryEndpoint:
         assert resp.status_code == 200
         data = resp.json()
         assert data["total_tasks"] == 3
-        assert data["cost_by_model"]["claude-sonnet-4@20250514"] == pytest.approx(0.60, abs=0.001)
+        assert data["cost_by_model"]["claude-sonnet-5"] == pytest.approx(0.60, abs=0.001)
         assert data["escalation_reasons"]["Stalled"] == 1
 
 
@@ -559,10 +568,9 @@ class TestAgentTrackerIntegration:
     async def test_handle_task_calls_start_and_finalize(self):
         from henchmen.mastermind.agent import MastermindAgent
 
-        # Override vertex_ai_model_complex via model_copy so the agent's
-        # cost accounting resolves to the expected tier. Pinecone fields
-        # were removed from Settings when RAG moved to Vertex AI.
-        settings = _mock_settings().model_copy(update={"vertex_ai_model_complex": "claude-sonnet-4@20250514"})
+        # Pin vertex_ai_model_complex so the agent's cost accounting resolves
+        # the COMPLEX tier to a known Gemini model (never Claude on Vertex AI).
+        settings = _mock_settings().model_copy(update={"vertex_ai_model_complex": "gemini-2.5-pro"})
 
         with patch("henchmen.mastermind.agent.LairManager"):
             agent = MastermindAgent(settings=settings)
@@ -1354,6 +1362,48 @@ class TestRecordNodeResultCost:
         node_data = update_data["node_metrics"]["implement_fix"]
         assert node_data["cached_input_tokens"] == 1_000_000
         assert node_data["cost_usd"] == pytest.approx(1.25 * 0.25, abs=0.001)
+
+    @staticmethod
+    def _report_with_provider_cost(cost: float, **overrides):
+        """An OperativeReport carrying the provider-summed ``estimated_cost_usd``."""
+        from henchmen.models.operative import OperativeReport
+
+        class _ReportWithCost(OperativeReport):
+            estimated_cost_usd: float = 0.0
+
+        base = _make_report(**overrides).model_dump()
+        return _ReportWithCost(**base, estimated_cost_usd=cost)
+
+    @pytest.mark.asyncio
+    async def test_provider_billed_cost_is_persisted_as_is(self):
+        """Anthropic cache writes bill at 125%; re-deriving from token counters cannot see them."""
+        store = _make_mock_store()
+        store.get = AsyncMock(return_value={})
+        tracker = self._make_tracker(store, llm_provider="anthropic", anthropic_api_key="k")
+        report = self._report_with_provider_cost(
+            0.4321, model_name="claude-sonnet-5", total_input_tokens=100_000, total_output_tokens=0
+        )
+
+        await tracker.record_node_result("test-task", "implement_fix", report)
+
+        _coll, _id, deltas = store.increment.call_args.args
+        assert deltas["estimated_cost_usd"] == pytest.approx(0.4321)
+        _coll, _id, update_data = store.update.call_args[0]
+        assert update_data["node_metrics"]["implement_fix"]["cost_usd"] == pytest.approx(0.4321)
+
+    @pytest.mark.asyncio
+    async def test_zero_provider_cost_falls_back_to_token_estimate(self):
+        store = _make_mock_store()
+        store.get = AsyncMock(return_value={})
+        tracker = self._make_tracker(store, llm_provider="gcp")
+        report = self._report_with_provider_cost(
+            0.0, model_name="gemini-2.5-pro", total_input_tokens=1_000_000, total_output_tokens=0
+        )
+
+        await tracker.record_node_result("test-task", "implement_fix", report)
+
+        _coll, _id, deltas = store.increment.call_args.args
+        assert deltas["estimated_cost_usd"] == pytest.approx(1.25, abs=0.001)
 
 
 # ---------------------------------------------------------------------------
