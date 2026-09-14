@@ -113,11 +113,11 @@ graph LR
 
 | Component | Path | Role |
 |---|---|---|
-| **Mastermind** | `src/henchmen/mastermind/` | Orchestrator. State machine, scheme selection, operative dispatch. Fail-closed CI gates. |
+| **Mastermind** | `src/henchmen/mastermind/` | Orchestrator. Scheme selection, DAG execution, operative dispatch, stalled-task watchdog. Fail-closed lint/test gates, then opens the PR. |
 | **Dispatch** | `src/henchmen/dispatch/` | Intake router. Normalizes tasks from all sources into a unified Task model. |
 | **Operative** | `src/henchmen/operative/` | Coding agent. Ephemeral container. Executes scheme nodes with Arsenal tools. |
 | **Arsenal** | `src/henchmen/arsenal/` | Tool registry, in-process inside the Operative. `code_edit`, `code_intel`, `context`, `git_ops`, `github`, `jira`, `slack`, `test_runner`. |
-| **Forge** | `src/henchmen/forge/` | CI + merge queue. Runs lint/tests, builds PRs, detects silent failures. |
+| **Forge** | `src/henchmen/forge/` | CI + merge queue. Runs lint/tests on the opened PR, detects silent failures, comments the results. |
 | **Dossier** | `src/henchmen/dossier/` | Context builder. Rules, semantic code search via Vertex AI RAG Engine, task analysis. Caches to object store. |
 | **Schemes** | `src/henchmen/schemes/` | DAG workflow blueprints: `bugfix_standard`, `feature_standard`, `goal_decomposition`. |
 
@@ -298,9 +298,12 @@ channels cannot be self-joined — invite the bot with `/invite @YourBot`.
 HENCHMEN_JIRA_BASE_URL=https://your-org.atlassian.net
 HENCHMEN_JIRA_EMAIL=your-service-account@your-org.com
 HENCHMEN_JIRA_API_TOKEN=your-jira-api-token
-HENCHMEN_JIRA_PROJECT_KEY=PROJ
 HENCHMEN_JIRA_WEBHOOK_SECRET=shared-secret
 ```
+
+`HENCHMEN_JIRA_WEBHOOK_SECRET` verifies the webhook signature. It is required in
+staging and prod — without it every Jira delivery is rejected with 401. The
+operative's Jira tools use the base URL, email and API token.
 
 </details>
 
@@ -362,20 +365,22 @@ Henchmen detects the target repository's stack at runtime via manifest
 files and runs the appropriate lint / test commands. The following
 stacks are detected and supported out of the box:
 
-| Stack        | Detected by                             | Test command                         | Lint command             |
-|--------------|-----------------------------------------|--------------------------------------|--------------------------|
-| Python       | `pyproject.toml`, `setup.py`, `requirements.txt` | `python -m pytest`          | `python -m ruff check`   |
-| Node (pnpm)  | `pnpm-lock.yaml` (+ `turbo.json` for monorepos) | `pnpm run test`             | `pnpm run lint`          |
-| Node (npm)   | `package.json` (no pnpm lockfile)       | `npm test`                           | `eslint` on changed files |
-| Go           | `go.mod`                                | `go test ./...`                      | `go vet ./...`           |
-| Rust         | `Cargo.toml`                            | `cargo test`                         | `cargo clippy`           |
-| Java (Maven) | `pom.xml`                               | `mvn test`                           | `mvn verify -DskipTests` |
-| Java (Gradle)| `build.gradle` or `build.gradle.kts`    | `./gradlew test`                     | `./gradlew check -x test`|
+| Stack        | Detected by                                      | Test command                          | Lint command                     |
+|--------------|--------------------------------------------------|---------------------------------------|----------------------------------|
+| Python       | `pyproject.toml`, `setup.py`, `requirements.txt` | `python -m pytest -q`                 | `python -m ruff check .`         |
+| Rust         | `Cargo.toml`                                     | `cargo test`                          | `cargo clippy -- -D warnings`    |
+| Go           | `go.mod`                                         | `go test ./...`                       | `go vet ./...`                   |
+| Java (Maven) | `pom.xml`                                        | `mvn test`                            | `mvn verify -DskipTests`         |
+| Java (Gradle)| `build.gradle` or `build.gradle.kts`             | `./gradlew test`                      | `./gradlew check -x test`        |
+| Node (pnpm)  | `package.json` + `pnpm-lock.yaml`                | `pnpm run --if-present test`          | `pnpm run --if-present lint`     |
+| Node (npm)   | `package.json` (no pnpm lockfile)                | `npm run --if-present test`           | `npm run --if-present lint`      |
 
-If your project uses something else, the run_tests handler falls back
-gracefully with a "stack not detected" skip rather than failing. See
-`src/henchmen/utils/stack_detector.py` for the detection logic and add
-a new stack via a pull request.
+Detection runs top to bottom and the first match wins, so a repo with both
+`pyproject.toml` and `package.json` is treated as Python. If no manifest
+matches, the lint and test gates **fail** and the task escalates for human
+review — Henchmen will not open a PR it could not check. See
+`src/henchmen/utils/stack_detector.py` for the detection logic and add a new
+stack via a pull request.
 
 ---
 
@@ -390,14 +395,18 @@ account, run the eval harness:
 # Run a single fixture against the provider of your choice.
 henchmen eval run --provider openai --fixture bugfix_off_by_one
 
-# Run the whole fixture set (3 fixtures by default — add your own in
-# evals/fixtures/).
+# Run every fixture in evals/fixtures/ (add your own there).
 henchmen eval run --provider ollama
+
+# Record this run as the provider's baseline.
+henchmen eval run --provider openai --write-baseline
 ```
 
-Results go to `evals/baseline.json`. A stub file ships in the repo with
-a `"how to populate me"` hint next to every provider entry. If you want
-to publish your numbers, open a PR updating the stub with your results.
+Every run is saved to a local SQLite history (`henchmen eval history`,
+`henchmen eval compare <run_a> <run_b>`). `--write-baseline` also writes the
+provider's entry in `evals/baseline.json`; `--compare-baseline` fails on a
+drop of more than 5%. If you want to publish your numbers, open a PR
+updating `evals/baseline.json`. See [`evals/README.md`](evals/README.md).
 
 The [`.github/workflows/evals.yml`](.github/workflows/evals.yml)
 workflow is `workflow_dispatch`-triggered so you can run it against
@@ -411,6 +420,10 @@ updating `evals/baseline.json` for review.
 - [Architecture](docs/architecture.md)
 - [Schemes](docs/schemes.md)
 - [Cost Model](docs/cost-model.md)
+- [Deploying on GCP](docs/deploy-gcp.md)
+- [Operations](docs/operations.md)
+- [Incident Runbook](docs/incident-runbook.md)
+- [Rollback Procedures](docs/rollback-procedures.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
 ---

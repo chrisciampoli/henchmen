@@ -10,10 +10,13 @@ Thank you for your interest in contributing. This guide covers everything you ne
    cd henchmen
    ```
 
-2. Install with dev dependencies:
+2. Install a runtime extra plus the dev tooling:
    ```bash
-   pip install -e ".[dev]"
+   pip install -e ".[local,dev]"          # unit tests, lint, type check
+   pip install -e ".[dev-integration]"    # everything, for tests/integration/
    ```
+   `dev` is tooling only (pytest, ruff, mypy, ...); it does not pull in any
+   provider SDK. CI type-checks and tests with `.[dev-integration]`.
 
 3. (Optional) Install pre-commit hooks for secret scanning and auto-formatting:
    ```bash
@@ -45,11 +48,11 @@ All five must pass. No exceptions.
 - Python 3.12+ with modern typing (`str | None`, not `Optional[str]`)
 - Pydantic v2 with `Field(...)` descriptors for all models
 - `pydantic-settings` with `HENCHMEN_` env prefix and `@lru_cache` singletons
-- Ruff for linting and formatting (120 character line length, rules: E, F, I, N, W, UP)
+- Ruff for linting and formatting (120 character line length, rules: E, F, I, N, W, UP, B, SIM, RET, ASYNC, T20, C4 — see `[tool.ruff.lint]` in `pyproject.toml`)
 - mypy strict mode — all code must type-check cleanly
 - `datetime.now(timezone.utc)` for all timestamps — no naive datetimes
 - `str(uuid4())` for IDs
-- `str, Enum` pattern for string enums
+- `StrEnum` for string enums
 - Module-level docstrings on all files
 - snake_case for variables and functions, PascalCase for classes
 - Pydantic models for all data crossing component boundaries — never raw dicts
@@ -72,7 +75,7 @@ future mode flip cannot silently skip async tests.
 
 ## Adding a Provider
 
-Providers live in `src/henchmen/providers/`. Each provider implements a set of abstract interfaces defined in `src/henchmen/providers/base.py`.
+Providers live in `src/henchmen/providers/`. Each provider implements the `Protocol` interfaces defined in `src/henchmen/providers/interfaces/`.
 
 To add a new cloud or infrastructure provider:
 
