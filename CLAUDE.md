@@ -163,7 +163,12 @@ Every error/exception path in the scheme executor returns `condition: "fail"`, n
 - A CI command that cannot run must surface its real exit code; never swallow
   it with `2>/dev/null || echo SKIP`
 - A lint gate must only judge files changed by the operative
-  (`git diff --name-only origin/<base>`), never pre-existing violations
+  (`git diff --name-only origin/<base>...HEAD`), never pre-existing violations.
+  Mastermind's gate (`scheme_executor/lint_scope.py`) runs ruff on changed
+  `.py` files, eslint on changed JS/TS files from the nearest `package.json`,
+  `go vet` on changed Go packages, and the whole-project Rust/Java lint only
+  when files in that language changed
+- A lint diff against `origin/<base>` that cannot be fetched or computed → fail
 
 ## Container Build & Deploy
 

@@ -141,14 +141,22 @@ issues (whitespace, import ordering, trailing commas) deterministically.
 
 ### 3. Lint Scope
 
-Forge's post-PR lint runs `ruff check` only on the Python files the PR changed,
-so pre-existing violations elsewhere do not fail it. The Mastermind lint gate
-(`run_lint` / `run_lint_retry`) currently runs the detected stack's lint command
-over the whole workspace (for example `python -m ruff check .` or
-`npm run --if-present lint`), so a target repository with pre-existing lint
-failures fails the gate, runs `fix_lint`, and can escalate on code the
-operative never touched. Keep the target repository lint-clean, or expect
-those escalations.
+Both lint passes are scoped to the operative's changes, so for Python, Node and
+Go targets pre-existing violations elsewhere in the repository do not trigger a
+`fix_lint` run or an escalation. (Rust and Java linters only work on a whole
+crate or build, so there a pre-existing violation still fails the gate once the
+branch touches that language.) Forge's post-PR lint runs `ruff check` on the Python files the PR
+changed. The Mastermind lint gate (`run_lint` / `run_lint_retry`) diffs the
+branch against `origin/<base>` and lints per stack: `ruff check` on changed
+`.py` files, `eslint` on changed JS/TS files from their nearest `package.json`,
+`go vet` on changed Go packages, and the whole-project Rust or Java lint only
+when files in that language changed. A branch with no changed files of the
+stack's language passes without running a linter; a diff that cannot be
+computed fails the gate.
+
+`fix_lint` itself still runs the fixer over the whole workspace
+(`ruff check . --fix`, `npx eslint . --fix`, `pnpm run lint:fix`), so it can
+commit fixes to files the operative did not touch.
 
 ### 4. Tool Result Truncation (Implemented)
 

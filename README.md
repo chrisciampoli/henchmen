@@ -433,6 +433,13 @@ stacks are detected and supported out of the box:
 | Node (pnpm)  | `package.json` + `pnpm-lock.yaml`                | `pnpm run --if-present test`          | `pnpm run --if-present lint`     |
 | Node (npm)   | `package.json` (no pnpm lockfile)                | `npm run --if-present test`           | `npm run --if-present lint`      |
 
+The lint column is the stack's project-wide command. The Mastermind lint gate
+narrows it to the files the operative changed against the base branch: `ruff`
+on changed Python files, `eslint` on changed JS/TS files (from the nearest
+`package.json`), `go vet` on changed Go packages, and the Rust or Java command
+only when the branch touched that language. If that diff cannot be computed
+the gate fails.
+
 Detection runs top to bottom and the first match wins, so a repo with both
 `pyproject.toml` and `package.json` is treated as Python. If no manifest
 matches, the lint and test gates **fail** and the task escalates for human

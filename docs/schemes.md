@@ -56,14 +56,14 @@ class SchemeEdge(BaseModel):
 | `create_branch` | Returns the branch name `henchmen/{task_id[:8]}`; the operative bootstrap creates the branch itself |
 | `prefetch_context` | Returns the dossier artifact URI |
 | `verify_changes` | Clones the branch and fails unless it has commits and changed files ahead of `origin/<base>` |
-| `run_lint` / `run_lint_retry` | Clones the branch, detects the stack (`utils/stack_detector.py`), installs dependencies and runs the stack's lint command (e.g. `python -m ruff check .`, `npm run --if-present lint`). In local mode the command runs inside the `henchmen-operative:local` image. |
+| `run_lint` / `run_lint_retry` | Clones the branch, detects the stack (`utils/stack_detector.py`), lists the files the branch changed (`git diff --name-only origin/<base>...HEAD`) and lints only those (`scheme_executor/lint_scope.py`): Python runs `ruff check` on the changed `.py` files; Node runs `eslint` on the changed JS/TS files from each file's nearest `package.json` directory (skipping packages with no ESLint dependency or config); Go runs `go vet` on the packages with changed `.go` files; Rust and Java run the stack's whole-project lint, but only when the branch changed files of that language or its build manifest. No relevant changed files passes with a "no changed ... files to lint" message. If the diff against `origin/<base>` cannot be computed the gate fails. In local mode the commands run inside the `henchmen-operative:local` image. |
 | `fix_lint` | Runs `pnpm run lint:fix` (pnpm + turbo), `npx eslint . --fix` (other Node repos) or `python -m ruff check . --fix`, then commits and pushes any changes. No LLM. |
 | `run_tests` / `run_tests_retry` | Same as `run_lint`, with the stack's test command (e.g. `python -m pytest -q`, `go test ./...`) |
 | `create_pr` | Opens a GitHub pull request via the GitHub API; fails if the repo or GitHub token is missing |
 | `escalate` | Marks the task for human review |
 | `report_plan` | Reports the `analyze_goal` decomposition back to the user |
 
-Every CI handler fails closed: a clone failure, an undetectable stack or a non-zero exit code returns `fail`.
+Every CI handler fails closed: a clone failure, an undetectable stack, a lint diff that cannot be computed or a non-zero exit code returns `fail`.
 
 **AGENTIC** nodes are dispatched to Lairs. The `LairManager` creates a Cloud Run Job (or a Docker container in local mode) from the operative image, injects the runtime environment (task ID, node ID, model tier, repo, branch, ...), and waits for the operative's report.
 
@@ -82,9 +82,10 @@ When a node returns a condition but no matching conditional edge exists, the exe
 2. **Tests fail -> LLM fix -> re-test -> escalate:** If tests fail after the `fix_tests` attempt, the task escalates.
 3. **No changes -> escalate:** If the implementation node produced no commits, `verify_changes` fails and the task escalates.
 4. **Lair provisioning fails in staging/prod:** The node returns `fail` and the task follows the failure path. Only in dev, and only for implementation nodes, is a provisioning failure simulated as a pass; `fix_lint`/`fix_tests` never simulate.
-5. **CI check errors:** If lint or test commands cannot run (clone failure, unknown stack), the node returns `fail` rather than silently passing.
-6. **Max node executions:** Each node can run at most 2 times (`SchemeExecutor._max_node_retries`); a third attempt is forced to `fail`.
-7. **Cost ceiling:** Before each agentic node the executor checks the task's cumulative cost against `HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD` and fails the node if it would exceed it.
+5. **CI check errors:** If lint or test commands cannot run (clone failure, unknown stack, or for lint a diff against `origin/<base>` that cannot be fetched or computed), the node returns `fail` rather than silently passing.
+6. **Lint judges only the operative's changes:** `run_lint` lints the files the branch changed, never pre-existing violations elsewhere in the repository (see the handler table above).
+7. **Max node executions:** Each node can run at most 2 times (`SchemeExecutor._max_node_retries`); a third attempt is forced to `fail`.
+8. **Cost ceiling:** Before each agentic node the executor checks the task's cumulative cost against `HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD` and fails the node if it would exceed it.
 
 ### Retry Loops
 

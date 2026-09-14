@@ -96,7 +96,7 @@ The Mastermind is the brain of the system. It receives tasks via Pub/Sub push su
    - Fetches repo rule files (CLAUDE.md, etc.) and related PRs via `DossierBuilder`
 
 3. **Scheme Execution** (`SchemeExecutor`): Walks the scheme DAG from root to terminal node:
-   - **Deterministic nodes** run inline handlers: `create_branch`, `prefetch_context`, `verify_changes`, `run_lint`, `fix_lint`, `run_lint_retry`, `run_tests`, `run_tests_retry`, `create_pr`, `escalate`, `report_plan`. A deterministic node with no registered handler fails.
+   - **Deterministic nodes** run inline handlers: `create_branch`, `prefetch_context`, `verify_changes`, `run_lint`, `fix_lint`, `run_lint_retry`, `run_tests`, `run_tests_retry`, `create_pr`, `escalate`, `report_plan`. A deterministic node with no registered handler fails. The lint gate (`run_lint`, `run_lint_retry`) only judges files the operative changed against `origin/<base>` (`scheme_executor/lint_scope.py`): `ruff check` on changed Python files, `eslint` on changed JS/TS files from their nearest `package.json`, `go vet` on changed Go packages, and the whole-project Rust/Java lint only when files in that language changed. It fails closed when that diff cannot be computed.
    - **Agentic nodes** (`implement_fix`, `implement_feature`, `fix_tests`, `analyze_goal`) are dispatched to Lairs via `LairManager`
    - Edge conditions (`pass`/`fail`) determine the next node. Unconditional edges are followed as fallback.
    - A per-node execution limit (2) forces `fail` if a node would run a third time.
@@ -243,7 +243,7 @@ The Dossier subsystem assembles context packages for operatives:
                                                |
                                          verify_changes (DETERMINISTIC: source commits ahead of base?)
                                                |
-                                         [pass] -> run_lint (DETERMINISTIC)
+                                         [pass] -> run_lint (DETERMINISTIC: files changed vs base only)
                                                |
                                          [pass] -> run_tests (DETERMINISTIC)
                                                |
