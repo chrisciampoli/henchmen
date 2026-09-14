@@ -140,9 +140,10 @@ echo -n "ghp_YourTokenHere" | gcloud secrets versions add henchmen-dev-github-to
 echo -n "xoxb-YourTokenHere" | gcloud secrets versions add henchmen-dev-slack-bot-token --data-file=-
 ```
 
-Secrets are read with `version="latest"`, so new Cloud Run revisions and new
-lairs pick up a rotated value. Existing revisions keep the value they started
-with — redeploy (or wait for the next revision) after rotating.
+Secrets are mounted as environment variables with `version = "latest"`, which
+Cloud Run resolves when an instance starts. New lairs and newly started
+instances pick up a rotated value; instances already running keep the old one
+until they are replaced — redeploy the service after rotating.
 
 ## Environment Variables
 
