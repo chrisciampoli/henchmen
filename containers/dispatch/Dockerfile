@@ -17,8 +17,9 @@ RUN pip install --no-cache-dir --prefix=/install -e ".[observability]"
 # --- Runtime stage ---
 FROM python:3.14.7-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f
 
-# git is required by the embedding pipeline in henchmen.dispatch.handlers.cli
-RUN apt-get update && apt-get install -y --no-install-recommends bash git && rm -rf /var/lib/apt/lists/*
+# bash runs entrypoint.sh. Dispatch only normalizes and publishes: repository
+# indexing (which needs git) runs in Mastermind's image.
+RUN apt-get update && apt-get install -y --no-install-recommends bash && rm -rf /var/lib/apt/lists/*
 
 # Copy Python packages from builder
 COPY --from=builder /install /usr/local
