@@ -85,13 +85,19 @@ async def _heartbeat_loop(
     watchdog can distinguish a live-but-slow operative from a dead one.
     Any Firestore write failures are swallowed — observability must never
     crash the operative.
+
+    The timestamp is an ISO-8601 UTC string, matching every other timestamp
+    ``TaskTracker`` stores. ``get_stalled_tasks`` range-filters
+    ``last_heartbeat < cutoff.isoformat()``; a native datetime is never matched
+    by a string range on Firestore (so the task could never be found stalled)
+    and raises on the SQLite store.
     """
     while True:
         try:
             await document_store.update(
                 _TASK_EXECUTIONS_COLLECTION,
                 task_id,
-                {"last_heartbeat": datetime.now(UTC)},
+                {"last_heartbeat": datetime.now(UTC).isoformat()},
             )
         except Exception as exc:
             logger.debug("Heartbeat write failed (non-fatal): %s", exc)
@@ -117,7 +123,8 @@ async def _persist_interrupted_report(
             report.task_id,
             {
                 "interrupted_node_id": report.node_id,
-                "interrupted_at": datetime.now(UTC),
+                # ISO string, like every TaskTracker timestamp (see _heartbeat_loop).
+                "interrupted_at": datetime.now(UTC).isoformat(),
                 "interrupted_report": report.model_dump(mode="json"),
                 "execution_state": "interrupted",
             },

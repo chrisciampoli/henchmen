@@ -470,6 +470,60 @@ class TestInitializeWorkspaceAlwaysClones:
         snapshot_cache.assert_not_called()
 
 
+class TestDocumentStoreTimestamps:
+    """TaskTracker range-filters ISO strings; a native datetime never matches (Firestore) or raises (SQLite)."""
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_writes_iso_utc_string(self):
+        import asyncio
+        from datetime import datetime
+
+        from henchmen.operative.bootstrap import _heartbeat_loop
+
+        store = MagicMock()
+        store.update = AsyncMock()
+        task = asyncio.create_task(_heartbeat_loop(store, "task-hb", interval_seconds=3600))
+        for _ in range(20):
+            if store.update.await_count:
+                break
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        collection, task_id, fields = store.update.await_args.args
+        assert (collection, task_id) == ("task_executions", "task-hb")
+        value = fields["last_heartbeat"]
+        assert isinstance(value, str)
+        assert datetime.fromisoformat(value).tzinfo is not None
+
+    @pytest.mark.asyncio
+    async def test_interrupted_report_writes_iso_utc_string(self):
+        from datetime import UTC, datetime
+
+        from henchmen.models.operative import OperativeReport
+        from henchmen.operative.bootstrap import _persist_interrupted_report
+
+        store = MagicMock()
+        store.update = AsyncMock()
+        report = OperativeReport(
+            task_id="task-int",
+            scheme_id="bugfix_standard",
+            node_id="implement_fix",
+            operative_id="op-1",
+            status=OperativeStatus.INTERRUPTED,
+            summary="partial",
+            confidence_score=0.1,
+            started_at=datetime.now(UTC),
+        )
+
+        await _persist_interrupted_report(store, report)
+
+        fields = store.update.await_args.args[2]
+        assert isinstance(fields["interrupted_at"], str)
+        assert datetime.fromisoformat(fields["interrupted_at"]).tzinfo is not None
+
+
 class TestDocumentStoreFailClosed:
     def test_dev_continues_without_document_store(self):
         from henchmen.operative.bootstrap import _get_document_store
