@@ -28,7 +28,7 @@ RUN npm install -g pnpm@9 && pnpm --version
 FROM docker:28-cli@sha256:625d9431a9f54c5a2bc90f24f0e1c3d55b1349fd857dd85035f98c2c9acbdd4d AS docker-cli
 
 # --- Runtime stage ---
-FROM python:3.14.7-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f
+FROM python:3.14.7-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
@@ -68,3 +68,30 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD ["python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health').status == 200 else 1)"]
 
 CMD ["uvicorn", "henchmen.mastermind.server:app", "--host", "0.0.0.0", "--port", "8080"]
+
+# --- Local all-in-one image (docker build --target local) ---
+# `henchmen serve` in one container: Console + Dispatch + Mastermind + Forge.
+# All state lives in the /data volume; the Henchmen Desktop app runs this with
+# --restart unless-stopped so applying setup (exit code 75) restarts it into
+# run mode. Root is required to use the mounted Docker socket, whose group id
+# differs per host.
+FROM runtime AS local
+
+USER root
+ENV HENCHMEN_DATA_DIR=/data \
+    HENCHMEN_PROVIDER=local \
+    HENCHMEN_ENVIRONMENT=dev \
+    HENCHMEN_LOCAL_SERVE_PORT=8000 \
+    HENCHMEN_LOCAL_SQLITE_PATH=/data/henchmen.db \
+    HENCHMEN_LOCAL_STORAGE_DIR=/data/storage
+RUN mkdir -p /data
+VOLUME ["/data"]
+EXPOSE 8000
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+  CMD ["python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status == 200 else 1)"]
+CMD ["henchmen", "serve", "--host", "0.0.0.0", "--port", "8000"]
+
+# --- Default target: the Cloud Run Mastermind service ---
+# Kept last so `docker build -f containers/mastermind/Dockerfile .` without
+# --target still produces the service image release.yml and Terraform expect.
+FROM runtime AS mastermind

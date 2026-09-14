@@ -177,6 +177,37 @@ jobs:
           docker run --rm --entrypoint python "henchmen-${{ matrix.service }}:ci" \
             -c "import importlib, henchmen; importlib.import_module('${module}'); print('henchmen', henchmen.__version__, '${module} OK')"
 
+  docker-local:
+    name: Local image (setup mode smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: docker build --target local
+        run: docker build -f containers/mastermind/Dockerfile --target local -t henchmen-local:ci .
+
+      # Starts with an empty data volume, so it must come up in setup mode,
+      # answer /health and the public Console status, refuse a non-loopback
+      # Host, and print the sign-in URL.
+      - name: Smoke-test setup mode
+        run: |
+          set -euo pipefail
+          docker run -d --name henchmen-local -p 127.0.0.1:8000:8000 \
+            -e HENCHMEN_CONSOLE_SETUP_TOKEN=ci-token henchmen-local:ci
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8000/health >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8000/health | grep -q '"mode":"setup"'
+          curl -fsS http://127.0.0.1:8000/console/api/status | grep -q '"mode":"setup"'
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' http://127.0.0.1:8000/console/api/status)" = "403"
+          docker logs henchmen-local 2>&1 | grep -q "console/session?setup_token=ci-token"
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs henchmen-local || true
+
   docker-compose-smoke:
     name: docker-compose smoke test
     runs-on: ubuntu-latest
