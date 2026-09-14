@@ -256,6 +256,71 @@ class TestSettingsExtraIgnored:
 
 
 # ---------------------------------------------------------------------------
+# Dispatch rate limiting and Jira field mapping
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchRateLimitSettings:
+    def test_defaults_match_the_previous_hardcoded_limiter(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+
+        settings = Settings(_env_file=None)  # type: ignore[call-arg]
+        assert settings.dispatch_rate_limit_requests == 60
+        assert settings.dispatch_rate_limit_window_seconds == 60.0
+        assert settings.dispatch_trust_forwarded_for is True
+
+    def test_env_overrides(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        monkeypatch.setenv("HENCHMEN_DISPATCH_RATE_LIMIT_REQUESTS", "5")
+        monkeypatch.setenv("HENCHMEN_DISPATCH_RATE_LIMIT_WINDOW_SECONDS", "0.5")
+        monkeypatch.setenv("HENCHMEN_DISPATCH_TRUST_FORWARDED_FOR", "false")
+
+        settings = Settings(_env_file=None)  # type: ignore[call-arg]
+        assert settings.dispatch_rate_limit_requests == 5
+        assert settings.dispatch_rate_limit_window_seconds == 0.5
+        assert settings.dispatch_trust_forwarded_for is False
+        # A sub-second window is valid and must not be truncated to 0 by the check.
+        assert not any("DISPATCH_RATE_LIMIT" in p for p in settings.validate_for_runtime())
+
+    @pytest.mark.parametrize(
+        ("field", "env_name"),
+        [
+            ("dispatch_rate_limit_requests", "HENCHMEN_DISPATCH_RATE_LIMIT_REQUESTS"),
+            ("dispatch_rate_limit_window_seconds", "HENCHMEN_DISPATCH_RATE_LIMIT_WINDOW_SECONDS"),
+        ],
+    )
+    def test_non_positive_values_are_reported(self, monkeypatch: pytest.MonkeyPatch, field: str, env_name: str):
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+
+        settings = Settings(_env_file=None, **{field: 0})  # type: ignore[call-arg, arg-type]
+        assert any(env_name in problem for problem in settings.validate_for_runtime())
+
+
+class TestJiraFieldIdSettings:
+    def test_default_to_empty(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+
+        settings = Settings(_env_file=None)  # type: ignore[call-arg]
+        assert settings.jira_repo_field == ""
+        assert settings.jira_branch_field == ""
+
+    def test_env_sets_the_custom_field_ids(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        monkeypatch.setenv("HENCHMEN_JIRA_REPO_FIELD", "customfield_10042")
+        monkeypatch.setenv("HENCHMEN_JIRA_BRANCH_FIELD", "customfield_10043")
+
+        settings = Settings(_env_file=None)  # type: ignore[call-arg]
+        assert settings.jira_repo_field == "customfield_10042"
+        assert settings.jira_branch_field == "customfield_10043"
+
+    def test_descriptions_say_field_id_not_display_name(self):
+        for name in ("jira_repo_field", "jira_branch_field"):
+            description = Settings.model_fields[name].description or ""
+            assert "field ID" in description
+            assert "display name" in description
+
+
+# ---------------------------------------------------------------------------
 # Every Settings field has a reader
 # ---------------------------------------------------------------------------
 
@@ -268,6 +333,13 @@ _FIELDS_AWAITING_A_READER: frozenset[str] = frozenset(
         "vertex_ai_context_cache_min_tokens",
         "vertex_ai_safety_threshold",
         "vertex_ai_grounding_enabled",
+        # Added for Dispatch; wired into dispatch/server.py and the Jira
+        # handler in a follow-up change, which must also drop these entries.
+        "dispatch_rate_limit_requests",
+        "dispatch_rate_limit_window_seconds",
+        "dispatch_trust_forwarded_for",
+        "jira_repo_field",
+        "jira_branch_field",
     }
 )
 

@@ -228,6 +228,20 @@ class Settings(BaseSettings):
         description="Jira API token",
     )
     jira_project_key: str = Field(default="", description="Default Jira project key")
+    jira_repo_field: str = Field(
+        default="",
+        description=(
+            "Jira field ID (e.g. customfield_10042) holding the target repository (owner/repo). Use the field ID "
+            "from the Jira instance, not its display name: webhooks only send custom fields as customfield_<number>."
+        ),
+    )
+    jira_branch_field: str = Field(
+        default="",
+        description=(
+            "Jira field ID (e.g. customfield_10043) holding the target branch. Use the field ID from the Jira "
+            "instance, not its display name: webhooks only send custom fields as customfield_<number>."
+        ),
+    )
     jira_webhook_secret: str = Field(
         default="", description="Shared secret for Jira webhook HMAC verification (X-Hub-Signature)"
     )
@@ -398,6 +412,23 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Dispatch intake rate limiting (per client IP, per instance)
+    dispatch_rate_limit_requests: int = Field(
+        default=60,
+        description="Maximum requests a single client IP may make to Dispatch intake routes per window.",
+    )
+    dispatch_rate_limit_window_seconds: float = Field(
+        default=60.0,
+        description="Length in seconds of the Dispatch rate-limit sliding window.",
+    )
+    dispatch_trust_forwarded_for: bool = Field(
+        default=True,
+        description=(
+            "Key the Dispatch rate limiter on the left-most X-Forwarded-For entry. Keep true behind a trusted "
+            "proxy (Cloud Run); set false when Dispatch is reachable directly, or callers can spoof their bucket."
+        ),
+    )
+
     # Observability
     metrics_auth_token: str = Field(
         default="",
@@ -481,9 +512,11 @@ class Settings(BaseSettings):
                     "or the /metrics endpoints return 401."
                 )
 
-        if self.operative_task_cost_ceiling_usd <= 0:
-            problems.append("HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD must be greater than 0.")
+        for float_field in ("operative_task_cost_ceiling_usd", "dispatch_rate_limit_window_seconds"):
+            if float(getattr(self, float_field)) <= 0:
+                problems.append(f"HENCHMEN_{float_field.upper()} must be greater than 0.")
         for field_name in (
+            "dispatch_rate_limit_requests",
             "operative_wallclock_ceiling_seconds",
             "operative_max_output_tokens",
             "operative_max_system_tokens",
