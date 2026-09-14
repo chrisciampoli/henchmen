@@ -287,10 +287,6 @@ comments, CI-failure events), point the repo's webhook at
 `HENCHMEN_GITHUB_WEBHOOK_SECRET` to the same secret. Only comments from users
 with a trusted association (owner, member, collaborator) can start a run.
 
-`HENCHMEN_GITHUB_APP_ID` and `HENCHMEN_GITHUB_APP_PRIVATE_KEY_SECRET` exist in
-settings but are reserved for a future GitHub App intake path; nothing reads
-them today.
-
 </details>
 
 <details>

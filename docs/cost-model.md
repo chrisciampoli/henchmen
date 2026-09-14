@@ -201,9 +201,7 @@ one operative run.
 - **Vertex AI (Gemini) and OpenAI:** Henchmen does not create explicit caches,
   but when the API reports cached input tokens (Vertex
   `cached_content_token_count`, OpenAI `cached_tokens`) they are priced at the
-  25% cached rate. `HENCHMEN_VERTEX_AI_CONTEXT_CACHE_ENABLED` and
-  `HENCHMEN_VERTEX_AI_CONTEXT_CACHE_MIN_TOKENS` are defined in Settings but
-  nothing reads them yet.
+  25% cached rate. There is no setting for explicit Gemini context caches.
 
 ## Long-Context Pricing
 
