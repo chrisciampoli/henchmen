@@ -43,6 +43,7 @@ def _agent() -> MagicMock:
     store.set = AsyncMock()
     agent = MagicMock()
     agent.settings.pubsub_topic_dead_letter = "henchmen-dev-dead-letter"
+    agent.settings.dead_letter_subscription = ""
     agent.tracker = MagicMock()
     agent.tracker._store = store
     agent.tracker.get_task = AsyncMock(return_value=None)
@@ -188,6 +189,97 @@ class TestCheckDLQ:
         escalated_ids = [call.args[0] for call in agent.tracker.mark_escalated.await_args_list]
         assert escalated_ids == ["task-from-payload", "task-from-attribute"]
 
+    def test_explicit_subscription_setting_wins(self, client, agent):
+        agent.settings.dead_letter_subscription = "custom-dlq-sub"
+        broker = MagicMock()
+        broker.pull_dlq = AsyncMock(return_value=[])
+        agent._get_broker = MagicMock(return_value=broker)
+
+        resp = client.post("/api/v1/check-dlq")
+
+        assert resp.status_code == 200
+        broker.pull_dlq.assert_awaited_once_with("custom-dlq-sub", max_messages=10)
+
+    def test_failed_pull_is_reported_not_counted(self, client, agent):
+        broker = MagicMock()
+        broker.pull_dlq = AsyncMock(side_effect=RuntimeError("permission denied"))
+        agent._get_broker = MagicMock(return_value=broker)
+
+        resp = client.post("/api/v1/check-dlq")
+
+        assert resp.status_code == 503
+        assert "permission denied" in resp.json()["detail"]["error"]
+
+
+# ---------------------------------------------------------------------------
+# shared providers
+# ---------------------------------------------------------------------------
+
+
+class TestSharedProviders:
+    @pytest.fixture
+    def fresh_server(self, monkeypatch):
+        """Reset the agent singleton and app.state providers around each test."""
+        from henchmen.mastermind import server
+
+        for name in ("message_broker", "document_store", "container_orchestrator"):
+            if hasattr(server.app.state, name):
+                monkeypatch.delattr(server.app.state, name)
+        monkeypatch.setattr(server, "_agent", None)
+        settings = MagicMock()
+        settings.pubsub_topic_dead_letter = "henchmen-dev-dead-letter"
+        settings.dead_letter_subscription = ""
+        monkeypatch.setattr(server, "get_settings", lambda: settings)
+        monkeypatch.setattr(server, "MastermindAgent", _FakeAgent)
+        registry_cls = MagicMock()
+        registry_cls.return_value.get_message_broker.side_effect = lambda: _broker()
+        monkeypatch.setattr("henchmen.providers.registry.ProviderRegistry", registry_cls)
+        yield server, registry_cls
+        for name in ("message_broker", "document_store", "container_orchestrator"):
+            if hasattr(server.app.state, name):
+                delattr(server.app.state, name)
+
+    def test_requests_share_one_message_broker(self, fresh_server):
+        server, registry_cls = fresh_server
+        client = TestClient(server.app, raise_server_exceptions=False)
+
+        first = client.post("/api/v1/check-dlq")
+        second = client.post("/api/v1/check-dlq")
+
+        assert first.status_code == second.status_code == 200
+        assert registry_cls.return_value.get_message_broker.call_count == 1
+        assert server.app.state.message_broker.pull_dlq.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_close_providers_closes_the_broker(self, fresh_server):
+        server, _registry_cls = fresh_server
+        broker = _broker()
+        server.app.state.message_broker = broker
+
+        await server._close_providers()
+
+        broker.aclose.assert_awaited_once()
+
+
+def _broker() -> MagicMock:
+    broker = MagicMock()
+    broker.pull_dlq = AsyncMock(return_value=[])
+    broker.aclose = AsyncMock()
+    return broker
+
+
+class _FakeAgent:
+    """Stands in for MastermindAgent: keeps the injected providers, builds nothing."""
+
+    def __init__(self, settings: Any, broker: Any, document_store: Any, container_orchestrator: Any) -> None:
+        self.settings = settings
+        self._broker = broker
+        self.tracker = MagicMock()
+        self.tracker.mark_escalated = AsyncMock()
+
+    def _get_broker(self) -> Any:
+        return self._broker
+
 
 # ---------------------------------------------------------------------------
 # watchdog lease identity
@@ -202,3 +294,30 @@ def test_instance_id_is_unique_per_process_not_per_revision():
     assert prefix
     assert len(suffix) == 8
     int(suffix, 16)
+
+
+# ---------------------------------------------------------------------------
+# watchdog
+# ---------------------------------------------------------------------------
+
+
+class TestWatchdog:
+    def test_failed_stalled_query_is_reported_not_counted_as_zero(self, client, agent):
+        """A failed query (e.g. a missing Firestore index) must not read as 'nothing stalled'."""
+        agent.tracker.get_stalled_tasks = AsyncMock(side_effect=RuntimeError("FailedPrecondition: index required"))
+
+        resp = client.post("/api/v1/watchdog")
+
+        assert resp.status_code == 503
+        detail = resp.json()["detail"]
+        assert detail["status"] == "error"
+        assert detail["stalled_found"] is None
+        assert "index required" in detail["error"]
+
+    def test_no_stalled_tasks_reports_zero(self, client, agent):
+        agent.tracker.get_stalled_tasks = AsyncMock(return_value=[])
+
+        resp = client.post("/api/v1/watchdog")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"stalled_found": 0, "recovered": 0, "escalated": 0}
