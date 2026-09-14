@@ -824,12 +824,14 @@ class TestTrackerExecutionState:
         assert results[0]["task_id"] == "t1"
 
     @pytest.mark.asyncio
-    async def test_get_stalled_tasks_returns_empty_on_error(self):
+    async def test_get_stalled_tasks_fails_closed_on_query_error(self, caplog):
+        """A failing query (e.g. missing Firestore index) must not look like "0 stalled"."""
         store = _make_mock_store()
-        store.query = AsyncMock(side_effect=Exception("Store down"))
+        store.query = AsyncMock(side_effect=RuntimeError("The query requires an index"))
         tracker = self._make_tracker(store)
-        results = await tracker.get_stalled_tasks()
-        assert results == []
+        with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="requires an index"):
+            await tracker.get_stalled_tasks()
+        assert "Failed to query stalled tasks" in caplog.text
 
     @pytest.mark.asyncio
     async def test_start_task_includes_execution_state_fields(self):

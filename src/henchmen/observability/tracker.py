@@ -464,9 +464,15 @@ class TaskTracker:
             logger.warning("Failed to increment recovery for task %s: %s", task_id, exc)
 
     async def get_stalled_tasks(self, heartbeat_threshold_minutes: int = 10) -> list[dict[str, Any]]:
-        """Find tasks with execution_state='running' whose heartbeat has expired."""
+        """Find tasks with execution_state='running' whose heartbeat has expired.
+
+        Fail-closed, unlike the other tracker methods: a failed query is logged
+        at ERROR and re-raised. On Firestore this query needs a composite index;
+        swallowing the error and returning ``[]`` made the watchdog report "0
+        stalled" forever while stalled tasks were never recovered.
+        """
+        cutoff = datetime.now(UTC) - timedelta(minutes=heartbeat_threshold_minutes)
         try:
-            cutoff = datetime.now(UTC) - timedelta(minutes=heartbeat_threshold_minutes)
             return await self._store.query(
                 _COLLECTION,
                 filters=[
@@ -475,8 +481,8 @@ class TaskTracker:
                 ],
             )
         except Exception as exc:
-            logger.warning("Failed to query stalled tasks: %s", exc)
-            return []
+            logger.error("Failed to query stalled tasks (the watchdog cannot see stalled work): %s", exc)
+            raise
 
     # ------------------------------------------------------------------
     # Read helpers
