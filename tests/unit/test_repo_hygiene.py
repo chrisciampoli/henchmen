@@ -465,3 +465,17 @@ def test_ci_builds_and_smoke_tests_the_local_image() -> None:
     steps = " ".join(str(step.get("run", "")) for step in jobs["docker-local"]["steps"])
     assert "--target local" in steps
     assert "/console/api/status" in steps
+
+
+def test_release_publishes_multi_arch_images_including_local() -> None:
+    steps = _load_yaml(".github/workflows/release.yml")["jobs"]["images"]["steps"]
+    uses = [str(step.get("uses", "")) for step in steps]
+    runs = " ".join(str(step.get("run", "")) for step in steps)
+    assert any(u.startswith("docker/setup-qemu-action@") for u in uses)
+    assert any(u.startswith("docker/setup-buildx-action@") for u in uses)
+    assert "--platform linux/amd64,linux/arm64" in runs
+    assert "--target local" in runs
+    assert "--push" in runs
+    for use in uses:
+        if use.startswith("docker/"):
+            assert len(use.split("@", 1)[1].split()[0]) == 40, f"{use} must be pinned to a commit SHA"
