@@ -306,6 +306,28 @@ async def _complete(
     return response.content
 
 
+# How each collected task type is spelled in the dispatched description. The
+# CreateTaskRequest / HenchmenTask contracts have no task-type field (and reject
+# unknown keys), so the type travels as a leading line the operative reads.
+# "bug fix" is spelled as two words so Mastermind's word-boundary scheme
+# keywords route an explicit bugfix to bugfix_standard.
+_TYPE_LINES = {
+    "bugfix": "Task type: bug fix",
+    "feature": "Task type: feature",
+    "refactor": "Task type: refactor",
+}
+
+
+def _description_with_type(task_data: dict[str, str]) -> str:
+    """Return the description, prefixed with the user's explicit task type when one was collected."""
+    description = task_data.get("description", "")
+    task_type = task_data.get("type", "").strip().lower()
+    line = _TYPE_LINES.get(task_type)
+    if not line:
+        return description
+    return f"{line}\n\n{description}" if description else line
+
+
 async def _dispatch_task(task_data: dict[str, str], settings: Settings) -> dict[str, Any]:
     """Dispatch a task to a local ``henchmen serve``, else to a durable broker.
 
@@ -323,8 +345,7 @@ async def _dispatch_task(task_data: dict[str, str], settings: Settings) -> dict[
 
     payload: dict[str, Any] = {
         "title": task_data["title"],
-        "description": task_data.get("description", ""),
-        "type": task_data.get("type", ""),
+        "description": _description_with_type(task_data),
         "repo": repo,
         "branch": task_data.get("branch", "main"),
         "priority": task_data.get("priority", "normal"),
