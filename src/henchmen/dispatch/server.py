@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -28,10 +29,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Rate limiting middleware
 # ---------------------------------------------------------------------------
-
-# Maximum requests per window per client IP
-_RATE_LIMIT = 60
-_RATE_WINDOW_SECONDS = 60
 
 # Path prefixes the limiter guards, matched against the ROUTE-relative path so
 # the limiter still works when the app is mounted under a prefix (as
@@ -63,20 +60,45 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     :func:`~henchmen.dispatch.pubsub_auth.verify_pubsub_oidc`. State is
     per-process, so a multi-instance deployment gets ``limit`` requests per
     window per instance.
+
+    Any argument left as ``None`` comes from Settings
+    (``HENCHMEN_DISPATCH_RATE_LIMIT_REQUESTS``,
+    ``HENCHMEN_DISPATCH_RATE_LIMIT_WINDOW_SECONDS``,
+    ``HENCHMEN_DISPATCH_TRUST_FORWARDED_FOR``), read on the first request so
+    importing this module never needs a loadable configuration.
     """
 
     def __init__(
         self,
         app: FastAPI,
-        limit: int = _RATE_LIMIT,
-        window_seconds: int = _RATE_WINDOW_SECONDS,
-        trust_forwarded_for: bool = True,
+        limit: int | None = None,
+        window_seconds: float | None = None,
+        trust_forwarded_for: bool | None = None,
     ) -> None:
         super().__init__(app)
-        self._limit = limit
-        self._window_seconds = window_seconds
-        self._trust_forwarded_for = trust_forwarded_for
+        self._limit_override = limit
+        self._window_override = window_seconds
+        self._trust_override = trust_forwarded_for
+        self._configured = False
+        self._limit = 0
+        self._window_seconds = 0.0
+        self._trust_forwarded_for = False
         self._requests: dict[str, list[float]] = {}
+
+    def _configure(self) -> None:
+        """Resolve every limit not passed to the constructor from Settings (once)."""
+        if self._configured:
+            return
+        limit, window, trust = self._limit_override, self._window_override, self._trust_override
+        if limit is None or window is None or trust is None:
+            settings = get_settings()
+            limit = settings.dispatch_rate_limit_requests if limit is None else limit
+            window = settings.dispatch_rate_limit_window_seconds if window is None else window
+            trust = settings.dispatch_trust_forwarded_for if trust is None else trust
+        self._limit = limit
+        self._window_seconds = float(window)
+        self._trust_forwarded_for = trust
+        self._configured = True
 
     def _client_key(self, request: Request) -> str:
         """Return the bucket key for *request*.
@@ -98,6 +120,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not path.startswith(_RATE_LIMITED_PREFIXES):
             return await call_next(request)
 
+        self._configure()
         client_ip = self._client_key(request)
         now = time.monotonic()
         window_start = now - self._window_seconds
@@ -108,7 +131,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if len(timestamps) >= self._limit:
             self._requests[client_ip] = timestamps
             logger.warning(
-                "[rate-limit] %s exceeded %d req/%ds on %s",
+                "[rate-limit] %s exceeded %d req/%gs on %s",
                 client_ip,
                 self._limit,
                 self._window_seconds,
@@ -118,7 +141,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 content=json.dumps({"detail": "Rate limit exceeded"}),
                 status_code=429,
                 media_type="application/json",
-                headers={"Retry-After": str(self._window_seconds)},
+                # Retry-After is an integer number of seconds (RFC 9110).
+                headers={"Retry-After": str(max(1, math.ceil(self._window_seconds)))},
             )
 
         timestamps.append(now)
@@ -313,6 +337,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Henchmen Dispatch", description="Task intake router", lifespan=lifespan)
+# Limits come from HENCHMEN_DISPATCH_RATE_LIMIT_* on the first guarded request.
 app.add_middleware(RateLimitMiddleware)  # type: ignore[arg-type]
 
 _normalizer = TaskNormalizer()
