@@ -492,9 +492,11 @@ class Settings(BaseSettings):
     local_docker_network: str = Field(
         default="",
         description=(
-            "Docker network operative containers join in local mode. The local image sets "
-            "`henchmen`, so operatives reach the server at http://henchmen:8000 instead of "
-            "host.docker.internal. Empty uses Docker's default bridge network."
+            "Docker network operative containers join in local mode. The image does not set "
+            "this itself: run the local image with `-e HENCHMEN_LOCAL_DOCKER_NETWORK=henchmen` "
+            "(and a network of that name) so operatives reach the server at "
+            "http://henchmen:8000 instead of host.docker.internal. Empty uses Docker's "
+            "default bridge network."
         ),
     )
     operative_image: str = Field(

@@ -86,10 +86,12 @@ silently ignored, and the Dispatch container never ran its own HTTP app.
   `/console/api/status`. Session signing keys live at
   `<data dir>/secrets/console-session.key` (mode 0600, at least 32 bytes,
   regenerated if shorter). The Console persists guide progress and applies
-  setup by restarting the process into run mode: a requested restart exits 75,
-  distinct from uvicorn's own startup-failure code (3) and a clean Ctrl+C
-  (0). `henchmen serve` prints `Open Henchmen setup: <url>` in setup mode and
-  `Open Henchmen: <url>` once running, and fails closed with a readable
+  setup by exiting the process with code 75, distinct from uvicorn's own
+  startup-failure code (3) and a clean Ctrl+C (0); the local image's
+  `--restart unless-stopped` policy is what actually relaunches the container
+  into run mode afterward — a bare `henchmen serve` with no restart policy
+  just stops. `henchmen serve` prints `Open Henchmen setup: <url>` in setup
+  mode and `Open Henchmen: <url>` once running, and fails closed with a readable
   `ERROR:` and exit code 2 on a corrupt `setup-state.json`, an unwritable
   secrets directory, or a non-integer `HENCHMEN_LOCAL_SERVE_PORT`.
 - Settings `local_docker_network` and `operative_image`.
