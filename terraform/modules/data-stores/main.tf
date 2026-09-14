@@ -52,6 +52,26 @@ resource "google_firestore_index" "tasks_source_status" {
 }
 
 # merge_queue: status ASC, created_at ASC
+# Stalled-task watchdog: TaskTracker.get_stalled_tasks filters
+# execution_state == "running" AND last_heartbeat < cutoff. An equality plus a
+# range filter on different fields needs a composite index; without it the
+# query fails and the watchdog can never find a stalled task.
+resource "google_firestore_index" "task_executions_state_heartbeat" {
+  project    = var.project_id
+  database   = google_firestore_database.henchmen.name
+  collection = "task_executions"
+
+  fields {
+    field_path = "execution_state"
+    order      = "ASCENDING"
+  }
+
+  fields {
+    field_path = "last_heartbeat"
+    order      = "ASCENDING"
+  }
+}
+
 resource "google_firestore_index" "merge_queue_status_created_at" {
   project    = var.project_id
   database   = google_firestore_database.henchmen.name
