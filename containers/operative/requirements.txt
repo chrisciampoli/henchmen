@@ -1,6 +1,5 @@
 google-cloud-pubsub>=2.26.1
 google-cloud-storage>=2.18.2
-google-cloud-logging>=3.11.3
 # Firestore is required for the intra-node heartbeat, the task-level cost
 # accumulator and the interrupted-report path. Without it the operative
 # silently degrades to document_store=None on GCP.

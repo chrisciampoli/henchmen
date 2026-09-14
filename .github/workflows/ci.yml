@@ -137,10 +137,18 @@ jobs:
       - name: docker build
         run: docker build -f "containers/${{ matrix.service }}/Dockerfile" -t "henchmen-${{ matrix.service }}:ci" .
 
-      - name: Smoke-import the package inside the image
+      # Import the module the container actually starts, not just the package
+      # root: a dependency missing from the service's requirements.txt only
+      # fails when its entry module (and what that pulls in) is imported.
+      - name: Smoke-import the service entry module inside the image
         run: |
+          set -euo pipefail
+          case "${{ matrix.service }}" in
+            operative) module=henchmen.operative.bootstrap ;;
+            *) module="henchmen.${{ matrix.service }}.server" ;;
+          esac
           docker run --rm --entrypoint python "henchmen-${{ matrix.service }}:ci" \
-            -c "import henchmen; print('henchmen', henchmen.__version__)"
+            -c "import importlib, henchmen; importlib.import_module('${module}'); print('henchmen', henchmen.__version__, '${module} OK')"
 
   docker-compose-smoke:
     name: docker-compose smoke test
