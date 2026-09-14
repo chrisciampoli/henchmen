@@ -6,23 +6,25 @@ that doc walks you from a blank GCP account to a running stack in
 ~30 minutes. This guide picks up once your stack is live and covers:
 
 - building + pushing new container images
-- updating a single Cloud Run service without a full Terraform apply
+- updating a single Cloud Run service
 - populating secrets after rotation
 - diagnosing common runtime problems
 - reading task execution state from Firestore
 
-If you're running Henchmen in local mode (docker-compose, SQLite,
-filesystem, Ollama), most of this guide still applies — GCP names map
-to local equivalents as follows:
+If you're running Henchmen in local mode (`henchmen serve`, or
+`docker compose up`, which runs the same single process), most of this guide
+still applies — GCP names map to local equivalents as follows:
 
-| GCP resource              | Local equivalent                                  |
-|---------------------------|---------------------------------------------------|
-| Cloud Run service         | container in docker-compose, or `henchmen serve`  |
-| Firestore                 | SQLite (`henchmen_dev.db`)                         |
-| Pub/Sub                   | in-memory broker                                   |
-| Secret Manager            | `.env.local`                                       |
-| Cloud Scheduler           | local cron hitting `/api/v1/watchdog`              |
-| Cloud Logging             | `docker logs` or stdout stream                     |
+| GCP resource              | Local equivalent                                                   |
+|---------------------------|--------------------------------------------------------------------|
+| Cloud Run services        | one `henchmen serve` process, services mounted at `/dispatch`, `/mastermind`, `/forge` on port 8000 |
+| Cloud Run Jobs (Lairs)    | Docker containers from `henchmen-operative:local`                  |
+| Firestore                 | SQLite at `~/.henchmen/henchmen_<env>.db` (`HENCHMEN_LOCAL_SQLITE_PATH`) |
+| Cloud Storage             | files under `~/.henchmen/storage` (`HENCHMEN_LOCAL_STORAGE_DIR`)   |
+| Pub/Sub                   | in-memory broker that HTTP-forwards to the mounted services        |
+| Secret Manager            | `.env.local`                                                       |
+| Cloud Scheduler           | a local cron hitting `http://localhost:8000/mastermind/api/v1/watchdog` |
+| Cloud Logging             | stdout of `henchmen serve` (`docker logs henchmen` under compose)   |
 
 See [`troubleshooting.md`](troubleshooting.md) for common local-mode
 problems, and [`incident-runbook.md`](incident-runbook.md) for the
@@ -41,7 +43,7 @@ If you're coming back to an already-provisioned stack, you'll need:
 - `gcloud` CLI authenticated (`gcloud auth application-default login`)
 - Docker running
 - Terraform `>= 1.7` (only if you're re-applying infra)
-- A GitHub personal access token or GitHub App credentials stored in Secret Manager
+- A GitHub classic personal access token (`repo` scope) stored in Secret Manager
 - Slack tokens in Secret Manager (if you've wired Slack)
 
 ### Build and Push Containers
@@ -54,22 +56,20 @@ PROJECT_ID="${PROJECT_ID}"   # your GCP project ID
 REGION="us-central1"
 ENV="dev"
 REGISTRY="${REGION}-docker.pkg.dev/${PROJECT_ID}/henchmen-${ENV}"
-
-# Build all containers
-docker build -f containers/mastermind/Dockerfile -t ${REGISTRY}/mastermind:latest .
-docker build -f containers/operative/Dockerfile -t ${REGISTRY}/operative:latest .
-docker build -f containers/dispatch/Dockerfile -t ${REGISTRY}/dispatch:latest .
-docker build -f containers/forge/Dockerfile -t ${REGISTRY}/forge:latest .
+TAG="$(git rev-parse --short HEAD)"   # or a release version
 
 # Authenticate Docker with Artifact Registry
 gcloud auth configure-docker ${REGION}-docker.pkg.dev
 
-# Push all images
-docker push ${REGISTRY}/mastermind:latest
-docker push ${REGISTRY}/operative:latest
-docker push ${REGISTRY}/dispatch:latest
-docker push ${REGISTRY}/forge:latest
+# Build and push all containers
+for svc in mastermind operative dispatch forge; do
+  docker build -f containers/${svc}/Dockerfile -t ${REGISTRY}/${svc}:${TAG} .
+  docker push ${REGISTRY}/${svc}:${TAG}
+done
 ```
+
+Prebuilt release images are also published to `ghcr.io`; see
+[Prebuilt images](deploy-gcp.md#prebuilt-images).
 
 ### Container Base Images
 
@@ -80,38 +80,55 @@ All containers use `python:3.14-slim-bookworm`, pinned by digest. The Mastermind
 ```bash
 cd terraform/environments/dev
 
-# Initialize (first time only)
-terraform init
+# First time only: identity values go in the git-ignored terraform.tfvars
+# (project_id, github_owner, github_default_repo, container_image_tag, ...).
+cp dev.auto.tfvars.example terraform.tfvars
+$EDITOR terraform.tfvars
+terraform init -backend-config=bucket=henchmen-tfstate-${PROJECT_ID}-dev
 
-# Plan changes
-terraform plan -var="project_id=${PROJECT_ID}" -var="region=${REGION}" -var="environment=dev"
-
-# Apply
-terraform apply -var="project_id=${PROJECT_ID}" -var="region=${REGION}" -var="environment=dev"
+# Every time
+terraform plan -out=dev.tfplan
+terraform apply dev.tfplan
 ```
 
-**Important:** After `terraform apply`, you must manually restore secrets that Terraform resets. Terraform manages the Cloud Run service definitions but strips environment variable secret references on each apply. After applying, verify that these secrets are present on the Cloud Run services:
+Variables come from `dev.auto.tfvars` (committed sizing) and `terraform.tfvars`
+(your identity and image tag), so no `-var` flags are needed.
 
-| Service | Required Secrets |
-|---------|-----------------|
-| Mastermind | `SLACK_BOT_TOKEN`, `GITHUB_TOKEN` |
-| Dispatch | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_APP_TOKEN` |
-| Forge | `GITHUB_TOKEN` |
-| Operative (Lairs) | `GITHUB_TOKEN` (injected by LairManager at job creation time) |
+**Terraform owns the full Cloud Run configuration.** Every service's image,
+environment variables and Secret Manager mounts are declared in the
+`cloud-run-services` module. An apply does not strip those secrets, but it does
+remove anything added by hand with `gcloud run services update`
+(`--set-env-vars`, `--set-secrets`, `--image`). Put permanent changes in
+Terraform. The mounts it declares:
+
+| Service | Secrets mounted (env var ← secret) |
+|---------|-----------------------------------|
+| Mastermind | `GITHUB_TOKEN`, `SLACK_BOT_TOKEN`, `HENCHMEN_METRICS_AUTH_TOKEN` |
+| Dispatch | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_APP_TOKEN`, `JIRA_API_TOKEN`, `HENCHMEN_METRICS_AUTH_TOKEN` |
+| Forge | `GITHUB_TOKEN`, `HENCHMEN_METRICS_AUTH_TOKEN` |
+| Operative (Lairs) | `GITHUB_TOKEN` (attached by LairManager when it creates each job) |
+
+Each maps to `henchmen-${ENV}-<name>` in Secret Manager (for example
+`GITHUB_TOKEN` ← `henchmen-dev-github-token`).
 
 Vertex AI RAG Engine uses the service account's Vertex AI IAM roles, so no separate API key secret is required.
 
 ### Update a Single Cloud Run Service
 
-To deploy a new version of a single service without a full Terraform apply:
+The durable way is to push a new tag and set `container_image_tag` in
+`terraform.tfvars`, then `terraform apply` — that updates all services and the
+operative image tag Mastermind launches lairs with in one step.
+
+For a quick redeploy of one service between applies:
 
 ```bash
-# Example: update Mastermind
 gcloud run services update henchmen-dev-mastermind \
-  --image=${REGISTRY}/mastermind:latest \
+  --image=${REGISTRY}/mastermind:${TAG} \
   --region=${REGION} \
   --project=${PROJECT_ID}
 ```
+
+The next `terraform apply` sets the image back to `container_image_tag`.
 
 ### Populate Secrets
 
@@ -123,11 +140,16 @@ echo -n "ghp_YourTokenHere" | gcloud secrets versions add henchmen-dev-github-to
 echo -n "xoxb-YourTokenHere" | gcloud secrets versions add henchmen-dev-slack-bot-token --data-file=-
 ```
 
+Secrets are mounted as environment variables with `version = "latest"`, which
+Cloud Run resolves when an instance starts. New lairs and newly started
+instances pick up a rotated value; instances already running keep the old one
+until they are replaced — redeploy the service after rotating.
+
 ## Environment Variables
 
 ### Settings Configuration
 
-All settings are managed via `src/henchmen/config/settings.py` using `pydantic-settings`. Environment variables use the `HENCHMEN_` prefix (case-insensitive).
+All settings are managed via `src/henchmen/config/settings.py` using `pydantic-settings`. Environment variables use the `HENCHMEN_` prefix (case-insensitive). `.env.example` documents every commonly used one.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -135,12 +157,16 @@ All settings are managed via `src/henchmen/config/settings.py` using `pydantic-s
 | `HENCHMEN_GCP_REGION` | No | `us-central1` | GCP region |
 | `HENCHMEN_ENVIRONMENT` | No | `dev` | `dev`, `staging`, or `prod` |
 | `HENCHMEN_FIRESTORE_DATABASE` | No | `(default)` | Firestore database name |
-| `HENCHMEN_VERTEX_AI_MODEL_COMPLEX` | No | `gemini-2.5-pro` | Default Gemini model for complex tasks (`implement_fix`, `implement_feature`) |
-| `HENCHMEN_VERTEX_AI_MODEL_LIGHT` | No | `gemini-2.5-flash` | Default Gemini model for lightweight tasks (`verify_changes`, `plan_implementation`) |
-| `HENCHMEN_VERTEX_AI_MODEL_REASONING` | No | `gemini-3.1-pro` | Default Gemini model for reasoning-heavy tasks (`fix_tests`, `analyze_goal`) |
-| `HENCHMEN_LAIR_DEFAULT_CPU` | No | `4` | Default CPU for operative containers |
-| `HENCHMEN_LAIR_DEFAULT_MEMORY` | No | `8Gi` | Default memory for operative containers |
-| `HENCHMEN_LAIR_DEFAULT_TIMEOUT` | No | `1800` | Default operative timeout (seconds) |
+| `HENCHMEN_VERTEX_AI_MODEL_COMPLEX` | No | `gemini-2.5-pro` | Vertex AI model for the `default/complex` tier (`implement_fix`, `implement_feature`) |
+| `HENCHMEN_VERTEX_AI_MODEL_LIGHT` | No | `gemini-2.5-flash` | Vertex AI model for the `default/light` tier (planning, classification, reranking) |
+| `HENCHMEN_VERTEX_AI_MODEL_REASONING` | No | `gemini-3.1-pro` | Vertex AI model for the `default/reasoning` tier (`fix_tests`, `analyze_goal`) |
+| `HENCHMEN_LAIR_DEFAULT_CPU` | No | `4` | CPU for operative jobs (Terraform injects `lair_cpu`) |
+| `HENCHMEN_LAIR_DEFAULT_MEMORY` | No | `8Gi` | Memory for operative jobs (Terraform injects `lair_memory`) |
+| `HENCHMEN_LAIR_DEFAULT_TIMEOUT` | No | `1800` | Job timeout (seconds) when a node sets none |
+| `HENCHMEN_LAIR_OPERATIVE_IMAGE_TAG` | No | `latest` | Operative image tag or digest lairs run (Terraform injects `container_image_tag`) |
+| `HENCHMEN_LAIR_SERVICE_ACCOUNT` | No | `sa-<env>-operative@<project>` | Service account lairs run as |
+| `HENCHMEN_METRICS_AUTH_TOKEN` | Staging/prod | `` | Bearer token for `/metrics` |
+| `HENCHMEN_PUBSUB_OIDC_AUDIENCE` | Staging/prod | `` | Expected OIDC audience on Pub/Sub pushes (Terraform sets `henchmen-<env>-<service>`) |
 | `HENCHMEN_GITHUB_DEFAULT_REPO` | No | `` | Default target repository (owner/repo format) |
 
 ### Runtime Secrets
@@ -161,29 +187,36 @@ Run secret mount in production and a `HENCHMEN_`-prefixed value from
 
 ### Operative-Specific Variables (injected by LairManager)
 
-These are set when the Mastermind creates a Cloud Run Job for an operative:
+Besides the `HENCHMEN_*` configuration it forwards, LairManager sets this
+runtime contract on every operative job:
 
 | Variable | Description |
 |----------|-------------|
 | `TASK_ID` | UUID of the parent task |
 | `NODE_ID` | Scheme node being executed (e.g., `implement_fix`) |
 | `SCHEME_ID` | Scheme definition ID (e.g., `bugfix_standard`) |
-| `LAIR_ID` | Cloud Run Job ID |
-| `MODEL_NAME` | Vertex AI model to use |
+| `LAIR_ID` | Job ID (`lair-{task_id[:8]}-{node_id}-{suffix}`) |
+| `MODEL_NAME` | Model tier for the node (e.g., `default/complex`); the operative's LLM provider resolves it |
 | `REPO_URL` | Target repository (owner/repo format) |
-| `BRANCH` | Base branch to clone (default: `main`) |
+| `BRANCH` | Branch to clone: the feature branch for fix/retry nodes, otherwise the base branch (default `main`) |
 | `TASK_TITLE` | Task title (truncated to 200 chars) |
-| `TASK_DESCRIPTION` | Task description (truncated to 500 chars) |
+| `TASK_DESCRIPTION` | Task description (truncated to 16,000 chars) |
+| `DOSSIER_URI` | Object-store URI of the serialized dossier, when one was uploaded |
 
 ### Pub/Sub Topics (auto-configured)
 
-Topic names are automatically derived from the environment: `henchmen-{env}-{topic-name}`. They do not need to be set manually unless overriding defaults.
+Topic names are derived from the environment: `henchmen-{env}-{topic-name}`. They do not need to be set manually unless overriding defaults.
 
 ## Monitoring
 
 ### Cloud Logging Queries
 
-The system uses structured print statements with component prefixes. Use these Cloud Logging filters to track task execution:
+Services log through Python `logging` with a component prefix (`[MASTERMIND]`,
+`[SCHEME]`, ...). Those lines arrive in Cloud Logging as `textPayload`, with
+token-shaped secrets redacted in Mastermind and the Operative. Metric-style
+events (`task.completed`, `cost.exceeded`, watchdog runs) are written as JSON
+lines by `observability/structured_logging.py` and arrive as `jsonPayload`
+(`jsonPayload.metric_name`, `jsonPayload.metric_labels`).
 
 **All Mastermind activity for a specific task:**
 ```
@@ -235,24 +268,30 @@ resource.type="cloud_run_revision"
 textPayload=~"\\[CI-LOOP\\]"
 ```
 
+**Metric events:**
+```
+jsonPayload.metric_name="cost.exceeded"
+```
+
 ### Key Log Patterns
 
 | Pattern | Component | Meaning |
 |---------|-----------|---------|
 | `[MASTERMIND] Starting task processing: {id}` | Mastermind | Task received and processing begun |
 | `[MASTERMIND] Task {id} completed with status:` | Mastermind | Task finished (check status) |
-| `[SCHEME] Dispatching agentic node '{id}'` | SchemeExecutor | Agentic node being sent to a Lair |
+| `[SCHEME] Dispatching agentic node '{id}' to Lair` | SchemeExecutor | Agentic node being sent to a Lair |
 | `[SCHEME] Lair {id} completed with status:` | SchemeExecutor | Lair finished execution |
-| `[SCHEME] Node {id} hit max retries` | SchemeExecutor | Node exhausted retry budget (2) |
+| `[SCHEME] Node {id} hit max retries` | SchemeExecutor | Node exhausted its execution budget (2) |
 | `[SCHEME] {type} PASSED/FAILED for task {id}` | SchemeExecutor | Deterministic lint/test result |
-| `[LAIR] Creating job {id}` | LairManager | Cloud Run Job being created |
+| `[SCHEME] Lair provisioning failed for node {id}` | SchemeExecutor | Job creation failed |
+| `[LAIR] Creating lair {id} for task {id} node {id}` | LairManager | Cloud Run Job being created |
 | `[LAIR] Execution started: {name}` | LairManager | Job execution launched |
-| `[OPERATIVE] git_commit succeeded` | OperativeAgent | Agent successfully committed changes |
-| `[OPERATIVE] Phase nudge at step {n}` | OperativeAgent | Agent pushed from reading to editing |
-| `[OPERATIVE] Pushed branch {name}` | bootstrap | Changes pushed to GitHub |
+| `[OPERATIVE] git_commit succeeded — stopping agent loop` | OperativeAgent | Agent successfully committed changes |
+| `[OPERATIVE] Nudge at step {n}` | OperativeAgent | Agent pushed from reading to editing |
+| `[OPERATIVE] Pushed branch {name} to origin` | bootstrap | Changes pushed to GitHub |
 | `[TOOL] {name}({args})` | OperativeAgent | Tool call with arguments |
 | `[TOOL] {name} -> {result}` | OperativeAgent | Tool call result (truncated) |
-| `[DOSSIER] Retrieved {n} semantic chunks` | MastermindAgent | RAG chunks from Vertex AI RAG Engine (`henchmen-code`) |
+| `[DOSSIER] Retrieved {n} semantic chunks from RAG Engine` | MastermindAgent | RAG chunks from Vertex AI RAG Engine (`henchmen-code`) |
 | `[CREATE_PR] PR created: {url}` | SchemeExecutor | Pull request opened |
 | `[FORGE] CI PASSED/FAILED for {url}` | Forge | CI check result |
 | `[CI-LOOP] Result: {result}` | Mastermind | CI auto-fix loop outcome |
@@ -261,54 +300,67 @@ textPayload=~"\\[CI-LOOP\\]"
 
 All task executions are persisted to the `task_executions` Firestore collection. Each document contains:
 
-- `task_id`, `title`, `source`, `scheme_id`
+- `task_id`, `title`, `source`, `scheme_id`, `task_payload`
 - `created_at`, `completed_at`, `final_status`
+- `execution_state` (`running`, `completed`, `escalated`, `stalled`), `current_node_id`, `last_heartbeat`, `recovery_attempts`
 - `pr_url`, `pr_number`, `ci_passed`
 - `nodes_executed` (list of node IDs)
 - `total_input_tokens`, `total_output_tokens`, `total_model_calls`, `total_tool_calls`
 - `estimated_cost_usd`, `wall_clock_seconds`
 - `node_metrics` (per-node breakdown: tokens, cost, duration, status)
-- `files_changed`, `confidence_score`
+- `files_changed`, `confidence_score`, `rag_chunks_retrieved`
 - `ci_fix_attempts`, `ci_fix_in_progress`
-- `expires_at` (30-day TTL)
+- `escalation_reason`, `escalation_node`
+- `expires_at` (30 days after creation; `POST /api/v1/cleanup` deletes expired documents, up to 100 per call — Cloud Scheduler calls it in staging/prod)
 
 ### Metrics API
 
-The Mastermind exposes a metrics API at `/metrics`:
+Mastermind serves the metrics router at `/metrics` (under `henchmen serve`:
+`http://localhost:8000/mastermind/metrics`). Every request needs
+`Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN`; with no token configured
+the endpoints are open in dev and return 401 in staging and prod. Responses
+carry telemetry only — never task content.
 
-- `GET /metrics/summary?days=7` -- Aggregated metrics: task count, CI pass rate, total cost, average cost per task, token usage, average confidence, breakdown by scheme
-- `GET /metrics/tasks?days=7` -- List of recent task execution records
+- `GET /metrics/summary?days=7` -- Aggregated metrics: `tasks_total`, `tasks_completed`, `tasks_escalated`, `tasks_ci_passed` / `_failed` / `_pending`, `ci_pass_rate` (null when no CI result has landed), total and average cost, average wall clock, token totals, average confidence, `by_scheme`
+- `GET /metrics/tasks?days=7` -- Recent task execution records (ids, statuses, timestamps, numeric telemetry)
+- `GET /metrics/tasks/{task_id}` -- One task execution record
+- `GET /metrics/prometheus?days=7` -- OpenMetrics gauges `henchmen_tasks_completed_window`, `henchmen_tasks_escalated_window`, `henchmen_cost_usd_window` and, once CI data exists, `henchmen_ci_pass_rate`, each labelled `window_days`. Needs `pip install -e ".[observability]"`; returns 503 without it. See `docs/images/metrics-sample.txt`.
+
+Mastermind also serves `GET /api/v1/metrics/summary?days=7`, a dashboard view
+with a different shape (`success_rate`, `escalation_rate`, `cost_by_model`,
+`escalation_reasons`). It is not behind the metrics bearer token.
 
 ### Merge Queue State
 
-The `merge_queue` Firestore collection tracks PRs waiting to be merged:
-
-- States: `pending -> merging -> merged` (or `failed`)
-- FIFO ordering by `created_at`
-- Serialization guard: only one merge in progress at a time
+The `merge_queue` Firestore collection holds merge claims (`pending -> merging -> merged | failed`).
+Nothing in Henchmen enqueues into it today — every PR is merged by a human — so
+the Forge's scheduled tick (`/api/v1/process-queue`) only expires `merging`
+claims older than their TTL and reports the queue depth. An empty collection is
+normal.
 
 ## Troubleshooting
 
-### Pub/Sub 403 Errors
+### Pub/Sub 401 / 403 Errors
 
-**Symptom:** Push subscriptions return 403 when delivering to Cloud Run services.
+**Symptom:** Push subscriptions show 401 or 403 when delivering to Cloud Run services, and tasks never reach Mastermind.
 
-**Cause:** The Pub/Sub push service account does not have `roles/run.invoker` on the target Cloud Run service.
+Push subscriptions authenticate as `sa-{env}-pubsub-push` with a fixed OIDC
+audience of `henchmen-{env}-{service}` (for example `henchmen-dev-mastermind`),
+which Terraform also registers on the service as a custom audience.
 
-**Fix:**
-```bash
-# Grant the push SA permission to invoke Mastermind
-gcloud run services add-iam-policy-binding henchmen-dev-mastermind \
-  --member="serviceAccount:sa-dev-mastermind@${PROJECT_ID}.iam.gserviceaccount.com" \
-  --role="roles/run.invoker" \
-  --region=${REGION}
-```
-
-All push subscriptions use OIDC tokens with the Mastermind service account. Verify with:
-```bash
-gcloud pubsub subscriptions describe henchmen-dev-task-intake-sub
-```
-The `pushConfig.oidcToken.serviceAccountEmail` must match a service account with `run.invoker` on the target.
+- **403 from the Cloud Run edge:** the push service account lacks `roles/run.invoker` on the service. Terraform grants it; re-apply, or grant it by hand:
+  ```bash
+  gcloud run services add-iam-policy-binding henchmen-dev-mastermind \
+    --member="serviceAccount:sa-dev-pubsub-push@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/run.invoker" \
+    --region=${REGION}
+  ```
+- **401 from the application:** the token's audience does not match `HENCHMEN_PUBSUB_OIDC_AUDIENCE` on the receiving service, or the sender is not in `HENCHMEN_PUBSUB_OIDC_ALLOWED_EMAILS`. Compare:
+  ```bash
+  gcloud pubsub subscriptions describe henchmen-dev-task-intake-sub \
+    --format="value(pushConfig.oidcToken.audience,pushConfig.oidcToken.serviceAccountEmail)"
+  ```
+  with the service's environment. Both are managed by Terraform, so a mismatch usually means a hand edit — re-apply.
 
 ### Lair Provisioning Failures
 
@@ -316,28 +368,28 @@ The `pushConfig.oidcToken.serviceAccountEmail` must match a service account with
 
 **Common causes:**
 
-1. **Permission denied on Cloud Run Jobs API:** The Mastermind service account needs `roles/run.developer` to create and run jobs.
+1. **Permission denied on Cloud Run Jobs API:** The Mastermind service account needs `roles/run.developer` to create and run jobs, plus `roles/iam.serviceAccountUser` on the operative service account. Terraform grants both; if one was removed:
    ```bash
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
      --member="serviceAccount:sa-dev-mastermind@${PROJECT_ID}.iam.gserviceaccount.com" \
      --role="roles/run.developer"
    ```
 
-2. **Image not found:** The operative image URI is built from settings: `{region}-docker.pkg.dev/{project}/henchmen-{env}/operative:latest`. Verify the image exists:
+2. **Image not found:** The operative image URI is built from settings: `{region}-docker.pkg.dev/{project}/henchmen-{env}/operative:{HENCHMEN_LAIR_OPERATIVE_IMAGE_TAG}`. Verify the tag exists:
    ```bash
-   gcloud artifacts docker images list ${REGION}-docker.pkg.dev/${PROJECT_ID}/henchmen-dev/operative
+   gcloud artifacts docker images list ${REGION}-docker.pkg.dev/${PROJECT_ID}/henchmen-dev/operative --include-tags
    ```
 
-3. **Secret access denied:** Operative Lairs reference `GITHUB_TOKEN` from Secret Manager. The operative service account needs `roles/secretmanager.secretAccessor`:
+3. **Secret access denied:** Lairs mount `henchmen-{env}-github-token` as `GITHUB_TOKEN`. The operative service account needs `roles/secretmanager.secretAccessor` on it (Terraform grants it):
    ```bash
    gcloud secrets add-iam-policy-binding henchmen-dev-github-token \
      --member="serviceAccount:sa-dev-operative@${PROJECT_ID}.iam.gserviceaccount.com" \
      --role="roles/secretmanager.secretAccessor"
    ```
 
-4. **Job ID too long:** Cloud Run Job IDs are capped at 63 characters. The format is `lair-{task_id[:8]}-{node_id}` with underscores replaced by hyphens. Long node IDs may cause issues.
+4. **Job ID:** Cloud Run Job IDs are capped at 63 characters. LairManager builds `lair-{task_id[:8]}-{node_id}` (underscores to hyphens, truncated to 56) plus a 6-character random suffix, so long node IDs are truncated rather than rejected.
 
-**Dev mode behavior:** In dev mode, lair provisioning failures are treated as simulated passes so the rest of the pipeline can be tested end-to-end. In production, failures are fail-closed.
+**Dev mode behavior:** In dev, a provisioning failure on an implementation node is treated as a simulated pass so the rest of the pipeline can be exercised; `fix_lint` and `fix_tests` never simulate. In staging and prod every provisioning failure fails the node.
 
 ### OOM Kills
 
@@ -347,32 +399,29 @@ The `pushConfig.oidcToken.serviceAccountEmail` must match a service account with
 
 **Fixes:**
 
-1. **Increase Lair memory:** The default is 8Gi. For large repositories or long-running tasks, the LairManager automatically scales to 4 vCPU / 8Gi for nodes with timeout > 300s. To increase the default:
-   ```
-   HENCHMEN_LAIR_DEFAULT_MEMORY=16Gi
-   ```
+1. **Increase Lair memory:** Every lair gets `HENCHMEN_LAIR_DEFAULT_MEMORY`, which Terraform sets from `lair_memory` (dev 4Gi, staging 8Gi). Raise `lair_memory` in `terraform.tfvars` and apply.
 
-2. **Increase Mastermind memory:** The Mastermind itself runs at 4Gi (set in Terraform). If it OOMs during dossier building for large repos, update the Cloud Run service limits.
+2. **Increase Mastermind memory:** The Mastermind itself runs at 4Gi (set in the `cloud-run-services` module). If it OOMs during dossier building for large repos, raise the limit there.
 
-3. **Reduce context size:** The operative pre-reads the top 10 most relevant files (capped at 5000 chars each). Large repos with many relevant files can cause context to grow. The tool result truncation limit is 30K chars.
+3. **Reduce context size:** The operative pre-reads up to 5 relevant files (4,000 chars each, 20,000 tokens total). Tool results over 10,000 characters and messages over 64,000 characters are truncated.
 
 4. **Node.js dependency install:** The `npm ci` or `pnpm install` step during workspace initialization can consume significant memory for large Node.js projects.
 
 ### Operative Timeouts
 
-**Symptom:** Task escalates with `Agent exceeded timeout of {n}s`.
+**Symptom:** The operative reports `timed_out`, or the task escalates after a node's timeout.
 
-**Context:** The operative reserves a 120-second buffer for branch push after the agent loop finishes. So the effective agent loop timeout is `node.timeout_seconds - 120`.
+**Context:** The operative reserves a 120-second buffer for branch push after the agent loop finishes, so the effective agent loop timeout is `node.timeout_seconds - 120` (never less than 60 seconds). A timed-out node stays `timed_out`; it is never upgraded to `completed`.
 
 **Fixes:**
 
 1. **Increase node timeout:** Edit the scheme definition to increase `timeout_seconds` on the agentic node.
-2. **Reduce max_steps:** A lower step limit forces the agent to work more efficiently.
+2. **Reduce the step budget:** A lower `max_steps` / `step_budget` forces the agent to work more efficiently.
 3. **Improve dossier quality:** Better pre-fetched context means fewer exploration steps needed.
 
 ### Silent Failure Scan Blocking PRs
 
-**Symptom:** CI fails with `silent_failure_scan: FAILED` despite lint and tests passing.
+**Symptom:** The Forge PR comment shows `silent_failure_scan` failed despite lint and tests passing.
 
 **Cause:** The SilentFailureDetector found critical patterns in the diff (empty catch blocks, bare except/pass, hardcoded secrets).
 
@@ -391,18 +440,15 @@ The `pushConfig.oidcToken.serviceAccountEmail` must match a service account with
 
 ### Terraform Module Dependencies
 
-The module dependency chain is:
+The shared composition in `terraform/environments/root/main.tf` declares:
 
 ```
-bootstrap -> networking -> iam -> secrets
-                                -> artifact-registry
-                                -> data-stores
-                         -> cloud-run-services -> pubsub
-                                               -> cloud-run-lairs
-                                               -> scheduler
-                         -> cloud-build
-                         -> observability
-                         -> vertex-ai
+bootstrap -> networking, iam, secrets, artifact-registry, cloud-build, observability
+bootstrap + iam -> data-stores
+bootstrap + networking + iam + secrets + data-stores + artifact-registry
+    -> cloud-run-services -> pubsub
+                          -> scheduler
+    -> cloud-run-lairs
 ```
 
-`cloud_run_services` must be deployed before `pubsub` because the push subscription endpoints reference the Cloud Run service URLs. If you see errors about unknown service URLs, ensure `cloud_run_services` is applied first.
+`cloud_run_services` must be applied before `pubsub` because the push subscription endpoints reference the Cloud Run service URLs. If you see errors about unknown service URLs, ensure `cloud_run_services` is applied first.

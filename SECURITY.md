@@ -4,10 +4,10 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | Yes       |
-| < 0.1   | No        |
+| 0.2.x   | Yes       |
+| < 0.2   | No        |
 
-Henchmen is pre-1.0. Security fixes are released against the latest 0.1.x
+Henchmen is pre-1.0. Security fixes are released against the latest 0.2.x
 minor line. Users on older 0.x lines should upgrade.
 
 ## Threat Model
@@ -47,7 +47,7 @@ requests to a target repository. Our working assumptions are:
 **Out of scope**
 
 - Issues that require control of the operator's laptop, Secret Manager,
-  GitHub App, or cloud provider account.
+  GitHub token, or cloud provider account.
 - LLM hallucinations or model quality issues that do not cross a security
   boundary.
 - Attacks that require a malicious custom Scheme committed to the repo by
