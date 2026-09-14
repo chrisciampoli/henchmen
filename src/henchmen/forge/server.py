@@ -274,7 +274,14 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
         from henchmen.forge.ci_runner import CIRunner
 
         try:
-            runner = CIRunner(redact=[github_token] if github_token else [])
+            # One budget for the whole run and for any single command: the run
+            # must finish (and ack) inside the 600s Pub/Sub ack deadline.
+            budget = settings.forge_ci_timeout_seconds
+            runner = CIRunner(
+                timeout_seconds=budget,
+                total_budget_seconds=budget,
+                redact=[github_token] if github_token else [],
+            )
             result = await runner.run(workspace, base_ref=base_branch)
         except Exception as exc:
             raise await _fail(pr_url, task_id, request_id, "ci-error", str(exc), retriable=True) from exc

@@ -491,6 +491,26 @@ class TestRunCIForPRSuccess:
         assert "INCOMPLETE" in comment
         assert "PASSED" not in comment
 
+    @pytest.mark.asyncio
+    async def test_ci_budget_comes_from_settings(self, forge_settings, forge_app, monkeypatch):
+        from henchmen.forge.server import _run_ci_for_pr
+
+        monkeypatch.setenv("HENCHMEN_GITHUB_TOKEN", "gh-token")
+        monkeypatch.setenv("HENCHMEN_FORGE_CI_TIMEOUT_SECONDS", "123")
+        runner = MagicMock()
+        runner.run = AsyncMock(return_value={"passed": True, "failed": [], "skipped": [], "checks": []})
+
+        with (
+            patch("github.Github", return_value=_github_client_stub(MagicMock())),
+            patch("henchmen.forge.server.clone_repo", new=AsyncMock()),
+            patch("henchmen.forge.ci_runner.CIRunner", return_value=runner) as runner_cls,
+        ):
+            await _run_ci_for_pr("https://github.com/acme/repo/pull/7", "task-1", "req-1")
+
+        kwargs = runner_cls.call_args.kwargs
+        assert kwargs["total_budget_seconds"] == 123
+        assert kwargs["timeout_seconds"] == 123
+
 
 class TestResultStatus:
     def test_passed_only_when_everything_ran_and_passed(self):
