@@ -281,6 +281,9 @@ def _eval_run(args: argparse.Namespace) -> None:
     from henchmen.providers.tiers import normalize_llm_provider
 
     logging.basicConfig(level=logging.INFO)
+    # Check the history store before any fixture runs: discovering a missing
+    # aiosqlite only after every fixture's LLM calls were paid for wastes them.
+    _require_storage_or_exit()
 
     provider = normalize_llm_provider(args.provider or "")
     if not provider:
@@ -679,7 +682,9 @@ def _serve(args: argparse.Namespace) -> None:
         await shared_broker.drain()
         logger.info("Shutting down")
 
-    app = FastAPI(title="Henchmen (Local Dev)", version="0.1.0", lifespan=lifespan)
+    from henchmen import __version__
+
+    app = FastAPI(title="Henchmen (Local Dev)", version=__version__, lifespan=lifespan)
     app.mount("/dispatch", dispatch_app)
     app.mount("/mastermind", mastermind_app)
     app.mount("/forge", forge_app)
