@@ -341,12 +341,58 @@ def _dockerfile(service: str) -> str:
     return _read(f"containers/{service}/Dockerfile")
 
 
+def _external_from_lines(text: str) -> list[str]:
+    """FROM lines whose base is an external image, not an earlier stage name.
+
+    A multi-stage Dockerfile may do ``FROM runtime AS local`` where ``runtime``
+    is a stage declared earlier in the same file, not a pullable image — that
+    line can never carry a ``@sha256:`` digest and must be exempt. Anything
+    that isn't a previously declared stage name is a real external image and
+    still needs one.
+    """
+    declared_stages: set[str] = set()
+    external: list[str] = []
+    for line in text.splitlines():
+        if not line.startswith("FROM "):
+            continue
+        parts = line.split()
+        base = parts[1]
+        if base not in declared_stages:
+            external.append(line)
+        if len(parts) >= 4 and parts[2].upper() == "AS":
+            declared_stages.add(parts[3])
+    return external
+
+
 @pytest.mark.parametrize("service", SERVICES)
 def test_every_pinned_base_image_carries_a_digest(service: str) -> None:
-    """Tag-only pins let a rebuilt upstream tag change the image silently."""
-    for line in _dockerfile(service).splitlines():
-        if line.startswith("FROM "):
-            assert "@sha256:" in line, line
+    """Tag-only pins let a rebuilt upstream tag change the image silently.
+
+    ``FROM <earlier-stage> AS <name>`` lines are exempt: the base names a
+    stage declared earlier in the same Dockerfile, not a pullable image, so
+    it cannot carry a digest.
+    """
+    for line in _external_from_lines(_dockerfile(service)):
+        assert "@sha256:" in line, line
+
+
+def test_undigested_external_image_in_stage_position_still_fails() -> None:
+    """Guard against the exemption swallowing real external images too.
+
+    A stage that pulls a fresh external image (not a prior stage) must still
+    be caught even when it appears after other named stages.
+    """
+    dockerfile = (
+        "FROM python:3.14.7-slim-bookworm@sha256:"
+        "9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f AS builder\n"
+        "FROM builder AS local\n"
+        "FROM node:24.21.0-bookworm-slim AS oops\n"
+    )
+    external = _external_from_lines(dockerfile)
+    assert not any(line.startswith("FROM builder") for line in external), "a prior-stage base must be exempt"
+    undigested = [line for line in external if "@sha256:" not in line]
+    assert len(undigested) == 1
+    assert undigested[0].startswith("FROM node:24.21.0-bookworm-slim")
 
 
 @pytest.mark.parametrize("service", SERVICES)
@@ -383,3 +429,39 @@ def test_ci_image_smoke_imports_the_service_entry_module() -> None:
     steps = yaml.dump(_load_yaml(".github/workflows/ci.yml")["jobs"]["docker-build"]["steps"])
     assert "henchmen.operative.bootstrap" in steps
     assert "henchmen.${{ matrix.service }}.server" in steps
+
+
+def _dockerfile_stages(text: str) -> list[tuple[str, str]]:
+    """Return (base, stage name) for each FROM line, in order."""
+    stages = []
+    for line in text.splitlines():
+        parts = line.split()
+        if parts[:1] == ["FROM"]:
+            name = parts[3] if len(parts) >= 4 and parts[2].upper() == "AS" else ""
+            stages.append((parts[1], name))
+    return stages
+
+
+def test_mastermind_dockerfile_default_target_is_still_the_service() -> None:
+    stages = _dockerfile_stages(_mastermind_dockerfile())
+    assert stages[-1] == ("runtime", "mastermind")
+
+
+def test_local_stage_runs_serve_from_the_data_volume() -> None:
+    text = _mastermind_dockerfile()
+    stages = _dockerfile_stages(text)
+    assert ("runtime", "local") in stages
+    local_block = text.split("AS local", 1)[1].split("\nFROM ", 1)[0]
+    assert "HENCHMEN_DATA_DIR=/data" in local_block
+    assert "HENCHMEN_PROVIDER=local" in local_block
+    assert "HENCHMEN_LOCAL_SQLITE_PATH=/data/henchmen.db" in local_block
+    assert 'VOLUME ["/data"]' in local_block
+    assert "USER root" in local_block
+    assert '"henchmen", "serve", "--host", "0.0.0.0", "--port", "8000"' in local_block
+
+
+def test_ci_builds_and_smoke_tests_the_local_image() -> None:
+    jobs = _load_yaml(".github/workflows/ci.yml")["jobs"]
+    steps = " ".join(str(step.get("run", "")) for step in jobs["docker-local"]["steps"])
+    assert "--target local" in steps
+    assert "/console/api/status" in steps
