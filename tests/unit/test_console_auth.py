@@ -104,6 +104,17 @@ def test_oversized_timestamp_is_rejected_not_raised() -> None:
     assert not auth.verify_session(f"{huge_timestamp}.abc", now=1_000.0)
 
 
+def test_max_age_seconds_exposes_the_accepted_session_lifetime() -> None:
+    assert ConsoleAuth(setup_token="t", signing_key=b"k" * 32, max_age_seconds=60).max_age_seconds == 60
+    assert ConsoleAuth(setup_token="t", signing_key=b"k" * 32).max_age_seconds == 30 * 24 * 3600
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits do not apply on Windows")
+def test_load_creates_the_secrets_directory_owner_only(tmp_path: Path) -> None:
+    ConsoleAuth.load(tmp_path / "secrets", setup_token=None)
+    assert oct(os.stat(tmp_path / "secrets").st_mode & 0o777) == "0o700"
+
+
 def test_load_creates_and_reuses_the_signing_key(tmp_path: Path) -> None:
     first = ConsoleAuth.load(tmp_path / "secrets", setup_token=None)
     second = ConsoleAuth.load(tmp_path / "secrets", setup_token="given")
