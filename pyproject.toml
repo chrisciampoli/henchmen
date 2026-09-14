@@ -143,6 +143,9 @@ dev-integration = [
 # (data read from the checkout, never imported).
 where = ["src"]
 
+[tool.setuptools.package-data]
+henchmen = ["console/static/*", "console/static/**/*"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"
@@ -172,6 +175,10 @@ ignore = []
 "src/henchmen/forge/ci_runner.py" = ["ASYNC240"]
 "src/henchmen/dossier/cache.py" = ["ASYNC240"]
 "src/henchmen/dossier/rules.py" = ["ASYNC240"]
+# The Console runs single-user on a local machine; a config-file existence
+# check is cheap enough that a blocking pathlib call is not worth an anyio
+# dependency.
+"src/henchmen/console/app.py" = ["ASYNC240"]
 # Fixture repos under evals/ are deliberately unpolished sample code.
 "evals/**/*.py" = ["T201"]
 # Tests get a relaxed ruleset — assert-raises-Exception, print-for-debug,
