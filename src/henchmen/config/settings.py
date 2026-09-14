@@ -12,8 +12,9 @@ are present the ``HENCHMEN_`` name wins.
 
 from enum import StrEnum
 from functools import lru_cache
+from typing import Literal
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -46,8 +47,6 @@ _OPERATIVE_ENV_FIELDS: tuple[str, ...] = (
     "vertex_ai_model_complex",
     "vertex_ai_model_light",
     "vertex_ai_model_reasoning",
-    "vertex_ai_context_cache_enabled",
-    "vertex_ai_context_cache_min_tokens",
     "vertex_ai_safety_threshold",
     "rag_corpus_display_name",
     "rag_corpus_region",
@@ -82,6 +81,26 @@ _VALID_PROVIDERS: frozenset[str] = frozenset({"gcp", "aws", "local"})
 _VALID_LLM_PROVIDER_INPUTS: frozenset[str] = frozenset(
     {"gcp", "aws", "local", "openai", "anthropic"}
     | {"ollama", "vertex", "vertexai", "vertex-ai", "vertex_ai", "gemini", "google", "bedrock", "claude"}
+)
+
+
+# terraform/modules/secrets seeds every Secret Manager secret with this value so
+# the first apply yields startable Cloud Run revisions. It is published in this
+# repository, so a credential still holding it is treated as unset: a secret
+# used to *verify* callers (webhook signatures, API and metrics bearer tokens)
+# would otherwise accept anyone who has read the Terraform source.
+SEEDED_SECRET_PLACEHOLDER = "placeholder-replace-with-a-real-value"
+
+_SEEDED_SECRET_FIELDS: tuple[str, ...] = (
+    "github_token",
+    "github_webhook_secret",
+    "slack_bot_token",
+    "slack_app_token",
+    "slack_signing_secret",
+    "jira_api_token",
+    "jira_webhook_secret",
+    "metrics_auth_token",
+    "dispatch_api_token",
 )
 
 
@@ -307,15 +326,15 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Vertex AI context caching
-    vertex_ai_context_cache_enabled: bool = Field(default=True, description="Enable Gemini context caching")
-    vertex_ai_context_cache_min_tokens: int = Field(
-        default=32_768, description="Minimum tokens required to create a cache"
-    )
-
     # Vertex AI safety settings
-    vertex_ai_safety_threshold: str = Field(
-        default="BLOCK_MEDIUM_AND_ABOVE", description="Safety filter threshold for Gemini"
+    vertex_ai_safety_threshold: Literal[
+        "BLOCK_LOW_AND_ABOVE", "BLOCK_MEDIUM_AND_ABOVE", "BLOCK_ONLY_HIGH", "BLOCK_NONE", "OFF"
+    ] = Field(
+        default="BLOCK_MEDIUM_AND_ABOVE",
+        description=(
+            "Gemini safety-filter threshold applied to the harassment, hate speech, sexually explicit "
+            "and dangerous content categories on every Vertex AI call"
+        ),
     )
 
     # Vertex AI evaluation
@@ -523,6 +542,12 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Derived helpers
     # ------------------------------------------------------------------
+
+    @field_validator(*_SEEDED_SECRET_FIELDS, mode="after")
+    @classmethod
+    def _seeded_placeholder_is_unset(cls, value: str) -> str:
+        """Treat Terraform's published placeholder secret as "not configured"."""
+        return "" if value.strip() == SEEDED_SECRET_PLACEHOLDER else value
 
     def operative_env(self, *, include_secrets: bool = False) -> dict[str, str]:
         """``HENCHMEN_*`` variables to inject into an operative container.

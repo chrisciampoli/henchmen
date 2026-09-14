@@ -420,7 +420,10 @@ class TestBedrockDefaults:
 
 
 class TestRemovedSettings:
-    @pytest.mark.parametrize("field", ["vertex_ai_grounding_enabled"])
+    @pytest.mark.parametrize(
+        "field",
+        ["vertex_ai_grounding_enabled", "vertex_ai_context_cache_enabled", "vertex_ai_context_cache_min_tokens"],
+    )
     def test_field_is_gone_and_not_forwarded(self, monkeypatch: pytest.MonkeyPatch, field: str):
         settings = _local_settings(monkeypatch)
         assert field not in Settings.model_fields
@@ -434,13 +437,7 @@ class TestRemovedSettings:
 # Fields forwarded to operatives whose consumer has not been wired yet. Each
 # entry is a known gap, not a place to park new dead config: remove it as soon
 # as a component reads the field (or the field is deleted).
-_FIELDS_AWAITING_A_READER: frozenset[str] = frozenset(
-    {
-        "vertex_ai_context_cache_enabled",
-        "vertex_ai_context_cache_min_tokens",
-        "vertex_ai_safety_threshold",
-    }
-)
+_FIELDS_AWAITING_A_READER: frozenset[str] = frozenset()
 
 
 def _unread_settings_fields() -> set[str]:
@@ -465,3 +462,59 @@ class TestEverySettingIsRead:
         """An allowlisted field that gained a reader (or was deleted) must leave the allowlist."""
         assert set(Settings.model_fields) >= _FIELDS_AWAITING_A_READER
         assert _unread_settings_fields() >= _FIELDS_AWAITING_A_READER
+
+
+class TestSeededSecretPlaceholder:
+    """Terraform's published placeholder must never count as a configured secret."""
+
+    def test_every_seeded_terraform_secret_maps_to_a_guarded_field(self) -> None:
+        import re
+        from pathlib import Path
+
+        from henchmen.config.settings import _SEEDED_SECRET_FIELDS
+
+        tf = (Path(__file__).resolve().parents[2] / "terraform/modules/secrets/main.tf").read_text(encoding="utf-8")
+        seeded = {
+            name.replace("-", "_")
+            for name in re.findall(r'secret_id\s*=\s*"henchmen-\$\{var\.environment\}-([a-z-]+)"', tf)
+        }
+        assert seeded, "no seeded secrets found in the secrets module"
+        assert seeded <= set(_SEEDED_SECRET_FIELDS), f"unguarded seeded secrets: {seeded - set(_SEEDED_SECRET_FIELDS)}"
+
+    @pytest.mark.parametrize(
+        "env_name",
+        [
+            "HENCHMEN_METRICS_AUTH_TOKEN",
+            "HENCHMEN_DISPATCH_API_TOKEN",
+            "HENCHMEN_SLACK_SIGNING_SECRET",
+            "HENCHMEN_GITHUB_WEBHOOK_SECRET",
+            "HENCHMEN_JIRA_WEBHOOK_SECRET",
+            "GITHUB_TOKEN",
+        ],
+    )
+    def test_placeholder_is_read_as_empty(self, monkeypatch: pytest.MonkeyPatch, env_name: str) -> None:
+        from henchmen.config.settings import SEEDED_SECRET_PLACEHOLDER, Settings
+
+        monkeypatch.setenv(env_name, SEEDED_SECRET_PLACEHOLDER)
+        field = env_name.removeprefix("HENCHMEN_").lower()
+        assert getattr(Settings(_env_file=None), field) == ""
+
+    def test_real_values_are_kept(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from henchmen.config.settings import Settings
+
+        monkeypatch.setenv("HENCHMEN_METRICS_AUTH_TOKEN", "a-real-token")
+        assert Settings(_env_file=None).metrics_auth_token == "a-real-token"
+
+    @pytest.mark.asyncio
+    async def test_metrics_endpoint_rejects_the_placeholder_in_prod(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fastapi import HTTPException
+
+        from henchmen.config.settings import SEEDED_SECRET_PLACEHOLDER, Settings
+        from henchmen.observability.api import build_metrics_auth_dependency
+
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "prod")
+        monkeypatch.setenv("HENCHMEN_METRICS_AUTH_TOKEN", SEEDED_SECRET_PLACEHOLDER)
+        dependency = build_metrics_auth_dependency(Settings(_env_file=None))
+        with pytest.raises(HTTPException) as excinfo:
+            await dependency(authorization=f"Bearer {SEEDED_SECRET_PLACEHOLDER}")
+        assert excinfo.value.status_code == 401

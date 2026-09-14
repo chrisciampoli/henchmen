@@ -1634,7 +1634,7 @@ class TestCreateTaskAuth:
 
     def test_terraform_placeholder_is_not_a_token(self, client, monkeypatch):
         """The seeded Secret Manager placeholder is public; it must not unlock the route."""
-        from henchmen.dispatch.server import _SEEDED_SECRET_PLACEHOLDER
+        from henchmen.config.settings import SEEDED_SECRET_PLACEHOLDER as _SEEDED_SECRET_PLACEHOLDER
 
         self._configure(
             monkeypatch, HENCHMEN_ENVIRONMENT="prod", HENCHMEN_DISPATCH_API_TOKEN=_SEEDED_SECRET_PLACEHOLDER
@@ -1649,7 +1649,7 @@ class TestCreateTaskAuth:
     def test_placeholder_matches_the_terraform_seed(self):
         from pathlib import Path
 
-        from henchmen.dispatch.server import _SEEDED_SECRET_PLACEHOLDER
+        from henchmen.config.settings import SEEDED_SECRET_PLACEHOLDER as _SEEDED_SECRET_PLACEHOLDER
 
         secrets_tf = Path(__file__).resolve().parents[2] / "terraform" / "modules" / "secrets" / "main.tf"
         assert f'secret_data = "{_SEEDED_SECRET_PLACEHOLDER}"' in secrets_tf.read_text(encoding="utf-8")

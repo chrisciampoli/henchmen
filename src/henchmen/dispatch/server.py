@@ -251,10 +251,6 @@ def _require_signing_secret(
 # session does not log it on every request.
 _open_api_warning_logged = False
 
-# The value terraform/modules/secrets seeds every secret with so the first
-# apply yields startable revisions. It is public, so it never counts as a token.
-_SEEDED_SECRET_PLACEHOLDER = "placeholder-replace-with-a-real-value"
-
 
 async def require_api_token(request: Request) -> None:
     """FastAPI dependency guarding ``POST /api/v1/tasks`` with a bearer token.
@@ -266,9 +262,8 @@ async def require_api_token(request: Request) -> None:
     """
     global _open_api_warning_logged
     settings = get_settings()
+    # Settings already maps Terraform's seeded placeholder secret to empty.
     expected = settings.dispatch_api_token.strip()
-    if expected == _SEEDED_SECRET_PLACEHOLDER:
-        expected = ""
     if not expected:
         if settings.environment in (Environment.STAGING, Environment.PROD):
             logger.error(
