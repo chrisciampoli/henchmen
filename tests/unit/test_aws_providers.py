@@ -257,6 +257,27 @@ class TestDynamoDBDocumentStore:
         assert result["_id"] == "t-1"
 
     @pytest.mark.asyncio
+    async def test_get_converts_decimals_nested_in_map_and_list_attributes(self):
+        """update() writes dict/list fields as top-level Map/List attributes; their numbers are Decimals."""
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {
+            "Item": {
+                "pk": "tasks",
+                "sk": "t-1",
+                "data": "{}",
+                "metrics": {"tokens": Decimal("12"), "cost": Decimal("0.5")},
+                "scores": [Decimal("1"), {"x": Decimal("2.25")}],
+            }
+        }
+        store = self._make_store(mock_table)
+        result = await store.get("tasks", "t-1")
+
+        assert result is not None
+        assert result["metrics"] == {"tokens": 12, "cost": 0.5}
+        assert type(result["metrics"]["tokens"]) is int
+        assert result["scores"] == [1, {"x": 2.25}]
+
+    @pytest.mark.asyncio
     async def test_set_puts_correct_item(self):
         mock_table = MagicMock()
         captured: dict = {}

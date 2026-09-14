@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 # Containers run with --rm, so `docker logs` is unavailable once they exit.
 # Keep the last N drained lines per execution instead.
 _LOG_BUFFER_LINES = 2000
+# Finished executions whose status and logs stay queryable after they exit.
+_FINISHED_RETAINED = 50
 
 
 class DockerOrchestrator:
@@ -31,6 +33,7 @@ class DockerOrchestrator:
         self._timeout_tasks: dict[str, asyncio.Task[None]] = {}
         self._logs: dict[str, deque[str]] = {}
         self._timed_out: set[str] = set()
+        self._finished: deque[str] = deque()
 
     async def run_job(
         self,
@@ -143,13 +146,28 @@ class DockerOrchestrator:
         )
 
     def _cleanup(self, execution_id: str) -> None:
-        """Drop finished bookkeeping tasks for a terminated execution."""
+        """Drop finished bookkeeping for a terminated execution.
+
+        The process handle and log buffer stay available for the most recent
+        :data:`_FINISHED_RETAINED` executions (callers re-poll ``get_status``
+        and read ``stream_logs`` after completion); older ones are evicted so
+        a long-running ``henchmen serve`` does not grow without bound.
+        """
         timeout_task = self._timeout_tasks.pop(execution_id, None)
         if timeout_task is not None and not timeout_task.done():
             timeout_task.cancel()
         drain_task = self._drain_tasks.get(execution_id)
         if drain_task is not None and drain_task.done():
             self._drain_tasks.pop(execution_id, None)
+        process = self._processes.get(execution_id)
+        if process is not None and process.returncode is not None and execution_id not in self._finished:
+            self._finished.append(execution_id)
+        while len(self._finished) > _FINISHED_RETAINED:
+            evicted = self._finished.popleft()
+            self._processes.pop(evicted, None)
+            self._logs.pop(evicted, None)
+            self._timed_out.discard(evicted)
+            self._drain_tasks.pop(evicted, None)
 
     def _buffered_logs(self, execution_id: str) -> str | None:
         buffer = self._logs.get(execution_id)
