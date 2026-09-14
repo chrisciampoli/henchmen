@@ -63,6 +63,16 @@ def _upper_types(schema: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# Categories vertex_ai_safety_threshold applies to. Image-only and jailbreak
+# categories are left at Gemini's defaults: operatives exchange text and code.
+_SAFETY_CATEGORY_NAMES: tuple[str, ...] = (
+    "HARM_CATEGORY_HARASSMENT",
+    "HARM_CATEGORY_HATE_SPEECH",
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+    "HARM_CATEGORY_DANGEROUS_CONTENT",
+)
+
+
 class VertexAIProvider:
     """LLMProvider backed by Vertex AI Gemini models."""
 
@@ -141,11 +151,16 @@ class VertexAIProvider:
                 )
             genai_tools = [types.Tool(function_declarations=declarations)]
 
+        threshold = types.HarmBlockThreshold[self._settings.vertex_ai_safety_threshold]
         config = types.GenerateContentConfig(
             temperature=temperature,
             max_output_tokens=max_tokens,
             system_instruction=system_prompt,
             tools=genai_tools,
+            safety_settings=[
+                types.SafetySetting(category=types.HarmCategory[name], threshold=threshold)
+                for name in _SAFETY_CATEGORY_NAMES
+            ],
         )
         response = await self._client_for(model).aio.models.generate_content(
             model=model,
