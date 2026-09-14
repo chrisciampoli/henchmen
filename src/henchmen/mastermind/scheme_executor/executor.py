@@ -393,11 +393,15 @@ class SchemeExecutor:
             }
 
     async def _maybe_evaluate(self, task: HenchmenTask, node: SchemeNode, report: Any) -> None:
-        """Run post-operative evaluation if enabled in settings."""
-        try:
-            if not getattr(self.settings, "vertex_ai_evaluation_enabled", False):
-                return
+        """Run post-operative evaluation if enabled in settings.
 
+        The evaluator is Vertex AI's GenAI evaluation service, so it only runs
+        when the deployment provider is GCP: on AWS or local it would fail on
+        every node (no project, no credentials) and log a warning each time.
+        """
+        if not self.settings.vertex_ai_evaluation_enabled or self.settings.provider != "gcp":
+            return
+        try:
             from henchmen.observability.evaluator import OperativeEvaluator, evaluate_and_record
 
             evaluator = OperativeEvaluator(
