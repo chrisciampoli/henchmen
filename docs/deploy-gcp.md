@@ -106,6 +106,7 @@ $EDITOR terraform.tfvars
 # State bucket names are globally unique, so the name includes the project ID.
 gcloud storage buckets create gs://henchmen-tfstate-${PROJECT_ID}-dev \
   --project=${PROJECT_ID} --location=${REGION} --uniform-bucket-level-access
+gcloud storage buckets update gs://henchmen-tfstate-${PROJECT_ID}-dev --versioning
 terraform init -backend-config=bucket=henchmen-tfstate-${PROJECT_ID}-dev
 
 terraform plan -out=tier1.tfplan

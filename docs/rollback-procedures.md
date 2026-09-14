@@ -14,11 +14,11 @@ If you're running Henchmen in local mode (docker-compose or
 
 | GCP procedure          | Local-mode equivalent                               |
 |------------------------|-----------------------------------------------------|
-| Container image pin    | `git checkout <sha>` then `docker compose up --build` |
+| Container image pin    | `git checkout <sha>`, then `henchmen build-operative` and restart `henchmen serve` (or `docker compose up --build`) |
 | Cloud Run revision     | restart the process / container                    |
 | Terraform revert       | not applicable — no infra state                    |
-| Emergency stop         | `docker compose down` (or kill `henchmen serve`)    |
-| Drain the task queue   | delete rows from `tasks` in `henchmen_dev.db`       |
+| Emergency stop         | `docker compose down` (or kill `henchmen serve`); stop operatives with `docker ps` / `docker stop` |
+| Drain the task queue   | restart the process — the in-memory broker keeps no messages across restarts; escalate unfinished tasks in `task_executions` (see `incident-runbook.md`) |
 
 See [`incident-runbook.md`](incident-runbook.md) for the full
 incident-response flow (triage, communication, postmortem).
@@ -38,7 +38,7 @@ All container images are stored in Artifact Registry at `us-central1-docker.pkg.
 
 2. Identify the previous working digest or tag.
 
-3. Update the Cloud Run service to the previous image:
+3. For an immediate rollback of one service, point it at the previous image:
    ```bash
    gcloud run services update henchmen-dev-{service} \
      --project=${PROJECT_ID} \
@@ -46,22 +46,34 @@ All container images are stored in Artifact Registry at `us-central1-docker.pkg.
      --image=us-central1-docker.pkg.dev/${PROJECT_ID}/henchmen-dev/{service}@sha256:{digest}
    ```
 
-4. For the Operative, also update the lair template:
+   Terraform owns the image, so the next `terraform apply` restores
+   `container_image_tag`. Make the rollback stick with step 4.
+
+4. Pin the previous release for every service and the operative. Mastermind
+   launches lairs from `operative:<HENCHMEN_LAIR_OPERATIVE_IMAGE_TAG>`, which
+   Terraform sets from the same `container_image_tag`, so tag the known-good
+   images and apply:
    ```bash
-   gcloud run jobs update henchmen-dev-lair-template \
-     --project=${PROJECT_ID} \
-     --region=us-central1 \
-     --image=us-central1-docker.pkg.dev/${PROJECT_ID}/henchmen-dev/operative@sha256:{digest}
+   for svc in dispatch mastermind forge operative; do
+     gcloud artifacts docker tags add \
+       us-central1-docker.pkg.dev/${PROJECT_ID}/henchmen-dev/${svc}@sha256:{digest_for_svc} \
+       us-central1-docker.pkg.dev/${PROJECT_ID}/henchmen-dev/${svc}:rollback-{date}
+   done
+   # terraform.tfvars: container_image_tag = "rollback-{date}"
+   cd terraform/environments/dev && terraform apply
    ```
+   Lairs created after the apply run the rolled-back operative. The
+   `henchmen-dev-lair-template` job is only a reference copy; updating it does
+   not change what operatives run.
 
 ### Services and Their Images
 
 | Service | Cloud Run Name | Image Path |
 |---------|---------------|------------|
-| Dispatch | `henchmen-dev-dispatch` | `.../henchmen-dev/dispatch:latest` |
-| Mastermind | `henchmen-dev-mastermind` | `.../henchmen-dev/mastermind:latest` |
-| Forge | `henchmen-dev-forge` | `.../henchmen-dev/forge:latest` |
-| Operative | `henchmen-dev-lair-template` (job) | `.../henchmen-dev/operative:latest` |
+| Dispatch | `henchmen-dev-dispatch` | `.../henchmen-dev/dispatch:<container_image_tag>` |
+| Mastermind | `henchmen-dev-mastermind` | `.../henchmen-dev/mastermind:<container_image_tag>` |
+| Forge | `henchmen-dev-forge` | `.../henchmen-dev/forge:<container_image_tag>` |
+| Operative | `lair-<task>-<node>-<suffix>` (one job per agentic node) | `.../henchmen-dev/operative:<container_image_tag>` |
 
 ## Cloud Run Revision Rollback
 
@@ -83,6 +95,10 @@ Cloud Run maintains a history of deployed revisions. To roll back to a previous 
      --to-revisions={previous-revision-name}=100
    ```
 
+   Terraform does not pin traffic, so the next `terraform apply` that creates a
+   new revision sends traffic to it again. Pin `container_image_tag` (see above)
+   before applying.
+
 3. Verify the service is healthy:
    ```bash
    curl -s https://henchmen-dev-{service}-{hash}.run.app/health
@@ -92,7 +108,7 @@ Cloud Run maintains a history of deployed revisions. To roll back to a previous 
 
 ### State Management
 
-Terraform state is stored in GCS: `gs://<YOUR_TFSTATE_BUCKET>/` (configured in `backend.tf`).
+Terraform state is stored in GCS under the `terraform/state` prefix of the bucket passed to `terraform init -backend-config=bucket=...` (by convention `henchmen-tfstate-<project_id>-<env>`; see `terraform/environments/dev/backend.tf`). If versioning is enabled on the bucket (`gcloud storage buckets update gs://<bucket> --versioning`), you can recover an earlier state object if one is corrupted.
 
 **WARNING:** Never manually edit Terraform state. Use `terraform state` commands.
 
@@ -121,14 +137,17 @@ Terraform state is stored in GCS: `gs://<YOUR_TFSTATE_BUCKET>/` (configured in `
    terraform apply rollback.plan
    ```
 
-6. **CRITICAL:** After `terraform apply`, re-set any secret environment variables that Terraform resets:
+6. Terraform owns every Cloud Run environment variable and secret mount
+   (`GITHUB_TOKEN` from `henchmen-dev-github-token`, `SLACK_BOT_TOKEN` from
+   `henchmen-dev-slack-bot-token`, ...), so the apply restores the mounts the
+   reverted configuration declares. Anything added by hand with
+   `gcloud run services update --set-env-vars/--set-secrets` is removed; if it
+   is still needed, add it to the `cloud-run-services` module rather than
+   re-adding it with gcloud. Verify:
    ```bash
-   # Terraform apply strips manually-set env vars from Cloud Run services.
-   # Re-apply secrets for each affected service:
-   gcloud run services update henchmen-dev-{service} \
-     --project=${PROJECT_ID} \
-     --region=us-central1 \
-     --set-secrets=GITHUB_APP_PRIVATE_KEY=github-app-private-key:latest,SLACK_BOT_TOKEN=slack-bot-token:latest
+   gcloud run services describe henchmen-dev-{service} \
+     --project=${PROJECT_ID} --region=us-central1 \
+     --format="yaml(spec.template.spec.containers[0].env)"
    ```
 
 ### Terraform State Lock
@@ -157,10 +176,10 @@ done
 
 To re-enable:
 ```bash
-# Re-apply push configs from Terraform
+# Re-apply push configs from Terraform. The pubsub module is nested inside
+# the environment's `henchmen` module.
 cd terraform/environments/dev
-terraform apply -target=module.pubsub
-# Then re-set secrets (see above)
+terraform apply -target=module.henchmen.module.pubsub
 ```
 
 ### Drain the Task Queue
@@ -181,13 +200,13 @@ echo "Queue drained."
 To cancel all in-progress Cloud Run Job executions:
 
 ```bash
+# Every operative is its own lair-* job, so list executions across all jobs.
 for exec_id in $(gcloud run jobs executions list \
-  --job=henchmen-dev-lair-template \
   --project=${PROJECT_ID} \
   --region=us-central1 \
-  --filter="status.conditions.type=Completed AND status.conditions.status!=True" \
-  --format="value(name)"); do
-  gcloud run jobs executions cancel "$exec_id" --project=${PROJECT_ID} --region=us-central1
+  --filter="metadata.name ~ ^lair- AND status.completionTime:null" \
+  --format="value(metadata.name)"); do
+  gcloud run jobs executions cancel "$exec_id" --project=${PROJECT_ID} --region=us-central1 --quiet
 done
 ```
 
