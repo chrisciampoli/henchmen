@@ -30,6 +30,27 @@ def _install_boto3_stub():
     return stub
 
 
+def _is_aws_module(name: str) -> bool:
+    return name == "boto3" or name.startswith(("boto3.", "botocore", "henchmen.providers.aws"))
+
+
+@pytest.fixture(autouse=True)
+def _restore_aws_sys_modules():
+    """Put boto3/botocore back exactly as they were after every test.
+
+    Tests here install MagicMock stand-ins for ``boto3``, ``boto3.dynamodb`` and
+    ``botocore.exceptions`` directly in ``sys.modules``; the per-class teardowns
+    only popped ``boto3``. A stub ``botocore.exceptions`` left behind makes the
+    next *real* ``import boto3`` elsewhere in the suite fail with a metaclass
+    conflict, so a provider test in another module broke depending on order.
+    """
+    saved = {name: module for name, module in sys.modules.items() if _is_aws_module(name)}
+    yield
+    for name in [name for name in sys.modules if _is_aws_module(name)]:
+        del sys.modules[name]
+    sys.modules.update(saved)
+
+
 def _remove_aws_modules():
     """Evict any cached AWS provider modules so re-imports pick up new mocks."""
     for key in list(sys.modules):
