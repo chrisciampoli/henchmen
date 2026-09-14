@@ -72,6 +72,8 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME#v}"
+          # GHCR rejects uppercase paths and github.repository preserves the owner's
+          # login case, so forks with a mixed-case login would fail without this.
           REPO="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           for svc in dispatch mastermind forge operative; do
             docker buildx build --platform linux/amd64,linux/arm64 \
