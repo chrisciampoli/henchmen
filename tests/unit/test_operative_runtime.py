@@ -437,6 +437,64 @@ class TestBootstrapWorkspaceFailure:
         assert "repository not found" in (report.error or "")
 
 
+class TestBootstrapReportsProviderCost:
+    @pytest.mark.asyncio
+    async def test_report_carries_guardrail_cost_even_on_timeout(self, tmp_path: Path):
+        """The tracker persists the provider-billed figure; re-deriving it from tokens misprices cache writes."""
+        from henchmen.operative.bootstrap import run_operative
+
+        agent = MagicMock()
+        agent.run = AsyncMock(side_effect=TimeoutError())
+        agent.get_telemetry.return_value = {
+            "model_name": "concrete-model-1",
+            "estimated_cost_usd": 0.4321,
+            "total_input_tokens": 1000,
+        }
+        with (
+            patch.dict(
+                "os.environ",
+                {"TASK_ID": "task-cost", "NODE_ID": "implement_fix", "SCHEME_ID": "bugfix_standard"},
+            ),
+            patch("henchmen.operative.bootstrap.get_settings", return_value=MagicMock()),
+            patch("henchmen.operative.bootstrap.ProviderRegistry", return_value=MagicMock()),
+            patch("henchmen.operative.bootstrap._get_document_store", return_value=None),
+            patch("henchmen.operative.bootstrap.resolve_model_name", return_value="m"),
+            patch("henchmen.operative.bootstrap.initialize_workspace", new=AsyncMock(return_value=str(tmp_path))),
+            patch("henchmen.operative.bootstrap._build_file_context", new=AsyncMock(return_value="")),
+            patch("henchmen.operative.bootstrap.build_operative_agent", new=AsyncMock(return_value=agent)),
+            patch("henchmen.operative.bootstrap._check_for_changes", new=AsyncMock(return_value=False)),
+            patch("henchmen.operative.bootstrap.publish_report", new_callable=AsyncMock) as publish,
+        ):
+            await run_operative()
+
+        report = publish.await_args.args[0]
+        assert report.status == OperativeStatus.TIMED_OUT
+        assert report.estimated_cost_usd == pytest.approx(0.4321)
+
+
+class TestOperativeReportCost:
+    def test_defaults_to_zero_and_rejects_negative(self):
+        from datetime import UTC, datetime
+
+        from pydantic import ValidationError
+
+        from henchmen.models.operative import OperativeReport
+
+        fields = {
+            "task_id": "t",
+            "scheme_id": "s",
+            "node_id": "n",
+            "operative_id": "o",
+            "status": OperativeStatus.COMPLETED,
+            "summary": "done",
+            "confidence_score": 0.9,
+            "started_at": datetime.now(UTC),
+        }
+        assert OperativeReport(**fields).estimated_cost_usd == 0.0
+        with pytest.raises(ValidationError):
+            OperativeReport(**fields, estimated_cost_usd=-0.01)
+
+
 class TestInitializeWorkspaceAlwaysClones:
     @pytest.mark.asyncio
     async def test_clones_without_consulting_snapshot_cache(self, tmp_path: Path):

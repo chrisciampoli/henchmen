@@ -1393,11 +1393,8 @@ class TestRecordNodeResultCost:
         """An OperativeReport carrying the provider-summed ``estimated_cost_usd``."""
         from henchmen.models.operative import OperativeReport
 
-        class _ReportWithCost(OperativeReport):
-            estimated_cost_usd: float = 0.0
-
         base = _make_report(**overrides).model_dump()
-        return _ReportWithCost(**base, estimated_cost_usd=cost)
+        return OperativeReport(**{**base, "estimated_cost_usd": cost})
 
     @pytest.mark.asyncio
     async def test_provider_billed_cost_is_persisted_as_is(self):

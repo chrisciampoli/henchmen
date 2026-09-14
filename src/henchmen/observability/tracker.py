@@ -228,9 +228,8 @@ class TaskTracker:
         stored cost matches the ceiling the guardrails enforced; otherwise the
         cost is re-estimated from the token counters.
         """
-        reported = getattr(report, "estimated_cost_usd", None)
-        if isinstance(reported, int | float) and not isinstance(reported, bool) and reported > 0:
-            return float(reported)
+        if report.estimated_cost_usd > 0:
+            return report.estimated_cost_usd
         return estimate_cost(
             model_name,
             report.total_input_tokens,
