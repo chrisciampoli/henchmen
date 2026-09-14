@@ -103,6 +103,11 @@ _SEEDED_SECRET_FIELDS: tuple[str, ...] = (
     "dispatch_api_token",
 )
 
+# The operative image local mode runs when `operative_image` is empty: the one
+# `henchmen build-operative` builds. Lairs, local CI gates and `henchmen doctor`
+# must all resolve the same image, so they share this default.
+DEFAULT_LOCAL_OPERATIVE_IMAGE = "henchmen-operative:local"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(

@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from henchmen.config.settings import DEFAULT_LOCAL_OPERATIVE_IMAGE
 from henchmen.models.llm import ModelTier
 from henchmen.models.operative import OperativeReport, OperativeStatus
 from henchmen.models.scheme import SchemeNode
@@ -186,7 +187,7 @@ class LairManager:
     def _build_image(self) -> str:
         """Build the operative container image URI."""
         if self.settings.provider == "local":
-            return self.settings.operative_image or "henchmen-operative:local"
+            return self.settings.operative_image or DEFAULT_LOCAL_OPERATIVE_IMAGE
         return (
             f"{self.settings.gcp_region}-docker.pkg.dev/"
             f"{self.settings.gcp_project_id}/"

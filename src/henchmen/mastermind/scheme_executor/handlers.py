@@ -19,6 +19,7 @@ from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from henchmen.config.settings import DEFAULT_LOCAL_OPERATIVE_IMAGE
 from henchmen.mastermind.scheme_executor.lint_scope import (
     CheckCommand,
     LintScopeError,
@@ -34,6 +35,7 @@ from henchmen.utils.git import clone_repo, get_github_token
 from henchmen.utils.stack_detector import Stack, detect_stack
 
 if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
     from henchmen.mastermind.scheme_executor.executor import SchemeExecutor
 
 logger = logging.getLogger(__name__)
@@ -347,7 +349,7 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
 
         if is_local:
             # Run inside the operative Docker image with the workspace mounted.
-            result = await _run_in_docker(workspace, to_shell_script(commands, _install_script(stack)))
+            result = await _run_in_docker(workspace, to_shell_script(commands, _install_script(stack)), settings)
         else:
             # In cloud mode the host has the toolchain.
             result = await _run_on_host(workspace, stack, commands)
@@ -372,17 +374,18 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
         shutil.rmtree(workspace, ignore_errors=True)
 
 
-async def _run_in_docker(workspace: str, shell_script: str) -> dict[str, Any]:
+async def _run_in_docker(workspace: str, shell_script: str, settings: Settings) -> dict[str, Any]:
     """Run a CI check command inside the operative Docker image.
 
     Mounts the cloned workspace as a volume so the container has access
     to the code and the correct toolchain (Node.js, npm, Python, etc.).
-    Only reachable in local mode, where the image is always the locally
-    built ``henchmen-operative:local``.
+    Only reachable in local mode, which runs the same image the Lairs use:
+    ``operative_image`` when set (the local image pulls only the published
+    operative), else the locally built default.
     """
     # Convert Windows paths to Docker-compatible format
     docker_workspace = workspace.replace("\\", "/")
-    image = "henchmen-operative:local"
+    image = settings.operative_image or DEFAULT_LOCAL_OPERATIVE_IMAGE
 
     cmd = [
         "docker",
