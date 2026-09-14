@@ -1,10 +1,12 @@
 """Unit tests for CI feedback loop tracker retry methods."""
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from henchmen.config.settings import Settings
+from henchmen.models.operative import OperativeReport, OperativeStatus
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -26,6 +28,22 @@ def _make_mock_store() -> MagicMock:
     store.increment = AsyncMock()
     store.update_if = AsyncMock(return_value=True)
     return store
+
+
+def _fix_report(status: OperativeStatus) -> OperativeReport:
+    """OperativeReport for the CI-fix operative with the given terminal status."""
+    now = datetime.now(UTC)
+    return OperativeReport(
+        task_id="full-task-id",
+        scheme_id="bugfix_standard",
+        node_id="implement_fix",
+        operative_id="lair-123",
+        status=status,
+        summary=f"fix operative {status.value}",
+        confidence_score=0.0,
+        started_at=now,
+        completed_at=now,
+    )
 
 
 def _make_tracker(settings: Settings, store: MagicMock | None = None):
@@ -296,13 +314,43 @@ class TestHandleCIFailure:
             agent.tracker.record_ci_fix_attempt = AsyncMock()
             agent.tracker.clear_ci_fix_in_progress = AsyncMock()
             agent.lair_manager.create_lair = AsyncMock(return_value="lair-123")
-            agent.lair_manager.wait_for_completion = AsyncMock(return_value={"status": "completed"})
+            agent.lair_manager.wait_for_completion = AsyncMock(return_value=_fix_report(OperativeStatus.COMPLETED))
 
             result = await agent.handle_ci_failure("task-prefix", "org/repo", "henchmen/task-prefix", 999)
 
             assert result["status"] == "fix_dispatched"
             assert result["attempt"] == 1
             agent.tracker.record_ci_fix_attempt.assert_called_once_with("full-task-id")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [OperativeStatus.FAILED, OperativeStatus.TIMED_OUT])
+    async def test_unsuccessful_fix_operative_is_reported_as_fix_failed(self, mock_settings, status):
+        from unittest.mock import patch as _patch
+
+        from henchmen.forge.error_extractor import CIError
+
+        with (
+            _patch("henchmen.mastermind.agent.extract_ci_errors", new_callable=AsyncMock) as mock_extract,
+            _patch("henchmen.mastermind.agent.format_errors_for_operative", return_value="errors"),
+            _patch("henchmen.mastermind.agent.get_github_token", return_value="test-token"),
+        ):
+            mock_extract.return_value = [
+                CIError(check_name="lint", file_path="foo.py", line=1, message="err", severity="failure")
+            ]
+            agent = self._make_agent(mock_settings)
+            agent.tracker.get_task_by_id_prefix = AsyncMock(
+                return_value={"task_id": "full-task-id", "ci_fix_attempts": 0, "ci_fix_in_progress": False}
+            )
+            agent.tracker.record_ci_fix_attempt = AsyncMock()
+            agent.tracker.clear_ci_fix_in_progress = AsyncMock()
+            agent.lair_manager.create_lair = AsyncMock(return_value="lair-123")
+            agent.lair_manager.wait_for_completion = AsyncMock(return_value=_fix_report(status))
+
+            result = await agent.handle_ci_failure("task-prefix", "org/repo", "henchmen/task-prefix", 999)
+
+        assert result["status"] == "fix_failed"
+        assert result["operative_status"] == status.value
+        agent.tracker.clear_ci_fix_in_progress.assert_awaited_once_with("full-task-id")
 
     @pytest.mark.asyncio
     async def test_escalates_after_max_retries(self, mock_settings):
@@ -315,12 +363,17 @@ class TestHandleCIFailure:
             }
         )
         agent.tracker.record_ci_result = AsyncMock()
+        agent.tracker.mark_escalated = AsyncMock()
 
         result = await agent.handle_ci_failure("task-prefix", "org/repo", "henchmen/task-prefix", 999)
 
         assert result["status"] == "escalated"
+        assert result["task_id"] == "full-task-id"
         assert "max retries" in result["reason"]
         agent.tracker.record_ci_result.assert_called_once_with("full-task-id", False)
+        # A permanently red PR must show up as an escalation, not just ci_passed=False.
+        agent.tracker.mark_escalated.assert_awaited_once()
+        assert agent.tracker.mark_escalated.await_args.args[0] == "full-task-id"
 
     @pytest.mark.asyncio
     async def test_skips_if_fix_in_progress(self, mock_settings):

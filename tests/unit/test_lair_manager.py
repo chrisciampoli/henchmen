@@ -243,6 +243,11 @@ class TestCreateLair:
 
 
 class TestWaitForCompletion:
+    @pytest.fixture(autouse=True)
+    def _no_report_grace(self, monkeypatch):
+        """Skip the post-finish Pub/Sub grace period so fallback paths run instantly."""
+        monkeypatch.setattr("henchmen.mastermind.lair_manager._REPORT_GRACE_SECONDS", 0)
+
     @pytest.mark.asyncio
     async def test_stale_stored_report_is_not_consumed(self):
         """A report from a previous execution must not satisfy this wait."""
@@ -285,6 +290,52 @@ class TestWaitForCompletion:
 
         assert report.status is OperativeStatus.FAILED
         assert report.confidence_score == 0.0
+
+    @pytest.mark.asyncio
+    async def test_interrupted_report_persisted_by_operative_is_used(self):
+        """A SIGTERM'd operative's partial report beats a fabricated FAILED one."""
+        orch = _orchestrator(JobStatus.FAILED)
+        store = _store()
+        lm = LairManager(_settings(), container_orchestrator=orch, document_store=store)
+        lair_id = await lm.create_lair(_task(), _node())
+        interrupted = _report(status=OperativeStatus.INTERRUPTED, total_input_tokens=1234)
+
+        async def _get(collection: str, doc_id: str):
+            if collection == "task_executions":
+                return {
+                    "interrupted_node_id": "implement_fix",
+                    "interrupted_report": interrupted.model_dump(mode="json"),
+                }
+            return None
+
+        store.get = AsyncMock(side_effect=_get)
+
+        report = await lm.wait_for_completion(lair_id, poll_interval=0)
+
+        assert report.status is OperativeStatus.INTERRUPTED
+        assert report.total_input_tokens == 1234
+        store.update.assert_awaited_with(
+            "task_executions", _task().id, {"interrupted_node_id": None, "interrupted_report": None}
+        )
+
+    @pytest.mark.asyncio
+    async def test_interrupted_report_for_another_node_is_ignored(self):
+        orch = _orchestrator(JobStatus.FAILED)
+        store = _store()
+        lm = LairManager(_settings(), container_orchestrator=orch, document_store=store)
+        lair_id = await lm.create_lair(_task(), _node())
+        other = _report(node_id="fix_tests", status=OperativeStatus.INTERRUPTED)
+
+        async def _get(collection: str, doc_id: str):
+            if collection == "task_executions":
+                return {"interrupted_node_id": "fix_tests", "interrupted_report": other.model_dump(mode="json")}
+            return None
+
+        store.get = AsyncMock(side_effect=_get)
+
+        report = await lm.wait_for_completion(lair_id, poll_interval=0)
+
+        assert report.status is OperativeStatus.FAILED
 
     @pytest.mark.asyncio
     async def test_timed_out_job_maps_to_timed_out(self):

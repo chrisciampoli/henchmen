@@ -5,6 +5,9 @@ from collections import defaultdict, deque
 from henchmen.models.llm import ModelTier
 from henchmen.models.scheme import NodeType, SchemeDefinition, SchemeEdge, SchemeNode
 
+# Scheme nodes name a tier, never a concrete model (CLAUDE.md: Model Tiering).
+_MODEL_TIERS: frozenset[str] = frozenset(tier.value for tier in ModelTier)
+
 
 class SchemeGraph:
     """Wraps a SchemeDefinition with DAG operations."""
@@ -49,6 +52,14 @@ class SchemeGraph:
                     errors.append(
                         f"Agentic node '{node.id}' has no model_name "
                         f"(expected a model tier such as '{ModelTier.COMPLEX.value}')"
+                    )
+                elif node.model_name not in _MODEL_TIERS:
+                    # A typo ("default/complx") or a concrete vendor id would
+                    # otherwise pass registration and only fail after a Lair
+                    # was provisioned — or silently pin one provider's model.
+                    errors.append(
+                        f"Agentic node '{node.id}' has model_name '{node.model_name}', which is not a model "
+                        f"tier (expected one of {sorted(_MODEL_TIERS)})"
                     )
             else:
                 if node.model_name is not None:

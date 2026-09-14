@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 from henchmen.mastermind.lair_manager import LairManager
 from henchmen.models.dossier import Dossier
 from henchmen.models.llm import ModelTier
-from henchmen.models.operative import OperativeStatus
+from henchmen.models.operative import OperativeReport, OperativeStatus
 from henchmen.models.scheme import NodeType, SchemeNode
 from henchmen.models.task import HenchmenTask
 from henchmen.schemes.base import SchemeGraph
@@ -28,6 +28,11 @@ _FIX_NODES = frozenset({"fix_lint", "fix_tests"})
 
 # Cap on the error text spliced into the fix node's task description.
 _MAX_ERROR_CONTEXT_CHARS = 4_000
+
+# How many times an INTERRUPTED operative is re-dispatched before its node
+# fails. Interruption is external (SIGTERM), so one retry is worthwhile; more
+# would mask a lair that is being killed every time.
+_MAX_INTERRUPTED_REDISPATCHES = 1
 
 
 def validate_deterministic_handlers(scheme_graph: SchemeGraph) -> list[str]:
@@ -265,6 +270,37 @@ class SchemeExecutor:
         )
         return enriched
 
+    async def _dispatch_to_lair(
+        self, enriched_task: HenchmenTask, node: SchemeNode, task: HenchmenTask, dossier: Dossier
+    ) -> tuple[str, OperativeReport]:
+        """Provision one Lair for *node*, wait for its report and record it."""
+        lair_id = await self.lair_manager.create_lair(
+            enriched_task, node, scheme_id=self.scheme_graph.definition.id, dossier=dossier
+        )
+        logger.info("[SCHEME] Lair %s created, waiting for completion...", lair_id)
+
+        # Run heartbeat concurrently with wait_for_completion
+        heartbeat_task: asyncio.Task[None] | None = None
+        try:
+            heartbeat_task = asyncio.create_task(
+                self._heartbeat_during_wait(task.id),
+                name=f"executor-heartbeat-{task.id[:8]}",
+            )
+            report = await self.lair_manager.wait_for_completion(lair_id)
+        finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
+        logger.info("[SCHEME] Lair %s completed with status: %s", lair_id, report.status)
+
+        if self.tracker:
+            await self.tracker.record_node_result(task.id, node.id, report)
+
+        # Post-operative evaluation (feature-flagged)
+        await self._maybe_evaluate(task, node, report)
+        return lair_id, report
+
     async def _execute_agentic(self, node: SchemeNode, task: HenchmenTask, dossier: Dossier) -> dict[str, Any]:
         """Execute an agentic node by provisioning a Lair and running an Operative.
 
@@ -305,31 +341,20 @@ class SchemeExecutor:
         logger.info("[SCHEME] Dispatching agentic node '%s' to Lair for task %s", node.id, task.id)
 
         try:
-            lair_id = await self.lair_manager.create_lair(
-                enriched_task, node, scheme_id=self.scheme_graph.definition.id, dossier=dossier
-            )
-            logger.info("[SCHEME] Lair %s created, waiting for completion...", lair_id)
-
-            # Run heartbeat concurrently with wait_for_completion
-            heartbeat_task: asyncio.Task[None] | None = None
-            try:
-                heartbeat_task = asyncio.create_task(
-                    self._heartbeat_during_wait(task.id),
-                    name=f"executor-heartbeat-{task.id[:8]}",
+            lair_id, report = await self._dispatch_to_lair(enriched_task, node, task, dossier)
+            # An INTERRUPTED operative (SIGTERM: instance eviction, platform
+            # shutdown) was stopped from outside, not by its own failure, so it
+            # gets a bounded re-dispatch before the node is failed.
+            redispatches = 0
+            while report.status == OperativeStatus.INTERRUPTED and redispatches < _MAX_INTERRUPTED_REDISPATCHES:
+                redispatches += 1
+                logger.warning(
+                    "[SCHEME] Node %s was interrupted — re-dispatching (%d/%d)",
+                    node.id,
+                    redispatches,
+                    _MAX_INTERRUPTED_REDISPATCHES,
                 )
-                report = await self.lair_manager.wait_for_completion(lair_id)
-            finally:
-                if heartbeat_task is not None:
-                    heartbeat_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await heartbeat_task
-            logger.info("[SCHEME] Lair %s completed with status: %s", lair_id, report.status)
-
-            if self.tracker:
-                await self.tracker.record_node_result(task.id, node.id, report)
-
-            # Post-operative evaluation (feature-flagged)
-            await self._maybe_evaluate(task, node, report)
+                lair_id, report = await self._dispatch_to_lair(enriched_task, node, task, dossier)
 
             if report.status == OperativeStatus.COMPLETED:
                 return {"condition": "pass", "report": report.model_dump(), "lair_id": lair_id}
