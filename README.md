@@ -107,8 +107,12 @@ containers. Configure `.env.local` first — `henchmen init` is the easy way.
 
 ### Local image (preview)
 
-The all-in-one image the upcoming Henchmen Desktop app runs. It starts in
-setup mode with an empty data volume:
+The all-in-one image the upcoming Henchmen Desktop app runs. This Phase 1
+preview starts the image in setup mode and demonstrates the secured Console —
+the sign-in link, status and guide-progress endpoints — but the guided setup
+screens that complete it ship in the next release, so there is currently no
+way to finish setup or run a task from this image. For a working local run
+today, use the [CLI](#cli) or [Docker Compose](#docker-compose) above instead.
 
 ```bash
 docker network create henchmen
@@ -118,16 +122,16 @@ docker run -d --name henchmen --network henchmen --restart unless-stopped \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e HENCHMEN_LOCAL_DOCKER_NETWORK=henchmen \
   -e HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8000 \
+  -e HENCHMEN_OPERATIVE_IMAGE=ghcr.io/chrisciampoli/henchmen/operative:latest \
   ghcr.io/chrisciampoli/henchmen/local:latest
-docker logs henchmen | grep "Open Henchmen"
+docker logs -f henchmen
 ```
 
-Open the printed link. Until the guided setup ships, write
-`henchmen.env` into the volume with `docker exec -it henchmen henchmen init`.
+Look for the line starting `Open Henchmen setup:` and open it.
 
 ### Prebuilt images
 
-Each release publishes `ghcr.io/chrisciampoli/henchmen/{dispatch,mastermind,forge,operative}`
+Each release publishes `ghcr.io/chrisciampoli/henchmen/{dispatch,mastermind,forge,operative,local}`
 tagged `X.Y.Z` and `latest`. See
 [Prebuilt images](docs/deploy-gcp.md#prebuilt-images) for pulling them and
 copying them into Artifact Registry for Cloud Run.
