@@ -33,7 +33,8 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "httpx",
-    "PyGithub",
+    # <3: a major release may change the Auth/Github constructor API we use.
+    "PyGithub>=2.4.0,<3",
 ]
 
 [project.urls]

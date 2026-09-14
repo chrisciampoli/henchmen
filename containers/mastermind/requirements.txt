@@ -12,7 +12,7 @@ google-cloud-run>=0.10.12
 google-cloud-aiplatform>=1.88.0,<2
 vertexai>=1.43.0,<2
 httpx>=0.27.2
-PyGithub>=2.4.0
+PyGithub>=2.4.0,<3
 slack-sdk>=3.33.1
 # In gcp/aws mode the scheme executor's run_lint / run_tests nodes shell out to
 # the detected stack's commands on this host (handlers._run_on_host). For a
