@@ -22,6 +22,8 @@ from henchmen.config.settings import Settings, get_settings
 from henchmen.dispatch.idempotency import TTLSet
 from henchmen.dispatch.normalizer import TaskNormalizer
 from henchmen.models.task import HenchmenTask
+from henchmen.providers.interfaces.message_broker import MessageBroker
+from henchmen.utils.redaction import install_secret_redaction
 
 if TYPE_CHECKING:
     from slack_bolt import App
@@ -59,8 +61,28 @@ def _bot_user_id(client: Any, cache: dict[str, str]) -> str:
     return cache["user_id"]
 
 
-def create_slack_app(settings: Settings | None = None) -> App:
-    """Create and configure the Slack Bolt app."""
+def _new_broker(settings: Settings) -> MessageBroker:
+    """Build the one message broker a standalone bot process owns."""
+    from henchmen.providers.registry import ProviderRegistry
+
+    return ProviderRegistry(settings).get_message_broker()
+
+
+async def _close_broker(broker: MessageBroker) -> None:
+    """Release a broker's clients (e.g. the Pub/Sub publisher), if it has any to release."""
+    aclose = getattr(broker, "aclose", None)
+    if aclose is not None:
+        await aclose()
+
+
+def create_slack_app(settings: Settings | None = None, broker: MessageBroker | None = None) -> App:
+    """Create and configure the Slack Bolt app.
+
+    Every mention publishes through *broker*: inside Dispatch that is the
+    service's own ``app.state.message_broker``. Without one (a bare call) a
+    single broker is built for this app, never one per message — a fresh GCP
+    PublisherClient per mention is expensive and leaks gRPC channels.
+    """
     from slack_bolt import App
 
     settings = settings or get_settings()
@@ -69,11 +91,7 @@ def create_slack_app(settings: Settings | None = None) -> App:
         signing_secret=settings.slack_signing_secret,
     )
 
-    # One broker per app instead of one per message (a fresh GCP
-    # PublisherClient per mention is expensive and leaks gRPC channels).
-    from henchmen.providers.registry import ProviderRegistry
-
-    broker = ProviderRegistry(settings).get_message_broker()
+    shared_broker = broker if broker is not None else _new_broker(settings)
     identity: dict[str, str] = {}
 
     @app.event("app_mention")
@@ -119,7 +137,7 @@ def create_slack_app(settings: Settings | None = None) -> App:
         # Normalize and publish
         task = normalizer.from_slack(payload, runtime_settings)
         # Synchronous publish (we're in a sync handler on a Bolt worker thread)
-        msg_id = _sync_publish(task, runtime_settings, broker=broker, dedup_key=dedup_key or None)
+        msg_id = _sync_publish(task, runtime_settings, broker=shared_broker, dedup_key=dedup_key or None)
 
         # Reply in thread
         say(
@@ -139,7 +157,7 @@ def create_slack_app(settings: Settings | None = None) -> App:
 def _sync_publish(
     task: HenchmenTask,
     settings: Settings,
-    broker: Any | None = None,
+    broker: MessageBroker,
     dedup_key: str | None = None,
 ) -> str:
     """Synchronously publish a task via the configured MessageBroker.
@@ -174,12 +192,13 @@ def _join_notification_channel(app: App, channel: str) -> None:
             logger.warning("Could not join Slack channel %s: %s", channel, exc)
 
 
-def start_socket_mode(settings: Settings) -> SocketModeHandler | None:
+def start_socket_mode(settings: Settings, broker: MessageBroker | None = None) -> SocketModeHandler | None:
     """Connect the Slack Socket Mode client in the background.
 
     Returns ``None`` (after one explanatory log line) when Slack is not
     configured, so the Dispatch HTTP service starts regardless. The returned
-    handler must be closed on shutdown.
+    handler must be closed on shutdown. Dispatch passes its own *broker* so the
+    bot and the HTTP intake share one publisher.
     """
     if not settings.slack_bot_token or not settings.slack_app_token:
         logger.info(
@@ -190,7 +209,7 @@ def start_socket_mode(settings: Settings) -> SocketModeHandler | None:
     try:
         from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-        slack_app = create_slack_app(settings)
+        slack_app = create_slack_app(settings, broker=broker)
         handler = SocketModeHandler(slack_app, settings.slack_app_token)
         handler.connect()  # type: ignore[no-untyped-call]
     except Exception:
@@ -206,6 +225,9 @@ def main() -> None:
     """Start the Slack bot in Socket Mode as a standalone process."""
     import sys
 
+    # Slack payloads and tokens pass through this process's logs; redact
+    # token-shaped secrets before anything is logged.
+    install_secret_redaction()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -219,10 +241,11 @@ def main() -> None:
         logger.error("HENCHMEN_SLACK_APP_TOKEN and HENCHMEN_SLACK_BOT_TOKEN must both be set")
         sys.exit(1)
 
+    broker = _new_broker(settings)
     try:
         from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-        slack_app = create_slack_app(settings)
+        slack_app = create_slack_app(settings, broker=broker)
         handler = SocketModeHandler(slack_app, settings.slack_app_token)
         _join_notification_channel(slack_app, settings.slack_notification_channel)
         logger.info("Starting Henchmen Slack bot in Socket Mode...")
@@ -230,6 +253,8 @@ def main() -> None:
     except Exception:
         logger.exception("FATAL: Slack bot crashed")
         raise
+    finally:
+        asyncio.run(_close_broker(broker))
 
 
 if __name__ == "__main__":

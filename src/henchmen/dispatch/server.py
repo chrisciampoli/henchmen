@@ -23,8 +23,13 @@ from henchmen.dispatch.handlers.slack import handle_slack_event
 from henchmen.dispatch.idempotency import TTLSet
 from henchmen.dispatch.normalizer import TaskNormalizer
 from henchmen.providers.registry import ProviderRegistry
+from henchmen.utils.redaction import install_secret_redaction
 
 logger = logging.getLogger(__name__)
+
+# Redact token-shaped secrets in every log record this process emits: intake
+# payloads (Slack events, webhook bodies) can carry them.
+install_secret_redaction()
 
 # ---------------------------------------------------------------------------
 # Rate limiting middleware
@@ -317,12 +322,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             settings.environment.value,
         )
 
-    registry = ProviderRegistry(settings)
-    app.state.message_broker = registry.get_message_broker()
+    # One broker for the whole process: every intake route and the Slack bot
+    # publish through it. A broker injected on app.state beforehand belongs to
+    # whoever injected it; one created here is closed and dropped on shutdown.
+    owns_broker = getattr(app.state, "message_broker", None) is None
+    if owns_broker:
+        app.state.message_broker = ProviderRegistry(settings).get_message_broker()
 
     from henchmen.dispatch.slack_bot import start_socket_mode
 
-    app.state.slack_socket_handler = start_socket_mode(settings)
+    app.state.slack_socket_handler = start_socket_mode(settings, broker=app.state.message_broker)
 
     logger.info("[dispatch] Service started")
     yield
@@ -334,6 +343,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.warning("[dispatch] Slack Socket Mode handler did not close cleanly", exc_info=True)
     shutdown_tracing()
     logger.info("[dispatch] Shutting down")
+    if owns_broker:
+        await _close_broker(app)
+
+
+async def _close_broker(app: FastAPI) -> None:
+    """Release the lifespan's broker (e.g. its Pub/Sub publisher) and drop it from ``app.state``."""
+    broker = getattr(app.state, "message_broker", None)
+    app.state.message_broker = None
+    aclose = getattr(broker, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception as exc:
+        logger.warning("[dispatch] Failed to close message broker: %s", exc)
 
 
 app = FastAPI(title="Henchmen Dispatch", description="Task intake router", lifespan=lifespan)

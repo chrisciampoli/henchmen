@@ -273,7 +273,7 @@ class TaskNormalizer:
         self,
         task: HenchmenTask,
         settings: Settings,
-        broker: MessageBroker | None = None,
+        broker: MessageBroker,
         dedup_key: str | None = None,
     ) -> str:
         """Publish normalized task to Pub/Sub task-intake topic. Returns message ID.
@@ -282,11 +282,11 @@ class TaskNormalizer:
         delivery, e.g. ``github:<X-GitHub-Delivery>``), it is attached as a
         message attribute so Mastermind's application-level dedup rejects
         replays even though each redelivery produces a fresh task id.
-        """
-        if broker is None:
-            from henchmen.providers.registry import ProviderRegistry
 
-            broker = ProviderRegistry(settings).get_message_broker()
+        *broker* is the caller's long-lived broker (``app.state.message_broker``
+        in the Dispatch service): building one per task would open a fresh
+        Pub/Sub publisher client, gRPC channel and batch thread every time.
+        """
         data = task.model_dump_json().encode("utf-8")
         attributes: dict[str, str] = {"task_id": task.id}
         if dedup_key:

@@ -628,7 +628,23 @@ class TestSharedBroker:
         registry_cls.return_value.get_message_broker.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_lifespan_reuses_and_closes_the_broker(self, forge_settings, forge_app):
+    async def test_lifespan_closes_the_broker_it_created(self, forge_settings, forge_app):
+        from henchmen.forge.server import lifespan
+
+        del app.state.message_broker
+        created = _mock_broker()
+        created.aclose = AsyncMock()
+        with patch("henchmen.providers.registry.ProviderRegistry") as registry_cls:
+            registry_cls.return_value.get_message_broker.return_value = created
+            async with lifespan(app):
+                assert app.state.message_broker is created
+
+        created.aclose.assert_awaited_once()
+        # A later lifespan must not reuse the closed broker.
+        assert app.state.message_broker is None
+
+    @pytest.mark.asyncio
+    async def test_lifespan_leaves_an_injected_broker_to_its_owner(self, forge_settings, forge_app):
         from henchmen.forge.server import lifespan
 
         broker, _store = forge_app
@@ -638,7 +654,7 @@ class TestSharedBroker:
                 assert app.state.message_broker is broker
             registry_cls.return_value.get_message_broker.assert_not_called()
 
-        broker.aclose.assert_awaited_once()
+        broker.aclose.assert_not_awaited()
 
 
 def test_importing_forge_server_installs_secret_redaction():

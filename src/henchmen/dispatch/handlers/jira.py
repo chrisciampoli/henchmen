@@ -42,7 +42,7 @@ async def handle_jira_webhook(
     payload: dict[str, Any],
     normalizer: TaskNormalizer,
     settings: Settings,
-    broker: MessageBroker | None = None,
+    broker: MessageBroker,
     dedup_key: str | None = None,
 ) -> dict[str, Any]:
     """Process Jira webhook (issue transition to 'Ready for Henchmen').

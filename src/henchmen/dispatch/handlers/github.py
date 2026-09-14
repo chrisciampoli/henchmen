@@ -63,7 +63,7 @@ async def handle_github_webhook(
     payload: dict[str, Any],
     normalizer: TaskNormalizer,
     settings: "Settings",
-    broker: MessageBroker | None = None,
+    broker: MessageBroker,
     dedup_key: str | None = None,
 ) -> dict[str, Any]:
     """Process GitHub webhook events.
@@ -120,7 +120,7 @@ def _is_ci_failure_on_henchmen_branch(payload: dict[str, Any]) -> bool:
 async def handle_ci_failure_webhook(
     payload: dict[str, Any],
     settings: "Settings",
-    broker: MessageBroker | None = None,
+    broker: MessageBroker,
 ) -> dict[str, Any]:
     """Handle a GitHub check_suite failure event on a Henchmen branch."""
     suite = payload.get("check_suite", {})
@@ -130,11 +130,6 @@ async def handle_ci_failure_webhook(
     head_sha = suite.get("head_sha", "")
     conclusion = suite.get("conclusion") or ""
     task_id_prefix = branch.replace("henchmen/", "", 1)
-
-    if broker is None:
-        from henchmen.providers.registry import ProviderRegistry
-
-        broker = ProviderRegistry(settings).get_message_broker()
 
     data = json.dumps(
         {
@@ -160,7 +155,7 @@ async def handle_ci_failure_webhook(
 async def handle_push_embed(
     payload: dict[str, Any],
     settings: "Settings",
-    broker: MessageBroker | None = None,
+    broker: MessageBroker,
 ) -> dict[str, Any]:
     """Handle a GitHub push event by requesting an embedding update.
 
@@ -171,11 +166,6 @@ async def handle_push_embed(
     """
     repo = payload.get("repository", {}).get("full_name", "")
     commit_sha = payload.get("after", "")
-
-    if broker is None:
-        from henchmen.providers.registry import ProviderRegistry
-
-        broker = ProviderRegistry(settings).get_message_broker()
 
     data = json.dumps(
         {

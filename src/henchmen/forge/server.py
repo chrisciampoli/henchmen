@@ -70,6 +70,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     instrument_fastapi(app)
 
     registry = ProviderRegistry(settings)
+    # A broker injected on app.state beforehand belongs to whoever injected it;
+    # one created here is closed and dropped on shutdown.
+    owns_broker = getattr(app.state, "message_broker", None) is None
     _get_broker()
     app.state.ci_provider = registry.get_ci_provider()
     app.state.document_store = registry.get_document_store()
@@ -78,7 +81,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
     shutdown_tracing()
     logger.info("[forge] Shutting down")
-    await _close_broker()
+    if owns_broker:
+        await _close_broker()
 
 
 app = FastAPI(title="Henchmen Forge", description="CI/merge pipeline", lifespan=lifespan)
@@ -177,8 +181,9 @@ def _get_broker() -> Any:
 
 
 async def _close_broker() -> None:
-    """Release the shared broker's resources (e.g. the Pub/Sub publisher) on shutdown."""
+    """Release the lifespan's broker (e.g. its Pub/Sub publisher) and drop it from ``app.state``."""
     broker = getattr(app.state, "message_broker", None)
+    app.state.message_broker = None
     aclose = getattr(broker, "aclose", None)
     if aclose is None:
         return

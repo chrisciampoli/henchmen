@@ -27,7 +27,7 @@ async def handle_cli_request(
     data: CreateTaskRequest,
     normalizer: TaskNormalizer,
     settings: "Settings",
-    broker: MessageBroker | None = None,
+    broker: MessageBroker,
 ) -> dict[str, Any]:
     """Process a CLI task creation request."""
     task = normalizer.from_cli(data.model_dump(), settings)

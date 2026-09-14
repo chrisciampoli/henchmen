@@ -298,6 +298,7 @@ class TestCliHandler:
                 CreateTaskRequest(title="Do something", repo="acme/api"),
                 normalizer,
                 settings,
+                broker=AsyncMock(),
             )
 
         assert result["status"] == "dispatched"
@@ -312,7 +313,9 @@ class TestCliHandler:
         settings = _mock_settings()
 
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="x")):
-            result = await handle_cli_request(CreateTaskRequest(title="T", repo="acme/api"), normalizer, settings)
+            result = await handle_cli_request(
+                CreateTaskRequest(title="T", repo="acme/api"), normalizer, settings, broker=AsyncMock()
+            )
 
         assert len(result["task_id"]) == 36
 
@@ -341,7 +344,7 @@ class TestSlackHandler:
         }
 
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="msg-slack-1")):
-            result = await handle_slack_event(payload, normalizer, settings)
+            result = await handle_slack_event(payload, normalizer, settings, broker=AsyncMock())
 
         assert result["status"] == "dispatched"
         assert result["message_id"] == "msg-slack-1"
@@ -361,7 +364,7 @@ class TestSlackHandler:
             }
         }
 
-        result = await handle_slack_event(payload, normalizer, settings)
+        result = await handle_slack_event(payload, normalizer, settings, broker=AsyncMock())
         assert result["status"] == "ignored"
 
     @pytest.mark.asyncio
@@ -382,7 +385,7 @@ class TestSlackHandler:
         }
 
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="msg-2")):
-            result = await handle_slack_event(payload, normalizer, settings)
+            result = await handle_slack_event(payload, normalizer, settings, broker=AsyncMock())
 
         assert result["status"] == "dispatched"
 
@@ -415,7 +418,7 @@ class TestGithubHandler:
         }
 
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="msg-gh-1")):
-            result = await handle_github_webhook(payload, normalizer, settings)
+            result = await handle_github_webhook(payload, normalizer, settings, broker=AsyncMock())
 
         assert result["status"] == "dispatched"
         assert result["trigger"] == "issue_labeled"
@@ -447,7 +450,7 @@ class TestGithubHandler:
         }
 
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="msg-gh-2")):
-            result = await handle_github_webhook(payload, normalizer, settings)
+            result = await handle_github_webhook(payload, normalizer, settings, broker=AsyncMock())
 
         assert result["status"] == "dispatched"
         assert result["trigger"] == "pr_comment"
@@ -472,7 +475,7 @@ class TestGithubHandler:
             "repository": {"full_name": "acme/api", "default_branch": "main"},
         }
 
-        result = await handle_github_webhook(payload, normalizer, settings)
+        result = await handle_github_webhook(payload, normalizer, settings, broker=AsyncMock())
         assert result["status"] == "ignored"
 
 
@@ -981,7 +984,9 @@ class TestGithubTriggerFilters:
 
         normalizer = TaskNormalizer()
         with patch.object(normalizer, "publish_task", new=AsyncMock()) as publish:
-            result = await handle_github_webhook(_pr_comment(action="edited"), normalizer, _mock_settings())
+            result = await handle_github_webhook(
+                _pr_comment(action="edited"), normalizer, _mock_settings(), broker=AsyncMock()
+            )
         assert result["status"] == "ignored"
         publish.assert_not_awaited()
 
@@ -990,7 +995,9 @@ class TestGithubTriggerFilters:
         from henchmen.dispatch.handlers.github import handle_github_webhook
 
         normalizer = TaskNormalizer()
-        result = await handle_github_webhook(_pr_comment(action="deleted"), normalizer, _mock_settings())
+        result = await handle_github_webhook(
+            _pr_comment(action="deleted"), normalizer, _mock_settings(), broker=AsyncMock()
+        )
         assert result["status"] == "ignored"
 
     @pytest.mark.asyncio
@@ -999,7 +1006,9 @@ class TestGithubTriggerFilters:
 
         normalizer = TaskNormalizer()
         with patch.object(normalizer, "publish_task", new=AsyncMock()) as publish:
-            result = await handle_github_webhook(_pr_comment(association="NONE"), normalizer, _mock_settings())
+            result = await handle_github_webhook(
+                _pr_comment(association="NONE"), normalizer, _mock_settings(), broker=AsyncMock()
+            )
         assert result == {"status": "ignored", "reason": "unauthorized commenter"}
         publish.assert_not_awaited()
 
@@ -1011,7 +1020,7 @@ class TestGithubTriggerFilters:
         payload = _pr_comment()
         del payload["comment"]["author_association"]
         normalizer = TaskNormalizer()
-        result = await handle_github_webhook(payload, normalizer, _mock_settings())
+        result = await handle_github_webhook(payload, normalizer, _mock_settings(), broker=AsyncMock())
         assert result["status"] == "ignored"
 
     @pytest.mark.asyncio
@@ -1038,7 +1047,7 @@ class TestGithubTriggerFilters:
         }
         normalizer = TaskNormalizer()
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="m")):
-            result = await handle_github_webhook(payload, normalizer, _mock_settings())
+            result = await handle_github_webhook(payload, normalizer, _mock_settings(), broker=AsyncMock())
         assert result["status"] == "dispatched"
         assert result["trigger"] == "pr_comment"
 
@@ -1103,7 +1112,7 @@ class TestJiraTransitionDetection:
         }
         normalizer = TaskNormalizer()
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="m")):
-            result = await handle_jira_webhook(payload, normalizer, _mock_settings())
+            result = await handle_jira_webhook(payload, normalizer, _mock_settings(), broker=AsyncMock())
         assert result["status"] == "dispatched"
 
     @pytest.mark.asyncio
@@ -1115,7 +1124,7 @@ class TestJiraTransitionDetection:
             "changelog": {"items": [{"field": "assignee", "toString": "someone"}]},
             "issue": {"key": "PROJ-9", "fields": {"summary": "Do it"}},
         }
-        result = await handle_jira_webhook(payload, TaskNormalizer(), _mock_settings())
+        result = await handle_jira_webhook(payload, TaskNormalizer(), _mock_settings(), broker=AsyncMock())
         assert result["status"] == "ignored"
 
     @pytest.mark.asyncio
@@ -1128,7 +1137,7 @@ class TestJiraTransitionDetection:
         }
         normalizer = TaskNormalizer()
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="m")):
-            result = await handle_jira_webhook(payload, normalizer, _mock_settings())
+            result = await handle_jira_webhook(payload, normalizer, _mock_settings(), broker=AsyncMock())
         assert result["status"] == "dispatched"
 
 
@@ -1154,7 +1163,7 @@ class TestSlackMentionDetection:
         }
         normalizer = TaskNormalizer()
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="m")):
-            result = await handle_slack_event(payload, normalizer, _mock_settings())
+            result = await handle_slack_event(payload, normalizer, _mock_settings(), broker=AsyncMock())
         assert result["status"] == "dispatched"
 
     @pytest.mark.asyncio
@@ -1165,7 +1174,7 @@ class TestSlackMentionDetection:
             "authorizations": [{"user_id": "U0BOT123"}],
             "event": {"type": "message", "user": "U1", "text": "<@U9999999> ping"},
         }
-        result = await handle_slack_event(payload, TaskNormalizer(), _mock_settings())
+        result = await handle_slack_event(payload, TaskNormalizer(), _mock_settings(), broker=AsyncMock())
         assert result["status"] == "ignored"
 
 
@@ -1845,6 +1854,26 @@ class TestTTLSet:
         for i in range(50):
             guard.add_if_absent(f"k{i}")
         assert len(guard._seen) <= 5
+
+
+def test_importing_dispatch_server_installs_secret_redaction():
+    """Dispatch logs intake payloads; token-shaped strings must be redacted in this process.
+
+    Runs in a fresh interpreter: another test module importing Mastermind would
+    already have installed the factory in this one.
+    """
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import logging, henchmen.dispatch.server\n"
+        "from henchmen.utils.redaction import _redacting_factory\n"
+        "assert logging.getLogRecordFactory() is _redacting_factory\n"
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), "HENCHMEN_PROVIDER": "local"}
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
 
 
 # ---------------------------------------------------------------------------
