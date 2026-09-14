@@ -16,11 +16,12 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    # Only 3.12 is exercised: CI pins python-version 3.12, mypy
-    # python_version = "3.12", ruff target-version = "py312", and every
-    # container image is built on python:3.12-slim. Add a classifier here
-    # only together with a CI matrix entry that actually runs it.
+    # Each classifier here has a CI matrix entry that runs it. 3.12 is the
+    # floor (mypy python_version and ruff target-version stay on it so the
+    # code remains 3.12-compatible); 3.14 is what every container image runs.
+    # Add a classifier only together with a matrix entry that exercises it.
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Code Generators",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Typing :: Typed",
