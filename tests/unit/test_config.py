@@ -439,10 +439,6 @@ _FIELDS_AWAITING_A_READER: frozenset[str] = frozenset(
         "vertex_ai_context_cache_enabled",
         "vertex_ai_context_cache_min_tokens",
         "vertex_ai_safety_threshold",
-        # Added ahead of their consumer (Jira handler); the change that wires
-        # each one must also drop its entry here.
-        "jira_repo_field",
-        "jira_branch_field",
     }
 )
 

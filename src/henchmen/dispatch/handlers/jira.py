@@ -55,7 +55,8 @@ async def handle_jira_webhook(
     task = normalizer.from_jira(payload, settings)
     if not task.context.repo:
         logger.warning(
-            "[jira] Issue %s has no repo field and HENCHMEN_GITHUB_DEFAULT_REPO is unset",
+            "[jira] Issue %s has no repo (checked HENCHMEN_JIRA_REPO_FIELD and 'repo') "
+            "and HENCHMEN_GITHUB_DEFAULT_REPO is unset",
             task.source_id,
         )
     msg_id = await normalizer.publish_task(task, settings, broker=broker, dedup_key=dedup_key)

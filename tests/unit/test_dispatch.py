@@ -884,6 +884,38 @@ class TestNormalizerRegressions:
         fallback = n.from_jira({"issue": {"key": "P-2", "fields": {"summary": "S"}}}, settings)
         assert fallback.context.repo == "acme/fallback"
 
+    def test_jira_repo_and_branch_from_configured_custom_field_ids(self, monkeypatch):
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "acme/fallback")
+        monkeypatch.setenv("HENCHMEN_JIRA_REPO_FIELD", "customfield_10042")
+        monkeypatch.setenv("HENCHMEN_JIRA_BRANCH_FIELD", "customfield_10043")
+        settings = _mock_settings()
+        fields = {
+            "summary": "S",
+            "customfield_10042": "acme/api",
+            # A select-list custom field arrives as an option object.
+            "customfield_10043": {"value": "develop", "id": "10001"},
+            # The configured field id wins over the plain name.
+            "repo": "acme/plain",
+        }
+
+        task = TaskNormalizer().from_jira({"issue": {"key": "P-3", "fields": fields}}, settings)
+
+        assert task.context.repo == "acme/api"
+        assert task.context.branch == "develop"
+
+    def test_jira_unconfigured_custom_field_ids_are_not_guessed(self, monkeypatch):
+        """``customfield_repo`` cannot exist in Jira; without a configured id only plain names count."""
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "acme/fallback")
+        monkeypatch.setenv("HENCHMEN_JIRA_REPO_FIELD", "")
+        monkeypatch.setenv("HENCHMEN_JIRA_BRANCH_FIELD", "")
+        settings = _mock_settings()
+        fields = {"summary": "S", "customfield_repo": "acme/impossible", "customfield_branch": "nope"}
+
+        task = TaskNormalizer().from_jira({"issue": {"key": "P-4", "fields": fields}}, settings)
+
+        assert task.context.repo == "acme/fallback"
+        assert task.context.branch is None
+
     def test_issue_comment_on_pr_uses_comment_body_and_pr_source_id(self):
         n = TaskNormalizer()
         payload = {

@@ -19,11 +19,17 @@ from henchmen.providers.interfaces.message_broker import MessageBroker
 _SLACK_MENTION_RE = re.compile(r"<@[A-Z0-9]+(?:\|[^>]*)?>")
 _PLAIN_MENTION_MARKERS = ("<@henchmen>", "@henchmen")
 
-# Jira Cloud keys custom fields as ``customfield_<numeric id>``; a literal
-# ``customfield_repo`` key cannot exist. Accept the plain names an automation
-# rule can set instead, and fall back to the configured default repo.
-_JIRA_REPO_KEYS = ("repo", "customfield_repo")
-_JIRA_BRANCH_KEYS = ("branch", "customfield_branch")
+# Jira Cloud keys custom fields as ``customfield_<numeric id>``, so the field
+# holding the repo/branch is configured by id (HENCHMEN_JIRA_REPO_FIELD /
+# HENCHMEN_JIRA_BRANCH_FIELD). The plain names an Automation web-request body
+# can set are always accepted after it, then the configured default repo.
+_JIRA_REPO_FALLBACK_KEY = "repo"
+_JIRA_BRANCH_FALLBACK_KEY = "branch"
+
+
+def _jira_keys(field_id: str, fallback: str) -> tuple[str, ...]:
+    """The keys to look up for one Jira value: the configured field id first, then *fallback*."""
+    return (field_id, fallback) if field_id else (fallback,)
 
 
 def strip_slack_mentions(text: str) -> str:
@@ -42,11 +48,17 @@ def _resolve_repo(repo: str, settings: Settings | None) -> str:
 
 
 def _first_str(source: dict[str, Any], keys: tuple[str, ...]) -> str:
-    """Return the first non-empty string value among *keys* in *source*."""
+    """Return the first non-empty string value among *keys* in *source*.
+
+    A Jira select-list custom field arrives as an option object
+    (``{"value": "acme/api", "id": "10001"}``); its ``value`` is used.
+    """
     for key in keys:
         value = source.get(key)
-        if isinstance(value, str) and value:
-            return value
+        if isinstance(value, dict):
+            value = value.get("value")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return ""
 
 
@@ -215,8 +227,10 @@ class TaskNormalizer:
         title = fields.get("summary") or f"Jira issue {issue_key}"
         description = fields.get("description") or ""
         created_by = (fields.get("assignee") or fields.get("reporter") or {}).get("emailAddress", "jira")
-        repo = _first_str(fields, _JIRA_REPO_KEYS) or _first_str(payload, _JIRA_REPO_KEYS)
-        branch = _first_str(fields, _JIRA_BRANCH_KEYS) or _first_str(payload, _JIRA_BRANCH_KEYS) or None
+        repo_keys = _jira_keys(settings.jira_repo_field if settings else "", _JIRA_REPO_FALLBACK_KEY)
+        branch_keys = _jira_keys(settings.jira_branch_field if settings else "", _JIRA_BRANCH_FALLBACK_KEY)
+        repo = _first_str(fields, repo_keys) or _first_str(payload, repo_keys)
+        branch = _first_str(fields, branch_keys) or _first_str(payload, branch_keys) or None
 
         issue_fields = {
             "key": issue_key,
