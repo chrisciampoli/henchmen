@@ -49,7 +49,6 @@ _OPERATIVE_ENV_FIELDS: tuple[str, ...] = (
     "vertex_ai_context_cache_enabled",
     "vertex_ai_context_cache_min_tokens",
     "vertex_ai_safety_threshold",
-    "vertex_ai_grounding_enabled",
     "rag_corpus_display_name",
     "rag_corpus_region",
     "rag_embedding_model",
@@ -125,6 +124,10 @@ class Settings(BaseSettings):
     pubsub_topic_dead_letter: str = Field(default="", description="Dead-letter topic drained by the watchdog")
     pubsub_topic_embed_request: str = Field(default="", description="Topic Dispatch publishes re-index requests to")
     pubsub_topic_ci_failure: str = Field(default="", description="Topic Dispatch publishes GitHub CI failures to")
+    dead_letter_subscription: str = Field(
+        default="",
+        description="Subscription the watchdog drains dead letters from; empty means <pubsub_topic_dead_letter>-sub",
+    )
 
     def model_post_init(self, __context: object) -> None:
         """Set environment-prefixed defaults for Pub/Sub topics and validate provider requirements."""
@@ -318,9 +321,6 @@ class Settings(BaseSettings):
     # Vertex AI evaluation
     vertex_ai_evaluation_enabled: bool = Field(default=False, description="Enable post-operative GenAI evaluation")
 
-    # Vertex AI grounding
-    vertex_ai_grounding_enabled: bool = Field(default=True, description="Enable Google Search grounding")
-
     # Vertex AI experiments
     vertex_ai_experiments_enabled: bool = Field(default=False, description="Enable Vertex AI Experiments tracking")
     vertex_ai_experiment_name: str = Field(default="henchmen-operatives", description="Vertex AI experiment name")
@@ -367,16 +367,28 @@ class Settings(BaseSettings):
     aws_ecs_cluster: str = Field(default="henchmen", description="ECS cluster name")
     aws_ecs_subnets: str = Field(default="", description="Comma-separated subnet IDs for ECS tasks")
     aws_ecs_security_groups: str = Field(default="", description="Comma-separated security group IDs")
+    aws_ecs_execution_role_arn: str = Field(
+        default="",
+        description=(
+            "ARN of the ECS task execution role. Required on Fargate: without it the awslogs log driver and "
+            "private image pulls are refused."
+        ),
+    )
 
     # Bedrock model tiers (experimental)
+    # Defaults are US cross-region inference profiles (``us.`` prefix): Bedrock
+    # rejects on-demand invocation of these models by their bare model IDs.
     bedrock_model_complex: str = Field(
-        default="anthropic.claude-sonnet-4-20250514-v1:0", description="Bedrock model ID for the COMPLEX tier"
+        default="us.anthropic.claude-sonnet-4-20250514-v1:0",
+        description="Bedrock model ID or inference profile for the COMPLEX tier",
     )
     bedrock_model_light: str = Field(
-        default="anthropic.claude-haiku-4-5-20251001-v1:0", description="Bedrock model ID for the LIGHT tier"
+        default="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        description="Bedrock model ID or inference profile for the LIGHT tier",
     )
     bedrock_model_reasoning: str = Field(
-        default="anthropic.claude-sonnet-4-20250514-v1:0", description="Bedrock model ID for the REASONING tier"
+        default="us.anthropic.claude-sonnet-4-20250514-v1:0",
+        description="Bedrock model ID or inference profile for the REASONING tier",
     )
 
     # Direct API keys (used when llm_provider=openai or anthropic)
@@ -402,7 +414,54 @@ class Settings(BaseSettings):
         description="Anthropic model used for the REASONING tier",
     )
 
+    # CI (Cloud Build runs the target repository's checks)
+    ci_builder_image: str = Field(
+        default="python:3.12",
+        description="Container image Cloud Build uses to run the target repository's checks",
+    )
+    ci_github_token_secret: str = Field(
+        default="",
+        description=(
+            "Secret Manager secret name the CI build reads the GitHub token from to clone private repos; "
+            "empty clones anonymously"
+        ),
+    )
+
+    # Dossier
+    dossier_semantic_rerank: bool = Field(
+        default=True,
+        description=(
+            "Rerank semantic code-search results with one light-tier LLM call before building the dossier. "
+            "Disable to save that call per task."
+        ),
+    )
+
+    # Forge
+    forge_ci_timeout_seconds: int = Field(
+        default=540,
+        ge=30,
+        le=580,
+        description=(
+            "Total wall-clock budget in seconds for one Forge CI run. Capped below 600 because Pub/Sub redelivers "
+            "a push after its 600s ack deadline, so a run must finish (and ack) before that or it runs twice."
+        ),
+    )
+
+    # Evals
+    eval_db_path: str = Field(
+        default="",
+        description="SQLite file for `henchmen eval` history; empty means ~/.henchmen/eval/results.db",
+    )
+
     # Local single-process mode (`henchmen serve`)
+    local_sqlite_path: str = Field(
+        default="",
+        description="SQLite file for the local DocumentStore; empty means <cwd>/.henchmen/henchmen_<environment>.db",
+    )
+    local_storage_dir: str = Field(
+        default="",
+        description="Directory for the local filesystem ObjectStore; empty means ~/.henchmen/storage",
+    )
     local_serve_port: int = Field(default=8000, description="Port `henchmen serve` listens on")
     local_forward_base_url: str = Field(
         default="",

@@ -321,6 +321,96 @@ class TestJiraFieldIdSettings:
 
 
 # ---------------------------------------------------------------------------
+# Provider, CI, Forge, Dossier, eval and local-mode settings
+# ---------------------------------------------------------------------------
+
+
+def _local_settings(monkeypatch: pytest.MonkeyPatch, **overrides: object) -> Settings:
+    monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+    return Settings(_env_file=None, **overrides)  # type: ignore[call-arg, arg-type]
+
+
+class TestOptionalProviderSettings:
+    @pytest.mark.parametrize(
+        ("field", "default"),
+        [
+            ("ci_builder_image", "python:3.12"),
+            ("ci_github_token_secret", ""),
+            ("local_sqlite_path", ""),
+            ("local_storage_dir", ""),
+            ("dead_letter_subscription", ""),
+            ("aws_ecs_execution_role_arn", ""),
+            ("eval_db_path", ""),
+            ("dossier_semantic_rerank", True),
+            ("forge_ci_timeout_seconds", 540),
+        ],
+    )
+    def test_defaults(self, monkeypatch: pytest.MonkeyPatch, field: str, default: object):
+        assert getattr(_local_settings(monkeypatch), field) == default
+
+    @pytest.mark.parametrize(
+        ("env_name", "field", "raw", "expected"),
+        [
+            ("HENCHMEN_CI_BUILDER_IMAGE", "ci_builder_image", "node:24", "node:24"),
+            ("HENCHMEN_CI_GITHUB_TOKEN_SECRET", "ci_github_token_secret", "github-token", "github-token"),
+            ("HENCHMEN_LOCAL_SQLITE_PATH", "local_sqlite_path", "/tmp/h.db", "/tmp/h.db"),
+            ("HENCHMEN_LOCAL_STORAGE_DIR", "local_storage_dir", "/tmp/store", "/tmp/store"),
+            ("HENCHMEN_DEAD_LETTER_SUBSCRIPTION", "dead_letter_subscription", "dl-sub", "dl-sub"),
+            (
+                "HENCHMEN_AWS_ECS_EXECUTION_ROLE_ARN",
+                "aws_ecs_execution_role_arn",
+                "arn:aws:iam::1:role/exec",
+                "arn:aws:iam::1:role/exec",
+            ),
+            ("HENCHMEN_EVAL_DB_PATH", "eval_db_path", "/tmp/evals.db", "/tmp/evals.db"),
+            ("HENCHMEN_DOSSIER_SEMANTIC_RERANK", "dossier_semantic_rerank", "false", False),
+            ("HENCHMEN_FORGE_CI_TIMEOUT_SECONDS", "forge_ci_timeout_seconds", "300", 300),
+        ],
+    )
+    def test_env_overrides(
+        self, monkeypatch: pytest.MonkeyPatch, env_name: str, field: str, raw: str, expected: object
+    ):
+        monkeypatch.setenv(env_name, raw)
+        assert getattr(_local_settings(monkeypatch), field) == expected
+
+    @pytest.mark.parametrize("value", [29, 581, 600])
+    def test_forge_ci_timeout_must_finish_before_the_pubsub_ack_deadline(
+        self, monkeypatch: pytest.MonkeyPatch, value: int
+    ):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="forge_ci_timeout_seconds"):
+            _local_settings(monkeypatch, forge_ci_timeout_seconds=value)
+
+    @pytest.mark.parametrize("value", [30, 580])
+    def test_forge_ci_timeout_bounds_are_inclusive(self, monkeypatch: pytest.MonkeyPatch, value: int):
+        assert _local_settings(monkeypatch, forge_ci_timeout_seconds=value).forge_ci_timeout_seconds == value
+
+
+class TestBedrockDefaults:
+    def test_tier_defaults_are_us_cross_region_inference_profiles(self, monkeypatch: pytest.MonkeyPatch):
+        settings = _local_settings(monkeypatch)
+        assert settings.bedrock_model_complex == "us.anthropic.claude-sonnet-4-20250514-v1:0"
+        assert settings.bedrock_model_light == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        assert settings.bedrock_model_reasoning == "us.anthropic.claude-sonnet-4-20250514-v1:0"
+
+    def test_inference_profile_defaults_are_priced(self, monkeypatch: pytest.MonkeyPatch):
+        from henchmen.providers.pricing import lookup_price
+
+        settings = _local_settings(monkeypatch)
+        for model in (settings.bedrock_model_complex, settings.bedrock_model_light, settings.bedrock_model_reasoning):
+            assert lookup_price(model) is not None, model
+
+
+class TestRemovedSettings:
+    @pytest.mark.parametrize("field", ["vertex_ai_grounding_enabled"])
+    def test_field_is_gone_and_not_forwarded(self, monkeypatch: pytest.MonkeyPatch, field: str):
+        settings = _local_settings(monkeypatch)
+        assert field not in Settings.model_fields
+        assert f"HENCHMEN_{field.upper()}" not in settings.operative_env()
+
+
+# ---------------------------------------------------------------------------
 # Every Settings field has a reader
 # ---------------------------------------------------------------------------
 
@@ -332,14 +422,17 @@ _FIELDS_AWAITING_A_READER: frozenset[str] = frozenset(
         "vertex_ai_context_cache_enabled",
         "vertex_ai_context_cache_min_tokens",
         "vertex_ai_safety_threshold",
-        "vertex_ai_grounding_enabled",
-        # Added for Dispatch; wired into dispatch/server.py and the Jira
-        # handler in a follow-up change, which must also drop these entries.
+        # Added ahead of their consumers (dispatch rate limiter, Jira handler,
+        # dossier reranker, mastermind dead-letter drain, local SQLite store);
+        # the change that wires each one must also drop its entry here.
         "dispatch_rate_limit_requests",
         "dispatch_rate_limit_window_seconds",
         "dispatch_trust_forwarded_for",
         "jira_repo_field",
         "jira_branch_field",
+        "dossier_semantic_rerank",
+        "dead_letter_subscription",
+        "local_sqlite_path",
     }
 )
 
