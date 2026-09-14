@@ -24,37 +24,6 @@ def _get_jira_client() -> Any:
 
 
 @tool(
-    name="update_issue_status",
-    category="jira",
-    description="Transition a Jira issue to a new status by status name.",
-)
-async def update_issue_status(issue_key: str, status: str) -> dict[str, Any]:
-    """Update a Jira issue's status using an available transition."""
-
-    def _sync() -> dict[str, Any]:
-        client = _get_jira_client()
-        transitions = client.transitions(issue_key)
-        transition_id = None
-        for t in transitions:
-            if t["name"].lower() == status.lower():
-                transition_id = t["id"]
-                break
-        if transition_id is None:
-            available = [t["name"] for t in transitions]
-            return {
-                "error": f"No transition named '{status}' found. Available: {available}",
-                "issue_key": issue_key,
-            }
-        client.transition_issue(issue_key, transition_id)
-        return {"success": True, "issue_key": issue_key, "new_status": status}
-
-    try:
-        return await asyncio.to_thread(_sync)
-    except Exception as exc:
-        return {"error": str(exc)}
-
-
-@tool(
     name="add_comment",
     category="jira",
     description="Add a comment to a Jira issue.",
@@ -76,21 +45,32 @@ async def add_comment(issue_key: str, body: str) -> dict[str, Any]:
 @tool(
     name="transition_issue",
     category="jira",
-    description="Transition a Jira issue using an explicit transition name.",
+    description=(
+        "Move a Jira issue through its workflow. Accepts either the transition name "
+        "(e.g. 'Start Progress') or the destination status name (e.g. 'In Progress'). "
+        "Use to reflect task progress on the originating issue. Do NOT use to edit issue "
+        "fields or to comment -- use add_comment for that."
+    ),
 )
 async def transition_issue(issue_key: str, transition_name: str) -> dict[str, Any]:
-    """Perform a named workflow transition on a Jira issue."""
+    """Perform a workflow transition on a Jira issue, matched by transition or status name.
+
+    A single tool covers both spellings: the previous ``update_issue_status``
+    and ``transition_issue`` implemented identical lookup logic under two names.
+    """
 
     def _sync() -> dict[str, Any]:
         client = _get_jira_client()
         transitions = client.transitions(issue_key)
+        wanted = transition_name.strip().lower()
         transition_id = None
         for t in transitions:
-            if t["name"].lower() == transition_name.lower():
+            to_status = str((t.get("to") or {}).get("name", "")).lower()
+            if str(t.get("name", "")).lower() == wanted or to_status == wanted:
                 transition_id = t["id"]
                 break
         if transition_id is None:
-            available = [t["name"] for t in transitions]
+            available = [t.get("name", "") for t in transitions]
             return {
                 "error": f"Transition '{transition_name}' not found. Available: {available}",
                 "issue_key": issue_key,

@@ -16,8 +16,9 @@ from typing import Any
 import henchmen.schemes.bugfix_standard  # noqa: F401
 import henchmen.schemes.feature_standard  # noqa: F401
 import henchmen.schemes.goal_decomposition  # noqa: F401
-from henchmen.arsenal._workspace import set_workspace_root
-from henchmen.config.settings import Settings, get_settings
+from henchmen.arsenal._repo import normalize_repo_slug
+from henchmen.arsenal._workspace import DEFAULT_WORKSPACE_ROOT, set_workspace_root
+from henchmen.config.settings import Environment, Settings, get_settings
 from henchmen.models.llm import ModelTier
 from henchmen.models.operative import OperativeConfig, OperativeReport, OperativeStatus
 from henchmen.operative.agent_builder import build_operative_agent
@@ -84,13 +85,19 @@ async def _heartbeat_loop(
     watchdog can distinguish a live-but-slow operative from a dead one.
     Any Firestore write failures are swallowed — observability must never
     crash the operative.
+
+    The timestamp is an ISO-8601 UTC string, matching every other timestamp
+    ``TaskTracker`` stores. ``get_stalled_tasks`` range-filters
+    ``last_heartbeat < cutoff.isoformat()``; a native datetime is never matched
+    by a string range on Firestore (so the task could never be found stalled)
+    and raises on the SQLite store.
     """
     while True:
         try:
             await document_store.update(
                 _TASK_EXECUTIONS_COLLECTION,
                 task_id,
-                {"last_heartbeat": datetime.now(UTC)},
+                {"last_heartbeat": datetime.now(UTC).isoformat()},
             )
         except Exception as exc:
             logger.debug("Heartbeat write failed (non-fatal): %s", exc)
@@ -116,7 +123,8 @@ async def _persist_interrupted_report(
             report.task_id,
             {
                 "interrupted_node_id": report.node_id,
-                "interrupted_at": datetime.now(UTC),
+                # ISO string, like every TaskTracker timestamp (see _heartbeat_loop).
+                "interrupted_at": datetime.now(UTC).isoformat(),
                 "interrupted_report": report.model_dump(mode="json"),
                 "execution_state": "interrupted",
             },
@@ -124,6 +132,29 @@ async def _persist_interrupted_report(
         logger.info("Persisted interrupted report for task %s node %s", report.task_id, report.node_id)
     except Exception as exc:
         logger.warning("Failed to persist interrupted report: %s", exc)
+
+
+def _get_document_store(registry: ProviderRegistry, settings: Settings) -> DocumentStore | None:
+    """Build the document store, failing closed outside dev.
+
+    The store carries the heartbeat the Mastermind watchdog relies on and the
+    task-level cost accumulator. Running without it in staging/prod would let
+    a node spend past the task ceiling and look dead to the watchdog, so there
+    the Job fails instead. Dev keeps the warn-and-continue path so a local run
+    without Firestore still works.
+    """
+    try:
+        return registry.get_document_store()
+    except Exception as exc:
+        if settings.environment == Environment.DEV:
+            logger.warning("Document store unavailable (heartbeat/accumulator disabled in dev): %s", exc)
+            return None
+        logger.error(
+            "Document store unavailable in %s — refusing to run without heartbeats and the task cost ceiling: %s",
+            settings.environment.value,
+            exc,
+        )
+        raise RuntimeError(f"Document store unavailable in {settings.environment.value}: {exc}") from exc
 
 
 async def run_operative() -> None:
@@ -140,12 +171,7 @@ async def run_operative() -> None:
     broker = registry.get_message_broker()
     object_store = registry.get_object_store()
     llm_provider = registry.get_llm_provider()
-    document_store: DocumentStore | None
-    try:
-        document_store = registry.get_document_store()
-    except Exception as exc:
-        logger.warning("Document store unavailable (heartbeat/accumulator disabled): %s", exc)
-        document_store = None
+    document_store = _get_document_store(registry, settings)
 
     # 1. Read config from environment. MODEL_NAME may be a tier ("default/complex");
     # resolve it once here so telemetry, the report and the cost gate all carry the
@@ -521,8 +547,8 @@ async def _build_file_context(workspace_dir: str, task_title: str, task_descript
 async def initialize_workspace(
     config: OperativeConfig, settings: Settings, object_store: ObjectStore | None = None
 ) -> str:
-    """Clone repo (or restore from GCS cache), checkout branch, download dossier."""
-    workspace = f"/workspace/{config.task_id}"
+    """Clone the repo, create the task branch, install dependencies, download the dossier."""
+    workspace = f"{DEFAULT_WORKSPACE_ROOT}/{config.task_id}"
     os.makedirs(workspace, exist_ok=True)
 
     # Arsenal resolves every tool path against WORKSPACE_DIR. Without this the
@@ -534,23 +560,16 @@ async def initialize_workspace(
     repo_url = os.environ.get("REPO_URL", "")
     branch = os.environ.get("BRANCH", "") or DEFAULT_BASE_BRANCH
 
-    # Try snapshot cache first
-    from henchmen.dossier.cache import SnapshotCache
-
-    cache = SnapshotCache(settings)
-    snapshot_uri = await cache.get_snapshot(repo_url, branch)
-    if snapshot_uri:
-        logger.info("Restoring workspace from snapshot cache: %s", snapshot_uri)
-        await cache.restore_snapshot(snapshot_uri, workspace)
-    elif repo_url:
-        # Normalize repo_url to "owner/repo" form expected by clone_repo.
-        github_token = os.environ.get("GITHUB_TOKEN", "")
-        if repo_url.startswith("https://github.com/"):
-            repo_slug = repo_url[len("https://github.com/") :]
-            if repo_slug.endswith(".git"):
-                repo_slug = repo_slug[: -len(".git")]
-        else:
-            repo_slug = repo_url
+    # Always clone. The snapshot cache used to be consulted here, but it was
+    # keyed without a commit SHA, nothing ever saved a snapshot, and a restore
+    # was never followed by a fetch — so it could never hit, and a hit would
+    # have handed the agent a stale tree.
+    if repo_url:
+        # Normalize repo_url to "owner/repo" form expected by clone_repo. The
+        # token comes from Settings, which accepts both HENCHMEN_GITHUB_TOKEN and
+        # the bare GITHUB_TOKEN a secret mount injects (and reads .env files).
+        github_token = settings.github_token
+        repo_slug = normalize_repo_slug(repo_url) or repo_url
 
         # Use deeper clone for feature branches so we have origin/main for diffing
         depth = 50 if branch.startswith("henchmen/") else 1

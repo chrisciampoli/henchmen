@@ -242,10 +242,28 @@ class TestGitBranchCreate:
         fake_git.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_creates_branch(self, fake_git: AsyncMock):
-        result = await git_ops.git_branch_create(branch_name="henchmen/task-1")
+    async def test_creates_branch_from_explicit_base(self, fake_git: AsyncMock):
+        result = await git_ops.git_branch_create(branch_name="henchmen/task-1", base_branch="main")
         assert result["branch_name"] == "henchmen/task-1"
         assert fake_git.await_args.args == ("checkout", "-b", "henchmen/task-1", "origin/main")
+
+    @pytest.mark.asyncio
+    async def test_default_base_is_the_repository_default_branch(
+        self, fake_git: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ):
+        import henchmen.operative.git_helpers as git_helpers
+
+        monkeypatch.setattr(git_helpers, "detect_base_branch", AsyncMock(return_value="master"))
+
+        await git_ops.git_branch_create(branch_name="henchmen/task-1")
+
+        assert fake_git.await_args.args == ("checkout", "-b", "henchmen/task-1", "origin/master")
+
+    @pytest.mark.asyncio
+    async def test_rejects_option_like_base_branch(self, fake_git: AsyncMock):
+        result = await git_ops.git_branch_create(branch_name="henchmen/task-1", base_branch="--mirror")
+        assert result["success"] is False
+        fake_git.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
