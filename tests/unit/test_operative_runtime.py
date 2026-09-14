@@ -439,6 +439,43 @@ class TestBootstrapWorkspaceFailure:
 
 class TestBootstrapReportsProviderCost:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("env", "expected"),
+        [
+            ({"LAIR_ID": "lair-abc"}, "lair-abc"),
+            ({"LAIR_ID": "lair-abc", "OPERATIVE_ID": "op-override"}, "op-override"),
+            ({}, "op-task-cost-implement_fix"),
+        ],
+    )
+    async def test_operative_id_comes_from_the_lair_contract(self, tmp_path: Path, env: dict[str, str], expected: str):
+        """The Lair injects LAIR_ID; the report must carry the same id the Mastermind's fallback report uses."""
+        from henchmen.operative.bootstrap import run_operative
+
+        agent = MagicMock()
+        agent.run = AsyncMock(side_effect=TimeoutError())
+        agent.get_telemetry.return_value = {}
+        base_env = {"TASK_ID": "task-cost", "NODE_ID": "implement_fix", "SCHEME_ID": "bugfix_standard"}
+        with (
+            patch.dict("os.environ", {**base_env, **env}),
+            patch("henchmen.operative.bootstrap.get_settings", return_value=MagicMock()),
+            patch("henchmen.operative.bootstrap.ProviderRegistry", return_value=MagicMock()),
+            patch("henchmen.operative.bootstrap._get_document_store", return_value=None),
+            patch("henchmen.operative.bootstrap.resolve_model_name", return_value="m"),
+            patch("henchmen.operative.bootstrap.initialize_workspace", new=AsyncMock(return_value=str(tmp_path))),
+            patch("henchmen.operative.bootstrap._build_file_context", new=AsyncMock(return_value="")),
+            patch("henchmen.operative.bootstrap.build_operative_agent", new=AsyncMock(return_value=agent)),
+            patch("henchmen.operative.bootstrap._check_for_changes", new=AsyncMock(return_value=False)),
+            patch("henchmen.operative.bootstrap.publish_report", new_callable=AsyncMock) as publish,
+        ):
+            if "OPERATIVE_ID" not in env:
+                os.environ.pop("OPERATIVE_ID", None)
+            if "LAIR_ID" not in env:
+                os.environ.pop("LAIR_ID", None)
+            await run_operative()
+
+        assert publish.await_args.args[0].operative_id == expected
+
+    @pytest.mark.asyncio
     async def test_report_carries_guardrail_cost_even_on_timeout(self, tmp_path: Path):
         """The tracker persists the provider-billed figure; re-deriving it from tokens misprices cache writes."""
         from henchmen.operative.bootstrap import run_operative
