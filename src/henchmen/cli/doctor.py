@@ -34,6 +34,7 @@ __all__ = [
     "check_github",
     "check_jira",
     "check_llm_credentials",
+    "check_model_pricing",
     "check_model_tiers",
     "check_operative_image",
     "check_python_version",
@@ -249,6 +250,33 @@ def check_model_tiers(settings: Settings) -> CheckResult:
     return CheckResult(name="Model tiers", status=CheckStatus.OK, message=rendered)
 
 
+def check_model_pricing(settings: Settings) -> CheckResult:
+    """Warn when a tier resolves to a model with no ``PRICE_TABLE`` entry.
+
+    An unpriced model is costed at $0, so ``operative_task_cost_ceiling_usd``
+    can never trip for it and the metrics under-report spend. Local (Ollama)
+    models are free by design; their runs are bounded by the wall-clock
+    ceiling instead.
+    """
+    from henchmen.providers.pricing import lookup_price
+    from henchmen.providers.tiers import tier_models
+
+    name = "Model pricing"
+    if _llm_provider(settings) == "local":
+        return CheckResult(name, CheckStatus.OK, "local models are free; the wall-clock ceiling bounds each run")
+    models = tier_models(settings)
+    unpriced = sorted({model for model in models.values() if model and lookup_price(model) is None})
+    if unpriced:
+        return CheckResult(
+            name,
+            CheckStatus.WARN,
+            f"no price for {', '.join(unpriced)} — cost is recorded as $0 and the task cost ceiling "
+            f"(${settings.operative_task_cost_ceiling_usd:.2f}) cannot trip",
+            hint="Pick a priced model, or add the model to PRICE_TABLE in src/henchmen/providers/pricing.py.",
+        )
+    return CheckResult(name, CheckStatus.OK, "every tier model has a price")
+
+
 def check_llm_credentials(settings: Settings, *, offline: bool = False) -> CheckResult:
     """Verify credentials for the configured LLM provider, live when possible.
 
@@ -425,6 +453,7 @@ def run_doctor(*, offline: bool = False) -> list[CheckResult]:
 
     results.append(check_runtime_config(settings))
     results.append(check_model_tiers(settings))
+    results.append(check_model_pricing(settings))
     results.append(check_llm_credentials(settings, offline=offline))
     results.append(check_github(settings, offline=offline))
     results.append(check_slack(settings, offline=offline))
