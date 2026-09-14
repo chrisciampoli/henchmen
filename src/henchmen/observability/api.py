@@ -29,6 +29,7 @@ STAGING/PROD.
 import logging
 import secrets
 from collections.abc import Callable, Coroutine
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -152,41 +153,45 @@ def _compute_summary(tasks: list[dict[str, Any]], days: int) -> dict[str, Any]:
     }
 
 
-def build_metrics_auth_dependency(settings: "Settings") -> Callable[..., Coroutine[Any, Any, None]]:
+_MetricsAuthDependency = Callable[..., Coroutine[Any, Any, None]]
+
+
+def build_metrics_auth_dependency(settings: "Settings") -> _MetricsAuthDependency:
     """Return the FastAPI dependency guarding the /metrics router.
 
     Fail-closed: an unset token means "open" only in DEV, never in STAGING or
     PROD. The token itself is never logged.
     """
+    return _build_metrics_auth((settings.metrics_auth_token or "").strip(), settings.environment.value)
+
+
+def _build_metrics_auth(token: str, environment: str) -> _MetricsAuthDependency:
     from henchmen.config.settings import Environment
 
-    token = (settings.metrics_auth_token or "").strip()
-    environment = settings.environment
-
     if not token:
-        if environment in (Environment.STAGING, Environment.PROD):
+        if environment in (Environment.STAGING.value, Environment.PROD.value):
 
-            async def _deny() -> None:
+            async def _deny(authorization: str = Header(default="")) -> None:
                 raise HTTPException(
                     status_code=401,
                     detail=(
                         "HENCHMEN_METRICS_AUTH_TOKEN is not configured; "
-                        f"the /metrics endpoints are disabled in {environment.value}."
+                        f"the /metrics endpoints are disabled in {environment}."
                     ),
                 )
 
             logger.error(
                 "[metrics] HENCHMEN_METRICS_AUTH_TOKEN is empty in %s — /metrics endpoints will return 401",
-                environment.value,
+                environment,
             )
             return _deny
 
         logger.warning(
             "[metrics] HENCHMEN_METRICS_AUTH_TOKEN is empty — /metrics endpoints are unauthenticated in %s",
-            environment.value,
+            environment,
         )
 
-        async def _allow() -> None:
+        async def _allow(authorization: str = Header(default="")) -> None:
             return None
 
         return _allow
@@ -202,6 +207,25 @@ def build_metrics_auth_dependency(settings: "Settings") -> Callable[..., Corouti
             )
 
     return _require_bearer
+
+
+# One dependency per (token, environment): the open/deny warning is logged once,
+# not on every request.
+_cached_metrics_auth = lru_cache(maxsize=8)(_build_metrics_auth)
+
+
+async def require_metrics_auth(authorization: str = Header(default="")) -> None:
+    """Per-request metrics auth for routes defined outside :func:`create_metrics_router`.
+
+    Reads ``Settings`` when the request arrives, so it can be attached at import
+    time (``@app.get(..., dependencies=[Depends(require_metrics_auth)])``) and
+    applies exactly the bearer-token rules of the ``/metrics`` router.
+    """
+    from henchmen.config.settings import get_settings
+
+    settings = get_settings()
+    check = _cached_metrics_auth((settings.metrics_auth_token or "").strip(), settings.environment.value)
+    await check(authorization)
 
 
 def create_metrics_router(tracker: Any, settings: "Settings | None" = None) -> APIRouter:

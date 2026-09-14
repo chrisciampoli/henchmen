@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 
 # Register schemes on import
 import henchmen.schemes.bugfix_standard  # noqa: F401
@@ -30,7 +30,7 @@ from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
 from henchmen.mastermind.agent import MastermindAgent
 from henchmen.mastermind.scheme_executor import validate_deterministic_handlers
 from henchmen.models.task import HenchmenTask
-from henchmen.observability.api import create_metrics_router
+from henchmen.observability.api import create_metrics_router, require_metrics_auth
 from henchmen.schemes.registry import SchemeRegistry
 from henchmen.utils.redaction import install_secret_redaction
 
@@ -763,7 +763,7 @@ async def ci_failure_handler(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"CI failure handling failed: {exc}") from exc
 
 
-@app.get("/api/v1/metrics/summary")
+@app.get("/api/v1/metrics/summary", dependencies=[Depends(require_metrics_auth)])
 async def metrics_summary(days: int = 7) -> dict[str, Any]:
     """Return aggregated metrics for the dashboard.
 

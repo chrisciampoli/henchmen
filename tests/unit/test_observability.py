@@ -557,6 +557,29 @@ class TestMetricsSummaryEndpoint:
         assert data["cost_by_model"]["claude-sonnet-5"] == pytest.approx(0.60, abs=0.001)
         assert data["escalation_reasons"]["Stalled"] == 1
 
+    @staticmethod
+    def _get(headers: dict[str, str] | None = None):
+        from fastapi.testclient import TestClient
+
+        from henchmen.mastermind.server import app
+
+        mock_agent = MagicMock()
+        mock_agent.tracker.get_metrics_summary = AsyncMock(return_value={"cost_by_model": {"m": 1.0}})
+        with patch("henchmen.mastermind.server.get_agent", return_value=mock_agent):
+            return TestClient(app).get("/api/v1/metrics/summary", headers=headers or {})
+
+    def test_requires_the_metrics_bearer_token(self, monkeypatch: pytest.MonkeyPatch):
+        """Cost-by-model and escalation reasons sit behind the same token as /metrics."""
+        monkeypatch.setenv("HENCHMEN_METRICS_AUTH_TOKEN", "s3cret")
+        assert self._get().status_code == 401
+        assert self._get({"Authorization": "Bearer wrong"}).status_code == 401
+        assert self._get({"Authorization": "Bearer s3cret"}).status_code == 200
+
+    def test_fails_closed_in_prod_without_a_token(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "prod")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_AUDIENCE", "https://example.test")
+        assert self._get().status_code == 401
+
 
 # ---------------------------------------------------------------------------
 # Agent tracker integration
