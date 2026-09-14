@@ -183,6 +183,19 @@ class RestartSignal:
             self._server.should_exit = True
 
 
+def configure_serve_logging(log_level: str) -> None:
+    """Configure logging for ``henchmen serve`` with secret redaction installed first.
+
+    Installed before any service module is imported and in setup mode too, so
+    uvicorn's access log never records the Console sign-in token (or any other
+    known secret) in a request line.
+    """
+    from henchmen.utils.redaction import install_secret_redaction
+
+    install_secret_redaction()
+    logging.basicConfig(level=getattr(logging, log_level.upper()))
+
+
 def console_url(port: int, setup_token: str) -> str:
     """The sign-in URL the launcher opens (and serve prints for engineers)."""
     return f"http://127.0.0.1:{port}/console/session?setup_token={setup_token}"

@@ -201,6 +201,7 @@ def _default_env(key: str, value: str, *, file_keys: set[str]) -> None:
 
 def _build_settings_or_exit() -> Settings:
     """Build ``Settings``, turning a validation error into an actionable exit."""
+    from henchmen.config import paths
     from henchmen.config.settings import get_settings
 
     try:
@@ -208,7 +209,8 @@ def _build_settings_or_exit() -> Settings:
     except ValueError as exc:  # pydantic ValidationError subclasses ValueError
         first = (str(exc).strip().splitlines() or ["invalid settings"])[0]
         print(f"ERROR: invalid configuration: {first}", file=sys.stderr)
-        print("Hint: run `henchmen init` to (re)write .env.local.", file=sys.stderr)
+        # Data-dir installs keep configuration in <data dir>/henchmen.env, not .env.local.
+        print(f"Hint: run `henchmen init` to (re)write {paths.config_file()}.", file=sys.stderr)
         sys.exit(2)
 
 
@@ -606,14 +608,21 @@ def _compare_baseline(path: Path, provider: str, report: EvalReport) -> int:
 
 def _serve(args: argparse.Namespace) -> None:
     """Run Henchmen in one process: setup mode (Console only) or run mode (all services)."""
-    from henchmen.cli.serve import RestartSignal, build_serve_app, build_setup_app, console_url, serve_app
+    from henchmen.cli.serve import (
+        RestartSignal,
+        build_serve_app,
+        build_setup_app,
+        configure_serve_logging,
+        console_url,
+        serve_app,
+    )
     from henchmen.config import paths
 
     _default_env("HENCHMEN_PROVIDER", "local", file_keys=_dotenv_keys())
     if args.port is not None:
         os.environ["HENCHMEN_LOCAL_SERVE_PORT"] = str(args.port)
 
-    logging.basicConfig(level=getattr(logging, args.log_level.upper()))
+    configure_serve_logging(args.log_level)
     logger = logging.getLogger("henchmen")
     restart = RestartSignal()
 
@@ -629,7 +638,8 @@ def _serve(args: argparse.Namespace) -> None:
         store = SetupStateStore(state_file)
         try:
             state = store.load()
-        except ValueError as exc:
+        except (ValueError, OSError) as exc:
+            # ValueError: corrupt JSON; OSError: e.g. a data volume the container user cannot read.
             print(f"ERROR: {exc}", file=sys.stderr)
             print(f"Hint: restore or delete {state_file} to restart setup.", file=sys.stderr)
             sys.exit(2)

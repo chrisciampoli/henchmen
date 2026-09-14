@@ -31,7 +31,13 @@ _PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"sk-[A-Za-z0-9]{32,}"),  # OpenAI / generic secret keys
     re.compile(r"AIza[A-Za-z0-9_-]{30,}"),  # Google API keys
     re.compile(r"x-access-token:[^@\s]+"),  # Authenticated git clone URLs
+    re.compile(r"(?<=setup_token=)[^&#\s\"']+"),  # Console sign-in token in a request line (value only)
 )
+
+# Loggers whose formatter reads ``record.args`` itself and so cannot have them
+# cleared: uvicorn's AccessFormatter unpacks (client, method, path, version,
+# status). Their string arguments are redacted one by one instead.
+_ARGS_PRESERVING_LOGGERS = frozenset({"uvicorn.access"})
 
 
 def redact(text: str) -> str:
@@ -46,6 +52,10 @@ _default_factory = logging.getLogRecordFactory()
 
 def _redacting_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
     record = _default_factory(*args, **kwargs)
+    if record.name in _ARGS_PRESERVING_LOGGERS and isinstance(record.args, tuple):
+        record.msg = redact(str(record.msg))
+        record.args = tuple(redact(arg) if isinstance(arg, str) else arg for arg in record.args)
+        return record
     try:
         message = record.getMessage()
     except Exception:  # pragma: no cover - malformed %-format args
