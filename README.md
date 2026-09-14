@@ -82,6 +82,23 @@ the scheme (`bugfix_standard`, or `feature_standard` for feature and refactor)
 instead of keyword matching on the text. Goal phrases in the title such as
 "improve" or "fix all" still route to `goal_decomposition` first.
 
+### CLI
+
+| Command | What it does |
+|---|---|
+| `henchmen init [--section ...]` | Interactive setup; writes `.env.local` |
+| `henchmen doctor [--offline]` | Checks the environment, credentials, tier models and their prices |
+| `henchmen config [--only-set]` | Prints the effective settings, credentials masked |
+| `henchmen build-operative [--no-cache]` | Builds the local `henchmen-operative:local` image |
+| `henchmen serve` | Runs Dispatch, Mastermind and Forge in one process, including each service's startup (the Slack bot connects, the metrics routes are mounted) |
+| `henchmen chat` | Describe a task conversationally, then submit it to Dispatch |
+| `henchmen embed <owner/repo> [--full]` | Indexes a repository into the RAG Engine corpus. Incremental by default; `--full` clears the repo's existing chunks and re-indexes every file. Exits non-zero unless the run completed |
+| `henchmen eval run / compare / history` | Offline eval harness (see [`evals/README.md`](evals/README.md)) |
+
+On GCP, Dispatch also requests an incremental re-index whenever GitHub reports a
+push to the repository's default branch; Mastermind runs it from the
+`embed-request` topic.
+
 ### Docker Compose
 
 `docker compose up` runs the same single-process server plus an Ollama

@@ -229,7 +229,7 @@ Vertex AI and other vendors offer batch prediction at reduced rates for non-urge
 
 ### Embedding Model Cost
 
-The RAG pipeline (Vertex AI RAG Engine, corpus: `henchmen-code`) uses embeddings to index repository code. The embedding cost is a one-time expense per repository indexing run, not per-task. Embedding and vector storage costs are billed through Vertex AI.
+The RAG pipeline (Vertex AI RAG Engine, corpus: `henchmen-code`) uses embeddings to index repository code. The embedding cost is paid per indexing run, not per task: a `henchmen embed <owner/repo> --full` run embeds every file, while the incremental runs Mastermind performs on each default-branch push (and `henchmen embed` without `--full`) embed only the files changed since the last indexed commit. Embedding and vector storage costs are billed through Vertex AI.
 
 ## Cost Tracking
 
