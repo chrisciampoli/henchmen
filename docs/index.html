@@ -663,7 +663,7 @@
         <div class="step-number">Step 03</div>
         <span class="step-icon" aria-hidden="true"><svg><use href="#icon-pr-land"/></svg></span>
         <h3 class="step-title">A PR Lands in Your Review Queue</h3>
-        <p class="step-desc">Mastermind verifies the Operative&#8217;s work, runs lint and tests through Forge, and opens a pull request on your repo. If CI breaks, the PR never sees daylight. No exceptions.</p>
+        <p class="step-desc">Mastermind verifies the Operative&#8217;s work, runs the lint and test gates, and only then opens a pull request on your repo. If a gate fails, the PR never sees daylight. No exceptions.</p>
         <div class="step-sources">
           <span class="chip">GitHub PR</span>
           <span class="chip">Fail-closed CI</span>
@@ -834,7 +834,7 @@
             <div class="comp-tag">Quality Control</div>
           </div>
         </div>
-        <p class="comp-desc">Runs CI on every Operative&#8217;s branch, manages the merge queue, catches silent failures. If CI breaks, the PR never sees daylight. No exceptions.</p>
+        <p class="comp-desc">Runs CI on every pull request Mastermind opens, catches silent failures, and comments the result &#8212; passed, failed, or incomplete when a check could not run.</p>
       </div>
 
       <div class="comp-card reveal">
@@ -985,7 +985,7 @@
           <div class="t-cmd">henchmen serve</div>
           <div class="t-blank"></div>
           <div class="t-success">&#10003; Starting Henchmen in single-process mode (provider=local)</div>
-          <div class="t-success">&#10003; Shared broker configured for 5 topics</div>
+          <div class="t-success">&#10003; Shared broker configured with forward map for 5 topics</div>
           <div class="t-success">&#10003; Uvicorn running on http://127.0.0.1:8000</div>
         </div>
       </div>

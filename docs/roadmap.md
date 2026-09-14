@@ -5,7 +5,7 @@
 ## Now (v0.2.x)
 
 - **RAG provider abstraction** — decouple `dossier/embedder.py` from Vertex AI RAG Engine behind a generic interface (same pattern as LLM, MessageBroker, etc.)
-- **AWS ECS launcher** — `ContainerOrchestrator` implementation for ECS Fargate so operatives can run outside GCP
+- **AWS end-to-end validation** — the AWS providers (ECS Fargate operatives, SNS/SQS, DynamoDB, S3, Bedrock, CodeBuild) exist but are experimental; exercise them end-to-end and write a `deploy-aws.md` walkthrough
 - **Eval baselines** — deterministic eval suite (`evals/`) with pass-rate targets for bugfix and feature schemes
 
 ## Next (v0.3.x)
