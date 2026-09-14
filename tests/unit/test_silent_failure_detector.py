@@ -214,6 +214,17 @@ class TestSilentFailureDetector:
             assert isinstance(pattern["regex"], str) and pattern["regex"]
         assert "noop_change" not in {p["name"] for p in SilentFailureDetector.PATTERNS}
 
+    def test_todo_marker_requires_a_whole_word(self):
+        """``lifehack`` / ``systemp`` must not read as HACK / TEMP markers."""
+        diff = "diff --git a/src/a.py b/src/a.py\n+++ b/src/a.py\n@@\n+tip = lifehack(systemp)\n"
+        findings = SilentFailureDetector().scan_diff(diff)
+        assert not any(f.pattern == "todo_fixme" for f in findings)
+
+        flagged = SilentFailureDetector().scan_diff(
+            "diff --git a/src/a.py b/src/a.py\n+++ b/src/a.py\n@@\n+x = 1  # TODO: remove\n"
+        )
+        assert any(f.pattern == "todo_fixme" for f in flagged)
+
     def test_format_findings_empty_list(self):
         """format_findings returns a recognisable string for an empty list."""
         detector = SilentFailureDetector()

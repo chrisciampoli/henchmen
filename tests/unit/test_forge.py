@@ -458,7 +458,8 @@ class TestRunCIForPRSuccess:
         runner = MagicMock()
         runner.run = AsyncMock(
             return_value={
-                "passed": True,
+                "passed": False,
+                "incomplete": True,
                 "failed": [],
                 "skipped": ["tests"],
                 "summary": "SKIP: tests",
@@ -481,11 +482,32 @@ class TestRunCIForPRSuccess:
         assert runner.run.call_args.kwargs["base_ref"] == "main"
 
         payload = _published(broker)[0]
-        assert payload["status"] == "passed"
+        # A check that never ran must never be published as a CI pass.
+        assert payload["status"] == "incomplete"
         assert payload["skipped"] == ["tests"]
 
         comment = pr.create_issue_comment.call_args.args[0]
         assert "skipped" in comment.lower()
+        assert "INCOMPLETE" in comment
+        assert "PASSED" not in comment
+
+
+class TestResultStatus:
+    def test_passed_only_when_everything_ran_and_passed(self):
+        from henchmen.forge.server import _result_status
+
+        assert _result_status({"passed": True, "failed": [], "skipped": []}) == "passed"
+
+    def test_skip_only_is_incomplete(self):
+        from henchmen.forge.server import _result_status
+
+        assert _result_status({"passed": False, "incomplete": True, "failed": [], "skipped": ["tests"]}) == "incomplete"
+
+    def test_failure_wins_over_skip(self):
+        from henchmen.forge.server import _result_status
+
+        result = {"passed": False, "incomplete": False, "failed": ["lint"], "skipped": ["tests"]}
+        assert _result_status(result) == "failed"
 
 
 # ===========================================================================

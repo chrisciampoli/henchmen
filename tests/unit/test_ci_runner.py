@@ -188,6 +188,7 @@ class TestLint:
         assert lint["status"] == STATUS_SKIPPED
         assert "ruff is not installed" in lint["error"]
         assert "lint" in result["skipped"]
+        assert result["passed"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +211,9 @@ class TestTestsCheck:
         assert tests["passed"] is False
         assert "tests" in result["skipped"]
         assert "SKIP: tests" in result["summary"]
+        # An unverified PR must not be reported as a CI pass overall either.
+        assert result["passed"] is False
+        assert result["incomplete"] is True
 
     @pytest.mark.asyncio
     async def test_node_project_without_npm_is_skipped(self, tmp_path, monkeypatch):
@@ -272,6 +276,22 @@ class TestSubprocessSafety:
 
         assert rc != 0
         assert "timed out" in err.lower()
+
+    @pytest.mark.asyncio
+    async def test_total_budget_bounds_the_whole_run(self, tmp_path):
+        """The run must end inside the Pub/Sub ack deadline, not per-command budgets summed."""
+        runner = CIRunner(timeout_seconds=60, total_budget_seconds=0)
+        runner._deadline = 0.0  # already exhausted
+
+        rc, _out, err = await runner._run_command([sys.executable, "-c", "print('never')"], str(tmp_path))
+
+        assert rc != 0
+        assert "budget" in err.lower()
+
+    def test_default_budget_fits_inside_pubsub_ack_deadline(self):
+        from henchmen.forge.ci_runner import DEFAULT_CI_TIMEOUT_SECONDS
+
+        assert DEFAULT_CI_TIMEOUT_SECONDS < 600
 
     @pytest.mark.asyncio
     async def test_missing_executable_is_reported(self, tmp_path):

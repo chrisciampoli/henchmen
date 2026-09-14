@@ -9,8 +9,9 @@ Graceful degradation: if the LLM call fails for any reason, the original
 chunks are returned sorted by their existing relevance_score so the dossier
 pipeline never breaks.
 
-Status: no production caller yet — ``MastermindAgent._fetch_semantic_chunks``
-is the intended call site, immediately after ``query_similar_chunks``.
+:func:`rerank_semantic_chunks` is the typed entry point: it takes and returns
+``SemanticChunk`` contracts exactly as ``query_similar_chunks`` produces them,
+so a caller can rerank retrieval output without converting to raw dicts.
 """
 
 import json
@@ -20,9 +21,11 @@ from typing import TYPE_CHECKING, Any
 from pydantic import Field
 
 from henchmen.models._base import StrictBase
+from henchmen.models.dossier import SemanticChunk
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
+    from henchmen.providers.interfaces.llm_provider import LLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +130,7 @@ def _resolve_model(model: str, settings: "Settings | None") -> str:
 async def rerank_chunks(
     chunks: list[dict[str, Any]],
     task_description: str,
-    llm_provider: Any,
+    llm_provider: "LLMProvider",
     model: str = "",
     top_k: int = 10,
     settings: "Settings | None" = None,
@@ -201,6 +204,33 @@ async def rerank_chunks(
     return _fallback_sort(chunks, top_k)
 
 
+async def rerank_semantic_chunks(
+    chunks: list[SemanticChunk],
+    task_description: str,
+    llm_provider: "LLMProvider",
+    model: str = "",
+    top_k: int = 10,
+    settings: "Settings | None" = None,
+) -> list[SemanticChunk]:
+    """Rerank retrieved ``SemanticChunk`` objects and return the top ``top_k``.
+
+    Each returned chunk is a copy of the original with ``relevance_score``
+    replaced by the reranker's score (or kept, on the fallback path). Line
+    spans, symbol and language survive, which ``RerankerResult`` alone drops.
+    """
+    if not chunks:
+        return []
+    raw = [
+        {"file_path": chunk.file_path, "content": chunk.content, "relevance_score": chunk.relevance_score}
+        for chunk in chunks
+    ]
+    ranked = await rerank_chunks(raw, task_description, llm_provider, model=model, top_k=top_k, settings=settings)
+    return [
+        chunks[result.original_index].model_copy(update={"relevance_score": result.relevance_score})
+        for result in ranked
+    ]
+
+
 def _fallback_sort(chunks: list[dict[str, Any]], top_k: int) -> list[RerankerResult]:
     """Return chunks sorted by their existing relevance_score as a fallback."""
     results: list[RerankerResult] = []
@@ -209,7 +239,9 @@ def _fallback_sort(chunks: list[dict[str, Any]], top_k: int) -> list[RerankerRes
             RerankerResult(
                 file_path=chunk.get("file_path", "unknown"),
                 content=chunk.get("content", ""),
-                relevance_score=float(chunk.get("relevance_score", 0.0)),
+                # Clamp: RerankerResult enforces 0-1 and this path runs outside
+                # the try block, so an out-of-range input must not raise here.
+                relevance_score=max(0.0, min(1.0, float(chunk.get("relevance_score", 0.0) or 0.0))),
                 original_index=i,
             )
         )

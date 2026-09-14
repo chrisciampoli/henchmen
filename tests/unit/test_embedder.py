@@ -234,6 +234,7 @@ class TestUpsertChunks:
 
         with (
             patch.object(embedder, "get_or_create_corpus", new_callable=AsyncMock, return_value="corpora/1"),
+            patch.object(embedder, "_delete_matching", new_callable=AsyncMock, return_value=0),
             patch.object(embedder.asyncio, "to_thread", new=_fake_to_thread),
             patch.object(embedder.asyncio, "sleep", new_callable=AsyncMock) as sleep,
         ):
@@ -251,6 +252,7 @@ class TestUpsertChunks:
 
         with (
             patch.object(embedder, "get_or_create_corpus", new_callable=AsyncMock, return_value="corpora/1"),
+            patch.object(embedder, "_delete_matching", new_callable=AsyncMock, return_value=0),
             patch.object(embedder.asyncio, "to_thread", new=_fake_to_thread),
         ):
             result = await embedder.upsert_chunks(
@@ -276,6 +278,44 @@ class TestUpsertChunks:
             await embedder.upsert_chunks([_make_chunk()], repo="org/repo", commit_sha="abc", replace_existing=True)
 
         delete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reembedded_files_have_their_old_chunks_cleared(self, _rag_available):
+        """upload_file always creates a new RagFile, so a modified file must be cleared first."""
+        chunks = [
+            _make_chunk(file_path="src/a.py", start_line=1, end_line=5),
+            _make_chunk(file_path="src/a.py", start_line=6, end_line=9),
+            _make_chunk(file_path="src/b.py"),
+        ]
+
+        async def _fake_to_thread(fn, batch):
+            return len(batch), [], 0
+
+        with (
+            patch.object(embedder, "get_or_create_corpus", new_callable=AsyncMock, return_value="corpora/1"),
+            patch.object(embedder, "_delete_matching", new_callable=AsyncMock, return_value=2) as delete,
+            patch.object(embedder.asyncio, "to_thread", new=_fake_to_thread),
+        ):
+            result = await embedder.upsert_chunks(chunks, repo="org/repo", commit_sha="abc", project_id="p", region="r")
+
+        assert result.ok
+        delete.assert_awaited_once_with("org/repo", "corpora/1", "p", "r", ["src/a.py", "src/b.py"])
+
+    @pytest.mark.asyncio
+    async def test_failed_clear_fails_the_upsert(self, _rag_available):
+        """Uploading over chunks that could not be cleared would duplicate them silently."""
+        upload = AsyncMock()
+
+        with (
+            patch.object(embedder, "get_or_create_corpus", new_callable=AsyncMock, return_value="corpora/1"),
+            patch.object(embedder, "_delete_matching", new_callable=AsyncMock, side_effect=RuntimeError("denied")),
+            patch.object(embedder.asyncio, "to_thread", new=upload),
+        ):
+            result = await embedder.upsert_chunks([_make_chunk()], repo="org/repo", commit_sha="abc")
+
+        assert not result.ok
+        assert result.failed == 1
+        upload.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
