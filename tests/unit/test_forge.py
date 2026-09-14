@@ -608,6 +608,56 @@ class TestForgeRequestHandler:
 
 
 # ===========================================================================
+# Shared providers and log redaction
+# ===========================================================================
+
+
+class TestSharedBroker:
+    def test_broker_is_created_once_and_reused(self, forge_settings, forge_app):
+        from henchmen.forge.server import _get_broker
+
+        del app.state.message_broker
+        created = _mock_broker()
+        with patch("henchmen.providers.registry.ProviderRegistry") as registry_cls:
+            registry_cls.return_value.get_message_broker.return_value = created
+            first = _get_broker()
+            second = _get_broker()
+
+        assert first is created
+        assert second is created
+        registry_cls.return_value.get_message_broker.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_lifespan_reuses_and_closes_the_broker(self, forge_settings, forge_app):
+        from henchmen.forge.server import lifespan
+
+        broker, _store = forge_app
+        broker.aclose = AsyncMock()
+        with patch("henchmen.providers.registry.ProviderRegistry") as registry_cls:
+            async with lifespan(app):
+                assert app.state.message_broker is broker
+            registry_cls.return_value.get_message_broker.assert_not_called()
+
+        broker.aclose.assert_awaited_once()
+
+
+def test_importing_forge_server_installs_secret_redaction():
+    """Forge logs git/CI output; token-shaped strings must be redacted in this process too."""
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import logging, henchmen.forge.server\n"
+        "from henchmen.utils.redaction import _redacting_factory\n"
+        "assert logging.getLogRecordFactory() is _redacting_factory\n"
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), "HENCHMEN_PROVIDER": "local"}
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+
+
+# ===========================================================================
 # Process Queue Endpoint
 # ===========================================================================
 
