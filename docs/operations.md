@@ -311,7 +311,7 @@ All task executions are persisted to the `task_executions` Firestore collection.
 - `files_changed`, `confidence_score`, `rag_chunks_retrieved`
 - `ci_fix_attempts`, `ci_fix_in_progress`
 - `escalation_reason`, `escalation_node`
-- `expires_at` (30-day TTL)
+- `expires_at` (30 days after creation; `POST /api/v1/cleanup` deletes expired documents, up to 100 per call — Cloud Scheduler calls it in staging/prod)
 
 ### Metrics API
 

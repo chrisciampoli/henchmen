@@ -177,13 +177,21 @@ recorded as a CI pass.
 **Symptom:** The SQLite store is hundreds of MB and writes are slow.
 
 **Diagnosis:** Henchmen writes one `task_executions` row per task (with
-per-node metrics). Its `expires_at` field only drives a Firestore TTL policy;
-SQLite has no TTL, so rows accumulate. The store lives at
+per-node metrics). Rows past their 30-day `expires_at` are only deleted when
+something calls the cleanup endpoint, which nothing does in local mode. The
+store lives at
 `~/.henchmen/henchmen_<environment>.db` unless `HENCHMEN_LOCAL_SQLITE_PATH`
 says otherwise. Every collection is a table of `(id, data)` rows where `data`
 is the JSON document.
 
-**Fix:** Stop `henchmen serve`, then:
+**Fix:** While `henchmen serve` is running, delete expired rows (repeat until
+`expired_cleaned` is 0 — it removes up to 100 per call):
+
+```bash
+curl -X POST http://localhost:8000/mastermind/api/v1/cleanup
+```
+
+Or stop `henchmen serve` and prune directly:
 
 ```bash
 DB=~/.henchmen/henchmen_dev.db
