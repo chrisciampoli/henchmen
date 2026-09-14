@@ -26,7 +26,8 @@ and OpenAI cached tokens. Cost is always computed with `estimate_cost` /
 `estimate_cost_for_settings` — never a second table. A scheme node stores a
 tier name, so cost is computed after resolving the tier to the active
 provider's concrete model; a model missing from `PRICE_TABLE` costs `$0.00`
-and never trips the cost ceiling (see `docs/incident-runbook.md`).
+and never trips the cost ceiling — `henchmen doctor` warns when a tier resolves
+to such a model (see `docs/incident-runbook.md`).
 
 ## Per-Task Cost Breakdown by Node
 
@@ -101,7 +102,7 @@ These are ongoing GCP costs independent of task volume:
 | Pub/Sub | ~$1-5/mo | ~$5-20/mo | 7 topics, push subscriptions |
 | Firestore | ~$0-5/mo | ~$5-20/mo | `task_executions`, `operative_reports`, `processed_messages` collections |
 | Cloud Storage | ~$1/mo | ~$1-5/mo | Dossier artifacts, Terraform state |
-| Secret Manager | ~$1/mo | ~$1/mo | 6 secrets |
+| Secret Manager | ~$1/mo | ~$1/mo | 7 secrets |
 | Artifact Registry | ~$1-5/mo | ~$1-5/mo | Docker images |
 | VPC Connector | ~$7/mo | ~$7/mo | Serverless VPC access |
 
@@ -141,14 +142,22 @@ issues (whitespace, import ordering, trailing commas) deterministically.
 
 ### 3. Lint Scope
 
-Forge's post-PR lint runs `ruff check` only on the Python files the PR changed,
-so pre-existing violations elsewhere do not fail it. The Mastermind lint gate
-(`run_lint` / `run_lint_retry`) currently runs the detected stack's lint command
-over the whole workspace (for example `python -m ruff check .` or
-`npm run --if-present lint`), so a target repository with pre-existing lint
-failures fails the gate, runs `fix_lint`, and can escalate on code the
-operative never touched. Keep the target repository lint-clean, or expect
-those escalations.
+Both lint passes are scoped to the operative's changes, so for Python, Node and
+Go targets pre-existing violations elsewhere in the repository do not trigger a
+`fix_lint` run or an escalation. (Rust and Java linters only work on a whole
+crate or build, so there a pre-existing violation still fails the gate once the
+branch touches that language.) Forge's post-PR lint runs `ruff check` on the Python files the PR
+changed. The Mastermind lint gate (`run_lint` / `run_lint_retry`) diffs the
+branch against `origin/<base>` and lints per stack: `ruff check` on changed
+`.py` files, `eslint` on changed JS/TS files from their nearest `package.json`,
+`go vet` on changed Go packages, and the whole-project Rust or Java lint only
+when files in that language changed. A branch with no changed files of the
+stack's language passes without running a linter; a diff that cannot be
+computed fails the gate.
+
+`fix_lint` itself still runs the fixer over the whole workspace
+(`ruff check . --fix`, `npx eslint . --fix`, `pnpm run lint:fix`), so it can
+commit fixes to files the operative did not touch.
 
 ### 4. Tool Result Truncation (Implemented)
 
@@ -192,9 +201,7 @@ one operative run.
 - **Vertex AI (Gemini) and OpenAI:** Henchmen does not create explicit caches,
   but when the API reports cached input tokens (Vertex
   `cached_content_token_count`, OpenAI `cached_tokens`) they are priced at the
-  25% cached rate. `HENCHMEN_VERTEX_AI_CONTEXT_CACHE_ENABLED` and
-  `HENCHMEN_VERTEX_AI_CONTEXT_CACHE_MIN_TOKENS` are defined in Settings but
-  nothing reads them yet.
+  25% cached rate. There is no setting for explicit Gemini context caches.
 
 ## Long-Context Pricing
 
@@ -229,7 +236,7 @@ Vertex AI and other vendors offer batch prediction at reduced rates for non-urge
 
 ### Embedding Model Cost
 
-The RAG pipeline (Vertex AI RAG Engine, corpus: `henchmen-code`) uses embeddings to index repository code. The embedding cost is a one-time expense per repository indexing run, not per-task. Embedding and vector storage costs are billed through Vertex AI.
+The RAG pipeline (Vertex AI RAG Engine, corpus: `henchmen-code`) uses embeddings to index repository code. The embedding cost is paid per indexing run, not per task: a `henchmen embed <owner/repo> --full` run embeds every file, while the incremental runs Mastermind performs on each default-branch push (and `henchmen embed` without `--full`) embed only the files changed since the last indexed commit. Embedding and vector storage costs are billed through Vertex AI.
 
 ## Cost Tracking
 
@@ -250,7 +257,14 @@ Query aggregated cost data (the bearer token is required in staging and prod):
 ```bash
 # Summary for the last 7 days
 curl -H "Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN" "https://mastermind-url/metrics/summary?days=7"
+
+# Dashboard view with cost per model and escalation reasons (same token rules)
+curl -H "Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN" "https://mastermind-url/api/v1/metrics/summary?days=7"
 ```
+
+Mastermind uses internal-only ingress by default, so call it from inside the
+project's network (or through `henchmen serve` locally at
+`http://localhost:8000/mastermind/...`).
 
 Response includes:
 - `total_cost_usd`: Total spend across all tasks

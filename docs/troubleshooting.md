@@ -48,7 +48,9 @@ log lines appear.
 **Diagnosis:** The bot connects over Socket Mode, which needs both the bot
 token and the app-level token. When either is missing the Dispatch service logs
 `Slack Socket Mode disabled: set HENCHMEN_SLACK_BOT_TOKEN and HENCHMEN_SLACK_APP_TOKEN to enable it`
-at startup. If you use the HTTP Events API (`/webhooks/slack`) instead, a
+at startup. This is the same under `henchmen serve` and `docker compose up`,
+which run Dispatch's startup inside the single process, so look for that line
+(or `[dispatch] Service started`) in the server log. If you use the HTTP Events API (`/webhooks/slack`) instead, a
 wrong signing secret makes Dispatch reject every event with 401.
 
 **Fix:**
@@ -116,7 +118,7 @@ publishing a `forge-result` (clone failure, crash, misconfigured provider).
 **Fix:**
 
 ```bash
-TOKEN="Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN"   # omit in dev if unset
+TOKEN="Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN"   # optional only in dev with no token set
 curl -H "$TOKEN" http://localhost:8000/mastermind/metrics/summary | jq .tasks_ci_pending
 curl -H "$TOKEN" http://localhost:8000/mastermind/metrics/summary | jq .by_scheme
 ```
@@ -226,8 +228,15 @@ wallet.
 
 3. Restart the service.
 
-`curl http://localhost:8000/mastermind/metrics/summary | jq .by_scheme` shows
-which scheme is spending the most.
+Which scheme is spending the most, and which model (the metrics bearer token
+is required whenever `HENCHMEN_METRICS_AUTH_TOKEN` is set, and always in
+staging and prod):
+
+```bash
+TOKEN="Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN"
+curl -H "$TOKEN" http://localhost:8000/mastermind/metrics/summary | jq .by_scheme
+curl -H "$TOKEN" http://localhost:8000/mastermind/api/v1/metrics/summary | jq .cost_by_model
+```
 
 ---
 

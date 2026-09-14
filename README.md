@@ -61,12 +61,43 @@ henchmen chat
 or post one directly:
 
 ```bash
-curl -X POST http://localhost:8000/dispatch/api/v1/tasks   -H "Content-Type: application/json"   -d '{
+curl -X POST http://localhost:8000/dispatch/api/v1/tasks \
+  -H "Authorization: Bearer $HENCHMEN_DISPATCH_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
     "title": "Fix the login bug",
     "description": "Users cannot log in after a password reset",
-    "repo": "your-org/your-repo"
+    "repo": "your-org/your-repo",
+    "task_type": "bugfix"
   }'
 ```
+
+`POST /api/v1/tasks` requires `Authorization: Bearer <HENCHMEN_DISPATCH_API_TOKEN>`.
+The header is optional in dev while the token is empty (Dispatch logs a warning
+and accepts the request); in staging and prod an empty token makes the route
+return 401. `henchmen chat` sends the header for you.
+
+`task_type` is optional: `bugfix`, `feature` or `refactor`. When set it picks
+the scheme (`bugfix_standard`, or `feature_standard` for feature and refactor)
+instead of keyword matching on the text. Goal phrases in the title such as
+"improve" or "fix all" still route to `goal_decomposition` first.
+
+### CLI
+
+| Command | What it does |
+|---|---|
+| `henchmen init [--section ...]` | Interactive setup; writes `.env.local` |
+| `henchmen doctor [--offline]` | Checks the environment, credentials, tier models and their prices |
+| `henchmen config [--only-set]` | Prints the effective settings, credentials masked |
+| `henchmen build-operative [--no-cache]` | Builds the local `henchmen-operative:local` image |
+| `henchmen serve` | Runs Dispatch, Mastermind and Forge in one process, including each service's startup (the Slack bot connects, the metrics routes are mounted) |
+| `henchmen chat` | Describe a task conversationally, then submit it to Dispatch |
+| `henchmen embed <owner/repo> [--full]` | Indexes a repository into the RAG Engine corpus. Incremental by default; `--full` clears the repo's existing chunks and re-indexes every file. Exits non-zero unless the run completed |
+| `henchmen eval run / compare / history` | Offline eval harness (see [`evals/README.md`](evals/README.md)) |
+
+On GCP, Dispatch also requests an incremental re-index whenever GitHub reports a
+push to the repository's default branch; Mastermind runs it from the
+`embed-request` topic.
 
 ### Docker Compose
 
@@ -209,6 +240,7 @@ the bare names a Cloud Run secret mount injects (`GITHUB_TOKEN`,
 | `HENCHMEN_GITHUB_TOKEN` | Classic PAT with the `repo` scope | *(required for PRs)* |
 | `HENCHMEN_GITHUB_DEFAULT_REPO` | Target repository, `owner/repo` | *(required)* |
 | `HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD` | Spend allowed per task | `6.0` |
+| `HENCHMEN_DISPATCH_API_TOKEN` | Bearer token for `POST /api/v1/tasks` (open in dev when empty, 401 in staging/prod) | *(empty)* |
 
 See [`.env.example`](.env.example) for every setting with commentary, or
 [`src/henchmen/config/settings.py`](src/henchmen/config/settings.py) for the
@@ -254,10 +286,6 @@ comments, CI-failure events), point the repo's webhook at
 `https://your-dispatch-url/webhooks/github` and set
 `HENCHMEN_GITHUB_WEBHOOK_SECRET` to the same secret. Only comments from users
 with a trusted association (owner, member, collaborator) can start a run.
-
-`HENCHMEN_GITHUB_APP_ID` and `HENCHMEN_GITHUB_APP_PRIVATE_KEY_SECRET` exist in
-settings but are reserved for a future GitHub App intake path; nothing reads
-them today.
 
 </details>
 
@@ -400,6 +428,13 @@ stacks are detected and supported out of the box:
 | Java (Gradle)| `build.gradle` or `build.gradle.kts`             | `./gradlew test`                      | `./gradlew check -x test`        |
 | Node (pnpm)  | `package.json` + `pnpm-lock.yaml`                | `pnpm run --if-present test`          | `pnpm run --if-present lint`     |
 | Node (npm)   | `package.json` (no pnpm lockfile)                | `npm run --if-present test`           | `npm run --if-present lint`      |
+
+The lint column is the stack's project-wide command. The Mastermind lint gate
+narrows it to the files the operative changed against the base branch: `ruff`
+on changed Python files, `eslint` on changed JS/TS files (from the nearest
+`package.json`), `go vet` on changed Go packages, and the Rust or Java command
+only when the branch touched that language. If that diff cannot be computed
+the gate fails.
 
 Detection runs top to bottom and the first match wins, so a repo with both
 `pyproject.toml` and `package.json` is treated as Python. If no manifest

@@ -102,18 +102,30 @@ token usage recorded, but its cost reads `$0.00` and it therefore never trips
 the per-task ceiling. Scheme nodes store tier names, and cost is computed after
 resolving the tier through the active provider's `Settings` field (for example
 `HENCHMEN_OPENAI_MODEL_COMPLEX`), so the entry must match that concrete model.
+`henchmen doctor` catches this before it costs anything: its **Model pricing**
+check warns when any tier resolves to a model with no `PRICE_TABLE` entry
+(`no price for <model> — cost is recorded as $0 and the task cost ceiling
+($X) cannot trip`). Local Ollama models are free by design and pass the check;
+their runs are bounded by the wall-clock ceiling instead.
+
 To fix:
 
-1. Run `henchmen doctor` to see the concrete model each tier resolves to.
+1. Run `henchmen doctor` to see the concrete model each tier resolves to and
+   which of them the **Model pricing** check reports as unpriced.
 2. Open `src/henchmen/providers/pricing.py`.
 3. Add a `PRICE_TABLE` entry keyed on the first-party model family id (e.g.
    `"gpt-4o-mini"`), using the `_anthropic`, `_gemini` or `_openai` helper so
    the cache-read and cache-write rates follow that vendor's discount. Dated
    snapshots, Vertex `@` forms and Bedrock ids normalise onto that key
    automatically, so one entry usually covers every spelling.
-4. Restart the process.
-5. Confirm with
-   `curl -H "Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN" http://localhost:8000/mastermind/metrics/summary | jq .total_cost_usd`.
+4. Restart the process and re-run `henchmen doctor`; the **Model pricing**
+   check should read `every tier model has a price`.
+5. Confirm new tasks are costed (both endpoints require the metrics bearer
+   token whenever one is configured, and always in staging and prod):
+   ```bash
+   curl -H "Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN" http://localhost:8000/mastermind/metrics/summary | jq .total_cost_usd
+   curl -H "Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN" http://localhost:8000/mastermind/api/v1/metrics/summary | jq .cost_by_model
+   ```
 
 Do not add a second price map anywhere. Cost is always computed through
 `estimate_cost` / `estimate_cost_for_settings` from that module.
@@ -281,4 +293,4 @@ see them.
 | Operative image stale | Push the operative image with the tag in `HENCHMEN_LAIR_OPERATIVE_IMAGE_TAG` (Terraform's `container_image_tag`); new lairs use it immediately |
 | Task stuck in `running` | Call `/api/v1/watchdog`; check Mastermind logs; set `execution_state`/`final_status` to `escalated` if needed |
 | Firestore quota exceeded | Check Firestore usage dashboard; consider adding indexes |
-| High LLM costs | Check `henchmen doctor` for the model each tier resolves to, confirm `HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD`, and compare `by_scheme` in `/metrics/summary`. `fix_lint` and `verify_changes` never call a model |
+| High LLM costs | Check `henchmen doctor` for the model each tier resolves to (and any unpriced-model warning), confirm `HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD`, and compare `by_scheme` in `/metrics/summary` and `cost_by_model` in `/api/v1/metrics/summary` (both need `Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN`). `fix_lint` and `verify_changes` never call a model |

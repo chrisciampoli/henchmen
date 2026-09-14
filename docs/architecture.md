@@ -2,7 +2,7 @@
 
 Henchmen Agent Factory is a production AI agent system that dispatches coding operatives to fix bugs and implement features in target repositories. It is inspired by Stripe's Minions architecture: a central orchestrator selects a workflow (Scheme), walks a DAG of deterministic and agentic nodes, provisions ephemeral containers (Lairs) for each agentic node, and opens a pull request with the results.
 
-This page describes the GCP deployment. In local mode (`henchmen serve`) the same three services run in one process, Pub/Sub is an in-memory broker, Firestore is SQLite and each Lair is a Docker container.
+This page describes the GCP deployment. In local mode (`henchmen serve`) the same three services run in one process, Pub/Sub is an in-memory broker, Firestore is SQLite and each Lair is a Docker container. The local broker forwards `task-intake`, `operative-complete`, `forge-request`, `forge-result` and `ci-failure` to the mounted services; it does not forward `embed-request`, so re-index locally with `henchmen embed <owner/repo>`.
 
 ## High-Level Architecture
 
@@ -69,13 +69,13 @@ CRJ = Cloud Run Job. The model tier each Lair runs on is resolved to a concrete 
 
 Dispatch is the system's front door:
 
-- `POST /api/v1/tasks` -- CLI task creation (JSON body with title, description, repo)
+- `POST /api/v1/tasks` -- CLI/REST task creation (`CreateTaskRequest`: `title`, `description`, `repo`, `branch`, `priority`, optional `task_type`, `created_by`). Requires `Authorization: Bearer <HENCHMEN_DISPATCH_API_TOKEN>`; with the token empty the route is open in dev (one logged warning) and returns 401 in staging and prod.
 - `POST /webhooks/slack` -- Slack Events API (handles `url_verification` and `app_mention`). Slack is normally connected over **Socket Mode** instead, started from the Dispatch lifespan when `HENCHMEN_SLACK_BOT_TOKEN` and `HENCHMEN_SLACK_APP_TOKEN` are both set.
 - `POST /webhooks/github` -- Repository webhook signed with `HENCHMEN_GITHUB_WEBHOOK_SECRET` (issues labelled `henchmen`, `@henchmen` comments from trusted users, CI failures, pushes)
 - `POST /webhooks/jira` -- Jira webhook signed with `HENCHMEN_JIRA_WEBHOOK_SECRET`
 - `POST /pubsub/task-planned` -- Legacy push endpoint that only logs; Terraform no longer creates a `task-planned` topic, so nothing calls it
 
-Each handler uses the `TaskNormalizer` to convert the source-specific payload into a `HenchmenTask` Pydantic model, then publishes the serialized task to the `henchmen-{env}-task-intake` topic. GitHub CI-failure events go to `ci-failure`; push events go to `embed-request`.
+Each handler uses the `TaskNormalizer` to convert the source-specific payload into a `HenchmenTask` Pydantic model, then publishes the serialized task to the `henchmen-{env}-task-intake` topic. GitHub CI-failure events go to `ci-failure`; a push to the repository's default branch publishes an `EmbedRequest` (`repo`, `commit_sha`, `mode: incremental`) to `embed-request`. Dispatch never clones or indexes anything itself.
 
 ### Mastermind
 
@@ -85,7 +85,7 @@ Each handler uses the `TaskNormalizer` to convert the source-specific payload in
 
 The Mastermind is the brain of the system. It receives tasks via Pub/Sub push subscription and orchestrates the full execution lifecycle:
 
-1. **Scheme Selection** (`_select_scheme`): Keyword matching on word boundaries. Goal keywords in the title route to `goal_decomposition`, then bug keywords to `bugfix_standard`, then feature keywords to `feature_standard`; anything else defaults to `bugfix_standard`.
+1. **Scheme Selection** (`_select_scheme`): Goal keywords in the title route to `goal_decomposition` first. Otherwise an explicit `task_type` on the task wins (`bugfix` runs `bugfix_standard`; `feature` and `refactor` run `feature_standard`). Without one, keyword matching on word boundaries sends bug keywords to `bugfix_standard`, then feature keywords to `feature_standard`; anything else defaults to `bugfix_standard`.
 
 2. **Dossier Building** (`_build_dossier`): Assembles context for operatives:
    - Fetches the repository file tree from GitHub and keeps the first 50 paths for file scoring
@@ -96,7 +96,7 @@ The Mastermind is the brain of the system. It receives tasks via Pub/Sub push su
    - Fetches repo rule files (CLAUDE.md, etc.) and related PRs via `DossierBuilder`
 
 3. **Scheme Execution** (`SchemeExecutor`): Walks the scheme DAG from root to terminal node:
-   - **Deterministic nodes** run inline handlers: `create_branch`, `prefetch_context`, `verify_changes`, `run_lint`, `fix_lint`, `run_lint_retry`, `run_tests`, `run_tests_retry`, `create_pr`, `escalate`, `report_plan`. A deterministic node with no registered handler fails.
+   - **Deterministic nodes** run inline handlers: `create_branch`, `prefetch_context`, `verify_changes`, `run_lint`, `fix_lint`, `run_lint_retry`, `run_tests`, `run_tests_retry`, `create_pr`, `escalate`, `report_plan`. A deterministic node with no registered handler fails. The lint gate (`run_lint`, `run_lint_retry`) only judges files the operative changed against `origin/<base>` (`scheme_executor/lint_scope.py`): `ruff check` on changed Python files, `eslint` on changed JS/TS files from their nearest `package.json`, `go vet` on changed Go packages, and the whole-project Rust/Java lint only when files in that language changed. It fails closed when that diff cannot be computed.
    - **Agentic nodes** (`implement_fix`, `implement_feature`, `fix_tests`, `analyze_goal`) are dispatched to Lairs via `LairManager`
    - Edge conditions (`pass`/`fail`) determine the next node. Unconditional edges are followed as fallback.
    - A per-node execution limit (2) forces `fail` if a node would run a third time.
@@ -111,8 +111,10 @@ The Mastermind is the brain of the system. It receives tasks via Pub/Sub push su
 - `POST /pubsub/operative-complete` -- Receive operative completion reports
 - `POST /pubsub/forge-result` -- Receive CI results from Forge
 - `POST /pubsub/ci-failure` -- Receive CI failure notifications for auto-fix
+- `POST /pubsub/embed-request` -- Re-index a repository in the RAG corpus (runs `dossier/embed_pipeline.py`); returns non-2xx unless the run completed, so Pub/Sub redelivers and finally dead-letters it, and 400 for an undecodable message
 - `POST /api/v1/watchdog`, `/api/v1/check-dlq`, `/api/v1/cleanup` -- Cloud Scheduler jobs
 - `GET /metrics/summary`, `/metrics/tasks`, `/metrics/tasks/{task_id}`, `/metrics/prometheus` -- Metrics API (see `docs/operations.md`)
+- `GET /api/v1/metrics/summary` -- Dashboard summary; same `HENCHMEN_METRICS_AUTH_TOKEN` bearer rules as `/metrics`
 
 ### Operative (Lair)
 
@@ -201,7 +203,7 @@ The Forge handles post-PR CI validation. It does not open PRs -- the Mastermind'
 
 ### Dossier
 
-**Source:** `src/henchmen/dossier/builder.py`, `rules.py`, `cache.py`, `task_analyzer.py`, `chunker.py`, `embedder.py`, `convention_detector.py`, `file_scorer.py`, `reranker.py`
+**Source:** `src/henchmen/dossier/builder.py`, `rules.py`, `cache.py`, `task_analyzer.py`, `chunker.py`, `embedder.py`, `embed_pipeline.py`, `convention_detector.py`, `file_scorer.py`, `reranker.py`
 
 The Dossier subsystem assembles context packages for operatives:
 
@@ -210,7 +212,8 @@ The Dossier subsystem assembles context packages for operatives:
 - **TaskAnalyzer** (`task_analyzer.py`): Classifies tasks by type (bug_fix, test_fix, feature, refactor, generic), extracts mentioned files, error patterns, and keywords using regex patterns.
 - **ConventionDetector** (`convention_detector.py`): Detects naming, indentation, test-framework and lint conventions from config files and sampled sources so generated code matches the project's style.
 - **FileScorer** (`file_scorer.py`): Scores files for relevance from weighted signals (task mentions, RAG hits, directory proximity, recent changes, stack traces).
-- **Chunker/Embedder** (`chunker.py`, `embedder.py`): Indexes repository code into Vertex AI RAG Engine (corpus: `henchmen-code`) for semantic search.
+- **Chunker/Embedder** (`chunker.py`, `embedder.py`): Splits files into chunks and uploads them to Vertex AI RAG Engine (corpus: `henchmen-code`) for semantic search.
+- **Embed pipeline** (`embed_pipeline.py`): `run_embedding_pipeline(repo, mode, settings)` clones the repository's default branch, chunks it and upserts the chunks. It runs in two places: Mastermind's `/pubsub/embed-request` handler (fed by Dispatch on a default-branch push) and `henchmen embed <owner/repo> [--full]`. An `incremental` run diffs from the last indexed commit, deletes the chunks of removed files and re-uploads changed files (with no last indexed commit it becomes a full run). A `full` run first deletes every chunk already indexed for the repo, so files deleted since the last index do not stay searchable. Fail-closed: the last indexed commit only advances once every chunk uploaded, so a partial run is retried from the same base.
 - **Reranker** (`reranker.py`): Reranks RAG chunks with the light-tier model; not yet called from the Mastermind pipeline.
 - **SnapshotCache** (`cache.py`): Helpers for storing repository snapshots in the snapshots bucket. Nothing creates snapshots, so operatives always clone the repository fresh.
 
@@ -240,7 +243,7 @@ The Dossier subsystem assembles context packages for operatives:
                                                |
                                          verify_changes (DETERMINISTIC: source commits ahead of base?)
                                                |
-                                         [pass] -> run_lint (DETERMINISTIC)
+                                         [pass] -> run_lint (DETERMINISTIC: files changed vs base only)
                                                |
                                          [pass] -> run_tests (DETERMINISTIC)
                                                |
@@ -266,7 +269,7 @@ Seven topics, each named `henchmen-{env}-<topic>` (`terraform/modules/pubsub`):
 | `forge-request` | Mastermind | Forge `/pubsub/forge-request` | Push |
 | `forge-result` | Forge | Mastermind `/pubsub/forge-result` | Push |
 | `ci-failure` | Dispatch (GitHub webhook) | Mastermind `/pubsub/ci-failure` | Push |
-| `embed-request` | Dispatch (GitHub push) | none yet (re-embedding hook) | -- |
+| `embed-request` | Dispatch (GitHub push to the default branch) | Mastermind `/pubsub/embed-request` | Push |
 | `dead-letter` | Pub/Sub (failed deliveries) | Mastermind `/api/v1/check-dlq` pulls `dead-letter-sub` | Pull |
 
 Forge also has a push subscription on Cloud Build's own `cloud-builds` topic (`/pubsub/build-complete`).
@@ -284,7 +287,7 @@ All push subscriptions authenticate with an OIDC token minted for the `sa-{env}-
 | **Pub/Sub** | Async message passing between all components |
 | **Firestore** | Task execution tracking, operative reports, processed-message dedup, merge queue claims |
 | **Cloud Storage (GCS)** | Dossier artifacts, Terraform state |
-| **Secret Manager** | GitHub token, Slack tokens, Jira API token, metrics bearer token |
+| **Secret Manager** | GitHub token, Slack tokens, Jira API token, metrics bearer token, Dispatch API bearer token |
 | **Artifact Registry** | Docker images for all containers |
 | **VPC + Serverless VPC Access** | Private-range networking only; public egress does not traverse the VPC |
 | **Cloud Scheduler** | Stale-task cleanup, watchdog, dead-letter check, merge queue maintenance (staging/prod; off in dev) |

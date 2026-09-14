@@ -104,7 +104,7 @@ Terraform. The mounts it declares:
 | Service | Secrets mounted (env var ← secret) |
 |---------|-----------------------------------|
 | Mastermind | `GITHUB_TOKEN`, `SLACK_BOT_TOKEN`, `HENCHMEN_METRICS_AUTH_TOKEN` |
-| Dispatch | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_APP_TOKEN`, `JIRA_API_TOKEN`, `HENCHMEN_METRICS_AUTH_TOKEN` |
+| Dispatch | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_APP_TOKEN`, `JIRA_API_TOKEN`, `HENCHMEN_METRICS_AUTH_TOKEN`, `DISPATCH_API_TOKEN` |
 | Forge | `GITHUB_TOKEN`, `HENCHMEN_METRICS_AUTH_TOKEN` |
 | Operative (Lairs) | `GITHUB_TOKEN` (attached by LairManager when it creates each job) |
 
@@ -138,7 +138,14 @@ echo -n "ghp_YourTokenHere" | gcloud secrets versions add henchmen-dev-github-to
 
 # Slack bot token
 echo -n "xoxb-YourTokenHere" | gcloud secrets versions add henchmen-dev-slack-bot-token --data-file=-
+
+# Dispatch API bearer token (POST /api/v1/tasks returns 401 in staging/prod until this is set)
+openssl rand -hex 32 | tr -d '\n' | gcloud secrets versions add henchmen-dev-dispatch-api-token --data-file=-
 ```
+
+Dispatch treats the placeholder value Terraform seeds into
+`henchmen-<env>-dispatch-api-token` as "no token", so the route stays closed in
+staging and prod until a real version is added.
 
 Secrets are mounted as environment variables with `version = "latest"`, which
 Cloud Run resolves when an instance starts. New lairs and newly started
@@ -165,7 +172,8 @@ All settings are managed via `src/henchmen/config/settings.py` using `pydantic-s
 | `HENCHMEN_LAIR_DEFAULT_TIMEOUT` | No | `1800` | Job timeout (seconds) when a node sets none |
 | `HENCHMEN_LAIR_OPERATIVE_IMAGE_TAG` | No | `latest` | Operative image tag or digest lairs run (Terraform injects `container_image_tag`) |
 | `HENCHMEN_LAIR_SERVICE_ACCOUNT` | No | `sa-<env>-operative@<project>` | Service account lairs run as |
-| `HENCHMEN_METRICS_AUTH_TOKEN` | Staging/prod | `` | Bearer token for `/metrics` |
+| `HENCHMEN_METRICS_AUTH_TOKEN` | Staging/prod | `` | Bearer token for `/metrics/*` and `/api/v1/metrics/summary` |
+| `HENCHMEN_DISPATCH_API_TOKEN` | Staging/prod | `` | Bearer token for `POST /api/v1/tasks` (also read as `DISPATCH_API_TOKEN`) |
 | `HENCHMEN_PUBSUB_OIDC_AUDIENCE` | Staging/prod | `` | Expected OIDC audience on Pub/Sub pushes (Terraform sets `henchmen-<env>-<service>`) |
 | `HENCHMEN_GITHUB_DEFAULT_REPO` | No | `` | Default target repository (owner/repo format) |
 
@@ -184,24 +192,63 @@ Run secret mount in production and a `HENCHMEN_`-prefixed value from
 | `SLACK_SIGNING_SECRET` | `slack_signing_secret` | Dispatch |
 | `SLACK_APP_TOKEN` | `slack_app_token` | Dispatch |
 | `JIRA_API_TOKEN` | `jira_api_token` | Dispatch, Operative |
+| `DISPATCH_API_TOKEN` | `dispatch_api_token` | Dispatch (`POST /api/v1/tasks` bearer token; empty is open in dev with a warning, 401 in staging/prod) |
+| `HENCHMEN_METRICS_AUTH_TOKEN` | `metrics_auth_token` | Mastermind (`/metrics/*` and `/api/v1/metrics/summary` bearer token; Terraform also mounts it on Dispatch and Forge) |
 
 ### Operative-Specific Variables (injected by LairManager)
 
-Besides the `HENCHMEN_*` configuration it forwards, LairManager sets this
-runtime contract on every operative job:
+LairManager builds each operative's environment in two layers.
+
+**Forwarded configuration.** `Settings.operative_env()` renders a fixed list of
+Mastermind's `Settings` fields as `HENCHMEN_<FIELD>` variables, so an override
+in Mastermind's environment or `.env.local` (tier models, token budgets, cost
+ceilings) reaches the container instead of the in-container defaults. Empty
+values are omitted. In local Docker mode the GitHub, OpenAI and Anthropic keys
+are forwarded too; on GCP the operative gets `GITHUB_TOKEN` from Secret
+Manager instead. The forwarded fields include:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HENCHMEN_PROVIDER`, `HENCHMEN_LLM_PROVIDER`, `HENCHMEN_ENVIRONMENT` | `gcp`, follows provider, `dev` | Backend family, LLM provider, environment |
+| `HENCHMEN_VERTEX_AI_MODEL_COMPLEX` | `gemini-2.5-pro` | Vertex AI model for the `default/complex` tier |
+| `HENCHMEN_VERTEX_AI_MODEL_LIGHT` | `gemini-2.5-flash` | Vertex AI model for the `default/light` tier |
+| `HENCHMEN_VERTEX_AI_MODEL_REASONING` | `gemini-3.1-pro` | Vertex AI model for the `default/reasoning` tier |
+| `HENCHMEN_ANTHROPIC_MODEL_COMPLEX` | `claude-sonnet-5` | Anthropic model for the `default/complex` tier |
+| `HENCHMEN_ANTHROPIC_MODEL_LIGHT` | `claude-haiku-4-5` | Anthropic model for the `default/light` tier |
+| `HENCHMEN_ANTHROPIC_MODEL_REASONING` | `claude-opus-5` | Anthropic model for the `default/reasoning` tier |
+| `HENCHMEN_OPENAI_MODEL_COMPLEX` | `gpt-4.1` | OpenAI model for the `default/complex` tier |
+| `HENCHMEN_OPENAI_MODEL_LIGHT` | `gpt-4.1-mini` | OpenAI model for the `default/light` tier |
+| `HENCHMEN_OPENAI_MODEL_REASONING` | `o3` | OpenAI model for the `default/reasoning` tier |
+| `HENCHMEN_BEDROCK_MODEL_*`, `HENCHMEN_LLM_OLLAMA_MODEL*` | see `.env.example` | Bedrock and Ollama tier models |
+| `HENCHMEN_OPERATIVE_MAX_OUTPUT_TOKENS` | `16384` | Max output tokens per LLM call |
+| `HENCHMEN_OPERATIVE_MAX_SYSTEM_TOKENS` | `20000` | Token budget for the system prompt |
+| `HENCHMEN_OPERATIVE_MAX_MESSAGE_TOKENS` | `16000` | Token budget for a single message |
+| `HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD` | `6.0` | Cumulative spend allowed for the task |
+| `HENCHMEN_OPERATIVE_WALLCLOCK_CEILING_SECONDS` | `1800` | Wall-clock ceiling for the operative |
+| `HENCHMEN_OPERATIVE_HEARTBEAT_INTERVAL_SECONDS` | `60` | Interval between heartbeat writes |
+| `HENCHMEN_ALLOW_FORCE_PUSH` | `false` | Allow force-push to non-protected branches |
+
+`_OPERATIVE_ENV_FIELDS` in `src/henchmen/config/settings.py` is the complete
+list (it also carries GCP project/region, buckets, git identity, the default
+repo, RAG corpus settings and the local forward URL).
+
+**Runtime contract.** On top of that, LairManager sets these unprefixed
+per-execution inputs:
 
 | Variable | Description |
 |----------|-------------|
 | `TASK_ID` | UUID of the parent task |
 | `NODE_ID` | Scheme node being executed (e.g., `implement_fix`) |
 | `SCHEME_ID` | Scheme definition ID (e.g., `bugfix_standard`) |
-| `LAIR_ID` | Job ID (`lair-{task_id[:8]}-{node_id}-{suffix}`) |
-| `MODEL_NAME` | Model tier for the node (e.g., `default/complex`); the operative's LLM provider resolves it |
+| `LAIR_ID` | Job ID (`lair-{task_id[:8]}-{node_id}-{suffix}`). The operative reports under this id (the same id Mastermind uses for its fallback report) unless `OPERATIVE_ID` overrides it |
+| `OPERATIVE_ID` | Optional. Not set by LairManager; when present it replaces `LAIR_ID` as the report's operative id (with neither set the operative uses `op-{task_id}-{node_id}`) |
+| `MODEL_NAME` | A tier (e.g., `default/complex`) or a concrete model name. The node's `model_name`, defaulting to `default/complex`; the operative resolves a tier through its LLM provider's `Settings` fields once at startup |
 | `REPO_URL` | Target repository (owner/repo format) |
 | `BRANCH` | Branch to clone: the feature branch for fix/retry nodes, otherwise the base branch (default `main`) |
 | `TASK_TITLE` | Task title (truncated to 200 chars) |
 | `TASK_DESCRIPTION` | Task description (truncated to 16,000 chars) |
-| `DOSSIER_URI` | Object-store URI of the serialized dossier, when one was uploaded |
+| `DOSSIER_URI` | Object-store URI of the serialized dossier; only set once the dossier was uploaded |
+| `WORKSPACE_DIR` | Not set by LairManager. The operative sets it to `/workspace/<task_id>` after cloning, and Arsenal resolves every tool path against it (default `/workspace`) |
 
 ### Pub/Sub Topics (auto-configured)
 
@@ -328,7 +375,17 @@ carry telemetry only — never task content.
 
 Mastermind also serves `GET /api/v1/metrics/summary?days=7`, a dashboard view
 with a different shape (`success_rate`, `escalation_rate`, `cost_by_model`,
-`escalation_reasons`). It is not behind the metrics bearer token.
+`escalation_reasons`). It applies the same bearer-token rules as `/metrics`:
+
+```bash
+curl -H "Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN" \
+  "http://localhost:8000/mastermind/api/v1/metrics/summary?days=7"
+```
+
+Both work under `henchmen serve` and docker compose: the single-process server
+runs each mounted service's startup and shutdown, so Mastermind registers its
+metrics router (and Dispatch connects the Slack bot) exactly as it does on
+Cloud Run.
 
 ### Merge Queue State
 

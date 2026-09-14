@@ -33,7 +33,7 @@ Seven components, all villain-themed:
 - **Operative** (`src/henchmen/operative/`) — Coding agent. Cloud Run Job. Bootstraps into ephemeral environment, executes Scheme nodes, uses Arsenal tools, reports results. TIMED_OUT stays TIMED_OUT (never upgraded to COMPLETED).
 - **Arsenal** (`src/henchmen/arsenal/`) — Tool registry. Runs inside Operative (NOT a separate service). Tool categories: `code_edit`, `code_intel`, `context`, `git_ops`, `github`, `jira`, `slack`, `test_runner`.
 - **Forge** (`src/henchmen/forge/`) — Post-PR CI. Cloud Run service. Never opens PRs — Mastermind's `create_pr` node does. Runs CI on the PR branch (ruff on changed Python files, tests, silent-failure scan on the diff), comments the result on the PR and publishes `forge-result` as `passed`, `failed`, or `incomplete` when a check could not run. `MergeQueue` exists but nothing enqueues into it; its tick only expires stale claims and reports depth.
-- **Dossier** (`src/henchmen/dossier/`) — Context builder. Library. Gathers rules, semantic code search via Vertex AI RAG Engine (corpus: `henchmen-code`), task analysis. Uploads the assembled dossier to the object store.
+- **Dossier** (`src/henchmen/dossier/`) — Context builder. Library. Gathers rules, semantic code search via Vertex AI RAG Engine (corpus: `henchmen-code`), task analysis. Uploads the assembled dossier to the object store. Its indexing pipeline (`embed_pipeline.py`) runs in Mastermind's `/pubsub/embed-request` handler, fed by Dispatch on a push to a repo's default branch, and in `henchmen embed <owner/repo> [--full]` — never in Dispatch. A full run deletes the repo's existing chunks first; the last-indexed commit only advances after every chunk uploaded.
 - **Schemes** (`src/henchmen/schemes/`) — DAG workflow blueprints. Library. Defines execution plans: `bugfix_standard`, `feature_standard`, `goal_decomposition`.
 
 Shared data contracts live in **Models** (`src/henchmen/models/`) — Pydantic v2 models for `Task`, `Operative`, `Scheme`, `Dossier`, `LLM` (messages, tool calls, `ModelTier`) and `Evaluation`.
@@ -48,6 +48,9 @@ Source → Dispatch → Pub/Sub (task-intake) → Mastermind → Dossier (contex
   → Pub/Sub (operative-complete) → Mastermind (lint/test gates, create_pr)
   → Pub/Sub (forge-request) → Forge (CI on the PR) → Pub/Sub (forge-result)
   → Human review
+
+GitHub push to default branch → Dispatch → Pub/Sub (embed-request)
+  → Mastermind (dossier.embed_pipeline re-indexes the RAG corpus)
 ```
 
 ## Model Tiering
@@ -128,7 +131,7 @@ These are the paths CI checks (`.github/workflows/ci.yml`).
 henchmen/
 ├── src/henchmen/              # Main package
 │   ├── arsenal/               # Tool registry + tools/ (runs inside the operative)
-│   ├── cli/                   # init wizard, doctor, chat, serve, eval
+│   ├── cli/                   # init wizard, doctor, config, chat, serve, embed, eval
 │   ├── config/settings.py     # Pydantic settings (HENCHMEN_ prefix)
 │   ├── dispatch/              # Intake router + handlers/ + slack_bot.py
 │   ├── dossier/               # Context builder
@@ -160,7 +163,12 @@ Every error/exception path in the scheme executor returns `condition: "fail"`, n
 - A CI command that cannot run must surface its real exit code; never swallow
   it with `2>/dev/null || echo SKIP`
 - A lint gate must only judge files changed by the operative
-  (`git diff --name-only origin/<base>`), never pre-existing violations
+  (`git diff --name-only origin/<base>...HEAD`), never pre-existing violations.
+  Mastermind's gate (`scheme_executor/lint_scope.py`) runs ruff on changed
+  `.py` files, eslint on changed JS/TS files from the nearest `package.json`,
+  `go vet` on changed Go packages, and the whole-project Rust/Java lint only
+  when files in that language changed
+- A lint diff against `origin/<base>` that cannot be fetched or computed → fail
 
 ## Container Build & Deploy
 
