@@ -73,8 +73,9 @@ Each cell is a `Settings` field (`anthropic_model_complex`,
 `llm_ollama_model`; Bedrock has its own `bedrock_model_*` fields.
 
 `fix_lint` and `verify_changes` are DETERMINISTIC — no LLM, no Lair. `fix_lint`
-runs `ruff check --fix` / `eslint --fix` (`pnpm run lint:fix` in a turbo
-monorepo); `verify_changes` checks the branch has source commits ahead of base.
+runs `ruff check --fix` / `eslint --fix` on only the files the operative
+changed and reverts any fix outside them; `verify_changes` checks the branch has
+source commits ahead of base.
 
 Token pricing lives in exactly one place: `src/henchmen/providers/pricing.py`.
 Cost is always computed with `estimate_cost` / `estimate_cost_for_settings`

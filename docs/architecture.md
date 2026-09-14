@@ -355,6 +355,6 @@ A scheme node never names a concrete model. Its `model_name` is a **tier**, and 
 
 Bedrock reads `HENCHMEN_BEDROCK_MODEL_*`; Ollama uses `HENCHMEN_LLM_OLLAMA_MODEL_<TIER>` and falls back to `HENCHMEN_LLM_OLLAMA_MODEL`.
 
-`verify_changes` and `fix_lint` are deterministic and never call a model: `verify_changes` checks that the branch has source commits ahead of its base, and `fix_lint` runs `ruff check --fix` / `eslint --fix` (`pnpm run lint:fix` in a turbo monorepo).
+`verify_changes` and `fix_lint` are deterministic and never call a model: `verify_changes` checks that the branch has source commits ahead of its base, and `fix_lint` runs `ruff check --fix` / `eslint --fix` on only the files the operative changed, reverting any fix outside them.
 
 **Hard rule:** on Vertex AI only Gemini models are used -- no Claude on Vertex AI. Terraform enforces this with an IAM condition that denies non-Google publisher models.
