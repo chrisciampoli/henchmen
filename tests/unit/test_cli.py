@@ -89,18 +89,23 @@ class TestServeApp:
         sub_apps = (dispatch_app, forge_app, mastermind_app)
         saved = [dict(sub.state._state) for sub in sub_apps]
         get_settings.cache_clear()
-        run = MagicMock()
-        monkeypatch.setattr("henchmen.cli.uvicorn.run", run)
+        run = MagicMock(return_value=0)
+        monkeypatch.setattr("henchmen.cli.serve.serve_app", run)
         try:
-            _serve(argparse.Namespace(host="127.0.0.1", port=None, log_level="info"))
+            with pytest.raises(SystemExit) as exit_info:
+                _serve(argparse.Namespace(host="127.0.0.1", port=None, log_level="info"))
         finally:
             get_settings.cache_clear()
             for sub, state in zip(sub_apps, saved, strict=True):
                 sub.state._state.clear()
                 sub.state._state.update(state)
 
-        app = run.call_args[0][0]
+        assert exit_info.value.code == 0
+        app = run.call_args.args[0]
         assert app.version == henchmen.__version__
+        assert run.call_args.kwargs["host"] == "127.0.0.1"
+        assert run.call_args.kwargs["port"] == 8000
+        assert run.call_args.kwargs["log_level"] == "info"
 
 
 class TestDefaultEnv:

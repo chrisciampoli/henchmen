@@ -153,3 +153,173 @@ class TestSignalOwnership:
             loop.add_signal_handler(signal.SIGTERM, lambda: installed.append(1))
         assert "add_signal_handler" not in vars(loop)
         assert installed == []
+
+
+# ---------------------------------------------------------------------------
+# Setup mode, Console mount and restart-to-apply
+# ---------------------------------------------------------------------------
+
+from henchmen.cli.serve import (  # noqa: E402
+    RESTART_EXIT_CODE,
+    RestartSignal,
+    build_serve_app,
+    build_setup_app,
+    console_url,
+)
+from henchmen.console.app import ConsoleMode, create_console_app  # noqa: E402
+from henchmen.console.auth import ConsoleAuth  # noqa: E402
+from henchmen.console.state import SetupStateStore  # noqa: E402
+
+_LOCAL = "http://127.0.0.1:8000"
+
+
+def _console_app(tmp_path: Path, mode: ConsoleMode = ConsoleMode.SETUP):
+    return create_console_app(
+        mode=mode,
+        store=SetupStateStore(tmp_path / "setup-state.json"),
+        auth=ConsoleAuth(setup_token="tok", signing_key=b"k" * 32),
+        config_file=tmp_path / "henchmen.env",
+        on_apply=lambda: None,
+    )
+
+
+def test_setup_app_serves_health_and_the_console(tmp_path: Path) -> None:
+    client = TestClient(build_setup_app(_console_app(tmp_path)), base_url=_LOCAL)
+    assert client.get("/health").json() == {"status": "ok", "mode": "setup"}
+    assert client.get("/console/api/status").json()["mode"] == "setup"
+    assert client.get("/").status_code == 200
+
+
+def test_setup_app_does_not_expose_the_services(tmp_path: Path) -> None:
+    client = TestClient(build_setup_app(_console_app(tmp_path)), base_url=_LOCAL)
+    response = client.post("/dispatch/api/v1/tasks", json={}, headers={"origin": _LOCAL})
+    assert response.status_code in {401, 404, 405}
+
+
+def test_health_does_not_require_a_loopback_host(tmp_path: Path) -> None:
+    """The launcher and operatives reach /health by container name."""
+    client = TestClient(build_setup_app(_console_app(tmp_path)), base_url="http://henchmen:8000")
+    assert client.get("/health").status_code == 200
+
+
+def test_restart_signal_stops_the_attached_server() -> None:
+    signal_ = RestartSignal()
+    server = MagicMock()
+    signal_.attach(server)
+    assert signal_.requested is False
+    signal_.request()
+    assert signal_.requested is True
+    assert server.should_exit is True
+
+
+def test_restart_requested_before_attach_is_remembered() -> None:
+    signal_ = RestartSignal()
+    signal_.request()
+    server = MagicMock()
+    signal_.attach(server)
+    assert server.should_exit is True
+
+
+def test_restart_exit_code_is_three() -> None:
+    assert RESTART_EXIT_CODE == 3
+
+
+def test_console_url_carries_the_setup_token() -> None:
+    assert console_url(8123, "abc") == "http://127.0.0.1:8123/console/session?setup_token=abc"
+
+
+def test_serve_app_mounts_the_console_after_the_services(serve_env: Path) -> None:
+    """Ruling R2: build_serve_app uses the serve_env fixture, not mock_settings alone —
+    it builds a real document store, so the test must be hermetic the same way the
+    pre-existing lifespan tests are.
+    """
+    from henchmen.config.settings import get_settings
+
+    app = build_serve_app(get_settings(), 8000, console=_console_app(serve_env, ConsoleMode.RUN))
+    route_paths = [getattr(route, "path", "") for route in app.routes]
+    # Starlette reports a Mount("/") as path "".
+    assert route_paths.index("") > route_paths.index("/health"), "the Console mount must come last"
+    # No `with`: lifespans are not entered, so this checks routing only.
+    client = TestClient(app, base_url=_LOCAL)
+    assert client.get("/health").json()["mode"] == "local"
+    assert client.get("/console/api/status").json()["mode"] == "run"
+
+
+def test_serve_app_without_console_is_unchanged(serve_env: Path) -> None:
+    from henchmen.config.settings import get_settings
+
+    app = build_serve_app(get_settings(), 8000)
+    assert "" not in [getattr(route, "path", "") for route in app.routes]
+
+
+def _serve_args(port: int | None = 8123):
+    import argparse
+
+    return argparse.Namespace(host="127.0.0.1", port=port, log_level="info")
+
+
+def test_serve_without_data_dir_runs_the_services(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import patch
+
+    from henchmen.cli import _serve
+
+    # Ruling R3: _serve writes HENCHMEN_LOCAL_SERVE_PORT to os.environ directly;
+    # pre-registering it with monkeypatch guarantees teardown restores/clears it.
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+    monkeypatch.delenv("HENCHMEN_DATA_DIR", raising=False)
+    with (
+        patch("henchmen.cli.serve.build_serve_app", return_value=MagicMock()) as build,
+        patch("henchmen.cli.serve.serve_app", return_value=0) as run,
+        pytest.raises(SystemExit) as exit_info,
+    ):
+        _serve(_serve_args())
+    assert exit_info.value.code == 0
+    assert build.call_args.kwargs["console"] is None
+    assert run.call_args.kwargs["port"] == 8123
+
+
+def test_serve_with_incomplete_setup_serves_only_the_console(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from unittest.mock import patch
+
+    from henchmen.cli import _serve
+
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("HENCHMEN_CONSOLE_SETUP_TOKEN", "given-token")
+    with (
+        patch("henchmen.cli.serve.build_serve_app") as build_services,
+        patch("henchmen.cli.serve.serve_app", return_value=RESTART_EXIT_CODE) as run,
+        pytest.raises(SystemExit) as exit_info,
+    ):
+        _serve(_serve_args())
+    assert exit_info.value.code == RESTART_EXIT_CODE
+    build_services.assert_not_called()
+    served = run.call_args.args[0]
+    assert TestClient(served, base_url=_LOCAL).get("/health").json()["mode"] == "setup"
+    assert "console/session?setup_token=given-token" in capsys.readouterr().out
+
+
+def test_serve_with_completed_setup_mounts_the_console_in_run_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from unittest.mock import patch
+
+    from henchmen.cli import _serve
+    from henchmen.console.state import SetupState, SetupStep
+
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    (tmp_path / "henchmen.env").write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+    store = SetupStateStore(tmp_path / "setup-state.json")
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True))
+    with (
+        patch("henchmen.cli.serve.build_serve_app", return_value=MagicMock()) as build,
+        patch("henchmen.cli.serve.serve_app", return_value=0),
+        pytest.raises(SystemExit),
+    ):
+        _serve(_serve_args())
+    console = build.call_args.kwargs["console"]
+    assert console is not None
+    assert TestClient(console, base_url=_LOCAL).get("/console/api/status").json()["mode"] == "run"

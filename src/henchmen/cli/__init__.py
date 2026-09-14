@@ -8,8 +8,6 @@ import os
 import sys
 from typing import TYPE_CHECKING
 
-import uvicorn
-
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -607,16 +605,57 @@ def _compare_baseline(path: Path, provider: str, report: EvalReport) -> int:
 
 
 def _serve(args: argparse.Namespace) -> None:
-    """Run Dispatch + Mastermind + Forge in a single process."""
-    # pydantic-settings loads .env.local then .env automatically via the
-    # Settings.model_config env_file tuple. Only seed defaults for keys the
-    # user has not set anywhere — os.environ outranks the dotenv files.
+    """Run Henchmen in one process: setup mode (Console only) or run mode (all services)."""
+    from henchmen.cli.serve import RestartSignal, build_serve_app, build_setup_app, console_url, serve_app
+    from henchmen.config import paths
+
     _default_env("HENCHMEN_PROVIDER", "local", file_keys=_dotenv_keys())
     if args.port is not None:
         os.environ["HENCHMEN_LOCAL_SERVE_PORT"] = str(args.port)
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
     logger = logging.getLogger("henchmen")
+    restart = RestartSignal()
+
+    console = None
+    state_file = paths.setup_state_file()
+    secrets_dir = paths.secrets_dir()
+    if state_file is not None and secrets_dir is not None:
+        from henchmen.console.app import ConsoleMode, create_console_app
+        from henchmen.console.auth import ConsoleAuth
+        from henchmen.console.state import SetupStateStore
+
+        store = SetupStateStore(state_file)
+        auth = ConsoleAuth.load(secrets_dir, setup_token=os.environ.get(paths.SETUP_TOKEN_ENV) or None)
+        console_port = args.port or int(os.environ.get("HENCHMEN_LOCAL_SERVE_PORT") or "8000")
+
+        if not store.load().completed:
+            logger.info("Setup is not complete; serving only the setup Console")
+            print(f"Open Henchmen setup: {console_url(console_port, auth.setup_token)}", flush=True)
+            setup_console = create_console_app(
+                mode=ConsoleMode.SETUP,
+                store=store,
+                auth=auth,
+                config_file=paths.config_file(),
+                on_apply=restart.request,
+            )
+            code = serve_app(
+                build_setup_app(setup_console),
+                host=args.host,
+                port=console_port,
+                log_level=args.log_level,
+                restart=restart,
+            )
+            sys.exit(code)
+
+        console = create_console_app(
+            mode=ConsoleMode.RUN,
+            store=store,
+            auth=auth,
+            config_file=paths.config_file(),
+            on_apply=restart.request,
+        )
+        print(f"Open Henchmen: {console_url(console_port, auth.setup_token)}", flush=True)
 
     from henchmen.providers.tiers import active_llm_provider
 
@@ -638,10 +677,5 @@ def _serve(args: argparse.Namespace) -> None:
         llm,
         settings.environment.value,
     )
-
-    # Each sub-app's own lifespan runs inside the combined app's lifespan
-    # (Slack Socket Mode, Mastermind's metrics router, tracing) — see cli/serve.py.
-    from henchmen.cli.serve import build_serve_app
-
-    app = build_serve_app(settings, port)
-    uvicorn.run(app, host=args.host, port=port, log_level=args.log_level)
+    app = build_serve_app(settings, port, console=console)
+    sys.exit(serve_app(app, host=args.host, port=port, log_level=args.log_level, restart=restart))
