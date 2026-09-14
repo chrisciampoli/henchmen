@@ -618,6 +618,7 @@ def _serve(args: argparse.Namespace) -> None:
     restart = RestartSignal()
 
     console = None
+    setup_token: str | None = None
     state_file = paths.setup_state_file()
     secrets_dir = paths.secrets_dir()
     if state_file is not None and secrets_dir is not None:
@@ -626,10 +627,30 @@ def _serve(args: argparse.Namespace) -> None:
         from henchmen.console.state import SetupStateStore
 
         store = SetupStateStore(state_file)
-        auth = ConsoleAuth.load(secrets_dir, setup_token=os.environ.get(paths.SETUP_TOKEN_ENV) or None)
-        console_port = args.port or int(os.environ.get("HENCHMEN_LOCAL_SERVE_PORT") or "8000")
+        try:
+            state = store.load()
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            print(f"Hint: restore or delete {state_file} to restart setup.", file=sys.stderr)
+            sys.exit(2)
 
-        if not store.load().completed:
+        try:
+            auth = ConsoleAuth.load(secrets_dir, setup_token=os.environ.get(paths.SETUP_TOKEN_ENV) or None)
+        except OSError as exc:
+            print(f"ERROR: could not read or write {secrets_dir}: {exc}", file=sys.stderr)
+            print("Hint: check permissions on the data volume.", file=sys.stderr)
+            sys.exit(2)
+
+        if not state.completed:
+            raw_port = args.port or os.environ.get("HENCHMEN_LOCAL_SERVE_PORT") or "8000"
+            try:
+                console_port = int(raw_port)
+            except ValueError:
+                print(
+                    f"ERROR: HENCHMEN_LOCAL_SERVE_PORT must be an integer, got {raw_port!r}.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
             logger.info("Setup is not complete; serving only the setup Console")
             print(f"Open Henchmen setup: {console_url(console_port, auth.setup_token)}", flush=True)
             setup_console = create_console_app(
@@ -655,7 +676,7 @@ def _serve(args: argparse.Namespace) -> None:
             config_file=paths.config_file(),
             on_apply=restart.request,
         )
-        print(f"Open Henchmen: {console_url(console_port, auth.setup_token)}", flush=True)
+        setup_token = auth.setup_token
 
     from henchmen.providers.tiers import active_llm_provider
 
@@ -670,6 +691,11 @@ def _serve(args: argparse.Namespace) -> None:
         )
         print("Hint: run `henchmen init`, or set HENCHMEN_PROVIDER=local for a fully local run.", file=sys.stderr)
         sys.exit(2)
+
+    if console is not None and setup_token is not None:
+        # Printed only now, from the port Settings actually resolved (which may
+        # come from <data dir>/henchmen.env), not the pre-Settings bootstrap guess.
+        print(f"Open Henchmen: {console_url(port, setup_token)}", flush=True)
 
     logger.info(
         "Starting Henchmen in single-process mode (provider=%s, llm=%s, environment=%s)",

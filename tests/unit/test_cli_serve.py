@@ -220,8 +220,78 @@ def test_restart_requested_before_attach_is_remembered() -> None:
     assert server.should_exit is True
 
 
-def test_restart_exit_code_is_three() -> None:
-    assert RESTART_EXIT_CODE == 3
+def test_restart_exit_code_is_distinct_from_uvicorns_startup_failure_code() -> None:
+    """75 (EX_TEMPFAIL) — must differ from uvicorn's own STARTUP_FAILURE (3), which
+    serve_app also returns (for a server whose lifespan never started).
+    """
+    assert RESTART_EXIT_CODE == 75
+
+
+class TestServeAppExitCodes:
+    """serve_app against a stubbed uvicorn.Server: restart, startup failure, Ctrl+C."""
+
+    def _stub_server(self, *, started: bool) -> MagicMock:
+        server = MagicMock()
+        server.started = started
+        return server
+
+    def test_restart_requested_returns_the_restart_exit_code(self) -> None:
+        from henchmen.cli.serve import serve_app
+
+        server = self._stub_server(started=True)
+        with patch("henchmen.cli.serve.uvicorn.Server", return_value=server):
+            restart = RestartSignal()
+            restart.request()
+            code = serve_app(MagicMock(), host="127.0.0.1", port=8000, log_level="info", restart=restart)
+        assert code == RESTART_EXIT_CODE
+        server.run.assert_called_once()
+
+    def test_normal_stop_with_started_true_returns_zero(self) -> None:
+        from henchmen.cli.serve import serve_app
+
+        server = self._stub_server(started=True)
+        with patch("henchmen.cli.serve.uvicorn.Server", return_value=server):
+            code = serve_app(MagicMock(), host="127.0.0.1", port=8000, log_level="info", restart=RestartSignal())
+        assert code == 0
+
+    def test_started_false_returns_uvicorns_startup_failure_code(self) -> None:
+        from henchmen.cli.serve import serve_app
+
+        server = self._stub_server(started=False)
+        with patch("henchmen.cli.serve.uvicorn.Server", return_value=server):
+            code = serve_app(MagicMock(), host="127.0.0.1", port=8000, log_level="info", restart=RestartSignal())
+        assert code == 3
+
+    def test_restart_requested_wins_over_a_failed_startup(self) -> None:
+        from henchmen.cli.serve import serve_app
+
+        server = self._stub_server(started=False)
+        with patch("henchmen.cli.serve.uvicorn.Server", return_value=server):
+            restart = RestartSignal()
+            restart.request()
+            code = serve_app(MagicMock(), host="127.0.0.1", port=8000, log_level="info", restart=restart)
+        assert code == RESTART_EXIT_CODE
+
+    def test_keyboard_interrupt_is_swallowed_and_returns_zero(self) -> None:
+        """Ctrl+C must not end in a traceback, matching uvicorn.run's own behaviour."""
+        from henchmen.cli.serve import serve_app
+
+        server = self._stub_server(started=True)
+        server.run.side_effect = KeyboardInterrupt
+        with patch("henchmen.cli.serve.uvicorn.Server", return_value=server):
+            code = serve_app(MagicMock(), host="127.0.0.1", port=8000, log_level="info", restart=RestartSignal())
+        assert code == 0
+
+    def test_keyboard_interrupt_after_a_restart_request_still_restarts(self) -> None:
+        from henchmen.cli.serve import serve_app
+
+        server = self._stub_server(started=True)
+        server.run.side_effect = KeyboardInterrupt
+        with patch("henchmen.cli.serve.uvicorn.Server", return_value=server):
+            restart = RestartSignal()
+            restart.request()
+            code = serve_app(MagicMock(), host="127.0.0.1", port=8000, log_level="info", restart=restart)
+        assert code == RESTART_EXIT_CODE
 
 
 def test_console_url_carries_the_setup_token() -> None:
@@ -258,7 +328,7 @@ def _serve_args(port: int | None = 8123):
     return argparse.Namespace(host="127.0.0.1", port=port, log_level="info")
 
 
-def test_serve_without_data_dir_runs_the_services(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_serve_without_data_dir_runs_the_services(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from unittest.mock import patch
 
     from henchmen.cli import _serve
@@ -267,6 +337,9 @@ def test_serve_without_data_dir_runs_the_services(monkeypatch: pytest.MonkeyPatc
     # pre-registering it with monkeypatch guarantees teardown restores/clears it.
     monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
     monkeypatch.delenv("HENCHMEN_DATA_DIR", raising=False)
+    # Without a data dir, get_settings() reads .env.local/.env from the working
+    # directory — chdir into an empty tmp_path so this never reads the repo's own.
+    monkeypatch.chdir(tmp_path)
     with (
         patch("henchmen.cli.serve.build_serve_app", return_value=MagicMock()) as build,
         patch("henchmen.cli.serve.serve_app", return_value=0) as run,
@@ -323,3 +396,87 @@ def test_serve_with_completed_setup_mounts_the_console_in_run_mode(
     console = build.call_args.kwargs["console"]
     assert console is not None
     assert TestClient(console, base_url=_LOCAL).get("/console/api/status").json()["mode"] == "run"
+
+
+def test_run_mode_prints_the_port_settings_actually_resolved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The printed URL must match the port build_serve_app/serve_app are bound to, which
+    comes from Settings (and so can come from <data dir>/henchmen.env) — not the
+    pre-Settings bootstrap fallback used only to bind the setup-mode-only Console.
+    """
+    from unittest.mock import patch
+
+    from henchmen.cli import _serve
+    from henchmen.console.state import SetupState, SetupStep
+
+    # Ruling R3 pre-registers HENCHMEN_LOCAL_SERVE_PORT only to undo _serve's direct
+    # os.environ write when args.port is not None; here port=None below means _serve
+    # never writes it, and the env var must stay absent so the port comes only from
+    # henchmen.env — so R3's pre-registration does not apply to this test.
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("HENCHMEN_LOCAL_SERVE_PORT", raising=False)
+    (tmp_path / "henchmen.env").write_text(
+        "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_SERVE_PORT=9999\n", encoding="utf-8"
+    )
+    store = SetupStateStore(tmp_path / "setup-state.json")
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True))
+    with (
+        patch("henchmen.cli.serve.build_serve_app", return_value=MagicMock()),
+        patch("henchmen.cli.serve.serve_app", return_value=0) as run,
+        pytest.raises(SystemExit),
+    ):
+        # No --port and no HENCHMEN_LOCAL_SERVE_PORT in the environment: the only
+        # source of the port is <data dir>/henchmen.env, read through Settings.
+        _serve(_serve_args(port=None))
+    assert run.call_args.kwargs["port"] == 9999
+    assert "http://127.0.0.1:9999/console/session" in capsys.readouterr().out
+
+
+def test_setup_mode_with_a_non_integer_port_env_exits_with_a_readable_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from henchmen.cli import _serve
+
+    # port=None below means _serve never writes HENCHMEN_LOCAL_SERVE_PORT itself, so
+    # this monkeypatch.setenv is the only write and R3's pre-registration concern
+    # (an untracked direct os.environ write) does not apply.
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "abc")
+    with pytest.raises(SystemExit) as exit_info:
+        _serve(_serve_args(port=None))
+    assert exit_info.value.code == 2
+    assert "HENCHMEN_LOCAL_SERVE_PORT" in capsys.readouterr().err
+
+
+def test_corrupt_setup_state_file_exits_with_a_readable_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from henchmen.cli import _serve
+
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    state_file = tmp_path / "setup-state.json"
+    state_file.write_text("not valid json", encoding="utf-8")
+    with pytest.raises(SystemExit) as exit_info:
+        _serve(_serve_args())
+    assert exit_info.value.code == 2
+    assert state_file.name in capsys.readouterr().err
+
+
+def test_console_auth_load_permission_error_exits_with_a_readable_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from unittest.mock import patch
+
+    from henchmen.cli import _serve
+
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    with (
+        patch.object(ConsoleAuth, "load", side_effect=PermissionError("denied")),
+        pytest.raises(SystemExit) as exit_info,
+    ):
+        _serve(_serve_args())
+    assert exit_info.value.code == 2
+    assert "secrets" in capsys.readouterr().err.lower()
