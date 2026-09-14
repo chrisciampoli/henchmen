@@ -49,6 +49,33 @@ silently ignored, and the Dispatch container never ran its own HTTP app.
   the resolved model tiers, and takes `--offline`.
 - Slack Socket Mode now starts inside the Dispatch process and joins
   `slack_notification_channel` on startup.
+- `henchmen embed <owner/repo> [--full]` re-indexes a repository for semantic
+  code search and exits non-zero unless indexing completes. Mastermind consumes
+  `embed-request` pushes at `POST /pubsub/embed-request`, with an authenticated
+  Terraform push subscription and dead-letter policy, so push-triggered
+  re-indexing is no longer published to a topic nothing reads.
+- `task_type` (`bugfix`, `feature`, `refactor`) on `POST /api/v1/tasks` and
+  `HenchmenTask`; scheme selection honours it after goal keywords. `henchmen chat`
+  sends it.
+- `henchmen config [--only-set]` prints the effective settings with every
+  credential masked.
+- Semantic code-search results are reranked with one light-tier LLM call
+  (`HENCHMEN_DOSSIER_SEMANTIC_RERANK`, on by default).
+- New settings: `dispatch_api_token`, `dispatch_rate_limit_requests`,
+  `dispatch_rate_limit_window_seconds`, `dispatch_trust_forwarded_for`,
+  `jira_repo_field`, `jira_branch_field`, `forge_ci_timeout_seconds`,
+  `dossier_semantic_rerank`, `eval_db_path`, `local_sqlite_path`,
+  `local_storage_dir`, `ci_builder_image`, `ci_github_token_secret`,
+  `dead_letter_subscription`, `aws_ecs_execution_role_arn`.
+- CI validates Terraform (`fmt -check`, `init -backend=false -lockfile=readonly`,
+  `validate` for dev and staging); the environments' provider lock files are
+  committed. Unit tests run on Python 3.12 and 3.14.
+- The Forge image includes Node 24 and pnpm, so JS/TS pull requests' test suites
+  actually run.
+- `henchmen doctor` warns when a tier's model has no price, since an unpriced
+  model can never trip the cost ceiling.
+- Firestore composite index on `task_executions` (`execution_state`,
+  `last_heartbeat`) for the stalled-task watchdog query.
 
 ### Changed
 - **Credential settings accept two spellings.** `github_token`,
@@ -81,6 +108,37 @@ silently ignored, and the Dispatch container never ran its own HTTP app.
 - `pytest`, `ruff` and the `[local]` extra are installed in the mastermind and
   operative images so cloud-mode CI checks and direct-LLM operatives work.
 - `src/henchmen/__init__.py` reads `__version__` from package metadata.
+- Container images run Python 3.14.7 and Node 24 LTS (Node copied from the
+  matching `bookworm-slim` image); GitHub Actions use the Node 24 runtime.
+- `henchmen serve` now enters every mounted service's lifespan, so the Slack
+  bot connects and `/mastermind/metrics/*` works under `serve` and Docker
+  Compose. The three services share one document store.
+- The Mastermind lint gate and `fix_lint` judge and fix only files the
+  operative changed (Python via ruff, JS/TS via eslint from the nearest
+  `package.json`, Go via `go vet`), and fail closed if the diff against the
+  base branch cannot be computed. `fix_lint` no longer runs ruff on non-Python
+  stacks and reverts any auto-fix outside the operative's changes.
+- Forge reports a CI run as `incomplete`, not passed, when a check cannot run,
+  and caps a run at `forge_ci_timeout_seconds` (540s) so it finishes inside
+  Pub/Sub's ack deadline. The Forge Cloud Run service timeout is 600s.
+- The embedding pipeline moved from Dispatch to `dossier/embed_pipeline.py`.
+  A full re-index clears the repository's existing chunks first, and re-uploading
+  a changed file replaces its old chunks instead of duplicating them.
+- Bedrock tier defaults are cross-region inference profiles
+  (`us.anthropic.claude-sonnet-4-20250514-v1:0`,
+  `us.anthropic.claude-haiku-4-5-20251001-v1:0`).
+- The local SQLite store defaults to `~/.henchmen/henchmen_<environment>.db`
+  instead of a working-directory-relative file.
+- Scheme registration rejects an agentic node whose `model_name` is not a model
+  tier.
+- The stalled-task watchdog and the dead-letter check return 503 when their
+  query fails, instead of reporting zero results.
+- Terraform creates 7 Pub/Sub topics; `task-planned`, `operative-dispatch` and
+  `operative-status` had no publisher and are gone.
+- Vertex AI applies `vertex_ai_safety_threshold` to every call and routes
+  `gemini-3*` models to the global endpoint. OpenAI and Bedrock replace another
+  vendor's model name with their complex-tier model instead of returning 404.
+- PyGithub is pinned `>=2.4.0,<3` and authenticates with `Auth.Token`.
 
 ### Fixed
 - **Tier names reached provider APIs unresolved.** Vertex AI, OpenAI and
@@ -123,6 +181,25 @@ silently ignored, and the Dispatch container never ran its own HTTP app.
 - `henchmen doctor` ignored `.env.local` entirely because it read `os.environ`.
 - Integration tests no longer authenticate with the developer's real
   credentials; `integration_settings` blanks them.
+- The operative wrote `last_heartbeat` as a datetime while the tracker and the
+  stalled-task query use ISO strings, so a task whose operative had heartbeated
+  once could never be detected as stalled.
+- `fix_lint` did not await or check its git steps and could report a push that
+  never happened; interrupted operatives' saved reports were ignored in favour
+  of a fabricated failure.
+- Task intake swallowed every exception, so Pub/Sub's retry path was
+  unreachable.
+- The embedding pipeline advanced the last-indexed commit after a partial
+  upload, permanently stranding the chunks that failed.
+- `henchmen chat` sent a `type` field the task endpoint rejects, so every task
+  dispatched from chat failed with 422.
+- An eval fixture requiring tests but declaring no test command could score 1.0.
+- The operative ran on without a document store outside dev, silently losing
+  heartbeats and the cost ceiling; it now fails the job.
+- The Slack Socket Mode bot published redelivered events as new tasks.
+- `symbol_lookup`-style scoping: `test_runner` fails closed on unknown project
+  types; `git_branch_create` branches from the repository's real default branch.
+- DynamoDB reads returned `Decimal` for numbers nested in maps and lists.
 
 ### Removed
 - `src/henchmen/arsenal/server.py` (the FastMCP tool server) and the `mcp`
@@ -131,6 +208,16 @@ silently ignored, and the Dispatch container never ran its own HTTP app.
   nothing imported; Forge runs CI in `server.py` and Mastermind opens PRs.
 - The `henchmen_dev.db` SQLite database and its WAL/SHM files are no longer
   tracked in git.
+- Settings nothing read: `arsenal_mcp_server_url`, `gcs_bucket_tfstate`,
+  `github_app_id`, `github_app_private_key_secret`, `pubsub_topic_task_planned`,
+  `pubsub_topic_operative_dispatch`, `pubsub_topic_operative_status`,
+  `vertex_ai_grounding_enabled`, `vertex_ai_context_cache_enabled`,
+  `vertex_ai_context_cache_min_tokens`.
+- `SchemeNode.grounding_enabled`; `fix_tests` no longer requests Google Search
+  grounding.
+- The `/pubsub/task-planned` handler, the operative's snapshot-cache lookup
+  (it could never hit), `google-cloud-logging` from the Forge and operative
+  images, and git from the Dispatch image.
 
 ### Security
 - Secret redaction now applies to the whole `henchmen` logger tree and formats
@@ -146,6 +233,14 @@ silently ignored, and the Dispatch container never ran its own HTTP app.
   rather than raising on invalid bytes.
 - `.gitleaks.toml` loads the default rule set; the hook was scanning with zero
   rules.
+- Terraform's seeded placeholder secret is treated as unset for every
+  credential, so the metrics bearer token, Slack signing secret and webhook
+  secrets no longer accept a value published in this repository.
+- `POST /api/v1/tasks` requires `Authorization: Bearer <HENCHMEN_DISPATCH_API_TOKEN>`
+  (open only in dev with a warning; 401 in staging and prod).
+- `/api/v1/metrics/summary` requires the metrics bearer token.
+- Secret redaction is installed in Dispatch, Forge and the Slack bot, which
+  previously logged tokens unredacted.
 
 ## [0.2.1] - 2026-04-12
 
@@ -238,8 +333,11 @@ Security
   failure when the secret is missing in non-dev environments. (A2)
 - Pub/Sub push subscriptions now require an explicit OIDC audience via
   `HENCHMEN_PUBSUB_OIDC_AUDIENCE`. Missing audience raises at startup instead
-  of producing silent 403s. (A3)
-- Per-task LLM cost ceiling (`HENCHMEN_COST_CEILING_USD_PER_TASK`) with a
+  of producing silent 403s. (A3) *Correction: a missing audience is reported by
+  `validate_for_runtime` and rejects pushes in staging and prod; it does not
+  raise at startup.*
+- Per-task LLM cost ceiling (`HENCHMEN_COST_CEILING_USD_PER_TASK`, now
+  `HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD`) with a
   fail-closed breaker when a task exceeds the limit. (A4)
 - Secret redaction on all structured log records for known token shapes
   (GitHub, Slack, OpenAI, Anthropic). (A5)
@@ -278,6 +376,7 @@ Security
   `HENCHMEN_ENVIRONMENT=dev`. (A1)
 - Secret Manager is now the only supported secret source in GCP
   environments; `.env.local` support is restricted to `HENCHMEN_PROVIDER=local`. (A5)
+  *Correction: `.env.local` is loaded for every provider.*
 
 Reliability
 
