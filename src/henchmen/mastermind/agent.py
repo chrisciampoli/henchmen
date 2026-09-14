@@ -312,9 +312,9 @@ class MastermindAgent:
         # 3. Max retries
         if ci_fix_attempts >= 2:
             await self.tracker.record_ci_result(task_id, False)
-            reason = "CI still failing after 2 fix attempts"
+            reason = "CI still failing after max retries (2 fix attempts)"
             await self.tracker.mark_escalated(task_id, reason=reason)
-            return {"status": "escalated", "reason": "max retries (2) reached"}
+            return {"status": "escalated", "task_id": task_id, "reason": reason}
 
         # 4. Extract errors
         github_token = get_github_token()
@@ -362,15 +362,17 @@ class MastermindAgent:
             report = await self.lair_manager.wait_for_completion(lair_id)
             await self.tracker.clear_ci_fix_in_progress(task_id)
 
-            status = getattr(report, "status", None)
-            if status is not None and status != OperativeStatus.COMPLETED:
-                logger.warning("[CI-LOOP] Fix operative for %s ended as %s", task_id, status)
+            if report.status != OperativeStatus.COMPLETED:
+                # TIMED_OUT/FAILED/INTERRUPTED are not a dispatched fix: report
+                # them as such so the outcome is visible to the caller.
+                logger.warning("[CI-LOOP] Fix operative for %s ended as %s", task_id, report.status)
                 return {
                     "status": "fix_failed",
                     "task_id": task_id,
                     "attempt": ci_fix_attempts + 1,
                     "lair_id": lair_id,
-                    "reason": getattr(report, "summary", str(status)),
+                    "operative_status": report.status.value,
+                    "reason": report.error or report.summary,
                 }
 
             return {"status": "fix_dispatched", "task_id": task_id, "attempt": ci_fix_attempts + 1, "lair_id": lair_id}

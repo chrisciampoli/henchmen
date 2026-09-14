@@ -410,7 +410,8 @@ async def task_intake_handler(request: Request) -> dict[str, Any]:
 
     # Execute synchronously — Cloud Run keeps the request alive (up to 3600s).
     # Returning before completion would ack the Pub/Sub message, causing lost tasks
-    # if the instance recycles.  Returning 500 triggers Pub/Sub retry.
+    # if the instance recycles. An exception escaping _process_task returns 500
+    # so Pub/Sub retries.
     try:
         await _process_task(agent, task)
         # E2: only upgrade dedup marker to ``done`` after successful processing.
@@ -428,13 +429,21 @@ async def task_intake_handler(request: Request) -> dict[str, Any]:
 
 
 async def _process_task(agent: MastermindAgent, task: HenchmenTask) -> None:
-    """Process a task in the background."""
-    try:
-        logger.info("[MASTERMIND] Starting task processing: %s (%s)", task.id, task.title)
-        result = await agent.handle_task(task)
-        logger.info("[MASTERMIND] Task %s completed with status: %s", task.id, result.get("status"))
-        logger.info("[MASTERMIND] Result: %s", json.dumps(result, default=str)[:500])
+    """Run a task to completion, then emit metrics and notify Slack.
 
+    An exception escaping ``handle_task`` propagates so the task-intake handler
+    returns 500 and Pub/Sub redelivers. ``handle_task`` already escalates the
+    ordinary failures itself, so what reaches the caller is an infrastructure
+    failure (e.g. the tracker could not record the escalation) — exactly the
+    case a retry exists for. Post-run reporting is best-effort: once the task
+    has been finalized, a Slack or metrics hiccup must not re-run it.
+    """
+    logger.info("[MASTERMIND] Starting task processing: %s (%s)", task.id, task.title)
+    result = await agent.handle_task(task)
+    logger.info("[MASTERMIND] Task %s completed with status: %s", task.id, result.get("status"))
+    logger.info("[MASTERMIND] Result: %s", json.dumps(result, default=str)[:500])
+
+    try:
         # Emit structured metric for Cloud Monitoring
         from henchmen.observability.structured_logging import emit_task_completed
 
@@ -452,9 +461,8 @@ async def _process_task(agent: MastermindAgent, task: HenchmenTask) -> None:
         # when neither a token nor a channel is configured).
         logger.info("[MASTERMIND] Sending Slack notification for task %s", task.id)
         await _notify_slack(task, result)
-
     except Exception as exc:
-        logger.exception("[MASTERMIND] ERROR processing task %s: %s", task.id, exc)
+        logger.exception("[MASTERMIND] Post-run reporting failed for task %s: %s", task.id, exc)
 
 
 def _format_metrics_block(metrics: dict[str, Any]) -> str:
@@ -675,6 +683,33 @@ async def forge_result_handler(request: Request) -> dict[str, Any]:
         return {"status": "error", "detail": str(exc)}
 
 
+async def _notify_ci_escalation(agent: MastermindAgent, result: dict[str, Any]) -> None:
+    """Tell the requester a PR's CI stayed red after every automated fix attempt.
+
+    Best-effort: the escalation is already recorded on the task, so a Slack
+    failure is logged rather than turned into a Pub/Sub redelivery that would
+    re-run the CI loop.
+    """
+    task_id = str(result.get("task_id", ""))
+    try:
+        task_data = await agent.tracker.get_task(task_id) if task_id else None
+        payload = (task_data or {}).get("task_payload")
+        if not payload:
+            logger.warning("[CI-LOOP] Cannot notify escalation for %r: no persisted task payload", task_id)
+            return
+        task = HenchmenTask.model_validate(payload)
+        await _notify_slack(
+            task,
+            {
+                "status": "escalated",
+                "scheme_id": (task_data or {}).get("scheme_id", "unknown"),
+                "error": result.get("reason", "CI still failing after automated fix attempts"),
+            },
+        )
+    except Exception as exc:
+        logger.error("[CI-LOOP] Failed to notify escalation for %s: %s", task_id, exc)
+
+
 @app.post("/pubsub/ci-failure")
 async def ci_failure_handler(request: Request) -> dict[str, Any]:
     """Handle CI failure events from Pub/Sub.
@@ -704,6 +739,8 @@ async def ci_failure_handler(request: Request) -> dict[str, Any]:
         agent = get_agent()
         result = await agent.handle_ci_failure(task_id_prefix, repo, branch, check_suite_id)
         logger.info("[CI-LOOP] Result: %s", result)
+        if result.get("status") == "escalated":
+            await _notify_ci_escalation(agent, result)
         return {"status": "completed", "result": result}
     except Exception as exc:
         tb_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
