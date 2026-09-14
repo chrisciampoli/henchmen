@@ -1,6 +1,6 @@
 # artifact-registry
 
-Creates the single Docker-format Artifact Registry repository Henchmen publishes every container image into (mastermind, dispatch, forge, operative, arsenal). The repository name is environment-scoped so dev/staging/prod push to isolated registries.
+Creates the Docker-format Artifact Registry repository Henchmen publishes its container images into: `mastermind`, `dispatch`, `forge` and `operative`. The repository name is environment-scoped (`henchmen-${environment}`) so dev, staging and prod push to isolated registries.
 
 ## Usage
 
@@ -10,6 +10,7 @@ module "artifact_registry" {
   project_id  = var.project_id
   region      = var.region
   environment = var.environment
+  labels      = local.labels
 }
 ```
 

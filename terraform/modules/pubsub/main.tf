@@ -9,29 +9,17 @@ locals {
 
 # ---------------------------------------------------------------------------
 # Topics
+#
+# Only topics that something publishes to exist here: task-intake,
+# operative-complete, forge-request, forge-result, ci-failure, embed-request
+# and dead-letter (7). task-planned, operative-dispatch and operative-status
+# were removed — no component ever published to them, and LairManager launches
+# operatives through the Cloud Run Jobs API rather than a pull subscription.
 # ---------------------------------------------------------------------------
 
 resource "google_pubsub_topic" "task_intake" {
   project = var.project_id
   name    = "henchmen-${var.environment}-task-intake"
-  labels  = var.labels
-}
-
-resource "google_pubsub_topic" "task_planned" {
-  project = var.project_id
-  name    = "henchmen-${var.environment}-task-planned"
-  labels  = var.labels
-}
-
-resource "google_pubsub_topic" "operative_dispatch" {
-  project = var.project_id
-  name    = "henchmen-${var.environment}-operative-dispatch"
-  labels  = var.labels
-}
-
-resource "google_pubsub_topic" "operative_status" {
-  project = var.project_id
-  name    = "henchmen-${var.environment}-operative-status"
   labels  = var.labels
 }
 
@@ -88,75 +76,6 @@ resource "google_pubsub_subscription" "task_intake" {
       audience              = var.push_audiences.mastermind
     }
   }
-
-  dead_letter_policy {
-    dead_letter_topic     = google_pubsub_topic.dead_letter.id
-    max_delivery_attempts = local.dead_letter_max_attempts
-  }
-
-  retry_policy {
-    minimum_backoff = local.retry_min_backoff
-    maximum_backoff = local.retry_max_backoff
-  }
-}
-
-# henchmen-task-planned → Dispatch (status updates)
-resource "google_pubsub_subscription" "task_planned" {
-  project = var.project_id
-  name    = "henchmen-${var.environment}-task-planned-sub"
-  topic   = google_pubsub_topic.task_planned.name
-
-  message_retention_duration = local.retention_duration
-  ack_deadline_seconds       = local.ack_deadline_seconds
-
-  push_config {
-    push_endpoint = "${var.push_endpoints.dispatch_url}/pubsub/task-planned"
-    oidc_token {
-      service_account_email = var.push_sa_email
-      audience              = var.push_audiences.dispatch
-    }
-  }
-
-  dead_letter_policy {
-    dead_letter_topic     = google_pubsub_topic.dead_letter.id
-    max_delivery_attempts = local.dead_letter_max_attempts
-  }
-
-  retry_policy {
-    minimum_backoff = local.retry_min_backoff
-    maximum_backoff = local.retry_max_backoff
-  }
-}
-
-# henchmen-operative-dispatch → pull (Lair launcher pulls work)
-resource "google_pubsub_subscription" "operative_dispatch" {
-  project = var.project_id
-  name    = "henchmen-${var.environment}-operative-dispatch-sub"
-  topic   = google_pubsub_topic.operative_dispatch.name
-
-  message_retention_duration   = local.retention_duration
-  ack_deadline_seconds         = local.ack_deadline_seconds
-  enable_exactly_once_delivery = true
-
-  dead_letter_policy {
-    dead_letter_topic     = google_pubsub_topic.dead_letter.id
-    max_delivery_attempts = local.dead_letter_max_attempts
-  }
-
-  retry_policy {
-    minimum_backoff = local.retry_min_backoff
-    maximum_backoff = local.retry_max_backoff
-  }
-}
-
-# henchmen-operative-status → pull (informational, no active handler)
-resource "google_pubsub_subscription" "operative_status" {
-  project = var.project_id
-  name    = "henchmen-${var.environment}-operative-status-sub"
-  topic   = google_pubsub_topic.operative_status.name
-
-  message_retention_duration = local.retention_duration
-  ack_deadline_seconds       = local.ack_deadline_seconds
 
   dead_letter_policy {
     dead_letter_topic     = google_pubsub_topic.dead_letter.id
@@ -322,9 +241,6 @@ locals {
 
   dead_lettered_subscriptions = {
     task_intake        = google_pubsub_subscription.task_intake.name
-    task_planned       = google_pubsub_subscription.task_planned.name
-    operative_dispatch = google_pubsub_subscription.operative_dispatch.name
-    operative_status   = google_pubsub_subscription.operative_status.name
     operative_complete = google_pubsub_subscription.operative_complete.name
     forge_request      = google_pubsub_subscription.forge_request.name
     forge_result       = google_pubsub_subscription.forge_result.name
