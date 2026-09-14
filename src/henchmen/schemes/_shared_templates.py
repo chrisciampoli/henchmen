@@ -255,12 +255,14 @@ def standard_ci_pipeline(implement_node: SchemeNode) -> tuple[list[SchemeNode], 
     Returns fresh node/edge objects on every call so two scheme definitions
     never share mutable model instances.
     """
+    # Deterministic nodes run inside the Mastermind through the scheme_executor
+    # handler registry, not in an operative, so they request no Arsenal tools:
+    # only agentic nodes are given a tool list.
     nodes = [
         SchemeNode(
             id="create_branch",
             name="Create Branch",
             node_type=NodeType.DETERMINISTIC,
-            arsenal_requirement=ArsenalRequirement(tool_sets=["git_ops"]),
             timeout_seconds=30,
         ),
         SchemeNode(
@@ -281,7 +283,6 @@ def standard_ci_pipeline(implement_node: SchemeNode) -> tuple[list[SchemeNode], 
             id="run_lint",
             name="Run Lint",
             node_type=NodeType.DETERMINISTIC,
-            arsenal_requirement=ArsenalRequirement(tool_sets=["test_runner"]),
             timeout_seconds=60,
         ),
         SchemeNode(
@@ -298,7 +299,6 @@ def standard_ci_pipeline(implement_node: SchemeNode) -> tuple[list[SchemeNode], 
             id="run_lint_retry",
             name="Run Lint (Retry)",
             node_type=NodeType.DETERMINISTIC,
-            arsenal_requirement=ArsenalRequirement(tool_sets=["test_runner"]),
             timeout_seconds=60,
         ),
         # --- Test cycle: run → agentic fix → retry ---
@@ -306,7 +306,6 @@ def standard_ci_pipeline(implement_node: SchemeNode) -> tuple[list[SchemeNode], 
             id="run_tests",
             name="Run Tests",
             node_type=NodeType.DETERMINISTIC,
-            arsenal_requirement=ArsenalRequirement(tool_sets=["test_runner"]),
             timeout_seconds=300,
         ),
         _fix_tests_node(),
@@ -314,7 +313,6 @@ def standard_ci_pipeline(implement_node: SchemeNode) -> tuple[list[SchemeNode], 
             id="run_tests_retry",
             name="Run Tests (Retry)",
             node_type=NodeType.DETERMINISTIC,
-            arsenal_requirement=ArsenalRequirement(tool_sets=["test_runner"]),
             timeout_seconds=300,
         ),
         # --- Terminal nodes ---
@@ -322,14 +320,12 @@ def standard_ci_pipeline(implement_node: SchemeNode) -> tuple[list[SchemeNode], 
             id="create_pr",
             name="Create PR",
             node_type=NodeType.DETERMINISTIC,
-            arsenal_requirement=ArsenalRequirement(tool_sets=["github"], allow_destructive=True),
             timeout_seconds=30,
         ),
         SchemeNode(
             id="escalate",
             name="Escalate",
             node_type=NodeType.DETERMINISTIC,
-            arsenal_requirement=ArsenalRequirement(tool_sets=["slack"]),
             timeout_seconds=30,
         ),
     ]

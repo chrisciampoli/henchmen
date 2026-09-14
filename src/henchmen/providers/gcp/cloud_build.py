@@ -6,14 +6,13 @@ import shlex
 from typing import TYPE_CHECKING, Any
 
 from henchmen.providers.interfaces.ci_provider import CIResult, CIStatus
-from henchmen.providers.settings_access import optional_setting
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
 
 # Image the CI commands run in. Cloud Build's own `node:20` default could not
 # run the Python commands the CI orchestrator emits. Override per deployment
-# with the (optional) ``ci_builder_image`` setting.
+# with the ``ci_builder_image`` setting.
 _DEFAULT_BUILDER_IMAGE = "python:3.12"
 
 _GIT_IMAGE = "gcr.io/cloud-builders/git"
@@ -25,10 +24,9 @@ class CloudBuildCIProvider:
 
     def __init__(self, settings: Settings) -> None:
         self._project = settings.gcp_project_id
-        # Optional settings: read defensively so this provider keeps working
-        # against a Settings class that has not grown the fields yet.
-        self._builder_image = optional_setting(settings, "ci_builder_image") or _DEFAULT_BUILDER_IMAGE
-        self._token_secret = optional_setting(settings, "ci_github_token_secret")
+        # A blank ``ci_builder_image`` falls back to the default image.
+        self._builder_image = settings.ci_builder_image.strip() or _DEFAULT_BUILDER_IMAGE
+        self._token_secret = settings.ci_github_token_secret.strip()
         self._client: Any = None
 
     def _get_client(self) -> Any:

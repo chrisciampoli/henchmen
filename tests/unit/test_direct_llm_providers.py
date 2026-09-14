@@ -533,6 +533,21 @@ class TestAnthropicProvider:
         assert system_val[0]["cache_control"] == {"type": "ephemeral"}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("system_prompt", [None, ""])
+    async def test_generate_without_system_prompt_sends_no_system_kwarg(self, system_prompt):
+        """The Messages API rejects ``system=None``; an absent prompt must omit the key entirely."""
+        provider = self._make_provider()
+        captured = self._capture(provider, self._mock_message())
+
+        await provider.generate(
+            messages=[Message(role=MessageRole.USER, content="Go")],
+            model="claude-sonnet-5",
+            system_prompt=system_prompt,
+        )
+
+        assert "system" not in captured
+
+    @pytest.mark.asyncio
     async def test_generate_caches_tool_list(self):
         """Tools render before the system prompt, so the last tool carries the breakpoint."""
         provider = self._make_provider()

@@ -1083,6 +1083,27 @@ class TestSQLiteQueryOperators:
         with pytest.raises(sqlite3.ProgrammingError):
             await store.get("tasks", "a")
 
+    @pytest.mark.asyncio
+    async def test_aclose_releases_the_connection_and_is_idempotent(self, tmp_path):
+        import sqlite3
+
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "t.db"))
+        await store.set("tasks", "a", {"x": 1})
+        await store.aclose()
+        await store.aclose()
+
+        with pytest.raises(sqlite3.ProgrammingError):
+            await store.get("tasks", "a")
+
+    def test_default_path_honours_local_sqlite_path(self, tmp_path):
+        from henchmen.providers.local.sqlite import default_db_path
+
+        target = tmp_path / "custom.db"
+        settings = _mock_settings(local_sqlite_path=f"  {target}  ")
+        assert default_db_path(settings) == target
+
 
 # ---------------------------------------------------------------------------
 # FilesystemObjectStore — path traversal

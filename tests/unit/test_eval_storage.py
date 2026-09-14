@@ -195,3 +195,46 @@ async def test_save_run_upsert(tmp_path: Path) -> None:
 
     runs = await list_runs(db_path=db)
     assert len(runs) == 1
+
+
+class TestDbPath:
+    """``_db_path`` reads ``Settings.eval_db_path`` and falls back to ~/.henchmen/eval/results.db."""
+
+    @pytest.fixture(autouse=True)
+    def _hermetic(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        import os
+
+        from henchmen.config.settings import get_settings
+
+        for key in [k for k in os.environ if k.startswith("HENCHMEN_")]:
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.chdir(tmp_path)  # no .env.local
+        get_settings.cache_clear()
+        yield
+        get_settings.cache_clear()
+
+    def test_configured_path_wins(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from henchmen.evals import storage
+
+        target = tmp_path / "nested" / "history.db"
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        monkeypatch.setenv("HENCHMEN_EVAL_DB_PATH", str(target))
+        assert storage._db_path() == target
+        assert target.parent.is_dir()
+
+    def test_empty_setting_uses_default(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from henchmen.evals import storage
+
+        default = tmp_path / "home" / "results.db"
+        monkeypatch.setattr(storage, "_DEFAULT_DB_PATH", default)
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        assert storage._db_path() == default
+
+    def test_unloadable_settings_use_default(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """A GCP provider with no project id fails Settings validation; history must still work."""
+        from henchmen.evals import storage
+
+        default = tmp_path / "home" / "results.db"
+        monkeypatch.setattr(storage, "_DEFAULT_DB_PATH", default)
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "gcp")
+        assert storage._db_path() == default

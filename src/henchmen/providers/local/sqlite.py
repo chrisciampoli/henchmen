@@ -11,8 +11,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from henchmen.providers.settings_access import optional_setting
-
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
 
@@ -55,7 +53,7 @@ def default_db_path(settings: Settings) -> Path:
     directories different databases, and dropped database files into
     whatever checkout the process was launched from.
     """
-    configured = optional_setting(settings, "local_sqlite_path")
+    configured = settings.local_sqlite_path.strip()
     if configured:
         return Path(configured).expanduser()
     return Path.home() / ".henchmen" / f"henchmen_{settings.environment.value}.db"
@@ -247,14 +245,22 @@ class SQLiteDocumentStore:
             await self.set(collection, document_id, merged)
             return True
 
-    async def close(self) -> None:
-        """Close the underlying SQLite connection."""
+    async def aclose(self) -> None:
+        """Close the underlying SQLite connection (idempotent).
+
+        ``henchmen serve`` calls this on shutdown after draining the broker, so
+        the WAL is checkpointed and the file handle released.
+        """
 
         def _close() -> None:
             with self._db_lock:
                 self._conn.close()
 
         await asyncio.to_thread(_close)
+
+    async def close(self) -> None:
+        """Alias for :meth:`aclose`."""
+        await self.aclose()
 
     @staticmethod
     def _matches_filters(data: dict[str, Any], filters: list[tuple[str, str, Any]]) -> bool:

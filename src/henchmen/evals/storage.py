@@ -1,7 +1,8 @@
 """SQLite-backed history storage for evaluation runs.
 
 Persists eval results to ``~/.henchmen/eval/results.db`` (override with
-``HENCHMEN_EVAL_DB_PATH``) so that runs can be compared over time. Uses
+``HENCHMEN_EVAL_DB_PATH``, read through ``Settings.eval_db_path``) so that
+runs can be compared over time. Uses
 ``aiosqlite`` for async access — an optional dependency shipped in the
 ``[evals]`` extra (also pulled in by ``[local]``), imported lazily so the
 rest of the package imports without it.
@@ -21,7 +22,7 @@ Public surface
 
 from __future__ import annotations
 
-import os
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -30,6 +31,8 @@ from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     import aiosqlite
+
+logger = logging.getLogger(__name__)
 
 
 class AiosqliteMissingError(RuntimeError):
@@ -116,14 +119,33 @@ class RunComparison(BaseModel):
 # Database path
 # ---------------------------------------------------------------------------
 
-_DEFAULT_DB_DIR = Path(os.path.expanduser("~")) / ".henchmen" / "eval"
+_DEFAULT_DB_DIR = Path.home() / ".henchmen" / "eval"
 _DEFAULT_DB_PATH = _DEFAULT_DB_DIR / "results.db"
+
+
+def _configured_db_path() -> str:
+    """Return ``Settings.eval_db_path``, or ``""`` when it is unset or Settings cannot load.
+
+    Eval history is read by ``henchmen eval history`` on machines that may not
+    have a complete configuration (a GCP provider without a project id, say);
+    that must not stop the history command, so a Settings validation error
+    falls back to the default location.
+    """
+    from pydantic import ValidationError
+
+    from henchmen.config.settings import get_settings
+
+    try:
+        return get_settings().eval_db_path.strip()
+    except ValidationError as exc:
+        logger.debug("Settings did not load (%d errors); using the default eval database", exc.error_count())
+        return ""
 
 
 def _db_path() -> Path:
     """Return the database path, creating the parent directory if needed."""
-    override = os.environ.get("HENCHMEN_EVAL_DB_PATH")
-    p = Path(override) if override else _DEFAULT_DB_PATH
+    configured = _configured_db_path()
+    p = Path(configured).expanduser() if configured else _DEFAULT_DB_PATH
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 

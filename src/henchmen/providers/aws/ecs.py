@@ -9,7 +9,6 @@ from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
 from henchmen.providers.interfaces.container_orchestrator import JobResult, JobStatus
-from henchmen.providers.settings_access import optional_setting
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -66,8 +65,8 @@ class ECSOrchestrator:
         self._subnets: list[str] = [s.strip() for s in settings.aws_ecs_subnets.split(",") if s.strip()]
         self._security_groups: list[str] = [s.strip() for s in settings.aws_ecs_security_groups.split(",") if s.strip()]
         # Fargate refuses a task definition that uses the awslogs driver
-        # without an execution role. Optional until Settings grows the field.
-        self._execution_role = optional_setting(settings, "aws_ecs_execution_role_arn")
+        # without an execution role.
+        self._execution_role = settings.aws_ecs_execution_role_arn.strip()
         self._client: Any = boto3.client("ecs", region_name=self._region)
         # task ARN -> deadline (monotonic seconds); task ARN -> task definition ARN
         self._deadlines: dict[str, float] = {}

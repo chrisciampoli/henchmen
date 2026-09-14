@@ -384,6 +384,8 @@ async def run_operative() -> None:
         total_input_tokens=telemetry.get("total_input_tokens", 0),
         total_output_tokens=telemetry.get("total_output_tokens", 0),
         cached_input_tokens=telemetry.get("cached_input_tokens", 0),
+        # The guardrails sum the provider-billed cost per call; the tracker persists this figure.
+        estimated_cost_usd=telemetry.get("estimated_cost_usd", 0.0),
         model_calls=telemetry.get("model_calls", 0),
         tool_calls_count=telemetry.get("tool_calls_count", 0),
         tool_calls_detail=telemetry.get("tool_calls_detail", {}),
