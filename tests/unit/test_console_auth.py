@@ -1,12 +1,16 @@
 """Tests for the Console's setup token, sessions and localhost guard."""
 
+import hashlib
+import hmac
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from henchmen.console.auth import SESSION_COOKIE, ConsoleAuth, ConsoleGuard, is_local_host, is_local_origin
 
@@ -18,7 +22,19 @@ def test_local_hosts_are_accepted(host: str) -> None:
     assert is_local_host(host)
 
 
-@pytest.mark.parametrize("host", [None, "", "evil.example", "127.0.0.1.evil.example", "henchmen:8000", "10.0.0.5"])
+@pytest.mark.parametrize(
+    "host",
+    [
+        None,
+        "",
+        "evil.example",
+        "127.0.0.1.evil.example",
+        "henchmen:8000",
+        "10.0.0.5",
+        "[",
+        "evil@127.0.0.1:8000",
+    ],
+)
 def test_other_hosts_are_rejected(host: str | None) -> None:
     assert not is_local_host(host)
 
@@ -28,7 +44,18 @@ def test_local_origins_are_accepted(origin: str) -> None:
     assert is_local_origin(origin)
 
 
-@pytest.mark.parametrize("origin", [None, "", "null", "https://evil.example", "http://127.0.0.1.evil.example"])
+@pytest.mark.parametrize(
+    "origin",
+    [
+        None,
+        "",
+        "null",
+        "https://evil.example",
+        "http://127.0.0.1.evil.example",
+        "http://[",
+        "http://evil@127.0.0.1:8000",
+    ],
+)
 def test_other_origins_are_rejected(origin: str | None) -> None:
     assert not is_local_origin(origin)
 
@@ -58,6 +85,12 @@ def test_tampered_or_foreign_sessions_fail() -> None:
     assert not auth.verify_session("garbage")
 
 
+def test_non_ascii_session_signature_is_rejected_not_raised() -> None:
+    auth = ConsoleAuth(setup_token="t", signing_key=b"k" * 32)
+    assert not auth.verify_session("1000.\xe9", now=1_000.0)
+    assert not auth.verify_session("not-a-number.abc", now=1_000.0)
+
+
 def test_load_creates_and_reuses_the_signing_key(tmp_path: Path) -> None:
     first = ConsoleAuth.load(tmp_path / "secrets", setup_token=None)
     second = ConsoleAuth.load(tmp_path / "secrets", setup_token="given")
@@ -67,6 +100,26 @@ def test_load_creates_and_reuses_the_signing_key(tmp_path: Path) -> None:
     assert len(first.setup_token) >= 32
     if sys.platform != "win32":
         assert oct(os.stat(tmp_path / "secrets" / "console-session.key").st_mode & 0o777) == "0o600"
+
+
+@pytest.mark.parametrize("bad_key", [b"", b"short"])
+def test_load_regenerates_an_empty_or_short_signing_key(tmp_path: Path, bad_key: bytes) -> None:
+    secrets_path = tmp_path / "secrets"
+    secrets_path.mkdir(parents=True)
+    key_path = secrets_path / "console-session.key"
+    key_path.write_bytes(bad_key)
+
+    auth = ConsoleAuth.load(secrets_path, setup_token="t")
+
+    regenerated = key_path.read_bytes()
+    assert len(regenerated) >= 32
+    assert regenerated != bad_key
+
+    forged_signature = hmac.new(bad_key, b"console-session:1000", hashlib.sha256).hexdigest()
+    assert not auth.verify_session(f"1000.{forged_signature}", now=1_000.0)
+
+    if sys.platform != "win32":
+        assert oct(os.stat(key_path).st_mode & 0o777) == "0o600"
 
 
 def _guarded_app(auth: ConsoleAuth) -> TestClient:
@@ -84,6 +137,12 @@ def _guarded_app(auth: ConsoleAuth) -> TestClient:
     async def private_post() -> dict[str, str]:
         return {"ok": "posted"}
 
+    @inner.websocket("/console/ws")
+    async def ws(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.send_text("hello")
+        await websocket.close()
+
     inner.add_middleware(ConsoleGuard, auth=auth, public_paths=frozenset({"/console/api/status"}))
     return TestClient(inner, base_url=LOCAL)
 
@@ -91,6 +150,18 @@ def _guarded_app(auth: ConsoleAuth) -> TestClient:
 def test_guard_rejects_non_local_hosts() -> None:
     client = _guarded_app(ConsoleAuth(setup_token="t", signing_key=b"k" * 32))
     response = client.get("/console/api/status", headers={"host": "evil.example"})
+    assert response.status_code == 403
+
+
+def test_guard_rejects_host_with_userinfo() -> None:
+    client = _guarded_app(ConsoleAuth(setup_token="t", signing_key=b"k" * 32))
+    response = client.get("/console/api/status", headers={"host": "evil@127.0.0.1:8000"})
+    assert response.status_code == 403
+
+
+def test_guard_rejects_malformed_host_header() -> None:
+    client = _guarded_app(ConsoleAuth(setup_token="t", signing_key=b"k" * 32))
+    response = client.get("/console/api/status", headers={"host": "["})
     assert response.status_code == 403
 
 
@@ -114,3 +185,95 @@ def test_guard_requires_a_local_origin_for_state_changes() -> None:
     assert client.post("/console/api/private").status_code == 403
     assert client.post("/console/api/private", headers={"origin": "https://evil.example"}).status_code == 403
     assert client.post("/console/api/private", headers={"origin": LOCAL}).status_code == 200
+
+
+def test_guard_requires_a_matching_origin_port_for_state_changes() -> None:
+    auth = ConsoleAuth(setup_token="t", signing_key=b"k" * 32)
+    client = _guarded_app(auth)
+    client.cookies.set(SESSION_COOKIE, auth.issue_session())
+
+    mismatched = client.post("/console/api/private", headers={"origin": "http://127.0.0.1:3000"})
+    assert mismatched.status_code == 403
+
+    matching = client.post("/console/api/private", headers={"origin": LOCAL})
+    assert matching.status_code == 200
+
+    other_loopback_name_same_port = client.post("/console/api/private", headers={"origin": "http://localhost:8000"})
+    assert other_loopback_name_same_port.status_code == 200
+
+
+def test_guard_rejects_malformed_origin_on_state_change() -> None:
+    auth = ConsoleAuth(setup_token="t", signing_key=b"k" * 32)
+    client = _guarded_app(auth)
+    client.cookies.set(SESSION_COOKIE, auth.issue_session())
+    response = client.post("/console/api/private", headers={"origin": "http://["})
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_guard_rejects_non_ascii_cookie_without_raising() -> None:
+    auth = ConsoleAuth(setup_token="t", signing_key=b"k" * 32)
+    guard = ConsoleGuard(_ok_app, auth=auth, public_paths=frozenset())
+    scope = _http_scope(
+        path="/console/api/private",
+        headers={"host": "127.0.0.1:8000", "cookie": "henchmen_console=1000.\xe9"},
+    )
+    events = await _run_asgi(guard, scope)
+    assert events[0]["status"] == 401
+
+
+def test_guard_rejects_websocket_without_a_session() -> None:
+    auth = ConsoleAuth(setup_token="t", signing_key=b"k" * 32)
+    client = _guarded_app(auth)
+    with (
+        pytest.raises(WebSocketDisconnect),
+        client.websocket_connect("/console/ws", headers={"host": "127.0.0.1:8000", "origin": LOCAL}),
+    ):
+        pass
+
+
+def test_guard_rejects_websocket_with_foreign_origin() -> None:
+    auth = ConsoleAuth(setup_token="t", signing_key=b"k" * 32)
+    client = _guarded_app(auth)
+    client.cookies.set(SESSION_COOKIE, auth.issue_session())
+    with (
+        pytest.raises(WebSocketDisconnect),
+        client.websocket_connect("/console/ws", headers={"host": "127.0.0.1:8000", "origin": "https://evil.example"}),
+    ):
+        pass
+
+
+def test_guard_accepts_websocket_with_valid_session_and_origin() -> None:
+    auth = ConsoleAuth(setup_token="t", signing_key=b"k" * 32)
+    client = _guarded_app(auth)
+    client.cookies.set(SESSION_COOKIE, auth.issue_session())
+    with client.websocket_connect("/console/ws", headers={"host": "127.0.0.1:8000", "origin": LOCAL}) as websocket:
+        assert websocket.receive_text() == "hello"
+
+
+async def _ok_app(scope: Any, receive: Any, send: Any) -> None:
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    await send({"type": "http.response.body", "body": b""})
+
+
+def _http_scope(*, method: str = "GET", path: str, headers: dict[str, str], scheme: str = "http") -> dict[str, Any]:
+    return {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "scheme": scheme,
+        "headers": [(k.encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()],
+    }
+
+
+async def _run_asgi(app: Any, scope: dict[str, Any]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        events.append(message)
+
+    await app(scope, receive, send)
+    return events
