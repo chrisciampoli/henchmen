@@ -64,6 +64,45 @@ class TestServeParsing:
         assert "invalid choice" in capsys.readouterr().err
 
 
+class TestServeApp:
+    def test_app_reports_the_package_version(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The single-process app must not hard-code a version that drifts from the package."""
+        import argparse
+        import os
+
+        import henchmen
+        from henchmen.cli import _serve
+
+        for key in [k for k in os.environ if k.startswith("HENCHMEN_")]:
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        monkeypatch.setattr("henchmen.providers.registry.ProviderRegistry", MagicMock())
+        monkeypatch.setattr("henchmen.providers.local.memory.set_shared_broker", MagicMock())
+        from henchmen.config.settings import get_settings
+        from henchmen.dispatch.server import app as dispatch_app
+        from henchmen.forge.server import app as forge_app
+        from henchmen.mastermind.server import app as mastermind_app
+
+        # _serve injects providers into the module-level sub-apps; restore them
+        # so no other test sees this test's mocks.
+        sub_apps = (dispatch_app, forge_app, mastermind_app)
+        saved = [dict(sub.state._state) for sub in sub_apps]
+        get_settings.cache_clear()
+        run = MagicMock()
+        monkeypatch.setattr("henchmen.cli.uvicorn.run", run)
+        try:
+            _serve(argparse.Namespace(host="127.0.0.1", port=None, log_level="info"))
+        finally:
+            get_settings.cache_clear()
+            for sub, state in zip(sub_apps, saved, strict=True):
+                sub.state._state.clear()
+                sub.state._state.update(state)
+
+        app = run.call_args[0][0]
+        assert app.version == henchmen.__version__
+
+
 class TestDefaultEnv:
     def test_does_not_override_process_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HENCHMEN_PROVIDER", "gcp")
@@ -169,6 +208,7 @@ def eval_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     (fixtures / "task.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr("henchmen.cli._save_report_to_storage", lambda *a, **kw: None)
     monkeypatch.setattr("henchmen.cli._save_single_fixture_run", lambda *a, **kw: None)
+    monkeypatch.setattr("henchmen.evals.storage.require_aiosqlite", MagicMock())
     registry = MagicMock()
     registry.return_value.get_llm_provider.return_value = MagicMock()
     monkeypatch.setattr("henchmen.providers.registry.ProviderRegistry", registry)
@@ -192,6 +232,24 @@ def _patched_harness(report: EvalReport):
 
 
 class TestEvalRunGuards:
+    def test_missing_aiosqlite_exits_before_any_fixture_runs(
+        self, eval_env: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        """A bare install must fail before paying for LLM calls, not after."""
+        from henchmen.evals.storage import AiosqliteMissingError
+
+        monkeypatch.setattr("henchmen.evals.storage.require_aiosqlite", MagicMock(side_effect=AiosqliteMissingError()))
+        report = _report()
+        with _patched_harness(report):
+            import henchmen.evals.harness as harness
+
+            code = _run_eval(["henchmen", "eval", "run", "--provider", "openai"])
+            run_all = harness.run_all_fixtures
+        assert code == 2
+        assert '.[evals]"' in capsys.readouterr().err
+        assert isinstance(run_all, AsyncMock)
+        run_all.assert_not_awaited()
+
     def test_fixture_with_write_baseline_is_rejected(self, eval_env: Path, capsys) -> None:
         code = _run_eval(
             ["henchmen", "eval", "run", "--provider", "openai", "--fixture", "bugfix_off_by_one", "--write-baseline"]
@@ -349,7 +407,8 @@ class TestEvalStoragePlumbing:
         ):
             main()
         assert exc.value.code == 2
-        assert "pip install" in capsys.readouterr().err
+        # aiosqlite ships in the [evals] extra (dev tooling carries no runtime deps).
+        assert 'pip install -e ".[evals]"' in capsys.readouterr().err
 
     def test_history_normalises_provider_alias(self) -> None:
         list_runs = AsyncMock(return_value=[])

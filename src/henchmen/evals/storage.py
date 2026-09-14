@@ -3,7 +3,8 @@
 Persists eval results to ``~/.henchmen/eval/results.db`` (override with
 ``HENCHMEN_EVAL_DB_PATH``) so that runs can be compared over time. Uses
 ``aiosqlite`` for async access — an optional dependency shipped in the
-``[dev]`` extra, imported lazily so ``henchmen eval run`` works without it.
+``[evals]`` extra (also pulled in by ``[local]``), imported lazily so the
+rest of the package imports without it.
 
 Tables
 ------
@@ -35,7 +36,7 @@ class AiosqliteMissingError(RuntimeError):
     """Raised when eval history is used without the optional ``aiosqlite`` dependency."""
 
     def __init__(self) -> None:
-        super().__init__('eval history requires aiosqlite — install it with: pip install -e ".[dev]"')
+        super().__init__('eval history requires aiosqlite — install it with: pip install -e ".[evals]"')
 
 
 def require_aiosqlite() -> Any:

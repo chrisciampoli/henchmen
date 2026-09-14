@@ -64,7 +64,7 @@ class DimensionScores(BaseModel):
     Weights:
         correctness  40%  — tests_pass * 0.6 + touched_expected_files * 0.2 + contains_expected_substrings * 0.2
         precision    20%  — penalises extra changed files and diff size vs expected
-        conventions  15%  — lint pass, type check pass
+        conventions  15%  — the fixture's ``lint_command`` passes
         efficiency   15%  — steps, tokens, time normalised against per-fixture budgets
         completion   10%  — finished without error/timeout
     """
@@ -134,7 +134,7 @@ class FixtureResult(BaseModel):
     """Outcome of running a single fixture through the harness."""
 
     fixture_id: str = Field(..., description="Fixture directory name")
-    provider: str = Field(..., description="LLM provider name (openai, anthropic, vertex, ollama, ...)")
+    provider: str = Field(..., description="Canonical LLM provider name (openai, anthropic, gcp, aws, local)")
     model_tier: str = Field(..., description="Model tier or concrete model used")
     score: FixtureScore = Field(..., description="Diff-based score")
     wall_clock_seconds: float = Field(..., ge=0.0, description="End-to-end wall clock time")
@@ -333,7 +333,7 @@ def _compute_precision(
     expected_set = set(expected_files)
     touched_expected_count = sum(1 for f in changed_files if any(e in f for e in expected_set))
     extra_files = len(changed_files) - touched_expected_count
-    file_precision = max(0.0, 1.0 - (extra_files * 0.25)) if changed_files else 1.0
+    file_precision = max(0.0, 1.0 - (extra_files * 0.25))
 
     # Diff-size precision: ratio of expected diff lines to actual diff lines.
     if expected_diff_lines is not None and expected_diff_lines > 0 and diff_line_count > 0:
@@ -457,6 +457,13 @@ def score_result(fixture_dir: Path, workspace: Path) -> FixtureScore:
     test_runner_error: str | None = None
     if spec.diff_patterns.get("must_fix_tests"):
         tests_pass, test_runner_error = _run_fixture_tests(workspace, spec.diff_patterns)
+        if tests_pass is None:
+            # The fixture demands passing tests but declares no way to run
+            # them. Scoring that as "not applicable" would hand the tests
+            # weight to the other signals — fail closed instead.
+            tests_pass = False
+            test_runner_error = "must_fix_tests is true but no test_command is declared"
+            logger.warning("Fixture %s: %s", spec.fixture_id, test_runner_error)
 
     # Weighted score. When tests_pass is None, redistribute its weight across
     # the other signals so each fixture's overall_score stays on [0, 1].
@@ -716,8 +723,10 @@ async def run_fixture(
         Optional parent directory for the temp workspace. Defaults to the
         system temp dir.
     settings:
-        Optional Henchmen ``Settings``. Passed through for provider APIs that
-        require it; the harness itself only reads the model tier.
+        Optional Henchmen ``Settings``, used only to price the run's tokens
+        via ``estimate_cost``. The model is always the provider's
+        ``default/complex`` tier (what ``implement_fix`` uses in production);
+        ``task.json``'s ``scheme`` key is informational and not read.
     provider_name:
         Canonical provider label to record (the registry name the CLI was
         given). Defaults to a name derived from the provider class, which

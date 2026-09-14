@@ -98,6 +98,13 @@ def main() -> None:
 
     subparsers.add_parser("chat", help="Interactive task builder REPL (uses the configured LLM provider)")
 
+    config_parser = subparsers.add_parser(
+        "config", help="Print the effective configuration (env + .env.local + defaults), secrets masked"
+    )
+    from henchmen.cli.config_cmd import add_config_arguments
+
+    add_config_arguments(config_parser)
+
     init_parser = subparsers.add_parser(
         "init",
         aliases=["setup"],
@@ -141,6 +148,10 @@ def main() -> None:
         from henchmen.cli import chat
 
         sys.exit(chat.run_chat_cli())
+    elif args.command == "config":
+        from henchmen.cli.config_cmd import run_config_cli
+
+        sys.exit(run_config_cli(args))
     elif args.command in ("init", "setup"):
         from henchmen.cli.init import run_init_cli
 
@@ -270,6 +281,9 @@ def _eval_run(args: argparse.Namespace) -> None:
     from henchmen.providers.tiers import normalize_llm_provider
 
     logging.basicConfig(level=logging.INFO)
+    # Check the history store before any fixture runs: discovering a missing
+    # aiosqlite only after every fixture's LLM calls were paid for wastes them.
+    _require_storage_or_exit()
 
     provider = normalize_llm_provider(args.provider or "")
     if not provider:
@@ -668,7 +682,9 @@ def _serve(args: argparse.Namespace) -> None:
         await shared_broker.drain()
         logger.info("Shutting down")
 
-    app = FastAPI(title="Henchmen (Local Dev)", version="0.1.0", lifespan=lifespan)
+    from henchmen import __version__
+
+    app = FastAPI(title="Henchmen (Local Dev)", version=__version__, lifespan=lifespan)
     app.mount("/dispatch", dispatch_app)
     app.mount("/mastermind", mastermind_app)
     app.mount("/forge", forge_app)

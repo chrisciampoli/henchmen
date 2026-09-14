@@ -11,6 +11,7 @@ from henchmen.cli.chat import (
     _build_system_prompt,
     _call_ollama,
     _check_ollama,
+    _description_with_type,
     _dispatch_task,
     _local_dispatch_url,
     _parse_task_block,
@@ -18,6 +19,7 @@ from henchmen.cli.chat import (
     _resolve_chat_model,
 )
 from henchmen.config.settings import Settings
+from henchmen.dispatch.api_models import CreateTaskRequest
 from henchmen.models.llm import LLMResponse, ModelTier, TokenUsage
 
 # --- _parse_task_block ---
@@ -196,8 +198,40 @@ async def test_dispatch_task_local_success(mock_settings: Settings) -> None:
     assert result["result"]["task_id"] == "abc-123"
     url, kwargs = post.call_args[0][0], post.call_args[1]
     assert url == _local_dispatch_url(mock_settings)
-    # The collected task type must survive into the dispatched payload.
-    assert kwargs["json"]["type"] == "bugfix"
+    # The payload must be accepted by the real intake contract (extra="forbid"):
+    # an unknown "type" key would 422 every chat dispatch against `henchmen serve`.
+    body = CreateTaskRequest.model_validate(kwargs["json"])
+    # The collected task type survives as a leading description line.
+    assert body.description == "Task type: bug fix\n\nFix the login bug"
+
+
+class TestDescriptionWithType:
+    def test_prefixes_known_type(self) -> None:
+        assert _description_with_type({"type": "Feature", "description": "Add X"}) == "Task type: feature\n\nAdd X"
+
+    def test_unknown_or_missing_type_leaves_description_alone(self) -> None:
+        assert _description_with_type({"type": "chore", "description": "d"}) == "d"
+        assert _description_with_type({"description": "d"}) == "d"
+
+    def test_type_without_description(self) -> None:
+        assert _description_with_type({"type": "refactor"}) == "Task type: refactor"
+
+    @pytest.mark.asyncio
+    async def test_explicit_bugfix_routes_to_bugfix_scheme(self) -> None:
+        """A task the user typed as bugfix routes to bugfix_standard even when the title says "Add"."""
+        from henchmen.mastermind.agent import MastermindAgent
+        from henchmen.models.task import HenchmenTask, TaskContext, TaskSource
+
+        task = HenchmenTask(
+            source=TaskSource.CLI,
+            source_id="x",
+            title="Add null check to parseConfig",
+            description=_description_with_type({"type": "bugfix", "description": "parseConfig crashes on None"}),
+            context=TaskContext(repo="acme/backend"),
+            created_by="chat",
+        )
+        agent = MastermindAgent.__new__(MastermindAgent)
+        assert await agent._select_scheme(task) == "bugfix_standard"
 
 
 @pytest.mark.asyncio
