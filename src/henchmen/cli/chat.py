@@ -353,9 +353,11 @@ async def _dispatch_task(task_data: dict[str, str], settings: Settings) -> dict[
     }
 
     url = _local_dispatch_url(settings)
+    # Dispatch requires this bearer token on /api/v1/tasks whenever it is configured.
+    headers = {"Authorization": f"Bearer {settings.dispatch_api_token}"} if settings.dispatch_api_token else {}
     try:
         async with httpx.AsyncClient(timeout=_LOCAL_DISPATCH_TIMEOUT) as client:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             return {"method": "local", "result": resp.json()}
     except (httpx.ConnectError, httpx.ConnectTimeout):

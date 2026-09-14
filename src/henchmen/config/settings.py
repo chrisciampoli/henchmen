@@ -471,6 +471,16 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Dispatch REST intake authentication
+    dispatch_api_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("HENCHMEN_DISPATCH_API_TOKEN", "DISPATCH_API_TOKEN"),
+        description=(
+            "Bearer token POST /api/v1/tasks requires (Authorization: Bearer <token>). Empty in DEV leaves the "
+            "route open with a warning; empty in STAGING/PROD makes it return 401."
+        ),
+    )
+
     # Dispatch intake rate limiting (per client IP, per instance)
     dispatch_rate_limit_requests: int = Field(
         default=60,

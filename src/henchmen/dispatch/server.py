@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import Scope
 
@@ -215,6 +215,57 @@ def _require_signing_secret(
 
 
 # ---------------------------------------------------------------------------
+# REST intake authentication
+# ---------------------------------------------------------------------------
+
+# Set once the "no API token in dev" warning has been logged, so a busy local
+# session does not log it on every request.
+_open_api_warning_logged = False
+
+# The value terraform/modules/secrets seeds every secret with so the first
+# apply yields startable revisions. It is public, so it never counts as a token.
+_SEEDED_SECRET_PLACEHOLDER = "placeholder-replace-with-a-real-value"
+
+
+async def require_api_token(request: Request) -> None:
+    """FastAPI dependency guarding ``POST /api/v1/tasks`` with a bearer token.
+
+    Every accepted request launches paid operative runs, so the route is
+    fail-closed: with ``HENCHMEN_DISPATCH_API_TOKEN`` unset it is open only in
+    DEV (with a one-time warning) and returns 401 in STAGING and PROD. The
+    token is compared in constant time and never logged or echoed.
+    """
+    global _open_api_warning_logged
+    settings = get_settings()
+    expected = settings.dispatch_api_token.strip()
+    if expected == _SEEDED_SECRET_PLACEHOLDER:
+        expected = ""
+    if not expected:
+        if settings.environment in (Environment.STAGING, Environment.PROD):
+            logger.error(
+                "[api] Refusing task creation: HENCHMEN_DISPATCH_API_TOKEN is not configured in %s",
+                settings.environment.value,
+            )
+            raise HTTPException(status_code=401, detail="Dispatch API token is not configured")
+        if not _open_api_warning_logged:
+            logger.warning(
+                "[api] HENCHMEN_DISPATCH_API_TOKEN is empty; /api/v1/tasks is unauthenticated (%s only)",
+                settings.environment.value,
+            )
+            _open_api_warning_logged = True
+        return
+
+    scheme, _, supplied = request.headers.get("Authorization", "").partition(" ")
+    supplied = supplied.strip()
+    if scheme.lower() != "bearer" or not supplied or not hmac.compare_digest(supplied.encode(), expected.encode()):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
@@ -235,6 +286,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     for problem in settings.validate_for_runtime():
         logger.warning("[dispatch] Configuration problem: %s", problem)
+    if settings.environment != Environment.DEV and not settings.dispatch_api_token:
+        logger.warning(
+            "[dispatch] Configuration problem: HENCHMEN_DISPATCH_API_TOKEN is empty, so POST /api/v1/tasks "
+            "returns 401 in %s",
+            settings.environment.value,
+        )
 
     registry = ProviderRegistry(settings)
     app.state.message_broker = registry.get_message_broker()
@@ -275,9 +332,9 @@ async def health() -> dict[str, Any]:
     return {"status": "ok"}
 
 
-@app.post("/api/v1/tasks")
+@app.post("/api/v1/tasks", dependencies=[Depends(require_api_token)])
 async def create_task(payload: CreateTaskRequest, request: Request) -> dict[str, Any]:
-    """CLI handler - accepts JSON task creation requests."""
+    """CLI handler - accepts JSON task creation requests (bearer-token authenticated)."""
     settings = get_settings()
     repo = payload.repo or settings.github_default_repo
     if not repo:

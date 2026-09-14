@@ -1610,6 +1610,108 @@ class TestCreateTaskValidation:
         assert resp.json()["status"] == "dispatched"
 
 
+class TestCreateTaskAuth:
+    """``POST /api/v1/tasks`` launches paid runs, so it requires a bearer token outside dev."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        import henchmen.dispatch.server as server
+
+        monkeypatch.setenv("HENCHMEN_GCP_PROJECT_ID", "test-project")
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "dev")
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "acme/api")
+        # Set empty rather than delete: Settings also reads .env.local.
+        monkeypatch.setenv("HENCHMEN_DISPATCH_API_TOKEN", "")
+        monkeypatch.delenv("DISPATCH_API_TOKEN", raising=False)
+        monkeypatch.setattr(server, "_open_api_warning_logged", False)
+        yield
+
+    @pytest.fixture
+    def client(self):
+        from henchmen.dispatch.server import app
+
+        with TestClient(app) as c:
+            yield c
+
+    @staticmethod
+    def _configure(monkeypatch, **env: str) -> None:
+        from henchmen.config.settings import get_settings
+
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        get_settings.cache_clear()
+
+    def test_dev_without_token_is_open_and_warns_once(self, client, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="henchmen.dispatch.server"):
+            assert client.post("/api/v1/tasks", json={"title": "T"}).status_code == 200
+            assert client.post("/api/v1/tasks", json={"title": "T"}).status_code == 200
+        warnings = [r for r in caplog.records if "HENCHMEN_DISPATCH_API_TOKEN is empty" in r.getMessage()]
+        assert len(warnings) == 1
+
+    @pytest.mark.parametrize("env_name", ["staging", "prod"])
+    def test_missing_token_outside_dev_fails_closed(self, client, monkeypatch, env_name):
+        self._configure(monkeypatch, HENCHMEN_ENVIRONMENT=env_name)
+        resp = client.post("/api/v1/tasks", json={"title": "T"})
+        assert resp.status_code == 401
+
+    def test_auth_is_checked_before_body_validation(self, client, monkeypatch):
+        """An unauthenticated caller gets 401, not a 422 that describes the request schema."""
+        self._configure(monkeypatch, HENCHMEN_DISPATCH_API_TOKEN="s3cret")
+        assert client.post("/api/v1/tasks", json={}).status_code == 401
+
+    @pytest.mark.parametrize(
+        "header",
+        [None, "Bearer wrong", "Basic czNjcmV0", "Bearer ", "s3cret"],
+    )
+    def test_wrong_or_missing_token_is_rejected(self, client, monkeypatch, header):
+        self._configure(monkeypatch, HENCHMEN_ENVIRONMENT="prod", HENCHMEN_DISPATCH_API_TOKEN="s3cret")
+        headers = {"Authorization": header} if header is not None else {}
+        resp = client.post("/api/v1/tasks", json={"title": "T"}, headers=headers)
+        assert resp.status_code == 401
+        assert resp.headers["WWW-Authenticate"] == "Bearer"
+        assert "s3cret" not in resp.text
+
+    def test_terraform_placeholder_is_not_a_token(self, client, monkeypatch):
+        """The seeded Secret Manager placeholder is public; it must not unlock the route."""
+        from henchmen.dispatch.server import _SEEDED_SECRET_PLACEHOLDER
+
+        self._configure(
+            monkeypatch, HENCHMEN_ENVIRONMENT="prod", HENCHMEN_DISPATCH_API_TOKEN=_SEEDED_SECRET_PLACEHOLDER
+        )
+        resp = client.post(
+            "/api/v1/tasks",
+            json={"title": "T"},
+            headers={"Authorization": f"Bearer {_SEEDED_SECRET_PLACEHOLDER}"},
+        )
+        assert resp.status_code == 401
+
+    def test_placeholder_matches_the_terraform_seed(self):
+        from pathlib import Path
+
+        from henchmen.dispatch.server import _SEEDED_SECRET_PLACEHOLDER
+
+        secrets_tf = Path(__file__).resolve().parents[2] / "terraform" / "modules" / "secrets" / "main.tf"
+        assert f'secret_data = "{_SEEDED_SECRET_PLACEHOLDER}"' in secrets_tf.read_text(encoding="utf-8")
+
+    def test_correct_token_is_accepted(self, client, monkeypatch):
+        self._configure(monkeypatch, HENCHMEN_ENVIRONMENT="prod", HENCHMEN_DISPATCH_API_TOKEN="s3cret")
+        resp = client.post("/api/v1/tasks", json={"title": "T"}, headers={"Authorization": "Bearer s3cret"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "dispatched"
+
+    def test_bare_secret_mount_name_is_honoured(self, client, monkeypatch):
+        """Cloud Run mounts the secret as DISPATCH_API_TOKEN."""
+        monkeypatch.delenv("HENCHMEN_DISPATCH_API_TOKEN")
+        self._configure(monkeypatch, HENCHMEN_ENVIRONMENT="staging", DISPATCH_API_TOKEN="mounted")
+        denied = client.post("/api/v1/tasks", json={"title": "T"}, headers={"Authorization": "Bearer other"})
+        allowed = client.post("/api/v1/tasks", json={"title": "T"}, headers={"Authorization": "bearer mounted"})
+        assert denied.status_code == 401
+        assert allowed.status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # Webhook replay protection
 # ---------------------------------------------------------------------------

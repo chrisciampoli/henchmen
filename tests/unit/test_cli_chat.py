@@ -203,6 +203,22 @@ async def test_dispatch_task_local_success(mock_settings: Settings) -> None:
     body = CreateTaskRequest.model_validate(kwargs["json"])
     # The collected task type survives as a leading description line.
     assert body.description == "Task type: bug fix\n\nFix the login bug"
+    # No token configured: no Authorization header is invented.
+    assert "Authorization" not in kwargs["headers"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_task_sends_the_dispatch_api_token(mock_settings: Settings) -> None:
+    settings = mock_settings.model_copy(update={"dispatch_api_token": "s3cret"})
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"task_id": "abc-123"}
+    mock_resp.raise_for_status = MagicMock()
+    post = AsyncMock(return_value=mock_resp)
+
+    with patch("henchmen.cli.chat.httpx.AsyncClient", return_value=_http_client(post=post)):
+        await _dispatch_task({"title": "Fix bug", "description": "d", "repo": "acme/backend"}, settings)
+
+    assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer s3cret"}
 
 
 class TestDescriptionWithType:

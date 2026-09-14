@@ -81,6 +81,7 @@ locals {
       SLACK_APP_TOKEN             = "slack-app-token"
       JIRA_API_TOKEN              = "jira-api-token"
       HENCHMEN_METRICS_AUTH_TOKEN = "metrics-auth-token"
+      DISPATCH_API_TOKEN          = "dispatch-api-token"
     }
     forge = {
       GITHUB_TOKEN                = "github-token"
