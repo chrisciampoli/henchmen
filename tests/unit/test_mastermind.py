@@ -1007,10 +1007,10 @@ class TestFetchSemanticChunks:
 
     @staticmethod
     def _patch_rerank(monkeypatch, rerank: AsyncMock) -> None:
-        """Install a rerank double; the real function may not exist on every branch."""
+        """Replace the real reranker (imported lazily by the agent) with a double."""
         import henchmen.dossier.reranker as reranker_module
 
-        monkeypatch.setattr(reranker_module, "rerank_semantic_chunks", rerank, raising=False)
+        monkeypatch.setattr(reranker_module, "rerank_semantic_chunks", rerank)
 
     def _agent_with_rerank(self, enabled: bool):
         llm = MagicMock(name="llm_provider")
