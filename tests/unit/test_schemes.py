@@ -655,6 +655,13 @@ class TestRegisteredSchemeContracts:
         assert node.instruction_template is None
 
     @pytest.mark.parametrize("scheme_id,node", _all_nodes(), ids=_node_case_id)
+    def test_deterministic_nodes_request_no_arsenal_tools(self, scheme_id: str, node: SchemeNode):
+        """Deterministic handlers run in the Mastermind; a tool request there is dead config that implies otherwise."""
+        if node.node_type != NodeType.DETERMINISTIC:
+            pytest.skip("agentic node")
+        assert node.arsenal_requirement is None, f"{scheme_id}.{node.id} requests Arsenal tools it never receives"
+
+    @pytest.mark.parametrize("scheme_id,node", _all_nodes(), ids=_node_case_id)
     def test_deterministic_nodes_have_a_registered_handler(self, scheme_id: str, node: SchemeNode):
         """Without a handler the executor falls through and the node is a silent no-op."""
         if node.node_type != NodeType.DETERMINISTIC:
