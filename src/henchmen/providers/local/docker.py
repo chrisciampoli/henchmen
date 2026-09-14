@@ -51,6 +51,8 @@ class DockerOrchestrator:
         cmd = ["docker", "run", "--rm", "--name", exec_id]
         # Allow container to reach host services (Ollama, Henchmen server)
         cmd.extend(["--add-host=host.docker.internal:host-gateway"])
+        if self._settings.local_docker_network:
+            cmd.extend(["--network", self._settings.local_docker_network])
         for k, v in env_vars.items():
             cmd.extend(["-e", f"{k}={v}"])
         mem = memory.lower().replace("gi", "g").replace("mi", "m")

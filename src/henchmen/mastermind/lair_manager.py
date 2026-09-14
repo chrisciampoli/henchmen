@@ -186,7 +186,7 @@ class LairManager:
     def _build_image(self) -> str:
         """Build the operative container image URI."""
         if self.settings.provider == "local":
-            return "henchmen-operative:local"
+            return self.settings.operative_image or "henchmen-operative:local"
         return (
             f"{self.settings.gcp_region}-docker.pkg.dev/"
             f"{self.settings.gcp_project_id}/"

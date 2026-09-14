@@ -400,3 +400,15 @@ class TestDoctorCLIWiring:
         with patch("henchmen.cli.doctor.run_doctor", return_value=[]) as mock:
             assert doctor.run_doctor_cli(argparse.Namespace()) == 0
         mock.assert_called_once_with(offline=False)
+
+
+def test_check_operative_image_inspects_the_given_image():
+    from unittest.mock import MagicMock, patch
+
+    from henchmen.cli.doctor import CheckStatus, check_operative_image
+
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as run:
+        result = check_operative_image("ghcr.io/acme/henchmen/operative:0.3.0")
+    assert run.call_args.args[0] == ["docker", "image", "inspect", "ghcr.io/acme/henchmen/operative:0.3.0"]
+    assert result.status == CheckStatus.OK
+    assert "ghcr.io/acme/henchmen/operative:0.3.0" in result.message
