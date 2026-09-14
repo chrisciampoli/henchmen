@@ -32,7 +32,7 @@ ARSENAL_TOOL_SETS: frozenset[str] = frozenset(get_args(ArsenalToolSet))
 
 
 class ArsenalRequirement(StrictBase):
-    """Specifies which tool sets an operative node requires from the Arsenal MCP server."""
+    """Specifies which Arsenal tool sets an operative node requires (the in-process tool registry)."""
 
     tool_sets: list[ArsenalToolSet] = Field(
         default_factory=list,

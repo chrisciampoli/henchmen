@@ -1127,7 +1127,7 @@ def _load_dossier_context(workspace_dir: str) -> str:
             sections.append(f"### {rf.get('path', 'rules')} (scope: {rf.get('scope', '/')})")
             sections.append(rf.get("content", ""))
 
-    # NOTE: relevant_files (200 paths) and repo_structure are EXCLUDED.
+    # NOTE: relevant_files (up to 50 paths, capped in MastermindAgent) and repo_structure are EXCLUDED.
     # They duplicate the file tree and add ~30K tokens of noise.
     # The operative has grep_search and file_read tools to discover files.
 
