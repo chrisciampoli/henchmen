@@ -73,7 +73,7 @@ docker push ${REGISTRY}/forge:latest
 
 ### Container Base Images
 
-All containers use `python:3.12-slim`. The Mastermind and Operative containers additionally install Node.js 20 and pnpm 9 (required for running lint and type checks on Node.js target repositories). The Forge container installs only git. The Dispatch container installs bash for its entrypoint script.
+All containers use `python:3.14-slim-bookworm`, pinned by digest. The Mastermind and Operative containers additionally install Node.js 24 LTS and pnpm 9 (required for running lint and type checks on Node.js target repositories); Node is copied from the matching `bookworm-slim` image so its glibc matches the Python base. The Forge container installs only git. The Dispatch container installs bash for its entrypoint script.
 
 ### Deploy Infrastructure with Terraform
 

@@ -191,10 +191,17 @@ def test_python_classifiers_match_what_ci_runs() -> None:
     }
     tested = set()
     for job in _load_yaml(".github/workflows/ci.yml")["jobs"].values():
+        matrix = (job.get("strategy") or {}).get("matrix") or {}
         for step in job.get("steps", []):
             python_version = step.get("with", {}).get("python-version")
-            if python_version:
-                tested.add(str(python_version))
+            if not python_version:
+                continue
+            python_version = str(python_version)
+            if python_version.replace(" ", "") == "${{matrix.python-version}}":
+                # Expand a matrix reference into the versions it actually runs.
+                tested.update(str(v) for v in matrix.get("python-version", []))
+            else:
+                tested.add(python_version)
     assert declared <= tested, f"classifiers claim {declared - tested} but CI never runs it"
 
 
