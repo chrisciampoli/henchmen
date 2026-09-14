@@ -540,7 +540,7 @@ async def _build_file_context(workspace_dir: str, task_title: str, task_descript
 async def initialize_workspace(
     config: OperativeConfig, settings: Settings, object_store: ObjectStore | None = None
 ) -> str:
-    """Clone repo (or restore from GCS cache), checkout branch, download dossier."""
+    """Clone the repo, create the task branch, install dependencies, download the dossier."""
     workspace = f"{DEFAULT_WORKSPACE_ROOT}/{config.task_id}"
     os.makedirs(workspace, exist_ok=True)
 
@@ -553,15 +553,11 @@ async def initialize_workspace(
     repo_url = os.environ.get("REPO_URL", "")
     branch = os.environ.get("BRANCH", "") or DEFAULT_BASE_BRANCH
 
-    # Try snapshot cache first
-    from henchmen.dossier.cache import SnapshotCache
-
-    cache = SnapshotCache(settings)
-    snapshot_uri = await cache.get_snapshot(repo_url, branch)
-    if snapshot_uri:
-        logger.info("Restoring workspace from snapshot cache: %s", snapshot_uri)
-        await cache.restore_snapshot(snapshot_uri, workspace)
-    elif repo_url:
+    # Always clone. The snapshot cache used to be consulted here, but it was
+    # keyed without a commit SHA, nothing ever saved a snapshot, and a restore
+    # was never followed by a fetch — so it could never hit, and a hit would
+    # have handed the agent a stale tree.
+    if repo_url:
         # Normalize repo_url to "owner/repo" form expected by clone_repo. The
         # token comes from Settings, which accepts both HENCHMEN_GITHUB_TOKEN and
         # the bare GITHUB_TOKEN a secret mount injects (and reads .env files).

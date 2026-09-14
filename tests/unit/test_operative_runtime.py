@@ -437,6 +437,39 @@ class TestBootstrapWorkspaceFailure:
         assert "repository not found" in (report.error or "")
 
 
+class TestInitializeWorkspaceAlwaysClones:
+    @pytest.mark.asyncio
+    async def test_clones_without_consulting_snapshot_cache(self, tmp_path: Path):
+        """The snapshot cache could never hit (no SHA, no writer) and would restore a stale tree."""
+        import henchmen.operative.bootstrap as bootstrap
+        from henchmen.arsenal._workspace import set_workspace_root
+
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        settings = _settings(github_token="ghp_from_settings")
+        try:
+            with (
+                patch.dict("os.environ", {"REPO_URL": "git@github.com:acme/widgets.git", "BRANCH": "main"}),
+                patch.object(bootstrap, "DEFAULT_WORKSPACE_ROOT", str(tmp_path)),
+                patch.object(bootstrap, "clone_repo", new_callable=AsyncMock) as clone,
+                patch.object(bootstrap.asyncio, "create_subprocess_exec", new=AsyncMock(return_value=proc)),
+                patch.object(bootstrap, "detect_base_branch", new=AsyncMock(return_value="main")),
+                patch.object(bootstrap, "run_git", new=AsyncMock(return_value=("", "", 0))),
+                patch.object(bootstrap, "_install_project_dependencies", new=AsyncMock()),
+                patch("henchmen.dossier.cache.SnapshotCache") as snapshot_cache,
+            ):
+                workspace = await bootstrap.initialize_workspace(_config(), settings)
+        finally:
+            set_workspace_root(None)
+
+        assert workspace == f"{tmp_path}/{_config().task_id}"
+        clone.assert_awaited_once()
+        assert clone.await_args.args[0] == "acme/widgets"
+        assert clone.await_args.kwargs["token"] == "ghp_from_settings"
+        snapshot_cache.assert_not_called()
+
+
 class TestDocumentStoreFailClosed:
     def test_dev_continues_without_document_store(self):
         from henchmen.operative.bootstrap import _get_document_store
