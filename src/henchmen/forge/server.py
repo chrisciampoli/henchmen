@@ -291,7 +291,7 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
                 "pr_url": pr_url,
                 "task_id": task_id,
                 "request_id": request_id,
-                "status": "passed" if result["passed"] else "failed",
+                "status": _result_status(result),
                 "summary": result.get("summary", ""),
                 "skipped": result.get("skipped", []),
                 "failed": result.get("failed", []),
@@ -301,12 +301,27 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
 
         logger.info(
             "[FORGE] CI %s for %s (skipped=%s)",
-            "PASSED" if result["passed"] else "FAILED",
+            _result_status(result).upper(),
             pr_url,
             ",".join(result.get("skipped", [])) or "none",
         )
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
+
+
+def _result_status(result: dict[str, Any]) -> str:
+    """Map a CIRunner result to the forge-result ``status`` field.
+
+    ``passed`` only when every check ran and passed. A run whose only problem
+    is a skipped check is ``incomplete`` - the PR was not verified, so it must
+    never be recorded as a CI pass (Mastermind treats anything other than
+    ``passed`` as not passed).
+    """
+    if result.get("passed"):
+        return "passed"
+    if result.get("incomplete") and not result.get("failed"):
+        return "incomplete"
+    return "failed"
 
 
 def _build_comment(result: dict[str, Any], task_id: str) -> str:
@@ -316,10 +331,11 @@ def _build_comment(result: dict[str, Any], task_id: str) -> str:
     read as a green tick.
     """
     skipped = result.get("skipped", [])
-    headline = "PASSED" if result["passed"] else "FAILED"
-    if result["passed"] and skipped:
-        headline = f"PASSED ({len(skipped)} check(s) skipped)"
-    status_emoji = "white_check_mark" if result["passed"] else "x"
+    status = _result_status(result)
+    headline = status.upper()
+    if status == "incomplete":
+        headline = f"INCOMPLETE ({len(skipped)} check(s) skipped - this PR was not fully verified)"
+    status_emoji = {"passed": "white_check_mark", "incomplete": "warning"}.get(status, "x")
 
     body = f"## Henchmen CI Results :{status_emoji}:\n\n**Status:** {headline}\n**Task:** `{task_id}`\n\n"
     emoji_by_status = {"passed": "white_check_mark", "failed": "x", "skipped": "warning"}

@@ -8,11 +8,13 @@ Every check reports one of three statuses:
     The check ran and found problems, or could not be trusted (fail-closed).
 ``skipped``
     The check could not run at all (no runner in the image, no test script).
-    A skipped check is never reported as a pass - see :meth:`CIRunner.run`.
+    A skipped check is never reported as a pass: a run with any skipped check
+    has ``passed=False`` and ``incomplete=True`` - see :meth:`CIRunner.run`.
 
-All subprocesses run with a wall-clock timeout, with the Henchmen secret
-environment stripped, and with every credential-bearing string redacted out of
-the captured output before it reaches a log line or a PR comment.
+All subprocesses run with a wall-clock timeout, the whole run is bounded by a
+total budget, the Henchmen secret environment is stripped, and every
+credential-bearing string is redacted out of the captured output before it
+reaches a log line or a PR comment.
 """
 
 from __future__ import annotations
@@ -32,9 +34,13 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-#: Default wall-clock budget for a single CI subprocess.
-#: TODO(settings): move to ``settings.forge_ci_timeout_seconds`` once the field lands.
-DEFAULT_CI_TIMEOUT_SECONDS = 900
+#: Default wall-clock budget for the whole CI run (and so for any single
+#: subprocess). Forge runs CI synchronously inside the Pub/Sub push request, and
+#: the push subscription's ack deadline is 600s (the Pub/Sub maximum): a run that
+#: outlives it is redelivered while the first run is still going, producing
+#: duplicate CI runs, PR comments and forge-results. 540s leaves headroom for the
+#: clone, the GitHub calls and publishing the result.
+DEFAULT_CI_TIMEOUT_SECONDS = 540
 
 #: How many commits of the PR base branch to fetch when looking for a merge base.
 BASE_FETCH_DEPTH = 200
@@ -82,10 +88,14 @@ class CIRunner:
         self,
         *,
         timeout_seconds: int = DEFAULT_CI_TIMEOUT_SECONDS,
+        total_budget_seconds: int = DEFAULT_CI_TIMEOUT_SECONDS,
         redact: Sequence[str] = (),
     ) -> None:
         self.timeout_seconds = timeout_seconds
+        self.total_budget_seconds = total_budget_seconds
         self._redact_values = tuple(value for value in redact if value)
+        # Monotonic deadline for the current :meth:`run`; ``None`` outside a run.
+        self._deadline: float | None = None
 
     # ------------------------------------------------------------------
     # Entry point
@@ -98,7 +108,18 @@ class CIRunner:
         and the silent-failure scan are both scoped to the files the PR changed,
         and without a base there is nothing trustworthy to compare against, so
         both checks fail closed rather than silently passing.
+
+        ``passed`` is True only when every check ran and passed. A skipped check
+        (no runner in the image, no test script) means the PR was not verified,
+        so it makes the run ``incomplete`` and not passed - never a green tick.
         """
+        self._deadline = asyncio.get_running_loop().time() + self.total_budget_seconds
+        try:
+            return await self._run_checks(workspace_dir, base_ref)
+        finally:
+            self._deadline = None
+
+    async def _run_checks(self, workspace_dir: str, base_ref: str | None) -> dict[str, Any]:
         merge_base, base_error = await self._resolve_merge_base(workspace_dir, base_ref)
 
         results: list[dict[str, Any]] = [await self._run_lint(workspace_dir, merge_base, base_error)]
@@ -112,7 +133,8 @@ class CIRunner:
         failed = [r["name"] for r in results if r["status"] == STATUS_FAILED]
         skipped = [r["name"] for r in results if r["status"] == STATUS_SKIPPED]
         return {
-            "passed": not failed,
+            "passed": not failed and not skipped,
+            "incomplete": bool(skipped) and not failed,
             "checks": results,
             "failed": failed,
             "skipped": skipped,
@@ -367,7 +389,12 @@ class CIRunner:
         distinct non-zero return code with an explanatory stderr, so callers
         fail closed instead of mistaking them for success.
         """
-        budget = self.timeout_seconds
+        budget: float = self.timeout_seconds
+        if self._deadline is not None:
+            remaining = self._deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return _RC_TIMEOUT, "", f"CI time budget of {self.total_budget_seconds}s exhausted before {cmd[0]} ran"
+            budget = min(budget, remaining)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -386,7 +413,7 @@ class CIRunner:
                 proc.kill()
             with contextlib.suppress(Exception):
                 await proc.wait()
-            return _RC_TIMEOUT, "", f"Command timed out after {budget}s: {cmd[0]} {' '.join(cmd[1:3])}"
+            return _RC_TIMEOUT, "", f"Command timed out after {budget:.0f}s:{cmd[0]} {' '.join(cmd[1:3])}"
 
         return (
             proc.returncode if proc.returncode is not None else _RC_NOT_FOUND,
