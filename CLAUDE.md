@@ -19,8 +19,8 @@ pip install -e ".[local,dev]"   # Runtime extras + tooling
 henchmen init                    # Interactive setup — writes .env.local
 henchmen doctor                  # Verify the environment
 pytest tests/unit/               # Run unit tests
-ruff check src/ tests/           # Lint
-mypy src/                        # Type check
+ruff check src/ tests/ evals/    # Lint
+mypy src/ evals/                 # Type check
 ```
 
 ## Architecture
@@ -78,7 +78,7 @@ from that module.
 
 ## GCP Services
 
-Cloud Run (services: Dispatch, Mastermind, Forge), Cloud Run Jobs (Operative), Pub/Sub (10 env-prefixed topics with OIDC audience auth), Firestore (state + metrics), GCS (artifacts, TF state), Vertex AI (Gemini for inference, RAG Engine for semantic code search — no Claude on Vertex), Secret Manager, Artifact Registry, Terraform for IaC.
+Cloud Run (services: Dispatch, Mastermind, Forge), Cloud Run Jobs (Operative), Pub/Sub (7 env-prefixed topics — task-intake, operative-complete, forge-request, forge-result, ci-failure, embed-request, dead-letter — with OIDC audience auth), Firestore (state + metrics), GCS (artifacts, TF state), Vertex AI (Gemini for inference, RAG Engine for semantic code search — no Claude on Vertex), Secret Manager, Artifact Registry, Terraform for IaC.
 
 ## Language & Stack
 
@@ -112,12 +112,14 @@ Cloud Run (services: Dispatch, Mastermind, Forge), Cloud Run Jobs (Operative), P
 Every task must pass all five before it's done:
 
 ```bash
-ruff check --fix src/ tests/   # 1. Auto-fix lint
-ruff check src/ tests/          # 2. Verify clean
-ruff format src/ tests/         # 3. Format
-mypy src/                       # 4. Type check
-pytest tests/unit/              # 5. Unit tests
+ruff check --fix src/ tests/ evals/   # 1. Auto-fix lint
+ruff check src/ tests/ evals/          # 2. Verify clean
+ruff format src/ tests/ evals/         # 3. Format
+mypy src/ evals/                       # 4. Type check
+pytest tests/unit/                     # 5. Unit tests
 ```
+
+These are the paths CI checks (`.github/workflows/ci.yml`).
 
 ## Directory Layout
 
@@ -161,6 +163,12 @@ Every error/exception path in the scheme executor returns `condition: "fail"`, n
 
 ## Container Build & Deploy
 
+Terraform owns every Cloud Run service's image, environment and secret mounts
+(`container_image_tag` in `terraform.tfvars`). A `gcloud run services update`
+works for a quick redeploy, but the next `terraform apply` puts back whatever
+Terraform declares — change the tag or the `cloud-run-services` module for
+anything that must stick.
+
 ```bash
 # Build and push (from repo root)
 docker build -f containers/mastermind/Dockerfile \
@@ -170,7 +178,8 @@ gcloud run services update henchmen-${ENV}-mastermind \
   --project=${PROJECT_ID} --region=${REGION} \
   --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/henchmen-${ENV}/mastermind:latest
 
-# Same pattern for: operative, forge, dispatch
+# Same pattern for forge and dispatch. The operative is built and pushed the
+# same way but has no service to update.
 # Mastermind creates a fresh `lair-<task>-<node>` job per agentic node from
 # operative:${HENCHMEN_LAIR_OPERATIVE_IMAGE_TAG} (default `latest`), so pushing
 # the operative image is what changes the operatives. The lair template job is

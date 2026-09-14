@@ -73,6 +73,13 @@ curl -X POST http://localhost:8000/dispatch/api/v1/tasks   -H "Content-Type: app
 sidecar. It mounts the Docker socket so the server can launch operative
 containers. Configure `.env.local` first — `henchmen init` is the easy way.
 
+### Prebuilt images
+
+Each release publishes `ghcr.io/chrisciampoli/henchmen/{dispatch,mastermind,forge,operative}`
+tagged `X.Y.Z` and `latest`. See
+[Prebuilt images](docs/deploy-gcp.md#prebuilt-images) for pulling them and
+copying them into Artifact Registry for Cloud Run.
+
 ---
 
 ## How It Works
@@ -299,11 +306,24 @@ HENCHMEN_JIRA_BASE_URL=https://your-org.atlassian.net
 HENCHMEN_JIRA_EMAIL=your-service-account@your-org.com
 HENCHMEN_JIRA_API_TOKEN=your-jira-api-token
 HENCHMEN_JIRA_WEBHOOK_SECRET=shared-secret
+HENCHMEN_JIRA_REPO_FIELD=customfield_10042
+HENCHMEN_JIRA_BRANCH_FIELD=customfield_10043
 ```
 
 `HENCHMEN_JIRA_WEBHOOK_SECRET` verifies the webhook signature. It is required in
 staging and prod — without it every Jira delivery is rejected with 401. The
 operative's Jira tools use the base URL, email and API token.
+
+A Jira webhook delivers custom fields only under their numeric id
+(`customfield_<number>`), never under a name like "Repository". If your issues
+carry the target repository (`owner/repo`) and branch in custom fields, set
+`HENCHMEN_JIRA_REPO_FIELD` and `HENCHMEN_JIRA_BRANCH_FIELD` to those ids. To
+find an id, open **Jira settings > Issues > Custom fields**, choose the field's
+**...** menu and read the numeric id from the page URL (`10042` becomes
+`customfield_10042`), or call
+`GET https://your-org.atlassian.net/rest/api/3/field` and take the `"id"` of the
+field whose `"name"` matches. An issue with no repository field falls back to
+`HENCHMEN_GITHUB_DEFAULT_REPO`.
 
 </details>
 
@@ -312,11 +332,11 @@ operative's Jira tools use the base URL, email and API token.
 ## Development
 
 ```bash
-ruff check --fix src/ tests/   # Auto-fix lint
-ruff check src/ tests/          # Verify clean
-ruff format src/ tests/         # Format
-mypy src/                       # Type check
-pytest tests/unit/              # Unit tests
+ruff check --fix src/ tests/ evals/   # Auto-fix lint
+ruff check src/ tests/ evals/          # Verify clean
+ruff format src/ tests/ evals/         # Format
+mypy src/ evals/                       # Type check
+pytest tests/unit/                     # Unit tests
 ```
 
 All five must pass before submitting a PR. See [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -34,14 +34,16 @@ Thank you for your interest in contributing. This guide covers everything you ne
 Run the full checklist before submitting any change:
 
 ```bash
-ruff check --fix src/ tests/   # Auto-fix lint
-ruff check src/ tests/          # Verify clean
-ruff format src/ tests/         # Format
-mypy src/                       # Type check
-pytest tests/unit/              # Unit tests
+ruff check --fix src/ tests/ evals/   # Auto-fix lint
+ruff check src/ tests/ evals/          # Verify clean
+ruff format src/ tests/ evals/         # Format
+mypy src/ evals/                       # Type check
+pytest tests/unit/                     # Unit tests
 ```
 
-All five must pass. No exceptions.
+All five must pass. No exceptions. These are the same paths CI checks
+(`.github/workflows/ci.yml`); CI runs the formatter as
+`ruff format --check src/ tests/ evals/`.
 
 ## Code Style
 
