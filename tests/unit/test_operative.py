@@ -498,6 +498,10 @@ class TestBootstrapTimeoutStatus:
             # Verify the report was published with TIMED_OUT, NOT COMPLETED
             report = mock_publish.call_args[0][0]
             assert report.status == OperativeStatus.TIMED_OUT
+            # Timed-out nodes are the expensive ones: their telemetry must survive.
+            assert report.total_input_tokens == 1234
+            assert report.total_output_tokens == 56
+            assert report.model_name == "claude-sonnet-5"
 
 
 # ---------------------------------------------------------------------------
