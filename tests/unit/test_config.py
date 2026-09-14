@@ -432,7 +432,6 @@ _FIELDS_AWAITING_A_READER: frozenset[str] = frozenset(
         "jira_branch_field",
         "dossier_semantic_rerank",
         "dead_letter_subscription",
-        "local_sqlite_path",
     }
 )
 

@@ -11,8 +11,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from henchmen.providers.settings_access import optional_setting
-
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
 
@@ -55,7 +53,7 @@ def default_db_path(settings: Settings) -> Path:
     directories different databases, and dropped database files into
     whatever checkout the process was launched from.
     """
-    configured = optional_setting(settings, "local_sqlite_path")
+    configured = settings.local_sqlite_path.strip()
     if configured:
         return Path(configured).expanduser()
     return Path.home() / ".henchmen" / f"henchmen_{settings.environment.value}.db"
