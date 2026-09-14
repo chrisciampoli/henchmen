@@ -116,17 +116,15 @@ class Settings(BaseSettings):
     )
     ci_provider: str = Field(default="", description="Override CI provider")
 
-    # Pub/Sub topics (defaults include environment prefix)
-    pubsub_topic_task_intake: str = Field(default="")
-    pubsub_topic_task_planned: str = Field(default="")
-    pubsub_topic_operative_dispatch: str = Field(default="")
-    pubsub_topic_operative_status: str = Field(default="")
-    pubsub_topic_operative_complete: str = Field(default="")
-    pubsub_topic_forge_request: str = Field(default="")
-    pubsub_topic_forge_result: str = Field(default="")
-    pubsub_topic_dead_letter: str = Field(default="")
-    pubsub_topic_embed_request: str = Field(default="")
-    pubsub_topic_ci_failure: str = Field(default="")
+    # Pub/Sub topics (defaults include environment prefix). Only topics some
+    # component publishes to or subscribes on have a field here.
+    pubsub_topic_task_intake: str = Field(default="", description="Topic Dispatch publishes normalized tasks to")
+    pubsub_topic_operative_complete: str = Field(default="", description="Topic operatives publish their reports to")
+    pubsub_topic_forge_request: str = Field(default="", description="Topic Mastermind publishes CI/PR requests to")
+    pubsub_topic_forge_result: str = Field(default="", description="Topic Forge publishes CI/PR results to")
+    pubsub_topic_dead_letter: str = Field(default="", description="Dead-letter topic drained by the watchdog")
+    pubsub_topic_embed_request: str = Field(default="", description="Topic Dispatch publishes re-index requests to")
+    pubsub_topic_ci_failure: str = Field(default="", description="Topic Dispatch publishes GitHub CI failures to")
 
     def model_post_init(self, __context: object) -> None:
         """Set environment-prefixed defaults for Pub/Sub topics and validate provider requirements."""
@@ -159,9 +157,6 @@ class Settings(BaseSettings):
         env = self.environment.value
         defaults = {
             "pubsub_topic_task_intake": f"henchmen-{env}-task-intake",
-            "pubsub_topic_task_planned": f"henchmen-{env}-task-planned",
-            "pubsub_topic_operative_dispatch": f"henchmen-{env}-operative-dispatch",
-            "pubsub_topic_operative_status": f"henchmen-{env}-operative-status",
             "pubsub_topic_operative_complete": f"henchmen-{env}-operative-complete",
             "pubsub_topic_forge_request": f"henchmen-{env}-forge-request",
             "pubsub_topic_forge_result": f"henchmen-{env}-forge-result",
@@ -178,11 +173,7 @@ class Settings(BaseSettings):
 
     # GCS buckets
     gcs_bucket_dossier: str = Field(default="", description="GCS bucket for dossier artifacts")
-    gcs_bucket_tfstate: str = Field(default="", description="GCS bucket for Terraform state")
     gcs_bucket_snapshots: str = Field(default="", description="GCS bucket for operative snapshots")
-
-    # Arsenal MCP server
-    arsenal_mcp_server_url: str = Field(default="http://localhost:8080", description="Arsenal MCP server URL")
 
     # Git identity for operative commits
     git_author_email: str = Field(
@@ -191,10 +182,6 @@ class Settings(BaseSettings):
     git_author_name: str = Field(default="Henchmen Operative", description="Git author name for operative commits")
 
     # GitHub integration
-    github_app_id: str = Field(default="", description="GitHub App ID (reserved for the GitHub App intake path)")
-    github_app_private_key_secret: str = Field(
-        default="", description="Secret Manager resource name for GitHub App private key (reserved)"
-    )
     github_webhook_secret: str = Field(default="", description="GitHub webhook secret")
     github_token: str = Field(
         default="",

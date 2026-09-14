@@ -163,9 +163,6 @@ class TestSettingsPubSubTopicPrefix:
         settings = Settings()
         topic_fields = [
             "pubsub_topic_task_intake",
-            "pubsub_topic_task_planned",
-            "pubsub_topic_operative_dispatch",
-            "pubsub_topic_operative_status",
             "pubsub_topic_operative_complete",
             "pubsub_topic_forge_request",
             "pubsub_topic_forge_result",
@@ -256,3 +253,44 @@ class TestSettingsExtraIgnored:
         # Should not raise ValidationError
         settings = Settings()
         assert settings.gcp_project_id == "test-project"
+
+
+# ---------------------------------------------------------------------------
+# Every Settings field has a reader
+# ---------------------------------------------------------------------------
+
+# Fields forwarded to operatives whose consumer has not been wired yet. Each
+# entry is a known gap, not a place to park new dead config: remove it as soon
+# as a component reads the field (or the field is deleted).
+_FIELDS_AWAITING_A_READER: frozenset[str] = frozenset(
+    {
+        "vertex_ai_context_cache_enabled",
+        "vertex_ai_context_cache_min_tokens",
+        "vertex_ai_safety_threshold",
+        "vertex_ai_grounding_enabled",
+    }
+)
+
+
+def _unread_settings_fields() -> set[str]:
+    """Settings fields that no module under src/henchmen (other than settings.py) mentions."""
+    from pathlib import Path
+
+    import henchmen
+
+    package_root = Path(henchmen.__file__).parent
+    settings_file = package_root / "config" / "settings.py"
+    corpus = "\n".join(path.read_text(encoding="utf-8") for path in package_root.rglob("*.py") if path != settings_file)
+    return {name for name in Settings.model_fields if name not in corpus and f"HENCHMEN_{name.upper()}" not in corpus}
+
+
+class TestEverySettingIsRead:
+    def test_every_field_is_referenced_outside_settings(self):
+        """Dead Settings fields let docs tell operators to set knobs that do nothing."""
+        unread = sorted(_unread_settings_fields() - _FIELDS_AWAITING_A_READER)
+        assert unread == [], f"Settings fields with no reader in src/henchmen: {unread}"
+
+    def test_allowlist_has_no_stale_entries(self):
+        """An allowlisted field that gained a reader (or was deleted) must leave the allowlist."""
+        assert set(Settings.model_fields) >= _FIELDS_AWAITING_A_READER
+        assert _unread_settings_fields() >= _FIELDS_AWAITING_A_READER
