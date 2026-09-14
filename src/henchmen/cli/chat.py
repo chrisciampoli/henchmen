@@ -23,6 +23,7 @@ import httpx
 
 from henchmen.config.settings import Settings, get_settings
 from henchmen.models.llm import Message, MessageRole, ModelTier
+from henchmen.models.task import TaskType
 
 if TYPE_CHECKING:
     from henchmen.providers.interfaces.llm_provider import LLMProvider
@@ -306,6 +307,20 @@ async def _complete(
     return response.content
 
 
+def _task_type(task_data: dict[str, str]) -> TaskType | None:
+    """The user's explicit task type, or ``None`` when none (or an unknown one) was collected.
+
+    Sent as ``task_type`` so Mastermind picks the scheme from it instead of
+    keyword matching; an unrecognised value is dropped rather than 422 the
+    whole dispatch.
+    """
+    raw = task_data.get("type", "").strip().lower()
+    try:
+        return TaskType(raw)
+    except ValueError:
+        return None
+
+
 async def _dispatch_task(task_data: dict[str, str], settings: Settings) -> dict[str, Any]:
     """Dispatch a task to a local ``henchmen serve``, else to a durable broker.
 
@@ -324,17 +339,21 @@ async def _dispatch_task(task_data: dict[str, str], settings: Settings) -> dict[
     payload: dict[str, Any] = {
         "title": task_data["title"],
         "description": task_data.get("description", ""),
-        "type": task_data.get("type", ""),
         "repo": repo,
         "branch": task_data.get("branch", "main"),
         "priority": task_data.get("priority", "normal"),
         "created_by": "chat",
     }
+    task_type = _task_type(task_data)
+    if task_type is not None:
+        payload["task_type"] = task_type.value
 
     url = _local_dispatch_url(settings)
+    # Dispatch requires this bearer token on /api/v1/tasks whenever it is configured.
+    headers = {"Authorization": f"Bearer {settings.dispatch_api_token}"} if settings.dispatch_api_token else {}
     try:
         async with httpx.AsyncClient(timeout=_LOCAL_DISPATCH_TIMEOUT) as client:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             return {"method": "local", "result": resp.json()}
     except (httpx.ConnectError, httpx.ConnectTimeout):

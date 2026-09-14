@@ -18,31 +18,39 @@ Henchmen is an AI agent factory. It receives tasks from Slack, Jira, GitHub, and
 pip install -e ".[local,dev]"   # Runtime extras + tooling
 henchmen init                    # Interactive setup — writes .env.local
 henchmen doctor                  # Verify the environment
+henchmen config --only-set       # Effective settings, credentials masked
 pytest tests/unit/               # Run unit tests
-ruff check src/ tests/           # Lint
-mypy src/                        # Type check
+ruff check src/ tests/ evals/    # Lint
+mypy src/ evals/                 # Type check
 ```
 
 ## Architecture
 
 Seven components, all villain-themed:
 
-- **Mastermind** (`src/henchmen/mastermind/`) — Orchestrator. Cloud Run service. Manages task lifecycle via state machine, selects Schemes, dispatches Operatives. Fail-closed CI gates: never creates PRs when checks fail.
+- **Mastermind** (`src/henchmen/mastermind/`) — Orchestrator. Cloud Run service. Tracks the task lifecycle (`TaskStatus`, plus the `execution_state` and heartbeat the stalled-task watchdog reads), selects Schemes, walks their DAG, dispatches Operatives and opens the PR. Fail-closed CI gates: never creates PRs when checks fail.
 - **Dispatch** (`src/henchmen/dispatch/`) — Intake router. Cloud Run service. Receives tasks from Slack (Socket Mode), Jira, GitHub, CLI. Normalizes to Task model. Publishes to message broker.
 - **Operative** (`src/henchmen/operative/`) — Coding agent. Cloud Run Job. Bootstraps into ephemeral environment, executes Scheme nodes, uses Arsenal tools, reports results. TIMED_OUT stays TIMED_OUT (never upgraded to COMPLETED).
 - **Arsenal** (`src/henchmen/arsenal/`) — Tool registry. Runs inside Operative (NOT a separate service). Tool categories: `code_edit`, `code_intel`, `context`, `git_ops`, `github`, `jira`, `slack`, `test_runner`.
-- **Forge** (`src/henchmen/forge/`) — CI/merge queue. Cloud Run service. Orchestrates CI, builds PRs, manages merge queue, detects silent failures.
-- **Dossier** (`src/henchmen/dossier/`) — Context builder. Library. Gathers rules, semantic code search via Vertex AI RAG Engine (corpus: `henchmen-code`), task analysis. Caches to object store.
+- **Forge** (`src/henchmen/forge/`) — Post-PR CI. Cloud Run service. Never opens PRs — Mastermind's `create_pr` node does. Runs CI on the PR branch (ruff on changed Python files, tests, silent-failure scan on the diff), comments the result on the PR and publishes `forge-result` as `passed`, `failed`, or `incomplete` when a check could not run. `MergeQueue` exists but nothing enqueues into it; its tick only expires stale claims and reports depth.
+- **Dossier** (`src/henchmen/dossier/`) — Context builder. Library. Gathers rules, semantic code search via Vertex AI RAG Engine (corpus: `henchmen-code`), task analysis. Uploads the assembled dossier to the object store. Its indexing pipeline (`embed_pipeline.py`) runs in Mastermind's `/pubsub/embed-request` handler, fed by Dispatch on a push to a repo's default branch, and in `henchmen embed <owner/repo> [--full]` — never in Dispatch. A full run deletes the repo's existing chunks first; the last-indexed commit only advances after every chunk uploaded.
 - **Schemes** (`src/henchmen/schemes/`) — DAG workflow blueprints. Library. Defines execution plans: `bugfix_standard`, `feature_standard`, `goal_decomposition`.
 
-Shared data contracts live in **Models** (`src/henchmen/models/`) — Pydantic v2 models for `Task`, `Operative`, `Scheme`, `Dossier`.
+Shared data contracts live in **Models** (`src/henchmen/models/`) — Pydantic v2 models for `Task`, `Operative`, `Scheme`, `Dossier`, `LLM` (messages, tool calls, `ModelTier`) and `Evaluation`.
 
 ## Task Flow
 
+Topic names are `henchmen-{env}-<topic>` (`Settings.pubsub_topic_*`).
+
 ```
-Source → Dispatch → Pub/Sub (tasks.created) → Mastermind → Dossier (context)
+Source → Dispatch → Pub/Sub (task-intake) → Mastermind → Dossier (context)
   → Scheme (plan) → Operative (Cloud Run Job) → Arsenal (tools)
-  → Pub/Sub (operative.complete) → Forge (CI + PR) → Human review
+  → Pub/Sub (operative-complete) → Mastermind (lint/test gates, create_pr)
+  → Pub/Sub (forge-request) → Forge (CI on the PR) → Pub/Sub (forge-result)
+  → Human review
+
+GitHub push to default branch → Dispatch → Pub/Sub (embed-request)
+  → Mastermind (dossier.embed_pipeline re-indexes the RAG corpus)
 ```
 
 ## Model Tiering
@@ -64,8 +72,10 @@ Each cell is a `Settings` field (`anthropic_model_complex`,
 `vertex_ai_model_reasoning`, ...). Ollama tiers fall back to
 `llm_ollama_model`; Bedrock has its own `bedrock_model_*` fields.
 
-`fix_lint` is DETERMINISTIC (`ruff --fix` / `eslint --fix`) — no LLM, no
-container.
+`fix_lint` and `verify_changes` are DETERMINISTIC — no LLM, no Lair. `fix_lint`
+runs `ruff check --fix` / `eslint --fix` on only the files the operative
+changed and reverts any fix outside them; `verify_changes` checks the branch has
+source commits ahead of base.
 
 Token pricing lives in exactly one place: `src/henchmen/providers/pricing.py`.
 Cost is always computed with `estimate_cost` / `estimate_cost_for_settings`
@@ -73,7 +83,7 @@ from that module.
 
 ## GCP Services
 
-Cloud Run (services: Dispatch, Mastermind, Forge), Cloud Run Jobs (Operative), Pub/Sub (10 env-prefixed topics with OIDC audience auth), Firestore (state + metrics), GCS (artifacts, TF state), Vertex AI (Gemini for inference, RAG Engine for semantic code search — no Claude on Vertex), Secret Manager, Artifact Registry, Terraform for IaC.
+Cloud Run (services: Dispatch, Mastermind, Forge), Cloud Run Jobs (Operative), Pub/Sub (7 env-prefixed topics — task-intake, operative-complete, forge-request, forge-result, ci-failure, embed-request, dead-letter — with OIDC audience auth), Firestore (state + metrics), GCS (artifacts, TF state), Vertex AI (Gemini for inference, RAG Engine for semantic code search — no Claude on Vertex), Secret Manager, Artifact Registry, Terraform for IaC.
 
 ## Language & Stack
 
@@ -107,12 +117,14 @@ Cloud Run (services: Dispatch, Mastermind, Forge), Cloud Run Jobs (Operative), P
 Every task must pass all five before it's done:
 
 ```bash
-ruff check --fix src/ tests/   # 1. Auto-fix lint
-ruff check src/ tests/          # 2. Verify clean
-ruff format src/ tests/         # 3. Format
-mypy src/                       # 4. Type check
-pytest tests/unit/              # 5. Unit tests
+ruff check --fix src/ tests/ evals/   # 1. Auto-fix lint
+ruff check src/ tests/ evals/          # 2. Verify clean
+ruff format src/ tests/ evals/         # 3. Format
+mypy src/ evals/                       # 4. Type check
+pytest tests/unit/                     # 5. Unit tests
 ```
+
+These are the paths CI checks (`.github/workflows/ci.yml`).
 
 ## Directory Layout
 
@@ -120,12 +132,12 @@ pytest tests/unit/              # 5. Unit tests
 henchmen/
 ├── src/henchmen/              # Main package
 │   ├── arsenal/               # Tool registry + tools/ (runs inside the operative)
-│   ├── cli/                   # init wizard, doctor, chat, serve, eval
+│   ├── cli/                   # init wizard, doctor, config, chat, serve, embed, eval
 │   ├── config/settings.py     # Pydantic settings (HENCHMEN_ prefix)
 │   ├── dispatch/              # Intake router + handlers/ + slack_bot.py
 │   ├── dossier/               # Context builder
 │   ├── evals/                 # Offline eval harness + SQLite history
-│   ├── forge/                 # CI + merge queue
+│   ├── forge/                 # Post-PR CI (lint, tests, silent-failure scan)
 │   ├── mastermind/            # Orchestrator + scheme_executor/
 │   ├── models/                # Pydantic data models (task, operative, scheme, dossier, llm, evaluation)
 │   ├── observability/         # Cost tracking, metrics API, tracing
@@ -151,9 +163,21 @@ Every error/exception path in the scheme executor returns `condition: "fail"`, n
 - An undetectable project stack in a CI gate → fail, not "skipped"
 - A CI command that cannot run must surface its real exit code; never swallow
   it with `2>/dev/null || echo SKIP`
-- Lint checks only run on files changed by the operative (`git diff --name-only origin/main`)
+- A lint gate must only judge files changed by the operative
+  (`git diff --name-only origin/<base>...HEAD`), never pre-existing violations.
+  Mastermind's gate (`scheme_executor/lint_scope.py`) runs ruff on changed
+  `.py` files, eslint on changed JS/TS files from the nearest `package.json`,
+  `go vet` on changed Go packages, and the whole-project Rust/Java lint only
+  when files in that language changed
+- A lint diff against `origin/<base>` that cannot be fetched or computed → fail
 
 ## Container Build & Deploy
+
+Terraform owns every Cloud Run service's image, environment and secret mounts
+(`container_image_tag` in `terraform.tfvars`). A `gcloud run services update`
+works for a quick redeploy, but the next `terraform apply` puts back whatever
+Terraform declares — change the tag or the `cloud-run-services` module for
+anything that must stick.
 
 ```bash
 # Build and push (from repo root)
@@ -164,8 +188,13 @@ gcloud run services update henchmen-${ENV}-mastermind \
   --project=${PROJECT_ID} --region=${REGION} \
   --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/henchmen-${ENV}/mastermind:latest
 
-# Same pattern for: operative, forge, dispatch
-# After operative rebuild, also update the lair template:
+# Same pattern for forge and dispatch. The operative is built and pushed the
+# same way but has no service to update.
+# Mastermind creates a fresh `lair-<task>-<node>` job per agentic node from
+# operative:${HENCHMEN_LAIR_OPERATIVE_IMAGE_TAG} (default `latest`), so pushing
+# the operative image is what changes the operatives. The lair template job is
+# a reference/smoke-test copy — keep it in sync so `gcloud run jobs execute`
+# tests the same image:
 gcloud run jobs update henchmen-${ENV}-lair-template \
   --project=${PROJECT_ID} --region=${REGION} \
   --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/henchmen-${ENV}/operative:latest

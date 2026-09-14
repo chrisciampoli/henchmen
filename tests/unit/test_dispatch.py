@@ -65,6 +65,22 @@ class TestTaskNormalizerFromCli:
         assert task.context.branch is None
         assert task.priority == TaskPriority.NORMAL
         assert task.created_by == "cli"
+        assert task.task_type is None
+
+    def test_explicit_task_type_is_carried_through_intake(self):
+        """CreateTaskRequest -> from_cli -> HenchmenTask keeps the requester's type, and it survives Pub/Sub JSON."""
+        from henchmen.models.task import TaskType
+
+        request = CreateTaskRequest(title="Add null check", repo="acme/api", task_type="bugfix")
+        task = TaskNormalizer().from_cli(request.model_dump())
+        assert task.task_type == TaskType.BUGFIX
+        assert HenchmenTask.model_validate_json(task.model_dump_json()).task_type == TaskType.BUGFIX
+
+    def test_unknown_task_type_is_rejected_by_the_api_model(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            CreateTaskRequest(title="T", task_type="chore")
 
     def test_source_id_is_uuid_when_not_provided(self):
         n = TaskNormalizer()
@@ -298,6 +314,7 @@ class TestCliHandler:
                 CreateTaskRequest(title="Do something", repo="acme/api"),
                 normalizer,
                 settings,
+                broker=AsyncMock(),
             )
 
         assert result["status"] == "dispatched"
@@ -312,7 +329,9 @@ class TestCliHandler:
         settings = _mock_settings()
 
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="x")):
-            result = await handle_cli_request(CreateTaskRequest(title="T", repo="acme/api"), normalizer, settings)
+            result = await handle_cli_request(
+                CreateTaskRequest(title="T", repo="acme/api"), normalizer, settings, broker=AsyncMock()
+            )
 
         assert len(result["task_id"]) == 36
 
@@ -341,7 +360,7 @@ class TestSlackHandler:
         }
 
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="msg-slack-1")):
-            result = await handle_slack_event(payload, normalizer, settings)
+            result = await handle_slack_event(payload, normalizer, settings, broker=AsyncMock())
 
         assert result["status"] == "dispatched"
         assert result["message_id"] == "msg-slack-1"
@@ -361,7 +380,7 @@ class TestSlackHandler:
             }
         }
 
-        result = await handle_slack_event(payload, normalizer, settings)
+        result = await handle_slack_event(payload, normalizer, settings, broker=AsyncMock())
         assert result["status"] == "ignored"
 
     @pytest.mark.asyncio
@@ -382,7 +401,7 @@ class TestSlackHandler:
         }
 
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="msg-2")):
-            result = await handle_slack_event(payload, normalizer, settings)
+            result = await handle_slack_event(payload, normalizer, settings, broker=AsyncMock())
 
         assert result["status"] == "dispatched"
 
@@ -415,7 +434,7 @@ class TestGithubHandler:
         }
 
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="msg-gh-1")):
-            result = await handle_github_webhook(payload, normalizer, settings)
+            result = await handle_github_webhook(payload, normalizer, settings, broker=AsyncMock())
 
         assert result["status"] == "dispatched"
         assert result["trigger"] == "issue_labeled"
@@ -447,7 +466,7 @@ class TestGithubHandler:
         }
 
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="msg-gh-2")):
-            result = await handle_github_webhook(payload, normalizer, settings)
+            result = await handle_github_webhook(payload, normalizer, settings, broker=AsyncMock())
 
         assert result["status"] == "dispatched"
         assert result["trigger"] == "pr_comment"
@@ -472,7 +491,7 @@ class TestGithubHandler:
             "repository": {"full_name": "acme/api", "default_branch": "main"},
         }
 
-        result = await handle_github_webhook(payload, normalizer, settings)
+        result = await handle_github_webhook(payload, normalizer, settings, broker=AsyncMock())
         assert result["status"] == "ignored"
 
 
@@ -506,7 +525,7 @@ class TestDispatchServerRoutes:
     def test_create_task_route_registered(self, client):
         """Route /api/v1/tasks must exist; missing 'title' returns 422."""
         response = client.post("/api/v1/tasks", json={})
-        assert response.status_code in (200, 400, 422, 500)
+        assert response.status_code == 422
 
     def test_slack_webhook_route_url_verification(self, client):
         response = client.post(
@@ -527,56 +546,10 @@ class TestDispatchServerRoutes:
         )
         assert response.status_code != 404
 
-    def test_pubsub_task_planned_route_registered(self, client):
-        import base64
-        import json
-
-        data = base64.b64encode(json.dumps({"task_id": "t1"}).encode()).decode()
-        response = client.post(
-            "/pubsub/task-planned",
-            json={"message": {"data": data}},
-        )
-        assert response.status_code == 200
-
-
-# ---------------------------------------------------------------------------
-# CLI embed command
-# ---------------------------------------------------------------------------
-
-
-class TestCliEmbedCommand:
-    @pytest.mark.asyncio
-    async def test_embed_full_mode(self):
-        from henchmen.dispatch.handlers.cli import handle_embed_command
-
-        with patch("henchmen.dispatch.handlers.cli.run_embedding_pipeline", new_callable=AsyncMock) as mock_run:
-            mock_run.return_value = {"status": "completed", "chunks_upserted": 100}
-            result = await handle_embed_command(
-                repo="acme-org/sample-repo",
-                full=True,
-                settings=MagicMock(),
-            )
-
-        mock_run.assert_awaited_once()
-        call_kwargs = mock_run.call_args[1]
-        assert call_kwargs["repo"] == "acme-org/sample-repo"
-        assert call_kwargs["mode"] == "full"
-        assert result["status"] == "completed"
-
-    @pytest.mark.asyncio
-    async def test_embed_incremental_mode(self):
-        from henchmen.dispatch.handlers.cli import handle_embed_command
-
-        with patch("henchmen.dispatch.handlers.cli.run_embedding_pipeline", new_callable=AsyncMock) as mock_run:
-            mock_run.return_value = {"status": "completed", "chunks_upserted": 5}
-            await handle_embed_command(
-                repo="acme-org/sample-repo",
-                full=False,
-                settings=MagicMock(),
-            )
-
-        call_kwargs = mock_run.call_args[1]
-        assert call_kwargs["mode"] == "incremental"
+    def test_task_planned_stub_route_is_gone(self, client):
+        """Nothing publishes task-planned; Dispatch must not expose an ack-everything stub."""
+        response = client.post("/pubsub/task-planned", json={"message": {"data": ""}})
+        assert response.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +601,31 @@ class TestGitHubPushEmbed:
 
         assert result["status"] == "embed_requested"
         mock_broker.publish.assert_awaited_once()
+        # The body is the contract Mastermind's /pubsub/embed-request validates.
+        from henchmen.dossier.embed_pipeline import EmbedRequest
+
+        topic, body = mock_broker.publish.await_args.args
+        assert topic == "henchmen-dev-embed-request"
+        assert EmbedRequest.model_validate_json(body) == EmbedRequest(
+            repo="org/repo", commit_sha="abc123", mode="incremental"
+        )
+
+    @pytest.mark.asyncio
+    async def test_push_without_repository_is_ignored(self):
+        from henchmen.dispatch.handlers.github import handle_push_embed
+
+        broker = AsyncMock()
+        result = await handle_push_embed({"ref": "refs/heads/main"}, MagicMock(), broker=broker)
+
+        assert result["status"] == "ignored"
+        broker.publish.assert_not_awaited()
+
+    def test_dispatch_no_longer_hosts_the_embedding_pipeline(self):
+        """Dispatch normalizes and publishes; cloning and indexing live in dossier.embed_pipeline."""
+        import henchmen.dispatch.handlers.cli as cli_handlers
+
+        for name in ("run_embedding_pipeline", "handle_embed_command", "_collect_all_files", "clone_repo"):
+            assert not hasattr(cli_handlers, name), name
 
 
 # ---------------------------------------------------------------------------
@@ -890,6 +888,38 @@ class TestNormalizerRegressions:
         fallback = n.from_jira({"issue": {"key": "P-2", "fields": {"summary": "S"}}}, settings)
         assert fallback.context.repo == "acme/fallback"
 
+    def test_jira_repo_and_branch_from_configured_custom_field_ids(self, monkeypatch):
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "acme/fallback")
+        monkeypatch.setenv("HENCHMEN_JIRA_REPO_FIELD", "customfield_10042")
+        monkeypatch.setenv("HENCHMEN_JIRA_BRANCH_FIELD", "customfield_10043")
+        settings = _mock_settings()
+        fields = {
+            "summary": "S",
+            "customfield_10042": "acme/api",
+            # A select-list custom field arrives as an option object.
+            "customfield_10043": {"value": "develop", "id": "10001"},
+            # The configured field id wins over the plain name.
+            "repo": "acme/plain",
+        }
+
+        task = TaskNormalizer().from_jira({"issue": {"key": "P-3", "fields": fields}}, settings)
+
+        assert task.context.repo == "acme/api"
+        assert task.context.branch == "develop"
+
+    def test_jira_unconfigured_custom_field_ids_are_not_guessed(self, monkeypatch):
+        """``customfield_repo`` cannot exist in Jira; without a configured id only plain names count."""
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "acme/fallback")
+        monkeypatch.setenv("HENCHMEN_JIRA_REPO_FIELD", "")
+        monkeypatch.setenv("HENCHMEN_JIRA_BRANCH_FIELD", "")
+        settings = _mock_settings()
+        fields = {"summary": "S", "customfield_repo": "acme/impossible", "customfield_branch": "nope"}
+
+        task = TaskNormalizer().from_jira({"issue": {"key": "P-4", "fields": fields}}, settings)
+
+        assert task.context.repo == "acme/fallback"
+        assert task.context.branch is None
+
     def test_issue_comment_on_pr_uses_comment_body_and_pr_source_id(self):
         n = TaskNormalizer()
         payload = {
@@ -955,7 +985,9 @@ class TestGithubTriggerFilters:
 
         normalizer = TaskNormalizer()
         with patch.object(normalizer, "publish_task", new=AsyncMock()) as publish:
-            result = await handle_github_webhook(_pr_comment(action="edited"), normalizer, _mock_settings())
+            result = await handle_github_webhook(
+                _pr_comment(action="edited"), normalizer, _mock_settings(), broker=AsyncMock()
+            )
         assert result["status"] == "ignored"
         publish.assert_not_awaited()
 
@@ -964,7 +996,9 @@ class TestGithubTriggerFilters:
         from henchmen.dispatch.handlers.github import handle_github_webhook
 
         normalizer = TaskNormalizer()
-        result = await handle_github_webhook(_pr_comment(action="deleted"), normalizer, _mock_settings())
+        result = await handle_github_webhook(
+            _pr_comment(action="deleted"), normalizer, _mock_settings(), broker=AsyncMock()
+        )
         assert result["status"] == "ignored"
 
     @pytest.mark.asyncio
@@ -973,7 +1007,9 @@ class TestGithubTriggerFilters:
 
         normalizer = TaskNormalizer()
         with patch.object(normalizer, "publish_task", new=AsyncMock()) as publish:
-            result = await handle_github_webhook(_pr_comment(association="NONE"), normalizer, _mock_settings())
+            result = await handle_github_webhook(
+                _pr_comment(association="NONE"), normalizer, _mock_settings(), broker=AsyncMock()
+            )
         assert result == {"status": "ignored", "reason": "unauthorized commenter"}
         publish.assert_not_awaited()
 
@@ -985,7 +1021,7 @@ class TestGithubTriggerFilters:
         payload = _pr_comment()
         del payload["comment"]["author_association"]
         normalizer = TaskNormalizer()
-        result = await handle_github_webhook(payload, normalizer, _mock_settings())
+        result = await handle_github_webhook(payload, normalizer, _mock_settings(), broker=AsyncMock())
         assert result["status"] == "ignored"
 
     @pytest.mark.asyncio
@@ -1012,7 +1048,7 @@ class TestGithubTriggerFilters:
         }
         normalizer = TaskNormalizer()
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="m")):
-            result = await handle_github_webhook(payload, normalizer, _mock_settings())
+            result = await handle_github_webhook(payload, normalizer, _mock_settings(), broker=AsyncMock())
         assert result["status"] == "dispatched"
         assert result["trigger"] == "pr_comment"
 
@@ -1077,7 +1113,7 @@ class TestJiraTransitionDetection:
         }
         normalizer = TaskNormalizer()
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="m")):
-            result = await handle_jira_webhook(payload, normalizer, _mock_settings())
+            result = await handle_jira_webhook(payload, normalizer, _mock_settings(), broker=AsyncMock())
         assert result["status"] == "dispatched"
 
     @pytest.mark.asyncio
@@ -1089,7 +1125,7 @@ class TestJiraTransitionDetection:
             "changelog": {"items": [{"field": "assignee", "toString": "someone"}]},
             "issue": {"key": "PROJ-9", "fields": {"summary": "Do it"}},
         }
-        result = await handle_jira_webhook(payload, TaskNormalizer(), _mock_settings())
+        result = await handle_jira_webhook(payload, TaskNormalizer(), _mock_settings(), broker=AsyncMock())
         assert result["status"] == "ignored"
 
     @pytest.mark.asyncio
@@ -1102,7 +1138,7 @@ class TestJiraTransitionDetection:
         }
         normalizer = TaskNormalizer()
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="m")):
-            result = await handle_jira_webhook(payload, normalizer, _mock_settings())
+            result = await handle_jira_webhook(payload, normalizer, _mock_settings(), broker=AsyncMock())
         assert result["status"] == "dispatched"
 
 
@@ -1128,7 +1164,7 @@ class TestSlackMentionDetection:
         }
         normalizer = TaskNormalizer()
         with patch.object(normalizer, "publish_task", new=AsyncMock(return_value="m")):
-            result = await handle_slack_event(payload, normalizer, _mock_settings())
+            result = await handle_slack_event(payload, normalizer, _mock_settings(), broker=AsyncMock())
         assert result["status"] == "dispatched"
 
     @pytest.mark.asyncio
@@ -1139,92 +1175,8 @@ class TestSlackMentionDetection:
             "authorizations": [{"user_id": "U0BOT123"}],
             "event": {"type": "message", "user": "U1", "text": "<@U9999999> ping"},
         }
-        result = await handle_slack_event(payload, TaskNormalizer(), _mock_settings())
+        result = await handle_slack_event(payload, TaskNormalizer(), _mock_settings(), broker=AsyncMock())
         assert result["status"] == "ignored"
-
-
-# ---------------------------------------------------------------------------
-# Embedding pipeline hygiene
-# ---------------------------------------------------------------------------
-
-
-class TestEmbeddingPipelineGuards:
-    @pytest.mark.asyncio
-    async def test_rejects_repo_that_is_not_owner_slash_name(self):
-        from henchmen.dispatch.handlers.cli import run_embedding_pipeline
-
-        result = await run_embedding_pipeline(repo="--upload-pack=evil", mode="full", settings=_mock_settings())
-        assert result["status"] == "failed"
-        assert "invalid repo name" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_clone_uses_resolved_default_branch_and_settings_token(self, monkeypatch):
-        from henchmen.dispatch.handlers import cli as cli_handlers
-
-        monkeypatch.setenv("HENCHMEN_GITHUB_TOKEN", "ghp-from-settings")
-        settings = _mock_settings()
-
-        clone = AsyncMock(side_effect=RuntimeError("stop here"))
-        monkeypatch.setattr(cli_handlers, "clone_repo", clone)
-        monkeypatch.setattr(
-            cli_handlers,
-            "_resolve_default_branch",
-            AsyncMock(return_value="develop"),
-        )
-
-        result = await cli_handlers.run_embedding_pipeline(repo="acme/api", mode="full", settings=settings)
-
-        assert result["status"] == "failed"
-        args, kwargs = clone.call_args
-        assert args[1] == "develop"
-        assert kwargs["token"] == "ghp-from-settings"
-
-    @pytest.mark.asyncio
-    async def test_failed_upsert_does_not_advance_last_indexed_commit(self, monkeypatch, tmp_path):
-        """A partial upsert must not mark the commit indexed.
-
-        The next incremental run only diffs from the last-indexed commit, so
-        advancing it past chunks that failed to upload strands them forever.
-        """
-        import subprocess
-
-        from henchmen.dispatch.handlers import cli as cli_handlers
-        from henchmen.dossier.embedder import UpsertResult
-
-        settings = _mock_settings()
-        repo_dir = tmp_path / "repo"
-        repo_dir.mkdir()
-        (repo_dir / "main.py").write_text("def hello():\n    return 1\n", encoding="utf-8")
-        # A real repo, because the pipeline reads HEAD with `git rev-parse`.
-        for cmd in (
-            ["git", "init", "-q"],
-            ["git", "config", "user.email", "t@example.com"],
-            ["git", "config", "user.name", "t"],
-            ["git", "add", "-A"],
-            ["git", "commit", "-qm", "seed"],
-        ):
-            subprocess.run(cmd, cwd=repo_dir, check=True, capture_output=True)
-
-        monkeypatch.setattr(cli_handlers, "_resolve_default_branch", AsyncMock(return_value="main"))
-        monkeypatch.setattr(cli_handlers, "clone_repo", AsyncMock())
-        monkeypatch.setattr(cli_handlers.tempfile, "mkdtemp", lambda **kw: str(repo_dir))
-        # The pipeline imports these inside the function body, so they are
-        # attributes of the embedder module, not of the handler module.
-        from henchmen.dossier import embedder
-
-        monkeypatch.setattr(
-            embedder,
-            "upsert_chunks",
-            AsyncMock(return_value=UpsertResult(uploaded=2, failed=5)),
-        )
-        set_commit = AsyncMock()
-        monkeypatch.setattr(embedder, "set_last_indexed_commit", set_commit)
-
-        result = await cli_handlers.run_embedding_pipeline(repo="acme/api", mode="full", settings=settings)
-
-        assert result["status"] == "failed"
-        assert result["chunks_failed"] == 5
-        set_commit.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -1428,7 +1380,7 @@ def _pubsub_request(headers=None):
         {
             "type": "http",
             "method": "POST",
-            "path": "/pubsub/task-planned",
+            "path": "/pubsub/example",
             "headers": raw,
             "query_string": b"",
             "client": ("10.0.0.1", 1234),
@@ -1506,6 +1458,63 @@ class TestPubsubOidc:
             await pubsub_auth.verify_pubsub_oidc(_pubsub_request({"Authorization": "Bearer jwt"}), _mock_settings())
         assert exc.value.status_code == 401
 
+    @pytest.mark.asyncio
+    async def test_valid_token_on_allow_list_is_accepted_and_claims_attached(self, monkeypatch):
+        from henchmen.dispatch import pubsub_auth
+
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "prod")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_AUDIENCE", "https://dispatch.example")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_ALLOWED_EMAILS", "pubsub@acme.iam.gserviceaccount.com")
+
+        claims = {"email": "pubsub@acme.iam.gserviceaccount.com", "aud": "https://dispatch.example"}
+        fake_id_token = MagicMock()
+        fake_id_token.verify_oauth2_token.return_value = claims
+        request = _pubsub_request({"Authorization": "Bearer good-jwt"})
+        with patch.dict(
+            "sys.modules",
+            {"google.auth.transport.requests": MagicMock(), "google.oauth2.id_token": fake_id_token},
+        ):
+            await pubsub_auth.verify_pubsub_oidc(request, _mock_settings())
+
+        assert request.state.pubsub_oidc_claims == claims
+        args = fake_id_token.verify_oauth2_token.call_args[0]
+        assert args[0] == "good-jwt"
+        assert args[2] == "https://dispatch.example"
+
+    @pytest.mark.asyncio
+    async def test_token_that_fails_verification_is_rejected(self, monkeypatch):
+        from fastapi import HTTPException
+
+        from henchmen.dispatch import pubsub_auth
+
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "prod")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_AUDIENCE", "https://dispatch.example")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_ALLOWED_EMAILS", "")
+
+        fake_id_token = MagicMock()
+        fake_id_token.verify_oauth2_token.side_effect = ValueError("Token has wrong audience")
+        with (
+            patch.dict(
+                "sys.modules",
+                {"google.auth.transport.requests": MagicMock(), "google.oauth2.id_token": fake_id_token},
+            ),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await pubsub_auth.verify_pubsub_oidc(_pubsub_request({"Authorization": "Bearer bad"}), _mock_settings())
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_non_bearer_authorization_scheme_is_rejected(self, monkeypatch):
+        from fastapi import HTTPException
+
+        from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
+
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "prod")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_AUDIENCE", "https://dispatch.example")
+        with pytest.raises(HTTPException) as exc:
+            await verify_pubsub_oidc(_pubsub_request({"Authorization": "Basic dXNlcjpwYXNz"}), _mock_settings())
+        assert exc.value.status_code == 401
+
 
 # ---------------------------------------------------------------------------
 # /api/v1/tasks request validation
@@ -1557,6 +1566,108 @@ class TestCreateTaskValidation:
         resp = client.post("/api/v1/tasks", json={"title": "T"})
         assert resp.status_code == 200
         assert resp.json()["status"] == "dispatched"
+
+
+class TestCreateTaskAuth:
+    """``POST /api/v1/tasks`` launches paid runs, so it requires a bearer token outside dev."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        import henchmen.dispatch.server as server
+
+        monkeypatch.setenv("HENCHMEN_GCP_PROJECT_ID", "test-project")
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "dev")
+        monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "acme/api")
+        # Set empty rather than delete: Settings also reads .env.local.
+        monkeypatch.setenv("HENCHMEN_DISPATCH_API_TOKEN", "")
+        monkeypatch.delenv("DISPATCH_API_TOKEN", raising=False)
+        monkeypatch.setattr(server, "_open_api_warning_logged", False)
+        yield
+
+    @pytest.fixture
+    def client(self):
+        from henchmen.dispatch.server import app
+
+        with TestClient(app) as c:
+            yield c
+
+    @staticmethod
+    def _configure(monkeypatch, **env: str) -> None:
+        from henchmen.config.settings import get_settings
+
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        get_settings.cache_clear()
+
+    def test_dev_without_token_is_open_and_warns_once(self, client, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="henchmen.dispatch.server"):
+            assert client.post("/api/v1/tasks", json={"title": "T"}).status_code == 200
+            assert client.post("/api/v1/tasks", json={"title": "T"}).status_code == 200
+        warnings = [r for r in caplog.records if "HENCHMEN_DISPATCH_API_TOKEN is empty" in r.getMessage()]
+        assert len(warnings) == 1
+
+    @pytest.mark.parametrize("env_name", ["staging", "prod"])
+    def test_missing_token_outside_dev_fails_closed(self, client, monkeypatch, env_name):
+        self._configure(monkeypatch, HENCHMEN_ENVIRONMENT=env_name)
+        resp = client.post("/api/v1/tasks", json={"title": "T"})
+        assert resp.status_code == 401
+
+    def test_auth_is_checked_before_body_validation(self, client, monkeypatch):
+        """An unauthenticated caller gets 401, not a 422 that describes the request schema."""
+        self._configure(monkeypatch, HENCHMEN_DISPATCH_API_TOKEN="s3cret")
+        assert client.post("/api/v1/tasks", json={}).status_code == 401
+
+    @pytest.mark.parametrize(
+        "header",
+        [None, "Bearer wrong", "Basic czNjcmV0", "Bearer ", "s3cret"],
+    )
+    def test_wrong_or_missing_token_is_rejected(self, client, monkeypatch, header):
+        self._configure(monkeypatch, HENCHMEN_ENVIRONMENT="prod", HENCHMEN_DISPATCH_API_TOKEN="s3cret")
+        headers = {"Authorization": header} if header is not None else {}
+        resp = client.post("/api/v1/tasks", json={"title": "T"}, headers=headers)
+        assert resp.status_code == 401
+        assert resp.headers["WWW-Authenticate"] == "Bearer"
+        assert "s3cret" not in resp.text
+
+    def test_terraform_placeholder_is_not_a_token(self, client, monkeypatch):
+        """The seeded Secret Manager placeholder is public; it must not unlock the route."""
+        from henchmen.config.settings import SEEDED_SECRET_PLACEHOLDER as _SEEDED_SECRET_PLACEHOLDER
+
+        self._configure(
+            monkeypatch, HENCHMEN_ENVIRONMENT="prod", HENCHMEN_DISPATCH_API_TOKEN=_SEEDED_SECRET_PLACEHOLDER
+        )
+        resp = client.post(
+            "/api/v1/tasks",
+            json={"title": "T"},
+            headers={"Authorization": f"Bearer {_SEEDED_SECRET_PLACEHOLDER}"},
+        )
+        assert resp.status_code == 401
+
+    def test_placeholder_matches_the_terraform_seed(self):
+        from pathlib import Path
+
+        from henchmen.config.settings import SEEDED_SECRET_PLACEHOLDER as _SEEDED_SECRET_PLACEHOLDER
+
+        secrets_tf = Path(__file__).resolve().parents[2] / "terraform" / "modules" / "secrets" / "main.tf"
+        assert f'secret_data = "{_SEEDED_SECRET_PLACEHOLDER}"' in secrets_tf.read_text(encoding="utf-8")
+
+    def test_correct_token_is_accepted(self, client, monkeypatch):
+        self._configure(monkeypatch, HENCHMEN_ENVIRONMENT="prod", HENCHMEN_DISPATCH_API_TOKEN="s3cret")
+        resp = client.post("/api/v1/tasks", json={"title": "T"}, headers={"Authorization": "Bearer s3cret"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "dispatched"
+
+    def test_bare_secret_mount_name_is_honoured(self, client, monkeypatch):
+        """Cloud Run mounts the secret as DISPATCH_API_TOKEN."""
+        monkeypatch.delenv("HENCHMEN_DISPATCH_API_TOKEN")
+        self._configure(monkeypatch, HENCHMEN_ENVIRONMENT="staging", DISPATCH_API_TOKEN="mounted")
+        denied = client.post("/api/v1/tasks", json={"title": "T"}, headers={"Authorization": "Bearer other"})
+        allowed = client.post("/api/v1/tasks", json={"title": "T"}, headers={"Authorization": "bearer mounted"})
+        assert denied.status_code == 401
+        assert allowed.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -1660,6 +1771,26 @@ class TestTTLSet:
         for i in range(50):
             guard.add_if_absent(f"k{i}")
         assert len(guard._seen) <= 5
+
+
+def test_importing_dispatch_server_installs_secret_redaction():
+    """Dispatch logs intake payloads; token-shaped strings must be redacted in this process.
+
+    Runs in a fresh interpreter: another test module importing Mastermind would
+    already have installed the factory in this one.
+    """
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import logging, henchmen.dispatch.server\n"
+        "from henchmen.utils.redaction import _redacting_factory\n"
+        "assert logging.getLogRecordFactory() is _redacting_factory\n"
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), "HENCHMEN_PROVIDER": "local"}
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
 
 
 # ---------------------------------------------------------------------------

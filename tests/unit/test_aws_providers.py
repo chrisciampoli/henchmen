@@ -30,6 +30,27 @@ def _install_boto3_stub():
     return stub
 
 
+def _is_aws_module(name: str) -> bool:
+    return name == "boto3" or name.startswith(("boto3.", "botocore", "henchmen.providers.aws"))
+
+
+@pytest.fixture(autouse=True)
+def _restore_aws_sys_modules():
+    """Put boto3/botocore back exactly as they were after every test.
+
+    Tests here install MagicMock stand-ins for ``boto3``, ``boto3.dynamodb`` and
+    ``botocore.exceptions`` directly in ``sys.modules``; the per-class teardowns
+    only popped ``boto3``. A stub ``botocore.exceptions`` left behind makes the
+    next *real* ``import boto3`` elsewhere in the suite fail with a metaclass
+    conflict, so a provider test in another module broke depending on order.
+    """
+    saved = {name: module for name, module in sys.modules.items() if _is_aws_module(name)}
+    yield
+    for name in [name for name in sys.modules if _is_aws_module(name)]:
+        del sys.modules[name]
+    sys.modules.update(saved)
+
+
 def _remove_aws_modules():
     """Evict any cached AWS provider modules so re-imports pick up new mocks."""
     for key in list(sys.modules):
@@ -255,6 +276,27 @@ class TestDynamoDBDocumentStore:
         assert result["status"] == "pending"
         assert result["title"] == "Fix bug"
         assert result["_id"] == "t-1"
+
+    @pytest.mark.asyncio
+    async def test_get_converts_decimals_nested_in_map_and_list_attributes(self):
+        """update() writes dict/list fields as top-level Map/List attributes; their numbers are Decimals."""
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {
+            "Item": {
+                "pk": "tasks",
+                "sk": "t-1",
+                "data": "{}",
+                "metrics": {"tokens": Decimal("12"), "cost": Decimal("0.5")},
+                "scores": [Decimal("1"), {"x": Decimal("2.25")}],
+            }
+        }
+        store = self._make_store(mock_table)
+        result = await store.get("tasks", "t-1")
+
+        assert result is not None
+        assert result["metrics"] == {"tokens": 12, "cost": 0.5}
+        assert type(result["metrics"]["tokens"]) is int
+        assert result["scores"] == [1, {"x": 2.25}]
 
     @pytest.mark.asyncio
     async def test_set_puts_correct_item(self):

@@ -349,6 +349,7 @@ async def upsert_chunks(
     region: str = "",
     collection_name: str = "",
     replace_existing: bool = False,
+    replace_files: bool = True,
     settings: Settings | None = None,
 ) -> UpsertResult:
     """Upload pre-chunked code to a RAG corpus.
@@ -370,6 +371,14 @@ async def upsert_chunks(
         replace_existing: Delete every RagFile already indexed for ``repo``
             before uploading. Required for a full re-index, which would
             otherwise duplicate every chunk.
+        replace_files: Delete the chunks already indexed for every source
+            file present in ``chunks`` before uploading (ignored when
+            ``replace_existing`` already cleared the repo). ``rag.upload_file``
+            always creates a new server-side file, so re-embedding a modified
+            file without this leaves its stale chunks searchable alongside the
+            new ones. If the upload then fails the result is not ``ok``, the
+            caller does not advance the last-indexed commit, and the next run
+            re-embeds the file.
         settings: Settings override (defaults to the process singleton).
 
     Returns:
@@ -407,6 +416,16 @@ async def upsert_chunks(
             collection_name=corpus_display_name,
             settings=settings,
         )
+    elif replace_files:
+        file_paths = sorted({chunk.file_path for chunk in chunks})
+        try:
+            removed = await _delete_matching(repo, corpus_name, project_id, region, file_paths)
+        except Exception:
+            # Uploading anyway would leave stale chunks searchable next to the
+            # new ones while reporting success; fail so the commit is not advanced.
+            logger.error("Could not clear existing chunks for %d files in %s", len(file_paths), repo, exc_info=True)
+            return UpsertResult(failed=len(chunks), skipped_reason="stale-chunk-delete-failed")
+        logger.info("Cleared %d existing RAG files for %d re-embedded source files", removed, len(file_paths))
 
     def _upload_batch(batch: list[CodeChunk]) -> tuple[int, list[CodeChunk], int]:
         """Upload a batch.

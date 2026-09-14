@@ -5,6 +5,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from henchmen.arsenal._workspace import set_workspace_root
+
+
+@pytest.fixture
+def tmp_workspace(tmp_path: Any) -> Any:
+    """test_runner workspace-checks ``working_dir``; make tmp_path the workspace root."""
+    set_workspace_root(tmp_path)
+    yield tmp_path
+    set_workspace_root(None)
+
+
 # ---------------------------------------------------------------------------
 # test_runner: _get_affected_packages
 # ---------------------------------------------------------------------------
@@ -130,6 +141,7 @@ class TestIsMonorepo:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("tmp_workspace")
 class TestRunLintScoping:
     """Verify run_lint uses --filter in monorepos."""
 
@@ -220,6 +232,7 @@ class TestRunLintScoping:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("tmp_workspace")
 class TestRunTestsScoping:
     """Verify run_tests uses --filter in monorepos."""
 

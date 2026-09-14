@@ -11,7 +11,9 @@ from henchmen.dossier.reranker import (
     _fallback_sort,
     _parse_rerank_response,
     rerank_chunks,
+    rerank_semantic_chunks,
 )
+from henchmen.models.dossier import SemanticChunk
 from henchmen.models.llm import LLMResponse
 from henchmen.providers.interfaces.llm_provider import LLMProvider
 
@@ -234,3 +236,57 @@ class TestRerankChunks:
                 relevance_score=1.5,
                 original_index=0,
             )
+
+
+# ---------------------------------------------------------------------------
+# rerank_semantic_chunks (typed entry point)
+# ---------------------------------------------------------------------------
+
+
+def _semantic(path: str, score: float, start: int = 1) -> SemanticChunk:
+    return SemanticChunk(
+        file_path=path,
+        start_line=start,
+        end_line=start + 4,
+        symbol_name=f"sym_{start}",
+        language="python",
+        content=f"# {path}",
+        relevance_score=score,
+    )
+
+
+class TestRerankSemanticChunks:
+    @pytest.mark.asyncio
+    async def test_returns_semantic_chunks_with_reranked_scores(self, mock_settings):
+        chunks = [_semantic("a.py", 0.9, 1), _semantic("b.py", 0.1, 10)]
+        provider = AsyncMock()
+        provider.generate = AsyncMock(
+            return_value=_response('[{"index": 1, "score": 0.8}, {"index": 0, "score": 0.3}]')
+        )
+
+        result = await rerank_semantic_chunks(chunks, "task", provider, top_k=2, settings=mock_settings)
+
+        assert [c.file_path for c in result] == ["b.py", "a.py"]
+        assert result[0].relevance_score == 0.8
+        # Metadata that RerankerResult alone would drop survives.
+        assert (result[0].start_line, result[0].end_line, result[0].symbol_name) == (10, 14, "sym_10")
+        # Inputs are not mutated.
+        assert chunks[1].relevance_score == 0.1
+
+    @pytest.mark.asyncio
+    async def test_fallback_keeps_order_by_existing_score(self, mock_settings):
+        chunks = [_semantic("a.py", 0.2), _semantic("b.py", 0.7)]
+        provider = AsyncMock()
+        provider.generate = AsyncMock(side_effect=RuntimeError("provider down"))
+
+        result = await rerank_semantic_chunks(chunks, "task", provider, settings=mock_settings)
+
+        assert [c.file_path for c in result] == ["b.py", "a.py"]
+
+    @pytest.mark.asyncio
+    async def test_empty_input(self):
+        assert await rerank_semantic_chunks([], "task", AsyncMock()) == []
+
+    def test_fallback_clamps_out_of_range_scores(self):
+        result = _fallback_sort([{"file_path": "a.py", "content": "x", "relevance_score": 3.5}], 1)
+        assert result[0].relevance_score == 1.0

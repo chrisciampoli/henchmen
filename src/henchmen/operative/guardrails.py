@@ -6,6 +6,7 @@ import os
 import time
 from typing import TYPE_CHECKING, Any
 
+from henchmen.arsenal._workspace import DEFAULT_WORKSPACE_ROOT
 from henchmen.config.settings import Settings, get_settings
 from henchmen.models.operative import OperativeConfig
 from henchmen.models.scheme import StepBudget
@@ -124,7 +125,9 @@ class OperativeGuardrails:
             return {"error": f"Tool '{tool_name}' is not permitted for this operative."}
 
         # Check for path traversal in file-related arguments using canonical resolution
-        workspace = os.environ.get("WORKSPACE_DIR", "/workspace")
+        # WORKSPACE_DIR is part of the operative runtime contract (bootstrap
+        # narrows it to the task's clone); the default is shared with Arsenal.
+        workspace = os.environ.get("WORKSPACE_DIR", DEFAULT_WORKSPACE_ROOT)
         path_args = [
             (k, v)
             for k, v in arguments.items()
@@ -406,7 +409,7 @@ class OperativeGuardrails:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _is_path_safe(path: str, workspace: str = "/workspace") -> bool:
+    def _is_path_safe(path: str, workspace: str = DEFAULT_WORKSPACE_ROOT) -> bool:
         """Check if a path resolves to within the workspace using canonical resolution.
 
         Uses ``os.path.realpath`` so symlinks and ``..`` segments are fully

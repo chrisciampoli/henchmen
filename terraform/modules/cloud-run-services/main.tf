@@ -81,6 +81,7 @@ locals {
       SLACK_APP_TOKEN             = "slack-app-token"
       JIRA_API_TOKEN              = "jira-api-token"
       HENCHMEN_METRICS_AUTH_TOKEN = "metrics-auth-token"
+      DISPATCH_API_TOKEN          = "dispatch-api-token"
     }
     forge = {
       GITHUB_TOKEN                = "github-token"
@@ -240,6 +241,10 @@ resource "google_cloud_run_v2_service" "forge" {
   custom_audiences = [local.pubsub_audiences["forge"]]
 
   template {
+    # A Forge CI run is capped at forge_ci_timeout_seconds (default 540s) so it
+    # finishes inside Pub/Sub's 600s ack deadline. Cloud Run's 300s default
+    # request timeout would kill the request long before that budget runs out.
+    timeout         = "600s"
     service_account = var.service_account_emails["forge"]
 
     vpc_access {

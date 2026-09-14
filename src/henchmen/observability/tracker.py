@@ -217,6 +217,27 @@ class TaskTracker:
         except Exception as exc:
             logger.warning("Failed to start tracking task %s: %s", task.id, exc)
 
+    def _node_cost(self, report: OperativeReport, model_name: str) -> float:
+        """USD cost of one node, preferring the figure the provider billed.
+
+        Providers price each call with the exact cache read/write split, which
+        the report's token counters cannot reproduce (a report has no
+        cache-write counter, so re-deriving the cost bills Anthropic cache
+        writes at the plain input rate). When the report carries the
+        provider-summed ``estimated_cost_usd`` it is persisted as-is so the
+        stored cost matches the ceiling the guardrails enforced; otherwise the
+        cost is re-estimated from the token counters.
+        """
+        if report.estimated_cost_usd > 0:
+            return report.estimated_cost_usd
+        return estimate_cost(
+            model_name,
+            report.total_input_tokens,
+            report.total_output_tokens,
+            cached_input_tokens=report.cached_input_tokens,
+            settings=self._settings,
+        )
+
     async def record_node_result(self, task_id: str, node_id: str, report: OperativeReport) -> None:
         """Record metrics from an agentic node's OperativeReport.
 
@@ -237,13 +258,7 @@ class TaskTracker:
             # the model that actually ran so cost_by_model and the experiment
             # params name a real model.
             model_name = resolve_model_name(self._settings, raw_model) if raw_model else ""
-            cost = estimate_cost(
-                model_name,
-                report.total_input_tokens,
-                report.total_output_tokens,
-                cached_input_tokens=report.cached_input_tokens,
-                settings=self._settings,
-            )
+            cost = self._node_cost(report, model_name)
             node_data = {
                 "input_tokens": report.total_input_tokens,
                 "output_tokens": report.total_output_tokens,
@@ -448,9 +463,15 @@ class TaskTracker:
             logger.warning("Failed to increment recovery for task %s: %s", task_id, exc)
 
     async def get_stalled_tasks(self, heartbeat_threshold_minutes: int = 10) -> list[dict[str, Any]]:
-        """Find tasks with execution_state='running' whose heartbeat has expired."""
+        """Find tasks with execution_state='running' whose heartbeat has expired.
+
+        Fail-closed, unlike the other tracker methods: a failed query is logged
+        at ERROR and re-raised. On Firestore this query needs a composite index;
+        swallowing the error and returning ``[]`` made the watchdog report "0
+        stalled" forever while stalled tasks were never recovered.
+        """
+        cutoff = datetime.now(UTC) - timedelta(minutes=heartbeat_threshold_minutes)
         try:
-            cutoff = datetime.now(UTC) - timedelta(minutes=heartbeat_threshold_minutes)
             return await self._store.query(
                 _COLLECTION,
                 filters=[
@@ -459,8 +480,8 @@ class TaskTracker:
                 ],
             )
         except Exception as exc:
-            logger.warning("Failed to query stalled tasks: %s", exc)
-            return []
+            logger.error("Failed to query stalled tasks (the watchdog cannot see stalled work): %s", exc)
+            raise
 
     # ------------------------------------------------------------------
     # Read helpers

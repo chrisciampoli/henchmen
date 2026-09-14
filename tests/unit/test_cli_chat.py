@@ -16,9 +16,12 @@ from henchmen.cli.chat import (
     _parse_task_block,
     _read_multiline_input,
     _resolve_chat_model,
+    _task_type,
 )
 from henchmen.config.settings import Settings
+from henchmen.dispatch.api_models import CreateTaskRequest
 from henchmen.models.llm import LLMResponse, ModelTier, TokenUsage
+from henchmen.models.task import TaskType
 
 # --- _parse_task_block ---
 
@@ -196,8 +199,73 @@ async def test_dispatch_task_local_success(mock_settings: Settings) -> None:
     assert result["result"]["task_id"] == "abc-123"
     url, kwargs = post.call_args[0][0], post.call_args[1]
     assert url == _local_dispatch_url(mock_settings)
-    # The collected task type must survive into the dispatched payload.
-    assert kwargs["json"]["type"] == "bugfix"
+    # The payload must be accepted by the real intake contract (extra="forbid"):
+    # an unknown "type" key would 422 every chat dispatch against `henchmen serve`.
+    body = CreateTaskRequest.model_validate(kwargs["json"])
+    # The collected task type travels as the explicit field; the description is untouched.
+    assert body.task_type == TaskType.BUGFIX
+    assert body.description == "Fix the login bug"
+    # No token configured: no Authorization header is invented.
+    assert "Authorization" not in kwargs["headers"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_task_sends_the_dispatch_api_token(mock_settings: Settings) -> None:
+    settings = mock_settings.model_copy(update={"dispatch_api_token": "s3cret"})
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"task_id": "abc-123"}
+    mock_resp.raise_for_status = MagicMock()
+    post = AsyncMock(return_value=mock_resp)
+
+    with patch("henchmen.cli.chat.httpx.AsyncClient", return_value=_http_client(post=post)):
+        await _dispatch_task({"title": "Fix bug", "description": "d", "repo": "acme/backend"}, settings)
+
+    assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer s3cret"}
+
+
+class TestTaskType:
+    def test_known_types_are_case_insensitive(self) -> None:
+        assert _task_type({"type": "Feature"}) == TaskType.FEATURE
+        assert _task_type({"type": " refactor "}) == TaskType.REFACTOR
+
+    def test_unknown_or_missing_type_is_dropped(self) -> None:
+        assert _task_type({"type": "chore"}) is None
+        assert _task_type({}) is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_type_is_not_sent(self, mock_settings: Settings) -> None:
+        """An unrecognised type must not 422 the whole dispatch."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"task_id": "abc-123"}
+        mock_resp.raise_for_status = MagicMock()
+        post = AsyncMock(return_value=mock_resp)
+
+        with patch("henchmen.cli.chat.httpx.AsyncClient", return_value=_http_client(post=post)):
+            await _dispatch_task(
+                {"title": "T", "description": "d", "repo": "acme/backend", "type": "chore"}, mock_settings
+            )
+
+        body = post.call_args.kwargs["json"]
+        assert "task_type" not in body
+        CreateTaskRequest.model_validate(body)
+
+    @pytest.mark.asyncio
+    async def test_explicit_bugfix_routes_to_bugfix_scheme_end_to_end(self, mock_settings: Settings) -> None:
+        """A chat task typed as bugfix and titled "Add ..." reaches bugfix_standard through the real intake."""
+        from henchmen.dispatch.normalizer import TaskNormalizer
+        from henchmen.mastermind.agent import MastermindAgent
+
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        post = AsyncMock(return_value=mock_resp)
+        task_data = {"title": "Add null check to parseConfig", "description": "crashes on None", "type": "bugfix"}
+        with patch("henchmen.cli.chat.httpx.AsyncClient", return_value=_http_client(post=post)):
+            await _dispatch_task({**task_data, "repo": "acme/backend"}, mock_settings)
+
+        request = CreateTaskRequest.model_validate(post.call_args.kwargs["json"])
+        task = TaskNormalizer().from_cli(request.model_dump(), mock_settings)
+        agent = MastermindAgent.__new__(MastermindAgent)
+        assert await agent._select_scheme(task) == "bugfix_standard"
 
 
 @pytest.mark.asyncio

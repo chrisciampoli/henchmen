@@ -32,7 +32,7 @@ ARSENAL_TOOL_SETS: frozenset[str] = frozenset(get_args(ArsenalToolSet))
 
 
 class ArsenalRequirement(StrictBase):
-    """Specifies which tool sets an operative node requires from the Arsenal MCP server."""
+    """Specifies which Arsenal tool sets an operative node requires (the in-process tool registry)."""
 
     tool_sets: list[ArsenalToolSet] = Field(
         default_factory=list,
@@ -114,16 +114,9 @@ class SchemeNode(StrictBase):
     model_name: str | None = Field(
         default=None,
         description=(
-            "Model tier (a ModelTier value such as 'default/complex') or a concrete model id. "
-            "Resolved per provider by henchmen.providers.tiers.resolve_model_name; "
-            "falls back to the COMPLEX tier when unset."
-        ),
-    )
-    grounding_enabled: bool = Field(
-        default=False,
-        description=(
-            "Request Google Search grounding for this node. Only the Vertex AI (Gemini) "
-            "direct-SDK path honours it; every other provider ignores it."
+            "Model tier (a ModelTier value such as 'default/complex'). Resolved per provider by "
+            "henchmen.providers.tiers.resolve_model_name; SchemeGraph.validate rejects concrete model "
+            "ids on registered schemes. Falls back to the COMPLEX tier when unset."
         ),
     )
 

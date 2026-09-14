@@ -98,6 +98,18 @@ def main() -> None:
 
     subparsers.add_parser("chat", help="Interactive task builder REPL (uses the configured LLM provider)")
 
+    embed_parser = subparsers.add_parser("embed", help="Index a repository into the RAG Engine corpus (owner/name)")
+    from henchmen.cli.embed import add_embed_arguments
+
+    add_embed_arguments(embed_parser)
+
+    config_parser = subparsers.add_parser(
+        "config", help="Print the effective configuration (env + .env.local + defaults), secrets masked"
+    )
+    from henchmen.cli.config_cmd import add_config_arguments
+
+    add_config_arguments(config_parser)
+
     init_parser = subparsers.add_parser(
         "init",
         aliases=["setup"],
@@ -141,6 +153,14 @@ def main() -> None:
         from henchmen.cli import chat
 
         sys.exit(chat.run_chat_cli())
+    elif args.command == "embed":
+        from henchmen.cli.embed import run_embed_cli
+
+        sys.exit(run_embed_cli(args))
+    elif args.command == "config":
+        from henchmen.cli.config_cmd import run_config_cli
+
+        sys.exit(run_config_cli(args))
     elif args.command in ("init", "setup"):
         from henchmen.cli.init import run_init_cli
 
@@ -270,6 +290,9 @@ def _eval_run(args: argparse.Namespace) -> None:
     from henchmen.providers.tiers import normalize_llm_provider
 
     logging.basicConfig(level=logging.INFO)
+    # Check the history store before any fixture runs: discovering a missing
+    # aiosqlite only after every fixture's LLM calls were paid for wastes them.
+    _require_storage_or_exit()
 
     provider = normalize_llm_provider(args.provider or "")
     if not provider:
@@ -598,7 +621,6 @@ def _serve(args: argparse.Namespace) -> None:
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
     logger = logging.getLogger("henchmen")
 
-    from henchmen.providers.local.memory import InMemoryMessageBroker, default_forward_map, set_shared_broker
     from henchmen.providers.tiers import active_llm_provider
 
     settings = _build_settings_or_exit()
@@ -620,61 +642,9 @@ def _serve(args: argparse.Namespace) -> None:
         settings.environment.value,
     )
 
-    # Create a shared InMemoryMessageBroker so all mounted services publish
-    # and consume from the same instance. The forward map simulates Pub/Sub
-    # push subscriptions by HTTP-POSTing envelopes between services.
-    shared_broker = InMemoryMessageBroker()
-    forward_map = default_forward_map(settings, f"http://localhost:{port}")
-    shared_broker.set_forward_map(forward_map)
-    set_shared_broker(shared_broker)
-    logger.info("Shared broker configured with forward map for %d topics", len(forward_map))
+    # Each sub-app's own lifespan runs inside the combined app's lifespan
+    # (Slack Socket Mode, Mastermind's metrics router, tracing) — see cli/serve.py.
+    from henchmen.cli.serve import build_serve_app
 
-    from collections.abc import AsyncIterator
-    from contextlib import asynccontextmanager
-
-    from fastapi import FastAPI
-
-    from henchmen.providers.registry import ProviderRegistry
-
-    registry = ProviderRegistry(settings)
-
-    from henchmen.dispatch.server import app as dispatch_app
-    from henchmen.forge.server import app as forge_app
-    from henchmen.mastermind.server import app as mastermind_app
-
-    # Pre-initialize sub-app state that would normally be set by their
-    # lifespans. Mounted sub-app lifespans may not run in all Starlette
-    # versions, so we inject the shared providers directly.
-    dispatch_app.state.message_broker = shared_broker
-
-    mastermind_app.state.message_broker = shared_broker
-    mastermind_app.state.document_store = registry.get_document_store()
-    mastermind_app.state.container_orchestrator = registry.get_container_orchestrator()
-
-    forge_app.state.message_broker = shared_broker
-    forge_app.state.ci_provider = registry.get_ci_provider()
-    forge_app.state.document_store = registry.get_document_store()
-
-    # Also eagerly initialize the Mastermind agent singleton so the
-    # Pub/Sub handlers find it immediately (they call get_agent()).
-    from henchmen.mastermind.server import get_agent  # noqa: E402
-
-    @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # Warm up the MastermindAgent singleton
-        get_agent()
-        logger.info("All services initialized")
-        yield
-        await shared_broker.drain()
-        logger.info("Shutting down")
-
-    app = FastAPI(title="Henchmen (Local Dev)", version="0.1.0", lifespan=lifespan)
-    app.mount("/dispatch", dispatch_app)
-    app.mount("/mastermind", mastermind_app)
-    app.mount("/forge", forge_app)
-
-    @app.get("/health")
-    async def health() -> dict[str, object]:
-        return {"status": "ok", "mode": "local", "services": ["dispatch", "mastermind", "forge"]}
-
+    app = build_serve_app(settings, port)
     uvicorn.run(app, host=args.host, port=port, log_level=args.log_level)

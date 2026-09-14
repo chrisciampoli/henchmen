@@ -12,8 +12,9 @@ are present the ``HENCHMEN_`` name wins.
 
 from enum import StrEnum
 from functools import lru_cache
+from typing import Literal
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -46,10 +47,7 @@ _OPERATIVE_ENV_FIELDS: tuple[str, ...] = (
     "vertex_ai_model_complex",
     "vertex_ai_model_light",
     "vertex_ai_model_reasoning",
-    "vertex_ai_context_cache_enabled",
-    "vertex_ai_context_cache_min_tokens",
     "vertex_ai_safety_threshold",
-    "vertex_ai_grounding_enabled",
     "rag_corpus_display_name",
     "rag_corpus_region",
     "rag_embedding_model",
@@ -86,6 +84,26 @@ _VALID_LLM_PROVIDER_INPUTS: frozenset[str] = frozenset(
 )
 
 
+# terraform/modules/secrets seeds every Secret Manager secret with this value so
+# the first apply yields startable Cloud Run revisions. It is published in this
+# repository, so a credential still holding it is treated as unset: a secret
+# used to *verify* callers (webhook signatures, API and metrics bearer tokens)
+# would otherwise accept anyone who has read the Terraform source.
+SEEDED_SECRET_PLACEHOLDER = "placeholder-replace-with-a-real-value"
+
+_SEEDED_SECRET_FIELDS: tuple[str, ...] = (
+    "github_token",
+    "github_webhook_secret",
+    "slack_bot_token",
+    "slack_app_token",
+    "slack_signing_secret",
+    "jira_api_token",
+    "jira_webhook_secret",
+    "metrics_auth_token",
+    "dispatch_api_token",
+)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="HENCHMEN_",
@@ -116,17 +134,19 @@ class Settings(BaseSettings):
     )
     ci_provider: str = Field(default="", description="Override CI provider")
 
-    # Pub/Sub topics (defaults include environment prefix)
-    pubsub_topic_task_intake: str = Field(default="")
-    pubsub_topic_task_planned: str = Field(default="")
-    pubsub_topic_operative_dispatch: str = Field(default="")
-    pubsub_topic_operative_status: str = Field(default="")
-    pubsub_topic_operative_complete: str = Field(default="")
-    pubsub_topic_forge_request: str = Field(default="")
-    pubsub_topic_forge_result: str = Field(default="")
-    pubsub_topic_dead_letter: str = Field(default="")
-    pubsub_topic_embed_request: str = Field(default="")
-    pubsub_topic_ci_failure: str = Field(default="")
+    # Pub/Sub topics (defaults include environment prefix). Only topics some
+    # component publishes to or subscribes on have a field here.
+    pubsub_topic_task_intake: str = Field(default="", description="Topic Dispatch publishes normalized tasks to")
+    pubsub_topic_operative_complete: str = Field(default="", description="Topic operatives publish their reports to")
+    pubsub_topic_forge_request: str = Field(default="", description="Topic Mastermind publishes CI/PR requests to")
+    pubsub_topic_forge_result: str = Field(default="", description="Topic Forge publishes CI/PR results to")
+    pubsub_topic_dead_letter: str = Field(default="", description="Dead-letter topic drained by the watchdog")
+    pubsub_topic_embed_request: str = Field(default="", description="Topic Dispatch publishes re-index requests to")
+    pubsub_topic_ci_failure: str = Field(default="", description="Topic Dispatch publishes GitHub CI failures to")
+    dead_letter_subscription: str = Field(
+        default="",
+        description="Subscription the watchdog drains dead letters from; empty means <pubsub_topic_dead_letter>-sub",
+    )
 
     def model_post_init(self, __context: object) -> None:
         """Set environment-prefixed defaults for Pub/Sub topics and validate provider requirements."""
@@ -159,9 +179,6 @@ class Settings(BaseSettings):
         env = self.environment.value
         defaults = {
             "pubsub_topic_task_intake": f"henchmen-{env}-task-intake",
-            "pubsub_topic_task_planned": f"henchmen-{env}-task-planned",
-            "pubsub_topic_operative_dispatch": f"henchmen-{env}-operative-dispatch",
-            "pubsub_topic_operative_status": f"henchmen-{env}-operative-status",
             "pubsub_topic_operative_complete": f"henchmen-{env}-operative-complete",
             "pubsub_topic_forge_request": f"henchmen-{env}-forge-request",
             "pubsub_topic_forge_result": f"henchmen-{env}-forge-result",
@@ -178,11 +195,7 @@ class Settings(BaseSettings):
 
     # GCS buckets
     gcs_bucket_dossier: str = Field(default="", description="GCS bucket for dossier artifacts")
-    gcs_bucket_tfstate: str = Field(default="", description="GCS bucket for Terraform state")
     gcs_bucket_snapshots: str = Field(default="", description="GCS bucket for operative snapshots")
-
-    # Arsenal MCP server
-    arsenal_mcp_server_url: str = Field(default="http://localhost:8080", description="Arsenal MCP server URL")
 
     # Git identity for operative commits
     git_author_email: str = Field(
@@ -191,10 +204,6 @@ class Settings(BaseSettings):
     git_author_name: str = Field(default="Henchmen Operative", description="Git author name for operative commits")
 
     # GitHub integration
-    github_app_id: str = Field(default="", description="GitHub App ID (reserved for the GitHub App intake path)")
-    github_app_private_key_secret: str = Field(
-        default="", description="Secret Manager resource name for GitHub App private key (reserved)"
-    )
     github_webhook_secret: str = Field(default="", description="GitHub webhook secret")
     github_token: str = Field(
         default="",
@@ -241,6 +250,20 @@ class Settings(BaseSettings):
         description="Jira API token",
     )
     jira_project_key: str = Field(default="", description="Default Jira project key")
+    jira_repo_field: str = Field(
+        default="",
+        description=(
+            "Jira field ID (e.g. customfield_10042) holding the target repository (owner/repo). Use the field ID "
+            "from the Jira instance, not its display name: webhooks only send custom fields as customfield_<number>."
+        ),
+    )
+    jira_branch_field: str = Field(
+        default="",
+        description=(
+            "Jira field ID (e.g. customfield_10043) holding the target branch. Use the field ID from the Jira "
+            "instance, not its display name: webhooks only send custom fields as customfield_<number>."
+        ),
+    )
     jira_webhook_secret: str = Field(
         default="", description="Shared secret for Jira webhook HMAC verification (X-Hub-Signature)"
     )
@@ -303,22 +326,19 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Vertex AI context caching
-    vertex_ai_context_cache_enabled: bool = Field(default=True, description="Enable Gemini context caching")
-    vertex_ai_context_cache_min_tokens: int = Field(
-        default=32_768, description="Minimum tokens required to create a cache"
-    )
-
     # Vertex AI safety settings
-    vertex_ai_safety_threshold: str = Field(
-        default="BLOCK_MEDIUM_AND_ABOVE", description="Safety filter threshold for Gemini"
+    vertex_ai_safety_threshold: Literal[
+        "BLOCK_LOW_AND_ABOVE", "BLOCK_MEDIUM_AND_ABOVE", "BLOCK_ONLY_HIGH", "BLOCK_NONE", "OFF"
+    ] = Field(
+        default="BLOCK_MEDIUM_AND_ABOVE",
+        description=(
+            "Gemini safety-filter threshold applied to the harassment, hate speech, sexually explicit "
+            "and dangerous content categories on every Vertex AI call"
+        ),
     )
 
     # Vertex AI evaluation
     vertex_ai_evaluation_enabled: bool = Field(default=False, description="Enable post-operative GenAI evaluation")
-
-    # Vertex AI grounding
-    vertex_ai_grounding_enabled: bool = Field(default=True, description="Enable Google Search grounding")
 
     # Vertex AI experiments
     vertex_ai_experiments_enabled: bool = Field(default=False, description="Enable Vertex AI Experiments tracking")
@@ -366,16 +386,28 @@ class Settings(BaseSettings):
     aws_ecs_cluster: str = Field(default="henchmen", description="ECS cluster name")
     aws_ecs_subnets: str = Field(default="", description="Comma-separated subnet IDs for ECS tasks")
     aws_ecs_security_groups: str = Field(default="", description="Comma-separated security group IDs")
+    aws_ecs_execution_role_arn: str = Field(
+        default="",
+        description=(
+            "ARN of the ECS task execution role. Required on Fargate: without it the awslogs log driver and "
+            "private image pulls are refused."
+        ),
+    )
 
     # Bedrock model tiers (experimental)
+    # Defaults are US cross-region inference profiles (``us.`` prefix): Bedrock
+    # rejects on-demand invocation of these models by their bare model IDs.
     bedrock_model_complex: str = Field(
-        default="anthropic.claude-sonnet-4-20250514-v1:0", description="Bedrock model ID for the COMPLEX tier"
+        default="us.anthropic.claude-sonnet-4-20250514-v1:0",
+        description="Bedrock model ID or inference profile for the COMPLEX tier",
     )
     bedrock_model_light: str = Field(
-        default="anthropic.claude-haiku-4-5-20251001-v1:0", description="Bedrock model ID for the LIGHT tier"
+        default="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        description="Bedrock model ID or inference profile for the LIGHT tier",
     )
     bedrock_model_reasoning: str = Field(
-        default="anthropic.claude-sonnet-4-20250514-v1:0", description="Bedrock model ID for the REASONING tier"
+        default="us.anthropic.claude-sonnet-4-20250514-v1:0",
+        description="Bedrock model ID or inference profile for the REASONING tier",
     )
 
     # Direct API keys (used when llm_provider=openai or anthropic)
@@ -401,13 +433,87 @@ class Settings(BaseSettings):
         description="Anthropic model used for the REASONING tier",
     )
 
+    # CI (Cloud Build runs the target repository's checks)
+    ci_builder_image: str = Field(
+        default="python:3.12",
+        description="Container image Cloud Build uses to run the target repository's checks",
+    )
+    ci_github_token_secret: str = Field(
+        default="",
+        description=(
+            "Secret Manager secret name the CI build reads the GitHub token from to clone private repos; "
+            "empty clones anonymously"
+        ),
+    )
+
+    # Dossier
+    dossier_semantic_rerank: bool = Field(
+        default=True,
+        description=(
+            "Rerank semantic code-search results with one light-tier LLM call before building the dossier. "
+            "Disable to save that call per task."
+        ),
+    )
+
+    # Forge
+    forge_ci_timeout_seconds: int = Field(
+        default=540,
+        ge=30,
+        le=580,
+        description=(
+            "Total wall-clock budget in seconds for one Forge CI run. Capped below 600 because Pub/Sub redelivers "
+            "a push after its 600s ack deadline, so a run must finish (and ack) before that or it runs twice."
+        ),
+    )
+
+    # Evals
+    eval_db_path: str = Field(
+        default="",
+        description="SQLite file for `henchmen eval` history; empty means ~/.henchmen/eval/results.db",
+    )
+
     # Local single-process mode (`henchmen serve`)
+    local_sqlite_path: str = Field(
+        default="",
+        description="SQLite file for the local DocumentStore; empty means ~/.henchmen/henchmen_<environment>.db",
+    )
+    local_storage_dir: str = Field(
+        default="",
+        description="Directory for the local filesystem ObjectStore; empty means ~/.henchmen/storage",
+    )
     local_serve_port: int = Field(default=8000, description="Port `henchmen serve` listens on")
     local_forward_base_url: str = Field(
         default="",
         description=(
             "Base URL operative containers use to deliver reports to the host in local mode. "
             "Empty means http://host.docker.internal:<local_serve_port>."
+        ),
+    )
+
+    # Dispatch REST intake authentication
+    dispatch_api_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("HENCHMEN_DISPATCH_API_TOKEN", "DISPATCH_API_TOKEN"),
+        description=(
+            "Bearer token POST /api/v1/tasks requires (Authorization: Bearer <token>). Empty in DEV leaves the "
+            "route open with a warning; empty in STAGING/PROD makes it return 401."
+        ),
+    )
+
+    # Dispatch intake rate limiting (per client IP, per instance)
+    dispatch_rate_limit_requests: int = Field(
+        default=60,
+        description="Maximum requests a single client IP may make to Dispatch intake routes per window.",
+    )
+    dispatch_rate_limit_window_seconds: float = Field(
+        default=60.0,
+        description="Length in seconds of the Dispatch rate-limit sliding window.",
+    )
+    dispatch_trust_forwarded_for: bool = Field(
+        default=True,
+        description=(
+            "Key the Dispatch rate limiter on the left-most X-Forwarded-For entry. Keep true behind a trusted "
+            "proxy (Cloud Run); set false when Dispatch is reachable directly, or callers can spoof their bucket."
         ),
     )
 
@@ -436,6 +542,12 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Derived helpers
     # ------------------------------------------------------------------
+
+    @field_validator(*_SEEDED_SECRET_FIELDS, mode="after")
+    @classmethod
+    def _seeded_placeholder_is_unset(cls, value: str) -> str:
+        """Treat Terraform's published placeholder secret as "not configured"."""
+        return "" if value.strip() == SEEDED_SECRET_PLACEHOLDER else value
 
     def operative_env(self, *, include_secrets: bool = False) -> dict[str, str]:
         """``HENCHMEN_*`` variables to inject into an operative container.
@@ -494,9 +606,11 @@ class Settings(BaseSettings):
                     "or the /metrics endpoints return 401."
                 )
 
-        if self.operative_task_cost_ceiling_usd <= 0:
-            problems.append("HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD must be greater than 0.")
+        for float_field in ("operative_task_cost_ceiling_usd", "dispatch_rate_limit_window_seconds"):
+            if float(getattr(self, float_field)) <= 0:
+                problems.append(f"HENCHMEN_{float_field.upper()} must be greater than 0.")
         for field_name in (
+            "dispatch_rate_limit_requests",
             "operative_wallclock_ceiling_seconds",
             "operative_max_output_tokens",
             "operative_max_system_tokens",

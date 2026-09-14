@@ -73,6 +73,14 @@ class OperativeReport(StrictBase):
     total_input_tokens: int = Field(default=0, description="Total input tokens consumed")
     total_output_tokens: int = Field(default=0, description="Total output tokens consumed")
     cached_input_tokens: int = Field(default=0, description="Input tokens served from context cache (75% discount)")
+    estimated_cost_usd: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Provider-billed USD cost summed by the operative guardrails (exact cache read/write split); "
+            "the tracker persists it instead of re-estimating from token counters"
+        ),
+    )
     model_calls: int = Field(default=0, description="Number of model API calls")
     tool_calls_count: int = Field(default=0, description="Total tool calls made")
     tool_calls_detail: dict[str, int] = Field(default_factory=dict, description="Tool call counts by tool name")

@@ -458,7 +458,8 @@ class TestRunCIForPRSuccess:
         runner = MagicMock()
         runner.run = AsyncMock(
             return_value={
-                "passed": True,
+                "passed": False,
+                "incomplete": True,
                 "failed": [],
                 "skipped": ["tests"],
                 "summary": "SKIP: tests",
@@ -481,11 +482,52 @@ class TestRunCIForPRSuccess:
         assert runner.run.call_args.kwargs["base_ref"] == "main"
 
         payload = _published(broker)[0]
-        assert payload["status"] == "passed"
+        # A check that never ran must never be published as a CI pass.
+        assert payload["status"] == "incomplete"
         assert payload["skipped"] == ["tests"]
 
         comment = pr.create_issue_comment.call_args.args[0]
         assert "skipped" in comment.lower()
+        assert "INCOMPLETE" in comment
+        assert "PASSED" not in comment
+
+    @pytest.mark.asyncio
+    async def test_ci_budget_comes_from_settings(self, forge_settings, forge_app, monkeypatch):
+        from henchmen.forge.server import _run_ci_for_pr
+
+        monkeypatch.setenv("HENCHMEN_GITHUB_TOKEN", "gh-token")
+        monkeypatch.setenv("HENCHMEN_FORGE_CI_TIMEOUT_SECONDS", "123")
+        runner = MagicMock()
+        runner.run = AsyncMock(return_value={"passed": True, "failed": [], "skipped": [], "checks": []})
+
+        with (
+            patch("github.Github", return_value=_github_client_stub(MagicMock())),
+            patch("henchmen.forge.server.clone_repo", new=AsyncMock()),
+            patch("henchmen.forge.ci_runner.CIRunner", return_value=runner) as runner_cls,
+        ):
+            await _run_ci_for_pr("https://github.com/acme/repo/pull/7", "task-1", "req-1")
+
+        kwargs = runner_cls.call_args.kwargs
+        assert kwargs["total_budget_seconds"] == 123
+        assert kwargs["timeout_seconds"] == 123
+
+
+class TestResultStatus:
+    def test_passed_only_when_everything_ran_and_passed(self):
+        from henchmen.forge.server import _result_status
+
+        assert _result_status({"passed": True, "failed": [], "skipped": []}) == "passed"
+
+    def test_skip_only_is_incomplete(self):
+        from henchmen.forge.server import _result_status
+
+        assert _result_status({"passed": False, "incomplete": True, "failed": [], "skipped": ["tests"]}) == "incomplete"
+
+    def test_failure_wins_over_skip(self):
+        from henchmen.forge.server import _result_status
+
+        result = {"passed": False, "incomplete": False, "failed": ["lint"], "skipped": ["tests"]}
+        assert _result_status(result) == "failed"
 
 
 # ===========================================================================
@@ -563,6 +605,72 @@ class TestForgeRequestHandler:
             resp = TestClient(app).post("/pubsub/build-complete", json=_pubsub_envelope({"id": "b1"}))
 
         assert resp.status_code == 401
+
+
+# ===========================================================================
+# Shared providers and log redaction
+# ===========================================================================
+
+
+class TestSharedBroker:
+    def test_broker_is_created_once_and_reused(self, forge_settings, forge_app):
+        from henchmen.forge.server import _get_broker
+
+        del app.state.message_broker
+        created = _mock_broker()
+        with patch("henchmen.providers.registry.ProviderRegistry") as registry_cls:
+            registry_cls.return_value.get_message_broker.return_value = created
+            first = _get_broker()
+            second = _get_broker()
+
+        assert first is created
+        assert second is created
+        registry_cls.return_value.get_message_broker.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_lifespan_closes_the_broker_it_created(self, forge_settings, forge_app):
+        from henchmen.forge.server import lifespan
+
+        del app.state.message_broker
+        created = _mock_broker()
+        created.aclose = AsyncMock()
+        with patch("henchmen.providers.registry.ProviderRegistry") as registry_cls:
+            registry_cls.return_value.get_message_broker.return_value = created
+            async with lifespan(app):
+                assert app.state.message_broker is created
+
+        created.aclose.assert_awaited_once()
+        # A later lifespan must not reuse the closed broker.
+        assert app.state.message_broker is None
+
+    @pytest.mark.asyncio
+    async def test_lifespan_leaves_an_injected_broker_to_its_owner(self, forge_settings, forge_app):
+        from henchmen.forge.server import lifespan
+
+        broker, _store = forge_app
+        broker.aclose = AsyncMock()
+        with patch("henchmen.providers.registry.ProviderRegistry") as registry_cls:
+            async with lifespan(app):
+                assert app.state.message_broker is broker
+            registry_cls.return_value.get_message_broker.assert_not_called()
+
+        broker.aclose.assert_not_awaited()
+
+
+def test_importing_forge_server_installs_secret_redaction():
+    """Forge logs git/CI output; token-shaped strings must be redacted in this process too."""
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import logging, henchmen.forge.server\n"
+        "from henchmen.utils.redaction import _redacting_factory\n"
+        "assert logging.getLogRecordFactory() is _redacting_factory\n"
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), "HENCHMEN_PROVIDER": "local"}
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
 
 
 # ===========================================================================

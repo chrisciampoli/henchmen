@@ -12,17 +12,11 @@ if TYPE_CHECKING:
 
 # Image the CI commands run in. Cloud Build's own `node:20` default could not
 # run the Python commands the CI orchestrator emits. Override per deployment
-# with the (optional) ``ci_builder_image`` setting.
+# with the ``ci_builder_image`` setting.
 _DEFAULT_BUILDER_IMAGE = "python:3.12"
 
 _GIT_IMAGE = "gcr.io/cloud-builders/git"
 _TOKEN_ENV = "GITHUB_TOKEN"
-
-
-def _optional_setting(settings: Settings, name: str) -> str:
-    """Read an optional string setting that may not exist on this Settings class."""
-    value = getattr(settings, name, "")
-    return value.strip() if isinstance(value, str) else ""
 
 
 class CloudBuildCIProvider:
@@ -30,10 +24,9 @@ class CloudBuildCIProvider:
 
     def __init__(self, settings: Settings) -> None:
         self._project = settings.gcp_project_id
-        # Optional settings: read defensively so this provider keeps working
-        # against a Settings class that has not grown the fields yet.
-        self._builder_image = _optional_setting(settings, "ci_builder_image") or _DEFAULT_BUILDER_IMAGE
-        self._token_secret = _optional_setting(settings, "ci_github_token_secret")
+        # A blank ``ci_builder_image`` falls back to the default image.
+        self._builder_image = settings.ci_builder_image.strip() or _DEFAULT_BUILDER_IMAGE
+        self._token_secret = settings.ci_github_token_secret.strip()
         self._client: Any = None
 
     def _get_client(self) -> Any:

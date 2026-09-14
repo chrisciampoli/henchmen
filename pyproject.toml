@@ -33,7 +33,8 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "httpx",
-    "PyGithub",
+    # <3: a major release may change the Auth/Github constructor API we use.
+    "PyGithub>=2.4.0,<3",
 ]
 
 [project.urls]
@@ -171,16 +172,10 @@ ignore = []
 "src/henchmen/forge/ci_runner.py" = ["ASYNC240"]
 "src/henchmen/dossier/cache.py" = ["ASYNC240"]
 "src/henchmen/dossier/rules.py" = ["ASYNC240"]
-# `timeout` kwarg on MastermindAgent.handle_task_with_timeout is a
-# wrapper-level budget, not a synchronous timeout — ASYNC109 is a false
-# positive there.
-"src/henchmen/mastermind/agent.py" = ["ASYNC109"]
+# Fixture repos under evals/ are deliberately unpolished sample code.
+"evals/**/*.py" = ["T201"]
 # Tests get a relaxed ruleset — assert-raises-Exception, print-for-debug,
 # and blocking-IO-in-async-tests are all idiomatic.
-# Eval harness prints its report for the operator; fixture repos under
-# evals/ are deliberately unpolished sample code.
-"src/henchmen/evals/*.py" = ["T201", "ASYNC240"]
-"evals/**/*.py" = ["T201"]
 "tests/**/*.py" = ["T201", "B017", "ASYNC230", "ASYNC240", "ASYNC221", "SIM105"]
 
 [tool.pytest.ini_options]

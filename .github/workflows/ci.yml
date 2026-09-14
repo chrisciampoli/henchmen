@@ -119,6 +119,33 @@ jobs:
           HENCHMEN_ENVIRONMENT: dev
         run: pytest tests/integration/ -v --tb=short
 
+  terraform:
+    name: Terraform validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Pinned to the version the committed provider lock files were produced
+      # with; required_version in the environments is ">= 1.7".
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.11.4
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive terraform/
+
+      # -backend=false: no state bucket or cloud credentials in CI.
+      # -lockfile=readonly: fail if a provider drifts from the committed lock.
+      - name: terraform validate (dev, staging)
+        run: |
+          for env in dev staging; do
+            echo "::group::$env"
+            terraform -chdir=terraform/environments/$env init -backend=false -input=false -lockfile=readonly
+            terraform -chdir=terraform/environments/$env validate
+            echo "::endgroup::"
+          done
+
   docker-build:
     name: Build image (${{ matrix.service }})
     runs-on: ubuntu-latest
@@ -137,10 +164,18 @@ jobs:
       - name: docker build
         run: docker build -f "containers/${{ matrix.service }}/Dockerfile" -t "henchmen-${{ matrix.service }}:ci" .
 
-      - name: Smoke-import the package inside the image
+      # Import the module the container actually starts, not just the package
+      # root: a dependency missing from the service's requirements.txt only
+      # fails when its entry module (and what that pulls in) is imported.
+      - name: Smoke-import the service entry module inside the image
         run: |
+          set -euo pipefail
+          case "${{ matrix.service }}" in
+            operative) module=henchmen.operative.bootstrap ;;
+            *) module="henchmen.${{ matrix.service }}.server" ;;
+          esac
           docker run --rm --entrypoint python "henchmen-${{ matrix.service }}:ci" \
-            -c "import henchmen; print('henchmen', henchmen.__version__)"
+            -c "import importlib, henchmen; importlib.import_module('${module}'); print('henchmen', henchmen.__version__, '${module} OK')"
 
   docker-compose-smoke:
     name: docker-compose smoke test

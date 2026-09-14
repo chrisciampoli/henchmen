@@ -197,15 +197,15 @@ async def test_rate_limiter_covers_pubsub_paths():
     app = FastAPI()
     app.add_middleware(RateLimitMiddleware)
 
-    @app.post("/pubsub/task-planned")
-    async def task_planned() -> dict[str, str]:
+    @app.post("/pubsub/example")
+    async def pubsub_example() -> dict[str, str]:
         return {"ok": "yes"}
 
     transport = ASGITransport(app=_SpoofClientIPMiddleware(app, "8.8.8.8"))  # type: ignore[arg-type]
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         for _ in range(60):
-            assert (await client.post("/pubsub/task-planned")).status_code == 200
-        assert (await client.post("/pubsub/task-planned")).status_code == 429
+            assert (await client.post("/pubsub/example")).status_code == 200
+        assert (await client.post("/pubsub/example")).status_code == 429
 
 
 @pytest.mark.asyncio
@@ -271,3 +271,56 @@ async def test_limits_are_configurable():
     assert (await middleware.dispatch(Request(scope), call_next)).status_code == 200  # type: ignore[arg-type]
     assert (await middleware.dispatch(Request(scope), call_next)).status_code == 200  # type: ignore[arg-type]
     assert (await middleware.dispatch(Request(scope), call_next)).status_code == 429  # type: ignore[arg-type]
+
+
+def _scope(client_ip: str, headers: list[tuple[bytes, bytes]] | None = None) -> dict:
+    return {
+        "type": "http",
+        "method": "POST",
+        "path": "/webhooks/foo",
+        "root_path": "",
+        "headers": headers or [],
+        "query_string": b"",
+        "client": (client_ip, 1234),
+    }
+
+
+async def _ok(_request: Request) -> Response:
+    return JSONResponse({"ok": True}, status_code=200)
+
+
+@pytest.mark.asyncio
+async def test_limits_come_from_settings(monkeypatch: pytest.MonkeyPatch):
+    """The Dispatch app builds the middleware with no arguments; HENCHMEN_DISPATCH_RATE_LIMIT_* must apply."""
+    monkeypatch.setenv("HENCHMEN_DISPATCH_RATE_LIMIT_REQUESTS", "2")
+    monkeypatch.setenv("HENCHMEN_DISPATCH_RATE_LIMIT_WINDOW_SECONDS", "1.5")
+    middleware = RateLimitMiddleware(FastAPI())
+
+    for _ in range(2):
+        assert (await middleware.dispatch(Request(_scope("6.6.6.7")), _ok)).status_code == 200  # type: ignore[arg-type]
+    blocked = await middleware.dispatch(Request(_scope("6.6.6.7")), _ok)  # type: ignore[arg-type]
+    assert blocked.status_code == 429
+    # A fractional window still yields an integer Retry-After, rounded up.
+    assert blocked.headers["Retry-After"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_trust_forwarded_for_comes_from_settings(monkeypatch: pytest.MonkeyPatch):
+    """With the setting off, a spoofed X-Forwarded-For cannot buy a fresh bucket."""
+    monkeypatch.setenv("HENCHMEN_DISPATCH_RATE_LIMIT_REQUESTS", "1")
+    monkeypatch.setenv("HENCHMEN_DISPATCH_TRUST_FORWARDED_FOR", "false")
+    middleware = RateLimitMiddleware(FastAPI())
+
+    first = Request(_scope("9.9.9.9", [(b"x-forwarded-for", b"203.0.113.1")]))  # type: ignore[arg-type]
+    spoofed = Request(_scope("9.9.9.9", [(b"x-forwarded-for", b"203.0.113.2")]))  # type: ignore[arg-type]
+    assert (await middleware.dispatch(first, _ok)).status_code == 200
+    assert (await middleware.dispatch(spoofed, _ok)).status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_constructor_arguments_override_settings(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("HENCHMEN_DISPATCH_RATE_LIMIT_REQUESTS", "1")
+    middleware = RateLimitMiddleware(FastAPI(), limit=3)
+    for _ in range(3):
+        assert (await middleware.dispatch(Request(_scope("4.4.4.4")), _ok)).status_code == 200  # type: ignore[arg-type]
+    assert (await middleware.dispatch(Request(_scope("4.4.4.4")), _ok)).status_code == 429  # type: ignore[arg-type]

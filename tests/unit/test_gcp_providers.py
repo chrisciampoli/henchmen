@@ -19,7 +19,6 @@ def mock_settings():
     s.firestore_database = "(default)"
     s.vertex_ai_model_complex = "gemini-2.5-pro"
     s.vertex_ai_model_light = "gemini-2.5-flash"
-    s.vertex_ai_context_cache_enabled = False
     s.vertex_ai_safety_threshold = "BLOCK_MEDIUM_AND_ABOVE"
     s.environment = MagicMock()
     s.environment.value = "dev"
@@ -651,3 +650,44 @@ class TestCloudBuildCIProvider:
 
         await provider.cancel("build-42")
         mock_client.cancel_build.assert_called_once_with(project_id="test-project", id="build-42")
+
+
+class TestVertexSafetySettings:
+    @pytest.mark.asyncio
+    async def test_threshold_setting_is_applied_to_every_text_category(self) -> None:
+        from google.genai import types
+
+        from henchmen.config.settings import Settings
+        from henchmen.models.llm import Message, MessageRole
+        from henchmen.providers.gcp.vertex_ai import VertexAIProvider
+
+        settings = Settings(_env_file=None, gcp_project_id="p", vertex_ai_safety_threshold="BLOCK_ONLY_HIGH")
+        captured: dict[str, object] = {}
+
+        async def fake_generate(**kwargs: object) -> MagicMock:
+            captured.update(kwargs)
+            return MagicMock(candidates=[], usage_metadata=None)
+
+        client = MagicMock()
+        client.aio.models.generate_content = fake_generate
+        with patch("google.genai.Client", return_value=client):
+            provider = VertexAIProvider(settings)
+            await provider.generate([Message(role=MessageRole.USER, content="hi")], model="gemini-2.5-pro")
+
+        config = captured["config"]
+        assert isinstance(config, types.GenerateContentConfig)
+        assert {s.category for s in config.safety_settings or []} == {
+            types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+            types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        }
+        assert {s.threshold for s in config.safety_settings or []} == {types.HarmBlockThreshold.BLOCK_ONLY_HIGH}
+
+    def test_unknown_threshold_is_rejected_at_startup(self) -> None:
+        from pydantic import ValidationError
+
+        from henchmen.config.settings import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, vertex_ai_safety_threshold="BLOCK_SOME")

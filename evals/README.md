@@ -9,9 +9,9 @@ OpenAI, Anthropic, or Ollama, how much quality do they give up?"*
 
 Unlike the production pipeline, the harness does **not** touch GCP,
 Pub/Sub, Firestore, or Cloud Run. It runs entirely on the local filesystem
-and talks directly to whichever `LLMProvider` you point it at. CI uses it
-as a canary: a drop of more than 5% against the stored baseline fails the
-job.
+and talks directly to whichever `LLMProvider` you point it at. With
+`--compare-baseline`, a drop of more than 5% against the stored baseline
+exits non-zero, so it can gate a pipeline.
 
 ## How to run
 
@@ -128,9 +128,11 @@ to `[0.0, 1.0]`.
 ## Baseline
 
 `evals/baseline.json` stores the last-known-good aggregate score per
-provider, keyed by the canonical provider name. CI runs
-`henchmen eval --provider <name> --compare-baseline` and fails if the
-aggregate drops by more than 5%.
+provider, keyed by the canonical provider name.
+`henchmen eval --provider <name> --compare-baseline` fails if the aggregate
+drops by more than 5%. No CI job runs it automatically: the
+`.github/workflows/evals.yml` workflow is `workflow_dispatch`-only and runs
+`--write-baseline`, opening a PR with the updated `baseline.json`.
 
 `--write-baseline` **merges** into the existing entry, so the hand-written
 `how_to_populate` and `notes` survive. A run in which any fixture errored —

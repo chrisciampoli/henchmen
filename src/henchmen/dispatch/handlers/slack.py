@@ -35,7 +35,7 @@ async def handle_slack_event(
     payload: dict[str, Any],
     normalizer: TaskNormalizer,
     settings: Settings,
-    broker: MessageBroker | None = None,
+    broker: MessageBroker,
     dedup_key: str | None = None,
 ) -> dict[str, Any]:
     """Process Slack event (app_mention in thread).

@@ -64,6 +64,13 @@ class TestCheckResult:
         warn = CheckResult("n", CheckStatus.WARN, "m")
         assert not warn.is_ok and not warn.is_failure
 
+    def test_status_renders_as_its_value(self):
+        """CheckStatus is a StrEnum: str()/format() yield the bare value, and it compares equal to it."""
+        assert str(CheckStatus.WARN) == "warn"
+        assert f"{CheckStatus.FAIL}" == "fail"
+        assert CheckStatus.OK == "ok"
+        assert CheckStatus("ok") is CheckStatus.OK
+
 
 # ---------------------------------------------------------------------------
 # Anthropic

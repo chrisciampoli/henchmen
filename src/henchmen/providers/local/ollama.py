@@ -43,9 +43,9 @@ class OllamaProvider:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._base_url = getattr(settings, "llm_ollama_base_url", "http://localhost:11434")
-        self._default_model = getattr(settings, "llm_ollama_model", "llama3.2")
-        self._skip_probe = bool(getattr(settings, "llm_ollama_skip_probe", False))
+        self._base_url = settings.llm_ollama_base_url
+        self._default_model = settings.llm_ollama_model
+        self._skip_probe = bool(settings.llm_ollama_skip_probe)
         self._client = httpx.AsyncClient(base_url=self._base_url, timeout=300.0)
         # Which tiers have their own model configured; the rest fall back to
         # llm_ollama_model and warn once.

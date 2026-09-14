@@ -1,7 +1,7 @@
 # Incident Runbook -- Henchmen
 
 > Note: The bulk of this runbook is written for operators running Henchmen on
-> GCP. If you are self-hosting on docker-compose, SQLite, or a single VM, read
+> GCP. If you are self-hosting with `henchmen serve` or docker compose, read
 > the "Self-Hosted / Non-GCP Operations" section first -- it explains how each
 > `gcloud` / Firestore instruction maps to your environment.
 
@@ -10,75 +10,88 @@
 Henchmen runs in two deployment shapes:
 
 1. GCP-managed (Cloud Run + Firestore + Pub/Sub + Cloud Scheduler).
-2. Self-hosted (docker-compose or bare `henchmen serve`, SQLite / filesystem
-   backends, in-memory broker or a local HTTP forwarder).
+2. Self-hosted: a single `henchmen serve` process (docker compose runs the
+   same process in the `henchmen` container), with a SQLite document store,
+   filesystem object store and in-memory broker.
 
 The checks below cover what to do in shape #2 -- no `gcloud`, no Cloud
-Logging, no Cloud Scheduler.
+Logging, no Cloud Scheduler. All services share port 8000 under `/dispatch`,
+`/mastermind` and `/forge`.
 
 ### Finding logs
 
-If you started the stack with docker-compose:
+If you started the stack with docker compose:
 
 ```bash
-docker logs -f henchmen-mastermind
-docker logs -f henchmen-dispatch
-docker logs -f henchmen-forge
+docker logs -f henchmen          # Dispatch + Mastermind + Forge
 docker logs -f henchmen-ollama
 ```
 
-If you started it with `henchmen serve` (single-process), all logs are on
-stdout of that process. Redirect to a file for persistence:
+If you started it with `henchmen serve`, all logs are on stdout of that
+process. Redirect to a file for persistence:
 
 ```bash
 henchmen serve 2>&1 | tee henchmen.log
 ```
 
+Operative containers log to their own Docker containers (`docker ps -a`).
+
 ### Inspecting task state (local document store)
 
-The local document store persists to `henchmen_dev.db` (SQLite) in the working
-directory. You can poke at it directly:
+The local document store is SQLite at `~/.henchmen/henchmen_<environment>.db`
+(override with `HENCHMEN_LOCAL_SQLITE_PATH`). Each collection is a table with
+two columns, `id` and `data`, where `data` is the JSON document, so query
+fields with `json_extract`:
 
 ```bash
-sqlite3 henchmen_dev.db
+sqlite3 ~/.henchmen/henchmen_dev.db
 sqlite> .tables
-sqlite> SELECT id, title, status, updated_at FROM tasks ORDER BY updated_at DESC LIMIT 10;
-sqlite> SELECT id, status, ci_passed FROM task_executions ORDER BY created_at DESC LIMIT 10;
+sqlite> SELECT id,
+   ...>        json_extract(data, '$.title'),
+   ...>        json_extract(data, '$.final_status'),
+   ...>        json_extract(data, '$.execution_state'),
+   ...>        json_extract(data, '$.ci_passed')
+   ...> FROM task_executions
+   ...> ORDER BY json_extract(data, '$.created_at') DESC LIMIT 10;
 ```
 
-If you chose the filesystem document store, each document is a JSON file
-under `./henchmen-data/<collection>/<id>.json`. Open them with any editor.
+There is no filesystem document store; the filesystem backend
+(`~/.henchmen/storage`) only holds object-store blobs such as dossiers.
 
 ### Recovering a stuck task without gcloud
 
-Symptom: a task is stuck in `dispatched` or `in_progress` and nothing is
-advancing it. Without Firestore you cannot use the GCP fix; instead, patch
-the document store directly:
+Symptom: a task's `execution_state` stays `running` and nothing is advancing
+it. First try the watchdog (next section), which re-publishes stalled tasks
+and escalates them after 3 attempts. To close the task out by hand instead,
+stop `henchmen serve` and patch the document:
 
 ```bash
-sqlite3 henchmen_dev.db
-sqlite> UPDATE tasks SET status = 'failed', updated_at = datetime('now') WHERE id = '<task-id>';
+sqlite3 ~/.henchmen/henchmen_dev.db
+sqlite> UPDATE task_executions
+   ...> SET data = json_set(data, '$.final_status', 'escalated',
+   ...>                           '$.execution_state', 'escalated')
+   ...> WHERE id = '<task-id>';
 sqlite> .quit
 ```
 
-For a filesystem store, open the JSON file and change the `status` field.
-Restart `henchmen serve` or the mastermind container so in-memory state
-aligns with the on-disk update.
+Then start `henchmen serve` again.
 
 ### Missing Cloud Scheduler cron
 
-The GCP deployment uses Cloud Scheduler to POST to `/api/v1/watchdog` on a
-schedule (stuck-task sweep, merge queue tick). Self-hosted users should call
-this endpoint themselves, either manually or from a local cron:
+The GCP staging/prod deployment uses Cloud Scheduler to call Mastermind's
+`/api/v1/watchdog` (every 5 minutes), `/api/v1/check-dlq` and
+`/api/v1/cleanup`, and Forge's `/api/v1/process-queue`. Dev sets
+`scheduler_enabled = false`. Self-hosted users should call the watchdog
+themselves, either manually or from a local cron:
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/watchdog
+curl -X POST http://localhost:8000/mastermind/api/v1/watchdog
 ```
 
 A reasonable crontab entry:
 
 ```
-*/5 * * * * curl -sS -X POST http://localhost:8000/api/v1/watchdog >/dev/null
+*/5 * * * * curl -sS -X POST http://localhost:8000/mastermind/api/v1/watchdog >/dev/null
 ```
 
 ### Adding a new LLM model to the price map
@@ -86,43 +99,64 @@ A reasonable crontab entry:
 Token prices live in exactly one place: `PRICE_TABLE` in
 `src/henchmen/providers/pricing.py`. A model that is not listed still has its
 token usage recorded, but its cost reads `$0.00` and it therefore never trips
-the per-task ceiling. To fix:
+the per-task ceiling. Scheme nodes store tier names, and cost is computed after
+resolving the tier through the active provider's `Settings` field (for example
+`HENCHMEN_OPENAI_MODEL_COMPLEX`), so the entry must match that concrete model.
+`henchmen doctor` catches this before it costs anything: its **Model pricing**
+check warns when any tier resolves to a model with no `PRICE_TABLE` entry
+(`no price for <model> — cost is recorded as $0 and the task cost ceiling
+($X) cannot trip`). Local Ollama models are free by design and pass the check;
+their runs are bounded by the wall-clock ceiling instead.
 
-1. Open `src/henchmen/providers/pricing.py`.
-2. Add a `PRICE_TABLE` entry keyed on the first-party model family id (e.g.
+To fix:
+
+1. Run `henchmen doctor` to see the concrete model each tier resolves to and
+   which of them the **Model pricing** check reports as unpriced.
+2. Open `src/henchmen/providers/pricing.py`.
+3. Add a `PRICE_TABLE` entry keyed on the first-party model family id (e.g.
    `"gpt-4o-mini"`), using the `_anthropic`, `_gemini` or `_openai` helper so
    the cache-read and cache-write rates follow that vendor's discount. Dated
    snapshots, Vertex `@` forms and Bedrock ids normalise onto that key
    automatically, so one entry usually covers every spelling.
-3. Restart the process.
-4. Confirm with
-   `curl -H "Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN" http://localhost:8000/mastermind/metrics/summary | jq .total_cost_usd`.
+4. Restart the process and re-run `henchmen doctor`; the **Model pricing**
+   check should read `every tier model has a price`.
+5. Confirm new tasks are costed (both endpoints require the metrics bearer
+   token whenever one is configured, and always in staging and prod):
+   ```bash
+   curl -H "Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN" http://localhost:8000/mastermind/metrics/summary | jq .total_cost_usd
+   curl -H "Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN" http://localhost:8000/mastermind/api/v1/metrics/summary | jq .cost_by_model
+   ```
 
 Do not add a second price map anywhere. Cost is always computed through
 `estimate_cost` / `estimate_cost_for_settings` from that module.
 
 ## Alert Conditions
 
+Terraform (`terraform/modules/observability`) provisions three alert policies,
+all on metrics Cloud Run and Pub/Sub emit themselves:
+
 | Alert | Trigger | Severity |
 |-------|---------|----------|
-| Operative Timeout | Cloud Run Job exceeds `lair_default_timeout` (1800s) | High |
-| Escalation Loop | Same task escalated >2 times within 1 hour | Critical |
-| Pub/Sub 403 | Push subscription returns 403 (missing OIDC audience) | Critical |
-| Dead Letter Queue Growth | `henchmen-{env}-dead-letter` message count >10 in 5 min | High |
-| CI Build Failure | Cloud Build returns non-zero for >3 consecutive PRs | Medium |
-| Forge Stuck | Merge queue entry in `merging` status >15 min | High |
-| Dispatch Unhealthy | `/health` returns non-200 or response time >5s | Critical |
+| Lair Timeout Alert | A Cloud Run Job execution finished with `result = failed` (timeouts included) | High |
+| Dead Letter Queue Alert | `henchmen-{env}-dead-letter-sub` has undelivered messages for 60s | High |
+| Henchmen Service Error Rate Alert | Any `henchmen-{env}-*` service returns 5xx over 5 minutes | Critical |
+
+The sections below also cover conditions no alert fires for (escalation loops,
+Pub/Sub auth failures); watch for them in logs.
 
 ## Quick Diagnosis
 
 ### Operative Timeout
 
-**Symptoms:** Task stuck in `in_progress`, operative Cloud Run Job shows `TIMED_OUT` status.
+**Symptoms:** Lair Timeout Alert fires, or a task's `execution_state` stays
+`running` and the operative's job execution shows as failed.
 
-1. Check the operative job logs:
+1. Find the lair jobs. Mastermind creates one job per agentic node, named
+   `lair-<task_id[:8]>-<node_id>-<suffix>`:
    ```bash
-   gcloud run jobs executions list --job=henchmen-{env}-lair-template --project=${PROJECT_ID} --region=us-central1
-   gcloud logging read 'resource.type="cloud_run_job" AND resource.labels.job_name="henchmen-{env}-lair-template"' --project=${PROJECT_ID} --limit=50
+   gcloud run jobs list --project=${PROJECT_ID} --region=us-central1 --filter="metadata.name ~ ^lair-<task_id[:8]>"
+   gcloud run jobs executions list --job=<lair-job-name> --project=${PROJECT_ID} --region=us-central1
+   gcloud logging read 'resource.type="cloud_run_job" AND resource.labels.job_name="<lair-job-name>"' --project=${PROJECT_ID} --limit=50
    ```
 
 2. Look for the telemetry report (logged just before timeout):
@@ -132,73 +166,86 @@ Do not add a second price map anywhere. Cost is always computed through
 
 3. Check if the model endpoint is responding:
    ```bash
-   gcloud logging read 'jsonPayload.message=~"VertexAI" AND severity>=ERROR' --project=${PROJECT_ID} --limit=20
+   gcloud logging read 'resource.type="cloud_run_job" AND severity>=ERROR' --project=${PROJECT_ID} --limit=20
    ```
 
 **Common fixes:**
-- If context window exhaustion: reduce `max_steps` on the scheme node or add file filtering to the dossier
-- If model timeout: check Vertex AI quota and regional status for Gemini (e.g., `us-central1`). Henchmen uses Gemini on Vertex AI exclusively -- no Claude/Anthropic routing.
+- If context window exhaustion: reduce the node's step budget or add file filtering to the dossier
+- If model timeout: check quota and status for the provider `HENCHMEN_LLM_PROVIDER` selects. On Vertex AI that means Gemini quota in the region (Henchmen never uses Claude on Vertex AI); for Anthropic, OpenAI or Bedrock, check that vendor's status page and rate limits.
 - If stuck in tool loop: review the scheme's `instruction_template` for missing phase constraints
+- A timed-out operative stays `timed_out`; never mark it completed by hand
 
 ### Escalation Loop
 
 **Symptoms:** Slack channel flooded with escalation messages for the same task.
 
-1. Query Firestore for the task:
-   ```bash
-   gcloud firestore documents list --collection=tasks --filter="id={task_id}" --project=${PROJECT_ID}
+1. Read the task's execution record. There is no `gcloud firestore` command for
+   documents; use the Firestore console
+   (`https://console.cloud.google.com/firestore/databases/<database>/data/panel/task_executions/<task_id>?project=${PROJECT_ID}`)
+   or the Python client:
+   ```python
+   from google.cloud import firestore
+
+   db = firestore.Client(project="PROJECT_ID", database="DATABASE")
+   print(db.collection("task_executions").document("TASK_ID").get().to_dict())
    ```
 
 2. Check the scheme executor logs for retry exhaustion:
    ```bash
-   gcloud logging read 'jsonPayload.task_id="{task_id}" AND jsonPayload.message=~"escalat"' --project=${PROJECT_ID} --limit=20
+   gcloud logging read 'resource.labels.service_name="henchmen-{env}-mastermind" AND textPayload=~"TASK_ID" AND textPayload=~"(escalat|max retries)"' --project=${PROJECT_ID} --limit=20
    ```
 
-3. Verify the task state machine isn't cycling:
-   - Valid terminal states: `completed`, `failed`, `escalated`
-   - If state is toggling between `in_progress` and `dispatched`, there is a re-dispatch bug
+3. Verify the task isn't cycling:
+   - Terminal `execution_state` values: `completed`, `escalated`
+   - `recovery_attempts` climbing means the watchdog keeps re-publishing a task whose heartbeat stops; it escalates after 3
 
 **Common fixes:**
-- Manually set the task status to `escalated` in Firestore to break the loop
+- Set `execution_state` and `final_status` to `escalated` on the `task_executions` document to stop the watchdog re-publishing it
 - If the scheme itself is causing re-dispatch, check `SchemeExecutor` retry logic -- max retries should fail-closed
 
-### Pub/Sub 403 (Silent Authentication Failure)
+### Pub/Sub Push 401 / 403
 
-**Symptoms:** Messages published successfully but push subscriptions never deliver. No errors in publisher logs. Subscriber logs show 403.
+**Symptoms:** Messages publish successfully but tasks never reach Mastermind. The Service Error Rate alert does not fire for 401/403, but the subscription's push metrics show failed deliveries and messages end up in the dead-letter topic.
 
-1. Check subscription configuration:
+Push subscriptions authenticate as `sa-{env}-pubsub-push` with a fixed OIDC
+audience of `henchmen-{env}-{service}` (for example `henchmen-dev-mastermind`),
+registered on the service as a custom audience and injected as
+`HENCHMEN_PUBSUB_OIDC_AUDIENCE`.
+
+1. Check the subscription configuration:
    ```bash
-   gcloud pubsub subscriptions describe henchmen-{env}-{topic}-sub --project=${PROJECT_ID}
+   gcloud pubsub subscriptions describe henchmen-{env}-{topic}-sub --project=${PROJECT_ID} \
+     --format="yaml(pushConfig,deadLetterPolicy)"
    ```
 
-2. Verify OIDC audience matches the Cloud Run service URL:
+2. Compare `pushConfig.oidcToken.audience` with the receiving service's `HENCHMEN_PUBSUB_OIDC_AUDIENCE`:
    ```bash
-   gcloud run services describe henchmen-{env}-mastermind --project=${PROJECT_ID} --region=us-central1 --format="value(status.url)"
-   ```
-   The `pushConfig.oidcToken.audience` in the subscription must match this URL exactly.
-
-3. Check the push subscription dead letter policy:
-   ```bash
-   gcloud pubsub subscriptions describe henchmen-{env}-{topic}-sub --project=${PROJECT_ID} --format="yaml(deadLetterPolicy)"
+   gcloud run services describe henchmen-{env}-mastermind --project=${PROJECT_ID} --region=us-central1 \
+     --format="yaml(spec.template.spec.containers[0].env)"
    ```
 
 **Common fixes:**
-- Update the subscription OIDC audience:
+- **401** (rejected by the application): audience or allowed-email mismatch. Both sides are Terraform-managed; re-run `terraform apply`. To patch a subscription by hand:
   ```bash
-  gcloud pubsub subscriptions update {sub_name} \
-    --push-auth-service-account={sa}@${PROJECT_ID}.iam.gserviceaccount.com \
-    --push-auth-token-audience={cloud_run_url} \
+  gcloud pubsub subscriptions update henchmen-{env}-{topic}-sub \
+    --push-auth-service-account=sa-{env}-pubsub-push@${PROJECT_ID}.iam.gserviceaccount.com \
+    --push-auth-token-audience=henchmen-{env}-{service} \
     --project=${PROJECT_ID}
   ```
-- If Terraform recently ran, it may have reset the audience. Re-apply the correct value.
+- **403** (rejected by the Cloud Run edge): `sa-{env}-pubsub-push` lacks `roles/run.invoker` on the service; re-apply Terraform (see `docs/operations.md`).
 
 ### Dead Letter Queue Growth
 
-**Symptoms:** Messages accumulating in `henchmen-{env}-dead-letter` topic.
+**Symptoms:** Dead Letter Queue Alert fires; messages accumulating in `henchmen-{env}-dead-letter-sub`.
 
-1. Pull messages to inspect:
+Mastermind's `/api/v1/check-dlq` (Cloud Scheduler, every 15 minutes) pulls up
+to 10 dead-lettered messages, escalates the task each one carries, and
+acknowledges them. Pulling by hand acknowledges them too, so the check will not
+see them.
+
+1. Trigger the check, or inspect messages without acking:
    ```bash
-   gcloud pubsub subscriptions pull henchmen-{env}-dead-letter-sub --project=${PROJECT_ID} --limit=5 --auto-ack
+   gcloud pubsub subscriptions pull henchmen-{env}-dead-letter-sub --project=${PROJECT_ID} --limit=5
    ```
 
 2. Check the original topic's subscription for delivery failures:
@@ -209,15 +256,16 @@ Do not add a second price map anywhere. Cost is always computed through
 **Common fixes:**
 - If messages are malformed: check Dispatch normalizer output
 - If subscriber is crashing: check Cloud Run service logs for the receiving service
-- If authentication: see "Pub/Sub 403" above
+- If authentication: see "Pub/Sub Push 401 / 403" above
 
-### Forge Stuck (Merge Queue)
+### GitHub Access Failing
 
-**Symptoms:** PR not being merged despite passing CI.
+**Symptoms:** `create_pr` fails, Forge cannot clone or comment, or operatives cannot push.
 
-1. Check merge queue in Firestore:
+1. Check the token Henchmen uses (a classic PAT stored as `henchmen-{env}-github-token`):
    ```bash
-   gcloud firestore documents list --collection=merge_queue --filter="status=merging" --project=${PROJECT_ID}
+   gcloud secrets versions access latest --secret=henchmen-{env}-github-token --project=${PROJECT_ID} \
+     | { read -r t; curl -s -H "Authorization: Bearer $t" https://api.github.com/user | jq .login; }
    ```
 
 2. Check Forge service logs:
@@ -225,15 +273,8 @@ Do not add a second price map anywhere. Cost is always computed through
    gcloud logging read 'resource.labels.service_name="henchmen-{env}-forge" AND severity>=WARNING' --project=${PROJECT_ID} --limit=30
    ```
 
-3. Verify GitHub API access:
-   ```bash
-   gcloud secrets versions access latest --secret=github-app-private-key --project=${PROJECT_ID} | head -1
-   ```
-
 **Common fixes:**
-- Mark the stuck entry as `failed` in Firestore to unblock the queue
-- If GitHub token expired: rotate the GitHub App installation token
-- Restart the Forge service: `gcloud run services update henchmen-{env}-forge --project=${PROJECT_ID} --region=us-central1`
+- If the token expired or lost the `repo` scope: create a new classic PAT and add it as a new version of `henchmen-{env}-github-token`, then redeploy Mastermind and Forge so new instances read it (new lairs pick it up automatically)
 
 ## Escalation Procedures
 
@@ -247,9 +288,9 @@ Do not add a second price map anywhere. Cost is always computed through
 
 | Issue | Fix |
 |-------|-----|
-| Service returning 503 | Redeploy: `gcloud run services update henchmen-{env}-{svc} --image=...` |
-| Env vars missing after TF apply | Re-set secrets: check Terraform output, manually re-apply secret env vars |
-| Operative image stale | Rebuild + push + update both service and lair template |
-| Task stuck in `dispatched` | Check Mastermind logs; manually transition to `failed` if needed |
+| Service returning 503 | Redeploy: `terraform apply` with the intended `container_image_tag`, or `gcloud run services update henchmen-{env}-{svc} --image=...` for a quick fix |
+| Hand-set env vars gone after TF apply | Expected: Terraform owns service env and secret mounts. Add the value to the `cloud-run-services` module |
+| Operative image stale | Push the operative image with the tag in `HENCHMEN_LAIR_OPERATIVE_IMAGE_TAG` (Terraform's `container_image_tag`); new lairs use it immediately |
+| Task stuck in `running` | Call `/api/v1/watchdog`; check Mastermind logs; set `execution_state`/`final_status` to `escalated` if needed |
 | Firestore quota exceeded | Check Firestore usage dashboard; consider adding indexes |
-| High LLM costs | Check model tiering -- ensure `fix_lint` is deterministic, `verify_changes` uses Flash |
+| High LLM costs | Check `henchmen doctor` for the model each tier resolves to (and any unpriced-model warning), confirm `HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD`, and compare `by_scheme` in `/metrics/summary` and `cost_by_model` in `/api/v1/metrics/summary` (both need `Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN`). `fix_lint` and `verify_changes` never call a model |

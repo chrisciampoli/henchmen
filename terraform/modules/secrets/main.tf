@@ -77,6 +77,21 @@ resource "google_secret_manager_secret" "metrics_auth_token" {
   labels = var.labels
 }
 
+# Bearer token Dispatch's POST /api/v1/tasks requires (mounted as
+# DISPATCH_API_TOKEN). Every accepted request launches paid operative runs, so
+# Dispatch returns 401 in staging/prod while this is empty or still holds the
+# seeded placeholder below.
+resource "google_secret_manager_secret" "dispatch_api_token" {
+  project   = var.project_id
+  secret_id = "henchmen-${var.environment}-dispatch-api-token"
+
+  replication {
+    auto {}
+  }
+
+  labels = var.labels
+}
+
 # ---------------------------------------------------------------------------
 # Placeholder versions
 #
@@ -99,6 +114,7 @@ locals {
     slack_app_token      = google_secret_manager_secret.slack_app_token.id
     jira_api_token       = google_secret_manager_secret.jira_api_token.id
     metrics_auth_token   = google_secret_manager_secret.metrics_auth_token.id
+    dispatch_api_token   = google_secret_manager_secret.dispatch_api_token.id
   } : {}
 }
 
@@ -196,4 +212,15 @@ resource "google_secret_manager_secret_iam_member" "metrics_auth_token" {
   secret_id = google_secret_manager_secret.metrics_auth_token.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${var.service_account_emails[each.value]}"
+}
+
+# ---------------------------------------------------------------------------
+# IAM access: henchmen-dispatch-api-token -> sa-dispatch
+# ---------------------------------------------------------------------------
+
+resource "google_secret_manager_secret_iam_member" "dispatch_api_token_dispatch" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.dispatch_api_token.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${var.service_account_emails["dispatch"]}"
 }

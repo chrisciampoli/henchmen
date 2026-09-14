@@ -1027,18 +1027,30 @@ class TestSQLiteQueryOperators:
         with pytest.raises(ValueError, match="Unsafe collection name"):
             await store.get("tasks]; DROP TABLE tasks; --", "x")
 
-    def test_default_path_is_under_a_dot_henchmen_dir(self, tmp_path, monkeypatch):
-        """The DB must never land in the repository root."""
+    def test_default_path_is_under_the_home_dot_henchmen_dir(self, tmp_path, monkeypatch):
+        """The DB must not depend on the working directory (nor land in the repo root)."""
+        from pathlib import Path
+
         from henchmen.providers.local.sqlite import SQLiteDocumentStore, default_db_path
 
+        home = tmp_path / "home"
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
         monkeypatch.chdir(tmp_path)
         settings = _mock_settings()
         expected = default_db_path(settings)
-        assert expected.parent.name == ".henchmen"
+        assert expected.parent == home / ".henchmen"
+        assert expected.name == f"henchmen_{settings.environment.value}.db"
 
         store = SQLiteDocumentStore(settings)
         assert store.path == expected
         assert expected.parent.is_dir()
+
+    def test_configured_sqlite_path_wins(self, tmp_path):
+        from henchmen.providers.local.sqlite import default_db_path
+
+        settings = MagicMock()
+        settings.local_sqlite_path = str(tmp_path / "shared.db")
+        assert default_db_path(settings) == tmp_path / "shared.db"
 
     @pytest.mark.asyncio
     async def test_update_does_not_clobber_a_concurrent_increment(self, tmp_path):
@@ -1070,6 +1082,27 @@ class TestSQLiteQueryOperators:
 
         with pytest.raises(sqlite3.ProgrammingError):
             await store.get("tasks", "a")
+
+    @pytest.mark.asyncio
+    async def test_aclose_releases_the_connection_and_is_idempotent(self, tmp_path):
+        import sqlite3
+
+        from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+        store = SQLiteDocumentStore(_mock_settings(), db_path=str(tmp_path / "t.db"))
+        await store.set("tasks", "a", {"x": 1})
+        await store.aclose()
+        await store.aclose()
+
+        with pytest.raises(sqlite3.ProgrammingError):
+            await store.get("tasks", "a")
+
+    def test_default_path_honours_local_sqlite_path(self, tmp_path):
+        from henchmen.providers.local.sqlite import default_db_path
+
+        target = tmp_path / "custom.db"
+        settings = _mock_settings(local_sqlite_path=f"  {target}  ")
+        assert default_db_path(settings) == target
 
 
 # ---------------------------------------------------------------------------
@@ -1245,6 +1278,40 @@ class TestDockerOrchestratorRuntime:
             lines = [line async for line in orch.stream_logs(exec_id)]
 
         assert lines == ["line one", "line two"]
+
+    @pytest.mark.asyncio
+    async def test_finished_executions_are_evicted_beyond_the_retention_cap(self, monkeypatch):
+        """Process handles and log buffers must not grow for the life of `henchmen serve`."""
+        from henchmen.providers.local import docker as docker_mod
+        from henchmen.providers.local.docker import DockerOrchestrator
+
+        monkeypatch.setattr(docker_mod, "_FINISHED_RETAINED", 2)
+        orch = DockerOrchestrator(_mock_settings())
+        ids = []
+        for _ in range(3):
+            proc = _FakeProcess(returncode=0)
+            with self._patch_exec(proc, []):
+                exec_id = await orch.run_job("j", "img", {}, timeout_seconds=60)
+            await orch._drain_tasks[exec_id]
+            assert (await orch.get_status(exec_id)).status == JobStatus.COMPLETED
+            ids.append(exec_id)
+
+        assert ids[0] not in orch._processes
+        assert ids[0] not in orch._logs
+        assert all(i in orch._processes for i in ids[1:])
+
+    @pytest.mark.asyncio
+    async def test_cancel_of_a_running_container_keeps_it_tracked(self):
+        from henchmen.providers.local.docker import DockerOrchestrator
+
+        orch = DockerOrchestrator(_mock_settings())
+        proc = _FakeProcess(wait_delay=30.0)
+        with self._patch_exec(proc, []):
+            exec_id = await orch.run_job("j", "img", {}, timeout_seconds=300)
+            await orch.cancel(exec_id)
+
+        assert exec_id in orch._processes
+        assert exec_id not in orch._finished
 
 
 # ---------------------------------------------------------------------------

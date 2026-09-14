@@ -12,11 +12,21 @@ import asyncio
 import contextlib
 import logging
 import os
+import shlex
 import shutil
 import tempfile
 from collections.abc import Callable, Coroutine
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from henchmen.mastermind.scheme_executor.lint_scope import (
+    CheckCommand,
+    LintScopeError,
+    changed_files,
+    plan_fix,
+    plan_lint,
+    to_shell_script,
+)
 from henchmen.models.dossier import Dossier
 from henchmen.models.scheme import SchemeNode
 from henchmen.models.task import HenchmenTask
@@ -136,98 +146,83 @@ async def handle_fix_lint(
             )
             await proc.communicate()
 
-        # Run lint with --fix
-        is_pnpm = os.path.exists(os.path.join(workspace, "pnpm-lock.yaml"))
-        is_turbo = os.path.exists(os.path.join(workspace, "turbo.json"))
-        if is_pnpm and is_turbo:
-            fix_cmd = ["pnpm", "run", "lint:fix"]
-        elif os.path.exists(os.path.join(workspace, "package.json")):
-            fix_cmd = ["npx", "eslint", ".", "--fix"]
-        else:
-            fix_cmd = ["python", "-m", "ruff", "check", ".", "--fix"]
+        # Fix only what the operative changed. Running the fixer over the whole
+        # repository used to commit rewrites of files the operative never touched.
+        stack = detect_stack(Path(workspace))
+        if stack.name == "unknown":
+            return {"condition": "fail", "message": f"fix_lint failed — could not detect the project stack for {repo}"}
+        base_branch = task.context.branch or "main"
+        try:
+            scope = await changed_files(workspace, base_branch)
+        except LintScopeError as exc:
+            detail = str(exc).replace(github_token, "***") if github_token else str(exc)
+            return {
+                "condition": "fail",
+                "message": f"fix_lint failed — could not determine the files changed against {base_branch}: {detail}",
+            }
+        plan = plan_fix(stack, Path(workspace), scope)
+        if not plan.commands:
+            logger.info("[SCHEME] fix_lint: nothing to auto-fix for task %s (%s)", task.id, plan.skip_reason)
+            return {"condition": None, "message": f"fix_lint: nothing to auto-fix ({plan.skip_reason})"}
 
-        proc = await asyncio.create_subprocess_exec(
-            *fix_cmd,
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        fix_output = stdout.decode(errors="replace")[:2000]
+        outputs: list[str] = []
+        for command in plan.commands:
+            proc = await asyncio.create_subprocess_exec(
+                *command.argv,
+                cwd=os.path.join(workspace, command.cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            outputs.append(stdout.decode(errors="replace"))
+            logger.info("[SCHEME] fix_lint ran %s for task %s (rc=%s)", command.argv[:3], task.id, proc.returncode)
+        fix_output = "\n".join(outputs)[:2000]
 
-        logger.info("[SCHEME] fix_lint auto-fix ran for task %s (rc=%s)", task.id, proc.returncode)
-
-        # Check if any files were changed by the auto-fix
+        # Stage only in-scope files; anything else the fixer touched is reverted.
         proc = await asyncio.create_subprocess_exec(
             "git",
             "status",
             "--porcelain",
+            "-z",
             cwd=workspace,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         status_out, _ = await proc.communicate()
-        changed_files = status_out.decode().strip()
+        modified = [entry[3:] for entry in status_out.decode(errors="replace").split("\0") if len(entry) > 3]
+        in_scope = sorted(set(modified) & set(scope))
+        out_of_scope = sorted(set(modified) - set(scope))
+        if out_of_scope:
+            logger.warning("[SCHEME] fix_lint: reverting auto-fixes outside the operative's changes: %s", out_of_scope)
+            returncode, revert_err = await _run_git(workspace, "checkout", "--", *out_of_scope)
+            if returncode != 0:
+                return {
+                    "condition": "fail",
+                    "message": f"fix_lint failed (could not revert out-of-scope fixes): {revert_err[:300]}",
+                }
 
-        if not changed_files:
+        if not in_scope:
             logger.info("[SCHEME] fix_lint: no files changed by auto-fix")
             return {"condition": None, "message": "fix_lint: auto-fix made no changes"}
 
-        # Commit and push the auto-fixed files
-        git_email = executor.settings.git_author_email
-        git_name = executor.settings.git_author_name
-        await asyncio.create_subprocess_exec(
-            "git",
-            "config",
-            "user.email",
-            git_email,
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.create_subprocess_exec(
-            "git",
-            "config",
-            "user.name",
-            git_name,
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.create_subprocess_exec(
-            "git",
-            "add",
-            "-A",
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "commit",
-            "-m",
-            "style: auto-fix lint issues",
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "push",
-            "origin",
-            branch,
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, push_err = await proc.communicate()
-        if proc.returncode != 0:
-            err = push_err.decode()[:300]
-            if github_token:
-                err = err.replace(github_token, "***")
-            return {"condition": "fail", "message": f"fix_lint failed (push failed): {err}"}
+        # Commit and push the auto-fixed files. Every git step is awaited to
+        # completion and checked: an unawaited `git config`/`git add` raced the
+        # commit, and an ignored commit failure pushed nothing while reporting
+        # "auto-fixed and pushed".
+        git_steps: list[tuple[str, ...]] = [
+            ("config", "user.email", executor.settings.git_author_email),
+            ("config", "user.name", executor.settings.git_author_name),
+            ("add", "--", *in_scope),
+            ("commit", "-m", "style: auto-fix lint issues"),
+            ("push", "origin", branch),
+        ]
+        for step in git_steps:
+            returncode, step_err = await _run_git(workspace, *step)
+            if returncode != 0:
+                err = step_err[:300]
+                if github_token:
+                    err = err.replace(github_token, "***")
+                return {"condition": "fail", "message": f"fix_lint failed (git {step[0]} failed): {err}"}
 
         logger.info("[SCHEME] fix_lint: auto-fixed and pushed for task %s", task.id)
         return {
@@ -241,6 +236,20 @@ async def handle_fix_lint(
         return {"condition": "fail", "message": f"fix_lint failed (error: {exc})"}
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
+
+
+async def _run_git(workspace: str, *args: str) -> tuple[int, str]:
+    """Run a git command in *workspace* to completion; return ``(returncode, stderr)``."""
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        *args,
+        cwd=workspace,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    returncode = proc.returncode if proc.returncode is not None else 1
+    return returncode, stderr.decode(errors="replace")
 
 
 @_register("run_tests")
@@ -263,8 +272,12 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
     as a volume. This ensures the correct toolchain (Node.js, npm,
     eslint, etc.) is available regardless of the host OS.
 
-    Fail-closed throughout: a clone failure, an undetectable stack or a
-    non-zero exit code all return ``condition: "fail"``. A project without a
+    The lint check only judges files the branch changed against
+    ``origin/<base>`` (see :mod:`henchmen.mastermind.scheme_executor.lint_scope`);
+    when that diff cannot be computed the gate fails.
+
+    Fail-closed throughout: a clone failure, an undetectable stack, an
+    uncomputable diff or a non-zero exit code all return ``condition: "fail"``. A project without a
     lint/test script is expressed through the package manager's
     ``--if-present`` flag (a real exit code of 0), never by masking the exit
     code in the shell.
@@ -298,18 +311,6 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
             logger.warning("Clone failed for %s check: %s", check_type, exc)
             return {"condition": "fail", "message": f"{check_type} failed (clone failed): {exc}"}
 
-        # Fetch the base branch for diffing — must map the ref explicitly
-        fetch_proc = await asyncio.create_subprocess_exec(
-            "git",
-            "fetch",
-            "origin",
-            f"{base_branch}:refs/remotes/origin/{base_branch}",
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await fetch_proc.communicate()
-
         stack = detect_stack(Path(workspace))
         logger.info("[SCHEME] Detected stack %s for %s check on task %s", stack.name, check_type, task.id)
 
@@ -325,30 +326,31 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
                 ),
             }
 
-        # Build the shell script that installs deps + runs the check.
-        # In local mode this runs inside the operative Docker image;
-        # in cloud mode it runs natively (the host has the toolchain).
-        shell_parts: list[str] = []
-        if stack.install_command is not None:
-            install_str = " ".join(stack.install_command)
-            if stack.name == "node-pnpm":
-                # --frozen-lockfile fails when the lockfile is stale/absent.
-                install_str = f"{install_str} || pnpm install --no-frozen-lockfile"
-            elif stack.name == "node-npm":
-                # `npm ci` requires a lockfile; a plain install is the fallback.
-                install_str = f"{install_str} || npm install --no-audit"
-            shell_parts.append(install_str)
-
-        check_command = stack.lint_command if check_type == "lint" else stack.test_command
-        shell_parts.append(" ".join(check_command))
-
-        shell_script = " && ".join(shell_parts)
+        if check_type == "lint":
+            # Judge only what the operative changed, never pre-existing violations.
+            # If the diff cannot be computed the gate cannot be scoped: fail closed.
+            try:
+                plan = plan_lint(stack, Path(workspace), await changed_files(workspace, base_branch))
+            except LintScopeError as exc:
+                detail = str(exc).replace(github_token, "***") if github_token else str(exc)
+                logger.warning("[SCHEME] lint scoping failed for task %s: %s", task.id, detail)
+                return {
+                    "condition": "fail",
+                    "message": f"lint failed — could not determine the files changed against {base_branch}: {detail}",
+                }
+            if not plan.commands:
+                logger.info("[SCHEME] lint passed for task %s: %s", task.id, plan.skip_reason)
+                return {"condition": "pass", "message": f"lint passed — {plan.skip_reason}", "output": ""}
+            commands = plan.commands
+        else:
+            commands = (CheckCommand(argv=tuple(stack.test_command)),)
 
         if is_local:
-            # Run inside the operative Docker image with the workspace mounted
-            result = await _run_in_docker(workspace, shell_script)
+            # Run inside the operative Docker image with the workspace mounted.
+            result = await _run_in_docker(workspace, to_shell_script(commands, _install_script(stack)))
         else:
-            result = await _run_on_host(workspace, stack, check_type)
+            # In cloud mode the host has the toolchain.
+            result = await _run_on_host(workspace, stack, commands)
 
         passed = result["returncode"] == 0
         output = result["output"]
@@ -406,12 +408,25 @@ async def _run_in_docker(workspace: str, shell_script: str) -> dict[str, Any]:
     stdout, _ = await proc.communicate()
     output = stdout.decode(errors="replace")[:5000] if stdout else ""
 
-    return {"returncode": proc.returncode or 0, "output": output}
+    return {"returncode": proc.returncode if proc.returncode is not None else 1, "output": output}
 
 
-async def _run_on_host(workspace: str, stack: Stack, check_type: str) -> dict[str, Any]:
-    """Run CI check commands natively on the host (cloud mode)."""
-    # Install dependencies
+def _install_script(stack: Stack) -> str | None:
+    """The dependency install step as a shell fragment, with a lockfile-less fallback for Node."""
+    if stack.install_command is None:
+        return None
+    install_str = shlex.join(stack.install_command)
+    if stack.name == "node-pnpm":
+        # --frozen-lockfile fails when the lockfile is stale/absent.
+        return f"{install_str} || pnpm install --no-frozen-lockfile"
+    if stack.name == "node-npm":
+        # `npm ci` requires a lockfile; a plain install is the fallback.
+        return f"{install_str} || npm install --no-audit"
+    return install_str
+
+
+async def _run_on_host(workspace: str, stack: Stack, commands: tuple[CheckCommand, ...]) -> dict[str, Any]:
+    """Run CI check commands natively on the host (cloud mode); the first non-zero exit code wins."""
     if stack.install_command is not None:
         proc = await asyncio.create_subprocess_exec(
             *stack.install_command,
@@ -421,30 +436,27 @@ async def _run_on_host(workspace: str, stack: Stack, check_type: str) -> dict[st
         )
         await proc.communicate()
 
-    # Run the actual check
-    if check_type == "lint":
+    returncode = 0
+    outputs: list[str] = []
+    for command in commands:
         proc = await asyncio.create_subprocess_exec(
-            *stack.lint_command,
-            cwd=workspace,
+            *command.argv,
+            cwd=os.path.join(workspace, command.cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-    else:
-        proc = await asyncio.create_subprocess_exec(
-            *stack.test_command,
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        stdout, stderr = await proc.communicate()
+        stdout_text = stdout.decode(errors="replace")[:3000]
+        stderr_text = stderr.decode(errors="replace")[:3000]
+        output = stdout_text
+        if stderr_text:
+            output = f"{stdout_text}\n--- stderr ---\n{stderr_text}" if stdout_text.strip() else stderr_text
+        outputs.append(output)
+        command_rc = proc.returncode if proc.returncode is not None else 1
+        if command_rc != 0 and returncode == 0:
+            returncode = command_rc
 
-    stdout, stderr = await proc.communicate()
-    stdout_text = stdout.decode(errors="replace")[:3000]
-    stderr_text = stderr.decode(errors="replace")[:3000]
-    output = stdout_text
-    if stderr_text:
-        output = f"{stdout_text}\n--- stderr ---\n{stderr_text}" if stdout_text.strip() else stderr_text
-
-    return {"returncode": proc.returncode or 0, "output": output}
+    return {"returncode": returncode, "output": "\n".join(outputs)}
 
 
 # ---------------------------------------------------------------------------

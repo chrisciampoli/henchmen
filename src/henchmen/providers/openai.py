@@ -8,7 +8,7 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from henchmen.models.llm import LLMResponse, Message, MessageRole, ModelTier, TokenUsage, ToolCall, ToolDefinition
-from henchmen.providers.llm_common import json_schema, normalize_finish_reason, resolve_provider_model
+from henchmen.providers.llm_common import json_schema, normalize_finish_reason, resolve_or_remap_model
 from henchmen.providers.pricing import estimate_cost
 from henchmen.providers.tiers import tier_models
 
@@ -22,6 +22,9 @@ PROVIDER_NAME = "openai"
 # o-series reasoning models (o1/o3/o4...) reject `max_tokens` (they take
 # `max_completion_tokens`) and reject any non-default `temperature`.
 _REASONING_MODEL = re.compile(r"^o\d")
+
+# Model families served by other vendors; the OpenAI API cannot answer them.
+_FOREIGN_MODEL_PREFIXES: tuple[str, ...] = ("gemini", "claude", "anthropic.")
 
 
 def _is_reasoning_model(model: str) -> bool:
@@ -51,13 +54,18 @@ class OpenAIProvider:
 
             # An empty string would disable the SDK's own OPENAI_API_KEY lookup,
             # so pass None when the setting is unset and let the SDK resolve it.
-            api_key = (getattr(self._settings, "openai_api_key", "") or "").strip() or None
+            api_key = self._settings.openai_api_key.strip() or None
             self._client = openai.AsyncOpenAI(api_key=api_key)
         return self._client
 
     def resolve_tier(self, tier: str) -> str:
-        """Map a model tier to the configured OpenAI model; concrete names pass through."""
-        return resolve_provider_model(self._settings, tier, PROVIDER_NAME)
+        """Map a model tier to the configured OpenAI model.
+
+        Gemini/Claude model names (which the OpenAI API would 404 on) are
+        remapped to the COMPLEX tier with a warning; any other concrete name
+        passes through, so fine-tuned and custom model ids keep working.
+        """
+        return resolve_or_remap_model(self._settings, tier, PROVIDER_NAME, _FOREIGN_MODEL_PREFIXES)
 
     def supported_models(self) -> list[str]:
         """Return the configured tier models, deduped and in tier order."""

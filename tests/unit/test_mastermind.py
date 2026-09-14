@@ -27,7 +27,7 @@ from henchmen.models.scheme import (
     SchemeEdge,
     SchemeNode,
 )
-from henchmen.models.task import HenchmenTask, TaskContext, TaskSource
+from henchmen.models.task import HenchmenTask, TaskContext, TaskSource, TaskType
 from henchmen.schemes.base import SchemeGraph
 from henchmen.schemes.registry import SchemeRegistry
 
@@ -108,7 +108,6 @@ def _mock_settings(**overrides):
     ``HENCHMEN_GCP_PROJECT_ID`` env var and disable Vertex AI evaluation
     so tests don't try to hit the real service.
     """
-    import os
 
     from henchmen.config.settings import get_settings
 
@@ -362,6 +361,57 @@ class TestSchemeExecutorAgentic:
 
         assert result["node_results"]["agent_step"]["condition"] == "fail"
 
+    @staticmethod
+    def _report(status: OperativeStatus) -> OperativeReport:
+        return OperativeReport(
+            task_id="task-001",
+            scheme_id="test_scheme",
+            node_id="agent_step",
+            operative_id="lair-x",
+            status=status,
+            summary=status.value,
+            confidence_score=0.0,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+        )
+
+    @pytest.mark.asyncio
+    async def test_interrupted_operative_is_redispatched_once(self):
+        """SIGTERM is external: an INTERRUPTED node gets one re-dispatch before failing."""
+        graph = _linear_scheme(["agent_step"], node_types={"agent_step": NodeType.AGENTIC})
+        mock_lair = AsyncMock(spec=LairManager)
+        mock_lair.create_lair.side_effect = ["lair-1", "lair-2"]
+        mock_lair.wait_for_completion.side_effect = [
+            self._report(OperativeStatus.INTERRUPTED),
+            self._report(OperativeStatus.COMPLETED),
+        ]
+        executor = SchemeExecutor(graph, mock_lair, _mock_settings())
+        task = _make_task()
+
+        result = await executor.execute(task, Dossier(task_id=task.id))
+
+        assert mock_lair.create_lair.await_count == 2
+        assert result["node_results"]["agent_step"]["condition"] == "pass"
+        assert result["node_results"]["agent_step"]["lair_id"] == "lair-2"
+
+    @pytest.mark.asyncio
+    async def test_repeatedly_interrupted_operative_fails_closed(self):
+        graph = _linear_scheme(["agent_step"], node_types={"agent_step": NodeType.AGENTIC})
+        mock_lair = AsyncMock(spec=LairManager)
+        mock_lair.create_lair.side_effect = ["lair-1", "lair-2", "lair-3"]
+        mock_lair.wait_for_completion.side_effect = [
+            self._report(OperativeStatus.INTERRUPTED),
+            self._report(OperativeStatus.INTERRUPTED),
+            self._report(OperativeStatus.COMPLETED),
+        ]
+        executor = SchemeExecutor(graph, mock_lair, _mock_settings())
+        task = _make_task()
+
+        result = await executor.execute(task, Dossier(task_id=task.id))
+
+        assert mock_lair.create_lair.await_count == 2
+        assert result["node_results"]["agent_step"]["condition"] == "fail"
+
 
 class TestSchemeExecutorCIChecks:
     """Test that CI check failures are fail-closed."""
@@ -422,6 +472,178 @@ class TestSchemeExecutorCIChecks:
         result = await _run_ci_check(executor, task, "lint")
 
         assert result["condition"] == "fail"
+
+    @staticmethod
+    def _ok_proc(returncode: int = 0, stdout: bytes = b"", stderr: bytes = b"") -> AsyncMock:
+        proc = AsyncMock()
+        proc.returncode = returncode
+        proc.communicate = AsyncMock(return_value=(stdout, stderr))
+        return proc
+
+    @pytest.mark.asyncio
+    async def test_undetectable_stack_fails_closed(self):
+        """No recognisable manifest means nothing was verified — escalate, never skip."""
+        from henchmen.mastermind.scheme_executor.handlers import _run_ci_check
+        from henchmen.utils.stack_detector import Stack
+
+        executor = SchemeExecutor(_linear_scheme(["run_lint"]), MagicMock(spec=LairManager), _mock_settings())
+
+        with (
+            patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
+            patch("asyncio.create_subprocess_exec", return_value=self._ok_proc()),
+            patch("henchmen.mastermind.scheme_executor.handlers.detect_stack", return_value=Stack(name="unknown")),
+        ):
+            result = await _run_ci_check(executor, _make_task(), "lint")
+
+        assert result["condition"] == "fail"
+        assert "could not detect" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_verify_changes_diffs_against_the_task_base_branch(self):
+        from henchmen.mastermind.scheme_executor.handlers import handle_verify_changes
+
+        executor = SchemeExecutor(_linear_scheme(["verify_changes"]), MagicMock(spec=LairManager), _mock_settings())
+        task = _make_task(context=TaskContext(repo="acme/webapp", branch="develop"))
+        calls: list[tuple[str, ...]] = []
+
+        async def _exec(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ("git", "log"):
+                return self._ok_proc(stdout=b"abc123 fix\n")
+            if args[:2] == ("git", "diff"):
+                return self._ok_proc(stdout=b"src/app.py\n")
+            return self._ok_proc()
+
+        with (
+            patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=""),
+            patch("asyncio.create_subprocess_exec", side_effect=_exec),
+        ):
+            result = await handle_verify_changes(executor, _make_node("verify_changes"), task, Dossier(task_id=task.id))
+
+        assert result["condition"] == "pass"
+        assert ("git", "fetch", "origin", "develop:refs/remotes/origin/develop", "--depth=1") in calls
+        assert ("git", "log", "origin/develop..HEAD", "--oneline") in calls
+        assert ("git", "diff", "--name-only", "origin/develop") in calls
+
+    @pytest.mark.asyncio
+    async def test_fix_lint_commit_failure_is_not_reported_as_pushed(self, tmp_path):
+        from henchmen.mastermind.scheme_executor.handlers import handle_fix_lint
+
+        executor = SchemeExecutor(_linear_scheme(["fix_lint"]), MagicMock(spec=LairManager), _mock_settings())
+        task = _make_task()
+        git_calls: list[tuple[str, ...]] = []
+
+        async def _exec(*args, **kwargs):
+            if args[0] == "git":
+                git_calls.append(args)
+                if args[1] == "status":
+                    return self._ok_proc(stdout=b" M src/app.py\0")
+                if args[1] == "commit":
+                    return self._ok_proc(returncode=1, stderr=b"nothing added to commit")
+            return self._ok_proc()
+
+        workspace = tmp_path / "ws"
+        (workspace / "src").mkdir(parents=True)
+        (workspace / "src" / "app.py").write_text("x = 1", encoding="utf-8")
+        with (
+            patch("henchmen.mastermind.scheme_executor.handlers.tempfile.mkdtemp", return_value=str(workspace)),
+            patch("henchmen.mastermind.scheme_executor.handlers.shutil.rmtree"),
+            patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=""),
+            patch("henchmen.mastermind.scheme_executor.handlers.detect_stack", return_value=_python_stack()),
+            patch(
+                "henchmen.mastermind.scheme_executor.handlers.changed_files",
+                new=AsyncMock(return_value=["src/app.py"]),
+            ),
+            patch("asyncio.create_subprocess_exec", side_effect=_exec),
+        ):
+            result = await handle_fix_lint(executor, _make_node("fix_lint"), task, Dossier(task_id=task.id))
+
+        assert result["condition"] == "fail"
+        assert "git commit failed" in result["message"]
+        assert not any(call[1] == "push" for call in git_calls)
+
+    @pytest.mark.asyncio
+    async def test_fix_lint_only_fixes_and_stages_files_the_operative_changed(self, tmp_path):
+        from henchmen.mastermind.scheme_executor.handlers import handle_fix_lint
+
+        executor = SchemeExecutor(_linear_scheme(["fix_lint"]), MagicMock(spec=LairManager), _mock_settings())
+        task = _make_task()
+        calls: list[tuple[str, ...]] = []
+
+        async def _exec(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ("git", "status"):
+                return self._ok_proc(stdout=b" M src/app.py\0 M src/untouched.py\0")
+            return self._ok_proc()
+
+        workspace = tmp_path / "ws"
+        (workspace / "src").mkdir(parents=True)
+        (workspace / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+        with (
+            patch("henchmen.mastermind.scheme_executor.handlers.tempfile.mkdtemp", return_value=str(workspace)),
+            patch("henchmen.mastermind.scheme_executor.handlers.shutil.rmtree"),
+            patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=""),
+            patch("henchmen.mastermind.scheme_executor.handlers.detect_stack", return_value=_python_stack()),
+            patch(
+                "henchmen.mastermind.scheme_executor.handlers.changed_files",
+                new=AsyncMock(return_value=["src/app.py"]),
+            ),
+            patch("asyncio.create_subprocess_exec", side_effect=_exec),
+        ):
+            result = await handle_fix_lint(executor, _make_node("fix_lint"), task, Dossier(task_id=task.id))
+
+        fixer = next(call for call in calls if "ruff" in call)
+        assert "--fix" in fixer
+        assert "./src/app.py" in fixer
+        assert "." not in fixer, "the fixer must not run over the whole repository"
+        assert ("git", "checkout", "--", "src/untouched.py") in calls
+        assert ("git", "add", "--", "src/app.py") in calls
+        assert result["condition"] is None
+
+    @pytest.mark.asyncio
+    async def test_fix_lint_does_not_run_ruff_on_non_python_stacks(self):
+        from henchmen.mastermind.scheme_executor.handlers import handle_fix_lint
+        from henchmen.utils.stack_detector import Stack
+
+        executor = SchemeExecutor(_linear_scheme(["fix_lint"]), MagicMock(spec=LairManager), _mock_settings())
+        task = _make_task()
+        go = Stack(name="go", test_command=["go", "test", "./..."], lint_command=["go", "vet", "./..."])
+        calls: list[tuple[str, ...]] = []
+
+        async def _exec(*args, **kwargs):
+            calls.append(args)
+            return self._ok_proc()
+
+        with (
+            patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=""),
+            patch("henchmen.mastermind.scheme_executor.handlers.detect_stack", return_value=go),
+            patch(
+                "henchmen.mastermind.scheme_executor.handlers.changed_files",
+                new=AsyncMock(return_value=["main.go"]),
+            ),
+            patch("asyncio.create_subprocess_exec", side_effect=_exec),
+        ):
+            result = await handle_fix_lint(executor, _make_node("fix_lint"), task, Dossier(task_id=task.id))
+
+        assert result["condition"] is None
+        assert "no auto-fixer" in result["message"]
+        assert not any("ruff" in call for call in calls)
+
+
+def _python_stack():
+    """The Stack detect_stack returns for a plain Python project."""
+    import tempfile
+    from pathlib import Path
+
+    from henchmen.utils.stack_detector import detect_stack
+
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+        return detect_stack(Path(tmp))
 
 
 class TestSchemeExecutorLairFailure:
@@ -630,6 +852,27 @@ class TestMastermindSelectScheme:
         task = _make_task(title="Something odd", description="we should improve this someday")
         assert await agent._select_scheme(task) == "bugfix_standard"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("task_type", "title", "expected"),
+        [
+            # An explicit type beats the opposite keywords in the text.
+            (TaskType.BUGFIX, "Add null check to parseConfig", "bugfix_standard"),
+            (TaskType.FEATURE, "Fix up the onboarding flow with a new wizard", "feature_standard"),
+            (TaskType.REFACTOR, "Fix naming in the auth module", "feature_standard"),
+        ],
+    )
+    async def test_explicit_task_type_overrides_keywords(self, task_type, title, expected):
+        agent = _make_agent()
+        task = _make_task(title=title, description="details", task_type=task_type)
+        assert await agent._select_scheme(task) == expected
+
+    @pytest.mark.asyncio
+    async def test_goal_keywords_still_win_over_explicit_type(self):
+        agent = _make_agent()
+        task = _make_task(title="Migrate every service to the new logger", description="", task_type=TaskType.FEATURE)
+        assert await agent._select_scheme(task) == "goal_decomposition"
+
 
 # ===========================================================================
 # MastermindAgent.handle_task (full lifecycle)
@@ -657,7 +900,13 @@ class TestMastermindHandleTask:
         downstream handler chain (which has its own dedicated tests).
         """
         settings = _mock_settings()
-        agent = _make_agent(settings)
+        # Inject a broker double: a PR URL triggers a CI publish, which must
+        # never build a real Pub/Sub client in a unit test.
+        broker = MagicMock()
+        broker.publish = AsyncMock()
+        agent = _make_agent(settings, broker=broker)
+        # Semantic search would otherwise call the live RAG Engine.
+        agent._fetch_semantic_chunks = AsyncMock(return_value=[])
 
         # Mock the DossierBuilder
         mock_builder = AsyncMock()
@@ -703,6 +952,8 @@ class TestMastermindHandleTask:
         assert result["task_id"] == "task-001"
         assert result["scheme_id"] == "bugfix_standard"
         assert result["status"] == "completed"
+        broker.publish.assert_awaited_once()
+        assert broker.publish.await_args.args[0] == settings.pubsub_topic_forge_request
 
         # Verify the task was tracked in the in-memory active set.
         # Authoritative state lives in Firestore `task_executions/{task_id}`.
@@ -817,54 +1068,109 @@ class TestFetchSemanticChunks:
         )
 
     @pytest.mark.asyncio
-    async def test_returns_empty_when_no_pinecone_key(self):
+    async def test_returns_empty_without_repo_and_skips_the_query(self):
         agent = self._make_agent()
         task = self._make_task()
+        task.context = TaskContext(repo="")
 
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("PINECONE_API_KEY", None)
+        with patch("henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock) as query:
             result = await agent._fetch_semantic_chunks(task)
 
         assert result == []
+        query.assert_not_awaited()
 
-    @pytest.mark.asyncio
-    async def test_returns_chunks_when_configured(self):
+    @staticmethod
+    def _chunks() -> list:
         from henchmen.models.dossier import SemanticChunk
 
-        agent = self._make_agent()
-        task = self._make_task()
-
-        mock_chunks = [
+        return [
             SemanticChunk(
-                file_path="src/auth.py",
+                file_path=f"src/auth_{i}.py",
                 start_line=1,
                 end_line=10,
                 symbol_name="login",
                 language="python",
                 content="def login(): ...",
-                relevance_score=0.9,
+                relevance_score=0.9 - i / 10,
             )
+            for i in range(3)
         ]
 
-        with (
-            patch.dict(os.environ, {"PINECONE_API_KEY": "test-key"}),
-            patch("henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock, return_value=mock_chunks),
-        ):
+    @staticmethod
+    def _patch_rerank(monkeypatch, rerank: AsyncMock) -> None:
+        """Replace the real reranker (imported lazily by the agent) with a double."""
+        import henchmen.dossier.reranker as reranker_module
+
+        monkeypatch.setattr(reranker_module, "rerank_semantic_chunks", rerank)
+
+    def _agent_with_rerank(self, enabled: bool):
+        llm = MagicMock(name="llm_provider")
+        settings = _mock_settings(dossier_semantic_rerank=enabled)
+        with patch("henchmen.mastermind.agent.LairManager"):
+            agent = _make_agent(settings, llm_provider=llm)
+        return agent, llm
+
+    @pytest.mark.asyncio
+    async def test_reranks_retrieved_chunks_when_enabled(self, monkeypatch):
+        agent, llm = self._agent_with_rerank(enabled=True)
+        task = self._make_task()
+        chunks = self._chunks()
+        reranked = list(reversed(chunks))[:2]
+        rerank = AsyncMock(return_value=reranked)
+        self._patch_rerank(monkeypatch, rerank)
+
+        with patch("henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock, return_value=chunks):
             result = await agent._fetch_semantic_chunks(task)
 
-        assert len(result) == 1
-        assert result[0].file_path == "src/auth.py"
+        assert result == reranked
+        rerank.assert_awaited_once()
+        args, kwargs = rerank.await_args
+        assert args == (chunks, f"{task.title}\n{task.description}", llm)
+        assert kwargs == {"top_k": 10, "settings": agent.settings}
+
+    @pytest.mark.asyncio
+    async def test_skips_rerank_when_disabled(self, monkeypatch):
+        agent, _llm = self._agent_with_rerank(enabled=False)
+        chunks = self._chunks()
+        rerank = AsyncMock()
+        self._patch_rerank(monkeypatch, rerank)
+
+        with patch("henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock, return_value=chunks):
+            result = await agent._fetch_semantic_chunks(self._make_task())
+
+        assert result == chunks
+        rerank.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_rerank_for_empty_results(self, monkeypatch):
+        agent, _llm = self._agent_with_rerank(enabled=True)
+        rerank = AsyncMock()
+        self._patch_rerank(monkeypatch, rerank)
+
+        with patch("henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock, return_value=[]):
+            result = await agent._fetch_semantic_chunks(self._make_task())
+
+        assert result == []
+        rerank.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rerank_failure_keeps_vector_search_order(self, monkeypatch):
+        agent, _llm = self._agent_with_rerank(enabled=True)
+        chunks = self._chunks()
+        self._patch_rerank(monkeypatch, AsyncMock(side_effect=RuntimeError("llm down")))
+
+        with patch("henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock, return_value=chunks):
+            result = await agent._fetch_semantic_chunks(self._make_task())
+
+        assert result == chunks
 
     @pytest.mark.asyncio
     async def test_graceful_on_exception(self):
         agent = self._make_agent()
         task = self._make_task()
 
-        with (
-            patch.dict(os.environ, {"PINECONE_API_KEY": "test-key"}),
-            patch(
-                "henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock, side_effect=Exception("boom")
-            ),
+        with patch(
+            "henchmen.mastermind.agent.query_similar_chunks", new_callable=AsyncMock, side_effect=Exception("boom")
         ):
             result = await agent._fetch_semantic_chunks(task)
 

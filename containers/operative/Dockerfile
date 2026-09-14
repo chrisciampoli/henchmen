@@ -9,10 +9,13 @@ COPY containers/operative/requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 COPY src/ ./src/
-COPY pyproject.toml .
-# [local] brings the openai + anthropic SDKs so direct-LLM operatives work.
+# README.md is pyproject's `readme`; without it setuptools warns and builds
+# metadata with an empty long description.
+COPY pyproject.toml README.md ./
+# [local] brings the openai + anthropic SDKs so direct-LLM operatives work;
+# [observability] lets bootstrap's init_tracing() export to Cloud Trace.
 # pytest/ruff/mypy are the tools the agent runs against a Python target repo.
-RUN pip install --no-cache-dir --prefix=/install -e ".[local]" \
+RUN pip install --no-cache-dir --prefix=/install -e ".[local,observability]" \
     && pip install --no-cache-dir --prefix=/install pytest ruff mypy
 
 # --- Node.js builder stage ---
@@ -47,7 +50,7 @@ RUN groupadd --gid 1001 henchmen && useradd --uid 1001 --gid henchmen --shell /b
 WORKDIR /app
 
 COPY src/ ./src/
-COPY pyproject.toml .
+COPY pyproject.toml README.md ./
 RUN pip install --no-cache-dir --no-deps -e .
 
 RUN mkdir -p /workspace && chown -R henchmen:henchmen /app /workspace

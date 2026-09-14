@@ -67,9 +67,9 @@ _TIER_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
         "reasoning": ("llm_ollama_model_reasoning", "deepseek-r1:8b"),
     },
     "aws": {
-        "complex": ("bedrock_model_complex", "anthropic.claude-sonnet-4-20250514-v1:0"),
-        "light": ("bedrock_model_light", "anthropic.claude-haiku-4-5-20251001-v1:0"),
-        "reasoning": ("bedrock_model_reasoning", "anthropic.claude-sonnet-4-20250514-v1:0"),
+        "complex": ("bedrock_model_complex", "us.anthropic.claude-sonnet-4-20250514-v1:0"),
+        "light": ("bedrock_model_light", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
+        "reasoning": ("bedrock_model_reasoning", "us.anthropic.claude-sonnet-4-20250514-v1:0"),
     },
 }
 _VERTEX_MODELS: tuple[str, ...] = ("gemini-2.5-pro", "gemini-2.5-flash", "gemini-3.1-pro")

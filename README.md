@@ -41,6 +41,7 @@ pip install -e ".[local,dev]"
 
 henchmen init              # interactive setup — writes .env.local
 henchmen doctor            # verify everything it just configured
+henchmen config --only-set # optional: the effective settings, credentials masked
 henchmen build-operative   # build the operative image (first run, ~3 min)
 henchmen serve             # Dispatch + Mastermind + Forge in one process
 ```
@@ -60,18 +61,56 @@ henchmen chat
 or post one directly:
 
 ```bash
-curl -X POST http://localhost:8000/dispatch/api/v1/tasks   -H "Content-Type: application/json"   -d '{
+curl -X POST http://localhost:8000/dispatch/api/v1/tasks \
+  -H "Authorization: Bearer $HENCHMEN_DISPATCH_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
     "title": "Fix the login bug",
     "description": "Users cannot log in after a password reset",
-    "repo": "your-org/your-repo"
+    "repo": "your-org/your-repo",
+    "task_type": "bugfix"
   }'
 ```
+
+`POST /api/v1/tasks` requires `Authorization: Bearer <HENCHMEN_DISPATCH_API_TOKEN>`.
+The header is optional in dev while the token is empty (Dispatch logs a warning
+and accepts the request); in staging and prod an empty token makes the route
+return 401. `henchmen chat` sends the header for you.
+
+`task_type` is optional: `bugfix`, `feature` or `refactor`. When set it picks
+the scheme (`bugfix_standard`, or `feature_standard` for feature and refactor)
+instead of keyword matching on the text. Goal phrases in the title such as
+"improve" or "fix all" still route to `goal_decomposition` first.
+
+### CLI
+
+| Command | What it does |
+|---|---|
+| `henchmen init [--section ...]` | Interactive setup; writes `.env.local` |
+| `henchmen doctor [--offline]` | Checks the environment, credentials, tier models and their prices |
+| `henchmen config [--only-set]` | Prints the effective settings, credentials masked |
+| `henchmen build-operative [--no-cache]` | Builds the local `henchmen-operative:local` image |
+| `henchmen serve` | Runs Dispatch, Mastermind and Forge in one process, including each service's startup (the Slack bot connects, the metrics routes are mounted) |
+| `henchmen chat` | Describe a task conversationally, then submit it to Dispatch |
+| `henchmen embed <owner/repo> [--full]` | Indexes a repository into the RAG Engine corpus. Incremental by default; `--full` clears the repo's existing chunks and re-indexes every file. Exits non-zero unless the run completed |
+| `henchmen eval run / compare / history` | Offline eval harness (see [`evals/README.md`](evals/README.md)) |
+
+On GCP, Dispatch also requests an incremental re-index whenever GitHub reports a
+push to the repository's default branch; Mastermind runs it from the
+`embed-request` topic.
 
 ### Docker Compose
 
 `docker compose up` runs the same single-process server plus an Ollama
 sidecar. It mounts the Docker socket so the server can launch operative
 containers. Configure `.env.local` first — `henchmen init` is the easy way.
+
+### Prebuilt images
+
+Each release publishes `ghcr.io/chrisciampoli/henchmen/{dispatch,mastermind,forge,operative}`
+tagged `X.Y.Z` and `latest`. See
+[Prebuilt images](docs/deploy-gcp.md#prebuilt-images) for pulling them and
+copying them into Artifact Registry for Cloud Run.
 
 ---
 
@@ -82,8 +121,9 @@ containers. Configure `.env.local` first — `henchmen init` is the easy way.
 2. Dispatch normalizes it     (unified Task model, publishes to message broker)
 3. Mastermind plans the work  (selects a Scheme, builds a Dossier with RAG context)
 4. Operative executes         (ephemeral container, LLM + Arsenal tools, commits code)
-5. Forge runs CI              (lint, tests, builds the PR)
-6. You review the PR          (human-in-the-loop, always)
+5. Mastermind gates and opens (lint + test gates must pass, then it opens the PR)
+6. Forge runs CI on the PR    (lint, tests, silent-failure scan, PR comment)
+7. You review the PR          (human-in-the-loop, always)
 ```
 
 ---
@@ -98,8 +138,9 @@ graph LR
     C --> E["Schemes\n(workflow DAG)"]
     E --> F["Operative\n(coding agent)"]
     F --> G["Arsenal\n(code tools)"]
-    F --> H["Forge\n(CI + PR)"]
-    H --> I["Pull Request\n(ready for review)"]
+    F --> C
+    C --> I["Pull Request\n(ready for review)"]
+    I --> H["Forge\n(post-PR CI)"]
 
     style A fill:#1a1a2e,stroke:#7c3aed,color:#e2e8f0
     style C fill:#1a1a2e,stroke:#7c3aed,color:#e2e8f0
@@ -113,12 +154,12 @@ graph LR
 
 | Component | Path | Role |
 |---|---|---|
-| **Mastermind** | `src/henchmen/mastermind/` | Orchestrator. State machine, scheme selection, operative dispatch. Fail-closed CI gates. |
+| **Mastermind** | `src/henchmen/mastermind/` | Orchestrator. Scheme selection, DAG execution, operative dispatch, stalled-task watchdog. Fail-closed lint/test gates, then opens the PR. |
 | **Dispatch** | `src/henchmen/dispatch/` | Intake router. Normalizes tasks from all sources into a unified Task model. |
 | **Operative** | `src/henchmen/operative/` | Coding agent. Ephemeral container. Executes scheme nodes with Arsenal tools. |
 | **Arsenal** | `src/henchmen/arsenal/` | Tool registry, in-process inside the Operative. `code_edit`, `code_intel`, `context`, `git_ops`, `github`, `jira`, `slack`, `test_runner`. |
-| **Forge** | `src/henchmen/forge/` | CI + merge queue. Runs lint/tests, builds PRs, detects silent failures. |
-| **Dossier** | `src/henchmen/dossier/` | Context builder. Rules, semantic code search via Vertex AI RAG Engine, task analysis. Caches to object store. |
+| **Forge** | `src/henchmen/forge/` | Post-PR CI. Runs lint/tests on the PR Mastermind opened, detects silent failures, comments the result (passed, failed, or incomplete when a check could not run). |
+| **Dossier** | `src/henchmen/dossier/` | Context builder. Rules, semantic code search via Vertex AI RAG Engine, task analysis. Uploads the dossier to the object store. |
 | **Schemes** | `src/henchmen/schemes/` | DAG workflow blueprints: `bugfix_standard`, `feature_standard`, `goal_decomposition`. |
 
 ---
@@ -199,6 +240,7 @@ the bare names a Cloud Run secret mount injects (`GITHUB_TOKEN`,
 | `HENCHMEN_GITHUB_TOKEN` | Classic PAT with the `repo` scope | *(required for PRs)* |
 | `HENCHMEN_GITHUB_DEFAULT_REPO` | Target repository, `owner/repo` | *(required)* |
 | `HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD` | Spend allowed per task | `6.0` |
+| `HENCHMEN_DISPATCH_API_TOKEN` | Bearer token for `POST /api/v1/tasks` (open in dev when empty, 401 in staging/prod) | *(empty)* |
 
 See [`.env.example`](.env.example) for every setting with commentary, or
 [`src/henchmen/config/settings.py`](src/henchmen/config/settings.py) for the
@@ -244,10 +286,6 @@ comments, CI-failure events), point the repo's webhook at
 `https://your-dispatch-url/webhooks/github` and set
 `HENCHMEN_GITHUB_WEBHOOK_SECRET` to the same secret. Only comments from users
 with a trusted association (owner, member, collaborator) can start a run.
-
-`HENCHMEN_GITHUB_APP_ID` and `HENCHMEN_GITHUB_APP_PRIVATE_KEY_SECRET` exist in
-settings but are reserved for a future GitHub App intake path; nothing reads
-them today.
 
 </details>
 
@@ -298,9 +336,25 @@ channels cannot be self-joined — invite the bot with `/invite @YourBot`.
 HENCHMEN_JIRA_BASE_URL=https://your-org.atlassian.net
 HENCHMEN_JIRA_EMAIL=your-service-account@your-org.com
 HENCHMEN_JIRA_API_TOKEN=your-jira-api-token
-HENCHMEN_JIRA_PROJECT_KEY=PROJ
 HENCHMEN_JIRA_WEBHOOK_SECRET=shared-secret
+HENCHMEN_JIRA_REPO_FIELD=customfield_10042
+HENCHMEN_JIRA_BRANCH_FIELD=customfield_10043
 ```
+
+`HENCHMEN_JIRA_WEBHOOK_SECRET` verifies the webhook signature. It is required in
+staging and prod — without it every Jira delivery is rejected with 401. The
+operative's Jira tools use the base URL, email and API token.
+
+A Jira webhook delivers custom fields only under their numeric id
+(`customfield_<number>`), never under a name like "Repository". If your issues
+carry the target repository (`owner/repo`) and branch in custom fields, set
+`HENCHMEN_JIRA_REPO_FIELD` and `HENCHMEN_JIRA_BRANCH_FIELD` to those ids. To
+find an id, open **Jira settings > Issues > Custom fields**, choose the field's
+**...** menu and read the numeric id from the page URL (`10042` becomes
+`customfield_10042`), or call
+`GET https://your-org.atlassian.net/rest/api/3/field` and take the `"id"` of the
+field whose `"name"` matches. An issue with no repository field falls back to
+`HENCHMEN_GITHUB_DEFAULT_REPO`.
 
 </details>
 
@@ -309,11 +363,11 @@ HENCHMEN_JIRA_WEBHOOK_SECRET=shared-secret
 ## Development
 
 ```bash
-ruff check --fix src/ tests/   # Auto-fix lint
-ruff check src/ tests/          # Verify clean
-ruff format src/ tests/         # Format
-mypy src/                       # Type check
-pytest tests/unit/              # Unit tests
+ruff check --fix src/ tests/ evals/   # Auto-fix lint
+ruff check src/ tests/ evals/          # Verify clean
+ruff format src/ tests/ evals/         # Format
+mypy src/ evals/                       # Type check
+pytest tests/unit/                     # Unit tests
 ```
 
 All five must pass before submitting a PR. See [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -325,6 +379,9 @@ All five must pass before submitting a PR. See [CONTRIBUTING.md](CONTRIBUTING.md
 Start with `henchmen doctor`. It builds the same `Settings` the services use,
 so it sees your `.env.local`, and it probes each configured credential against
 the real API. `henchmen doctor --offline` skips the network calls.
+`henchmen config` prints the effective settings with credentials masked;
+`--only-set` limits it to the values you changed from the defaults — the
+quickest way to see whether `.env.local` or an exported variable won.
 
 **`henchmen-operative:local` image build fails**
 Check that Docker Desktop is running with at least 4GB of RAM. Try
@@ -362,20 +419,29 @@ Henchmen detects the target repository's stack at runtime via manifest
 files and runs the appropriate lint / test commands. The following
 stacks are detected and supported out of the box:
 
-| Stack        | Detected by                             | Test command                         | Lint command             |
-|--------------|-----------------------------------------|--------------------------------------|--------------------------|
-| Python       | `pyproject.toml`, `setup.py`, `requirements.txt` | `python -m pytest`          | `python -m ruff check`   |
-| Node (pnpm)  | `pnpm-lock.yaml` (+ `turbo.json` for monorepos) | `pnpm run test`             | `pnpm run lint`          |
-| Node (npm)   | `package.json` (no pnpm lockfile)       | `npm test`                           | `eslint` on changed files |
-| Go           | `go.mod`                                | `go test ./...`                      | `go vet ./...`           |
-| Rust         | `Cargo.toml`                            | `cargo test`                         | `cargo clippy`           |
-| Java (Maven) | `pom.xml`                               | `mvn test`                           | `mvn verify -DskipTests` |
-| Java (Gradle)| `build.gradle` or `build.gradle.kts`    | `./gradlew test`                     | `./gradlew check -x test`|
+| Stack        | Detected by                                      | Test command                          | Lint command                     |
+|--------------|--------------------------------------------------|---------------------------------------|----------------------------------|
+| Python       | `pyproject.toml`, `setup.py`, `requirements.txt` | `python -m pytest -q`                 | `python -m ruff check .`         |
+| Rust         | `Cargo.toml`                                     | `cargo test`                          | `cargo clippy -- -D warnings`    |
+| Go           | `go.mod`                                         | `go test ./...`                       | `go vet ./...`                   |
+| Java (Maven) | `pom.xml`                                        | `mvn test`                            | `mvn verify -DskipTests`         |
+| Java (Gradle)| `build.gradle` or `build.gradle.kts`             | `./gradlew test`                      | `./gradlew check -x test`        |
+| Node (pnpm)  | `package.json` + `pnpm-lock.yaml`                | `pnpm run --if-present test`          | `pnpm run --if-present lint`     |
+| Node (npm)   | `package.json` (no pnpm lockfile)                | `npm run --if-present test`           | `npm run --if-present lint`      |
 
-If your project uses something else, the run_tests handler falls back
-gracefully with a "stack not detected" skip rather than failing. See
-`src/henchmen/utils/stack_detector.py` for the detection logic and add
-a new stack via a pull request.
+The lint column is the stack's project-wide command. The Mastermind lint gate
+narrows it to the files the operative changed against the base branch: `ruff`
+on changed Python files, `eslint` on changed JS/TS files (from the nearest
+`package.json`), `go vet` on changed Go packages, and the Rust or Java command
+only when the branch touched that language. If that diff cannot be computed
+the gate fails.
+
+Detection runs top to bottom and the first match wins, so a repo with both
+`pyproject.toml` and `package.json` is treated as Python. If no manifest
+matches, the lint and test gates **fail** and the task escalates for human
+review — Henchmen will not open a PR it could not check. See
+`src/henchmen/utils/stack_detector.py` for the detection logic and add a new
+stack via a pull request.
 
 ---
 
@@ -390,14 +456,18 @@ account, run the eval harness:
 # Run a single fixture against the provider of your choice.
 henchmen eval run --provider openai --fixture bugfix_off_by_one
 
-# Run the whole fixture set (3 fixtures by default — add your own in
-# evals/fixtures/).
+# Run every fixture in evals/fixtures/ (11 ship today — add your own there).
 henchmen eval run --provider ollama
+
+# Record this run as the provider's baseline.
+henchmen eval run --provider openai --write-baseline
 ```
 
-Results go to `evals/baseline.json`. A stub file ships in the repo with
-a `"how to populate me"` hint next to every provider entry. If you want
-to publish your numbers, open a PR updating the stub with your results.
+Every run is saved to a local SQLite history (`henchmen eval history`,
+`henchmen eval compare <run_a> <run_b>`). `--write-baseline` also writes the
+provider's entry in `evals/baseline.json`; `--compare-baseline` fails on a
+drop of more than 5%. If you want to publish your numbers, open a PR
+updating `evals/baseline.json`. See [`evals/README.md`](evals/README.md).
 
 The [`.github/workflows/evals.yml`](.github/workflows/evals.yml)
 workflow is `workflow_dispatch`-triggered so you can run it against
@@ -411,6 +481,10 @@ updating `evals/baseline.json` for review.
 - [Architecture](docs/architecture.md)
 - [Schemes](docs/schemes.md)
 - [Cost Model](docs/cost-model.md)
+- [Deploying on GCP](docs/deploy-gcp.md)
+- [Operations](docs/operations.md)
+- [Incident Runbook](docs/incident-runbook.md)
+- [Rollback Procedures](docs/rollback-procedures.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
 ---

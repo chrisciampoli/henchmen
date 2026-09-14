@@ -74,7 +74,10 @@ gcloud-service-key.json
 
 # Terraform
 **/.terraform/
-**/.terraform.lock.hcl
+# Provider lock files ARE committed (terraform/environments/*): CI validates
+# with -lockfile=readonly, so provider versions cannot drift silently.
+# Modules are not root configurations; a lock there is a stray local init.
+terraform/modules/**/.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfplan

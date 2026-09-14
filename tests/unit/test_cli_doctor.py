@@ -23,6 +23,7 @@ from henchmen.cli.doctor import (
     check_github,
     check_jira,
     check_llm_credentials,
+    check_model_pricing,
     check_model_tiers,
     check_operative_image,
     check_python_version,
@@ -182,6 +183,34 @@ class TestCheckModelTiers:
         result = check_model_tiers(settings)
         assert result.status == CheckStatus.FAIL
         assert "default/light" in result.message
+
+
+class TestCheckModelPricing:
+    def test_priced_defaults_are_ok(self) -> None:
+        result = check_model_pricing(_settings(llm_provider="anthropic"))
+        assert result.status == CheckStatus.OK
+
+    def test_unpriced_tier_model_warns(self) -> None:
+        """An unpriced model costs $0, so the task cost ceiling can never trip."""
+        result = check_model_pricing(_settings(llm_provider="openai", openai_model_complex="gpt-made-up-9"))
+        assert result.status == CheckStatus.WARN
+        assert "gpt-made-up-9" in result.message
+        assert "ceiling" in result.message
+        assert result.hint is not None and "PRICE_TABLE" in result.hint
+
+    def test_local_models_are_not_flagged(self) -> None:
+        result = check_model_pricing(_settings(llm_provider="local", llm_ollama_model="qwen-unpriced"))
+        assert result.status == CheckStatus.OK
+
+    def test_run_doctor_includes_the_pricing_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        with (
+            patch("henchmen.cli.doctor.check_docker", return_value=CheckResult("Docker", CheckStatus.OK, "")),
+            patch("henchmen.cli.doctor.check_git_identity", return_value=CheckResult("Git", CheckStatus.OK, "")),
+            patch("henchmen.cli.doctor.check_operative_image", return_value=CheckResult("Img", CheckStatus.OK, "")),
+        ):
+            names = [r.name for r in run_doctor(offline=True)]
+        assert "Model pricing" in names
 
 
 class TestCheckLLMCredentials:

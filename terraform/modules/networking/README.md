@@ -1,6 +1,8 @@
 # networking
 
-Provisions the Henchmen VPC, primary subnet, egress-allowlist firewall rules, and the Serverless VPC Access Connector used by Cloud Run services to reach private Google APIs. The network is designed for default-deny egress with an explicit allowlist for GitHub, Slack, Jira/Atlassian, and Google APIs, so Operatives cannot exfiltrate data to arbitrary destinations.
+Provisions the Henchmen VPC, its primary subnet, an allow-internal ingress firewall rule, and the Serverless VPC Access Connector Cloud Run uses to reach private-range resources.
+
+This module does **not** restrict egress. Every service and the lair template set `egress = "PRIVATE_RANGES_ONLY"`, so public traffic (GitHub, Slack, Jira, Google APIs) never traverses the VPC, and the lair jobs Mastermind creates at runtime attach no connector at all. Real egress control would need Cloud NAT, an egress allowlist or HTTPS proxy, and `ALL_TRAFFIC` egress with the connector attached to runtime-created jobs; see the header comment in `main.tf`.
 
 ## Usage
 
@@ -21,8 +23,6 @@ module "networking" {
 | region | string | (required) | The GCP region to deploy networking resources into. |
 | environment | string | (required) | The deployment environment (e.g. dev, staging, prod). |
 | subnet_cidr | string | `10.0.0.0/20` | The IP CIDR range for the primary subnet. |
-| labels | map(string) | `{}` | Labels to apply to networking resources. |
-| allowlist_cidrs | list(string) | `[]` | Additional egress CIDR ranges to allow (e.g. Slack, Jira/Atlassian). |
 
 ## Outputs
 
@@ -40,6 +40,6 @@ module "networking" {
 - `google_compute_network.vpc` — The Henchmen VPC (no auto subnets).
 - `google_compute_subnetwork.subnet` — Primary regional subnet with private Google access.
 - `google_compute_firewall.allow_internal` — Allow-all ingress within the subnet CIDR.
-- `google_compute_firewall.deny_all_egress` — Default-deny egress rule.
-- `google_compute_firewall.allow_egress_allowlist` — Explicit egress allowlist for GitHub, Google APIs, Slack, and Jira/Atlassian.
-- `google_vpc_access_connector.connector` — Serverless VPC connector for Cloud Run.
+- `google_vpc_access_connector.connector` — Serverless VPC connector (`10.8.0.0/28`, e2-micro, 2–3 instances).
+
+VPC networks, subnets and firewall rules do not support labels, so this module takes none.

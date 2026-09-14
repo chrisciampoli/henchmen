@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 
 # Register schemes on import
 import henchmen.schemes.bugfix_standard  # noqa: F401
@@ -30,7 +30,7 @@ from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
 from henchmen.mastermind.agent import MastermindAgent
 from henchmen.mastermind.scheme_executor import validate_deterministic_handlers
 from henchmen.models.task import HenchmenTask
-from henchmen.observability.api import create_metrics_router
+from henchmen.observability.api import create_metrics_router, require_metrics_auth
 from henchmen.schemes.registry import SchemeRegistry
 from henchmen.utils.redaction import install_secret_redaction
 
@@ -53,23 +53,51 @@ _INSTANCE_ID = f"{os.environ.get('K_REVISION') or os.environ.get('HOSTNAME') or 
 _agent: MastermindAgent | None = None
 
 
+def _ensure_providers() -> None:
+    """Create the process-wide providers on ``app.state`` once.
+
+    Every request reuses these instances: a message broker owns a Pub/Sub
+    publisher client (gRPC channel, background threads), so building one per
+    request leaks connections and pays the client start-up cost each time.
+    """
+    state = app.state
+    if all(hasattr(state, name) for name in ("message_broker", "document_store", "container_orchestrator")):
+        return
+    from henchmen.providers.registry import ProviderRegistry
+
+    registry = ProviderRegistry(get_settings())
+    if not hasattr(state, "message_broker"):
+        state.message_broker = registry.get_message_broker()
+    if not hasattr(state, "document_store"):
+        state.document_store = registry.get_document_store()
+    if not hasattr(state, "container_orchestrator"):
+        state.container_orchestrator = registry.get_container_orchestrator()
+
+
 def get_agent() -> MastermindAgent:
+    """Return the process-wide MastermindAgent, built on the shared ``app.state`` providers."""
     global _agent
     if _agent is None:
-        settings = get_settings()
-        from henchmen.providers.registry import ProviderRegistry
-
-        registry = ProviderRegistry(settings)
-        app.state.message_broker = registry.get_message_broker()
-        app.state.document_store = registry.get_document_store()
-        app.state.container_orchestrator = registry.get_container_orchestrator()
+        _ensure_providers()
         _agent = MastermindAgent(
-            settings=settings,
+            settings=get_settings(),
             broker=app.state.message_broker,
             document_store=app.state.document_store,
             container_orchestrator=app.state.container_orchestrator,
         )
     return _agent
+
+
+async def _close_providers() -> None:
+    """Release provider resources (e.g. the Pub/Sub publisher) on shutdown."""
+    broker = getattr(app.state, "message_broker", None)
+    aclose = getattr(broker, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception as exc:
+        logger.warning("[mastermind] Failed to close message broker: %s", exc)
 
 
 @asynccontextmanager
@@ -82,22 +110,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     init_tracing("mastermind", project_id=settings.gcp_project_id)
     instrument_fastapi(app)
 
-    # Initialize providers and agent
-    from henchmen.providers.registry import ProviderRegistry
-
-    registry = ProviderRegistry(settings)
-    app.state.message_broker = registry.get_message_broker()
-    app.state.document_store = registry.get_document_store()
-    app.state.container_orchestrator = registry.get_container_orchestrator()
-
-    global _agent
-    _agent = MastermindAgent(
-        settings=settings,
-        broker=app.state.message_broker,
-        document_store=app.state.document_store,
-        container_orchestrator=app.state.container_orchestrator,
-    )
-
+    # Initialize the shared providers and agent once for the whole process.
     agent = get_agent()
     router = create_metrics_router(agent.tracker)
     app.include_router(router)
@@ -131,6 +144,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Shutdown
     shutdown_tracing()
     logger.info("[mastermind] Shutting down — active tasks: %d", len(agent._active_tasks))
+    await _close_providers()
 
 
 app = FastAPI(title="Henchmen Mastermind", description="Task orchestration engine", lifespan=lifespan)
@@ -410,7 +424,8 @@ async def task_intake_handler(request: Request) -> dict[str, Any]:
 
     # Execute synchronously — Cloud Run keeps the request alive (up to 3600s).
     # Returning before completion would ack the Pub/Sub message, causing lost tasks
-    # if the instance recycles.  Returning 500 triggers Pub/Sub retry.
+    # if the instance recycles. An exception escaping _process_task returns 500
+    # so Pub/Sub retries.
     try:
         await _process_task(agent, task)
         # E2: only upgrade dedup marker to ``done`` after successful processing.
@@ -428,15 +443,23 @@ async def task_intake_handler(request: Request) -> dict[str, Any]:
 
 
 async def _process_task(agent: MastermindAgent, task: HenchmenTask) -> None:
-    """Process a task in the background."""
-    try:
-        logger.info("[MASTERMIND] Starting task processing: %s (%s)", task.id, task.title)
-        result = await agent.handle_task(task)
-        logger.info("[MASTERMIND] Task %s completed with status: %s", task.id, result.get("status"))
-        logger.info("[MASTERMIND] Result: %s", json.dumps(result, default=str)[:500])
+    """Run a task to completion, then emit metrics and notify Slack.
 
+    An exception escaping ``handle_task`` propagates so the task-intake handler
+    returns 500 and Pub/Sub redelivers. ``handle_task`` already escalates the
+    ordinary failures itself, so what reaches the caller is an infrastructure
+    failure (e.g. the tracker could not record the escalation) — exactly the
+    case a retry exists for. Post-run reporting is best-effort: once the task
+    has been finalized, a Slack or metrics hiccup must not re-run it.
+    """
+    logger.info("[MASTERMIND] Starting task processing: %s (%s)", task.id, task.title)
+    result = await agent.handle_task(task)
+    logger.info("[MASTERMIND] Task %s completed with status: %s", task.id, result.get("status"))
+    logger.info("[MASTERMIND] Result: %s", json.dumps(result, default=str)[:500])
+
+    try:
         # Emit structured metric for Cloud Monitoring
-        from henchmen.observability.structured_logging import emit_task_completed
+        from henchmen.observability.structured_logging import emit_task_completed, primary_model_name
 
         task_metrics = await agent.tracker.get_task(task.id)
         emit_task_completed(
@@ -445,6 +468,7 @@ async def _process_task(agent: MastermindAgent, task: HenchmenTask) -> None:
             final_status=result.get("result", {}).get("final_status", result.get("status", "unknown")),
             cost_usd=task_metrics.get("estimated_cost_usd", 0.0) if task_metrics else 0.0,
             wall_clock_seconds=task_metrics.get("wall_clock_seconds", 0.0) if task_metrics else 0.0,
+            model_name=primary_model_name(task_metrics) if task_metrics else "unknown",
         )
 
         # Notify Slack. Tasks from Slack get a threaded reply; everything else
@@ -452,9 +476,8 @@ async def _process_task(agent: MastermindAgent, task: HenchmenTask) -> None:
         # when neither a token nor a channel is configured).
         logger.info("[MASTERMIND] Sending Slack notification for task %s", task.id)
         await _notify_slack(task, result)
-
     except Exception as exc:
-        logger.exception("[MASTERMIND] ERROR processing task %s: %s", task.id, exc)
+        logger.exception("[MASTERMIND] Post-run reporting failed for task %s: %s", task.id, exc)
 
 
 def _format_metrics_block(metrics: dict[str, Any]) -> str:
@@ -675,6 +698,33 @@ async def forge_result_handler(request: Request) -> dict[str, Any]:
         return {"status": "error", "detail": str(exc)}
 
 
+async def _notify_ci_escalation(agent: MastermindAgent, result: dict[str, Any]) -> None:
+    """Tell the requester a PR's CI stayed red after every automated fix attempt.
+
+    Best-effort: the escalation is already recorded on the task, so a Slack
+    failure is logged rather than turned into a Pub/Sub redelivery that would
+    re-run the CI loop.
+    """
+    task_id = str(result.get("task_id", ""))
+    try:
+        task_data = await agent.tracker.get_task(task_id) if task_id else None
+        payload = (task_data or {}).get("task_payload")
+        if not payload:
+            logger.warning("[CI-LOOP] Cannot notify escalation for %r: no persisted task payload", task_id)
+            return
+        task = HenchmenTask.model_validate(payload)
+        await _notify_slack(
+            task,
+            {
+                "status": "escalated",
+                "scheme_id": (task_data or {}).get("scheme_id", "unknown"),
+                "error": result.get("reason", "CI still failing after automated fix attempts"),
+            },
+        )
+    except Exception as exc:
+        logger.error("[CI-LOOP] Failed to notify escalation for %s: %s", task_id, exc)
+
+
 @app.post("/pubsub/ci-failure")
 async def ci_failure_handler(request: Request) -> dict[str, Any]:
     """Handle CI failure events from Pub/Sub.
@@ -704,6 +754,8 @@ async def ci_failure_handler(request: Request) -> dict[str, Any]:
         agent = get_agent()
         result = await agent.handle_ci_failure(task_id_prefix, repo, branch, check_suite_id)
         logger.info("[CI-LOOP] Result: %s", result)
+        if result.get("status") == "escalated":
+            await _notify_ci_escalation(agent, result)
         return {"status": "completed", "result": result}
     except Exception as exc:
         tb_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -712,7 +764,54 @@ async def ci_failure_handler(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"CI failure handling failed: {exc}") from exc
 
 
-@app.get("/api/v1/metrics/summary")
+@app.post("/pubsub/embed-request")
+async def embed_request_handler(request: Request) -> dict[str, Any]:
+    """Re-index a repository in RAG Engine when Dispatch saw a push to its default branch.
+
+    Fail-closed: anything but a ``completed`` pipeline run returns non-2xx, so
+    Pub/Sub redelivers and finally dead-letters the request instead of
+    acknowledging an index that is missing chunks. A malformed message gets a
+    400 for the same reason — acknowledging it would drop the re-index silently.
+    """
+    settings = get_settings()
+    await verify_pubsub_oidc(request, settings)
+
+    from pydantic import ValidationError
+
+    from henchmen.dossier.embed_pipeline import EmbedRequest, run_embedding_pipeline
+
+    try:
+        envelope = await request.json()
+        data_b64 = (envelope.get("message") or {}).get("data", "")
+        embed_request = EmbedRequest.model_validate_json(base64.b64decode(data_b64))
+    except (ValueError, ValidationError, AttributeError) as exc:
+        logger.error("[EMBED] Undecodable embed-request message: %s", exc)
+        raise HTTPException(status_code=400, detail=f"Invalid embed-request message: {exc}") from exc
+
+    logger.info(
+        "[EMBED] Embed request for %s (%s, pushed %s)",
+        embed_request.repo,
+        embed_request.mode,
+        embed_request.commit_sha[:8] or "unknown",
+    )
+    try:
+        # The pushed head is not a diff base (diffing it against itself finds
+        # nothing), so incremental runs diff from the last indexed commit.
+        result = await run_embedding_pipeline(embed_request.repo, embed_request.mode, settings)
+    except Exception as exc:
+        logger.exception("[EMBED] Pipeline crashed for %s", embed_request.repo)
+        raise HTTPException(status_code=500, detail=f"Embedding pipeline failed: {exc}") from exc
+
+    if result.get("status") != "completed":
+        logger.error("[EMBED] Indexing %s did not complete: %s", embed_request.repo, result.get("error", result))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Embedding pipeline did not complete: {result.get('error', 'unknown error')}",
+        )
+    return {"status": "completed", "repo": embed_request.repo, "result": result}
+
+
+@app.get("/api/v1/metrics/summary", dependencies=[Depends(require_metrics_auth)])
 async def metrics_summary(days: int = 7) -> dict[str, Any]:
     """Return aggregated metrics for the dashboard.
 
@@ -750,7 +849,17 @@ async def watchdog_handler() -> dict[str, Any]:
     if not have_lease:
         return {"stalled_found": 0, "recovered": 0, "escalated": 0, "skipped": "lease_held"}
 
-    stalled = await agent.tracker.get_stalled_tasks(heartbeat_threshold_minutes=10)
+    try:
+        stalled = await agent.tracker.get_stalled_tasks(heartbeat_threshold_minutes=10)
+    except Exception as exc:
+        # A failed query (e.g. a missing Firestore composite index) is not
+        # "nothing stalled": reporting 0 would hide stuck tasks indefinitely.
+        # A 503 also marks the Cloud Scheduler run as failed, so it alerts.
+        logger.error("[WATCHDOG] Stalled-task query failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "error", "stalled_found": None, "error": f"Stalled-task query failed: {exc}"},
+        ) from exc
 
     recovered = 0
     escalated = 0
@@ -830,38 +939,40 @@ async def check_dlq_handler() -> dict[str, Any]:
     truncated log line.  Returns the count of dead-lettered messages found.
     """
     agent = get_agent()
-    subscription_name = f"{agent.settings.pubsub_topic_dead_letter}-sub"
+    settings = agent.settings
+    # An empty ``dead_letter_subscription`` falls back to the Terraform naming convention.
+    subscription_name = settings.dead_letter_subscription or f"{settings.pubsub_topic_dead_letter}-sub"
 
     try:
-        broker = agent._get_broker()
-        messages = await broker.pull_dlq(subscription_name, max_messages=10)
-        count = len(messages)
-
-        escalated = 0
-        if count > 0:
-            logger.warning("[DLQ] Found %d dead-lettered messages", count)
-            for msg in messages:
-                task_id = _dlq_task_id(msg)
-                if not task_id:
-                    logger.warning("[DLQ] Message with no identifiable task: %s", str(msg.get("data", ""))[:500])
-                    continue
-                try:
-                    await agent.tracker.mark_escalated(
-                        task_id, reason="Message dead-lettered after exhausting Pub/Sub retries"
-                    )
-                    escalated += 1
-                    logger.warning("[DLQ] Escalated dead-lettered task %s", task_id)
-                except Exception as exc:
-                    logger.error("[DLQ] Failed to escalate task %s: %s", task_id, exc)
-
-        return {"dead_letter_count": count, "escalated": escalated}
-    except NotImplementedError as exc:
-        # Provider (e.g. AWS SNS) does not expose a DLQ pull path.
-        logger.info("[DLQ] Check skipped (provider unsupported): %s", exc)
-        return {"dead_letter_count": 0, "skipped": True, "reason": str(exc)}
+        messages = await agent._get_broker().pull_dlq(subscription_name, max_messages=10)
     except Exception as exc:
-        logger.error("[DLQ] Check failed: %s", exc)
-        return {"dead_letter_count": -1, "error": str(exc)}
+        # Not "zero dead letters": a failed pull must fail the scheduled run so
+        # it is noticed, just like the watchdog.
+        logger.error("[DLQ] Pull from %s failed: %s", subscription_name, exc)
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "error", "dead_letter_count": None, "error": f"DLQ pull failed: {exc}"},
+        ) from exc
+
+    count = len(messages)
+    escalated = 0
+    if count > 0:
+        logger.warning("[DLQ] Found %d dead-lettered messages", count)
+        for msg in messages:
+            task_id = _dlq_task_id(msg)
+            if not task_id:
+                logger.warning("[DLQ] Message with no identifiable task: %s", str(msg.get("data", ""))[:500])
+                continue
+            try:
+                await agent.tracker.mark_escalated(
+                    task_id, reason="Message dead-lettered after exhausting Pub/Sub retries"
+                )
+                escalated += 1
+                logger.warning("[DLQ] Escalated dead-lettered task %s", task_id)
+            except Exception as exc:
+                logger.error("[DLQ] Failed to escalate task %s: %s", task_id, exc)
+
+    return {"dead_letter_count": count, "escalated": escalated}
 
 
 @app.post("/api/v1/cleanup")
