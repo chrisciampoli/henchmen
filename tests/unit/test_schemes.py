@@ -542,6 +542,23 @@ class TestSchemeNodeInvariants:
         errors = SchemeGraph(_one_node_scheme(node)).validate()
         assert any("model_name" in e for e in errors)
 
+    @pytest.mark.parametrize("model_name", ["default/complx", "gemini-2.5-pro", "claude-sonnet-5"])
+    def test_agentic_node_with_a_non_tier_model_name_is_invalid(self, model_name: str):
+        """Tier typos and concrete vendor ids must fail at registration, not after a Lair starts."""
+        node = SchemeNode(
+            id="implement",
+            name="Implement",
+            node_type=NodeType.AGENTIC,
+            model_name=model_name,
+            instruction_template="do the thing",
+        )
+        errors = SchemeGraph(_one_node_scheme(node)).validate()
+        assert any("not a model tier" in e for e in errors)
+
+    def test_scheme_node_has_no_grounding_field(self):
+        """Grounding had no consumer on the provider path; the field must not advertise it."""
+        assert "grounding_enabled" not in SchemeNode.model_fields
+
     def test_deterministic_node_with_model_name_is_invalid(self):
         """A deterministic node that names a model is the fix_lint regression."""
         node = SchemeNode(

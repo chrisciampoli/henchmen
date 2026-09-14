@@ -236,9 +236,6 @@ def _fix_tests_node() -> SchemeNode:
         max_steps=15,
         timeout_seconds=600,
         model_name=ModelTier.REASONING.value,
-        # Grounding is a Vertex-only capability and is not wired through the
-        # provider interface, so leave it off rather than implying it applies.
-        grounding_enabled=False,
         instruction_template=FIX_TESTS_INSTRUCTION_TEMPLATE,
     )
 
