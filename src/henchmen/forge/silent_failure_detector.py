@@ -84,7 +84,9 @@ class SilentFailureDetector:
         },
         {
             "name": "todo_fixme",
-            "regex": r"(?:TODO|FIXME|HACK|XXX|TEMP)\b",
+            # Leading and trailing word boundaries: the scan is case-insensitive,
+            # so without them ``contemp`` / ``hackathon``-style substrings match.
+            "regex": r"\b(?:TODO|FIXME|HACK|XXX|TEMP)\b",
             "severity": "info",
             "description": "TODO/FIXME comment — indicates incomplete implementation",
         },
