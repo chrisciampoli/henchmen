@@ -22,6 +22,11 @@ from typing import TYPE_CHECKING, Any
 import uvicorn
 from fastapi import FastAPI
 
+try:
+    from uvicorn.main import STARTUP_FAILURE
+except ImportError:  # pragma: no cover - defensive; mirrors uvicorn.main.STARTUP_FAILURE (3)
+    STARTUP_FAILURE = 3
+
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
 
@@ -157,7 +162,7 @@ def build_serve_app(settings: Settings, port: int, console: FastAPI | None = Non
 # Setup mode and restart-to-apply
 # ---------------------------------------------------------------------------
 
-RESTART_EXIT_CODE = 3
+RESTART_EXIT_CODE = 75  # EX_TEMPFAIL; distinct from uvicorn's own STARTUP_FAILURE (3)
 
 
 class RestartSignal:
@@ -198,8 +203,21 @@ def build_setup_app(console: FastAPI) -> FastAPI:
 
 
 def serve_app(app: FastAPI, *, host: str, port: int, log_level: str, restart: RestartSignal) -> int:
-    """Run ``app`` until it stops; return the process exit code."""
+    """Run ``app`` until it stops; return the process exit code.
+
+    Mirrors ``uvicorn.run``'s own handling, which bare ``Server.run()`` does not
+    provide: a plain ``KeyboardInterrupt`` (Ctrl+C) is swallowed rather than
+    left to print a traceback, and a server whose lifespan never started
+    (``server.started`` still ``False``) exits with uvicorn's own
+    ``STARTUP_FAILURE`` code so a genuine startup failure is distinguishable
+    from a clean stop. A requested restart takes priority over both.
+    """
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level=log_level))
     restart.attach(server)
-    server.run()
-    return RESTART_EXIT_CODE if restart.requested else 0
+    with suppress(KeyboardInterrupt):
+        server.run()
+    if restart.requested:
+        return RESTART_EXIT_CODE
+    if not server.started:
+        return STARTUP_FAILURE
+    return 0
