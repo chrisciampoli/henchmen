@@ -28,6 +28,22 @@ from henchmen.cli.prompts import ScriptedPrompter
 ANTHROPIC_MODELS = ["claude-haiku-4-5", "claude-opus-5", "claude-sonnet-5"]
 
 
+class TestTierFallbacks:
+    def test_fallbacks_match_the_settings_defaults(self) -> None:
+        """The import-failure fallbacks must not drift from Settings (bare Bedrock ids fail on-demand invocation)."""
+        from henchmen.config.settings import Settings
+
+        for provider, tiers in init._TIER_FIELDS.items():
+            for tier, (field_name, fallback) in tiers.items():
+                default = Settings.model_fields[field_name].default
+                if default:
+                    assert fallback == default, (provider, tier)
+
+    def test_bedrock_fallbacks_are_inference_profiles(self) -> None:
+        for _field_name, fallback in init._TIER_FIELDS["aws"].values():
+            assert fallback.startswith("us."), fallback
+
+
 def _ok(name: str, message: str = "ok") -> CheckResult:
     return CheckResult(name, CheckStatus.OK, message)
 
