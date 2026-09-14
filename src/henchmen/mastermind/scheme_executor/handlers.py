@@ -173,61 +173,24 @@ async def handle_fix_lint(
             logger.info("[SCHEME] fix_lint: no files changed by auto-fix")
             return {"condition": None, "message": "fix_lint: auto-fix made no changes"}
 
-        # Commit and push the auto-fixed files
-        git_email = executor.settings.git_author_email
-        git_name = executor.settings.git_author_name
-        await asyncio.create_subprocess_exec(
-            "git",
-            "config",
-            "user.email",
-            git_email,
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.create_subprocess_exec(
-            "git",
-            "config",
-            "user.name",
-            git_name,
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.create_subprocess_exec(
-            "git",
-            "add",
-            "-A",
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "commit",
-            "-m",
-            "style: auto-fix lint issues",
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "push",
-            "origin",
-            branch,
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, push_err = await proc.communicate()
-        if proc.returncode != 0:
-            err = push_err.decode()[:300]
-            if github_token:
-                err = err.replace(github_token, "***")
-            return {"condition": "fail", "message": f"fix_lint failed (push failed): {err}"}
+        # Commit and push the auto-fixed files. Every git step is awaited to
+        # completion and checked: an unawaited `git config`/`git add` raced the
+        # commit, and an ignored commit failure pushed nothing while reporting
+        # "auto-fixed and pushed".
+        git_steps: list[tuple[str, ...]] = [
+            ("config", "user.email", executor.settings.git_author_email),
+            ("config", "user.name", executor.settings.git_author_name),
+            ("add", "-A"),
+            ("commit", "-m", "style: auto-fix lint issues"),
+            ("push", "origin", branch),
+        ]
+        for step in git_steps:
+            returncode, step_err = await _run_git(workspace, *step)
+            if returncode != 0:
+                err = step_err[:300]
+                if github_token:
+                    err = err.replace(github_token, "***")
+                return {"condition": "fail", "message": f"fix_lint failed (git {step[0]} failed): {err}"}
 
         logger.info("[SCHEME] fix_lint: auto-fixed and pushed for task %s", task.id)
         return {
@@ -241,6 +204,20 @@ async def handle_fix_lint(
         return {"condition": "fail", "message": f"fix_lint failed (error: {exc})"}
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
+
+
+async def _run_git(workspace: str, *args: str) -> tuple[int, str]:
+    """Run a git command in *workspace* to completion; return ``(returncode, stderr)``."""
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        *args,
+        cwd=workspace,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    returncode = proc.returncode if proc.returncode is not None else 1
+    return returncode, stderr.decode(errors="replace")
 
 
 @_register("run_tests")
@@ -406,7 +383,7 @@ async def _run_in_docker(workspace: str, shell_script: str) -> dict[str, Any]:
     stdout, _ = await proc.communicate()
     output = stdout.decode(errors="replace")[:5000] if stdout else ""
 
-    return {"returncode": proc.returncode or 0, "output": output}
+    return {"returncode": proc.returncode if proc.returncode is not None else 1, "output": output}
 
 
 async def _run_on_host(workspace: str, stack: Stack, check_type: str) -> dict[str, Any]:
@@ -444,7 +421,7 @@ async def _run_on_host(workspace: str, stack: Stack, check_type: str) -> dict[st
     if stderr_text:
         output = f"{stdout_text}\n--- stderr ---\n{stderr_text}" if stdout_text.strip() else stderr_text
 
-    return {"returncode": proc.returncode or 0, "output": output}
+    return {"returncode": proc.returncode if proc.returncode is not None else 1, "output": output}
 
 
 # ---------------------------------------------------------------------------

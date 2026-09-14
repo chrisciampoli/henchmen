@@ -39,6 +39,14 @@ _MAX_TASK_TITLE_CHARS = 200
 # container still has to start, upload its report and be observed as finished.
 _WAIT_GRACE_SECONDS = 300
 
+# After the job is observed as finished, how long to wait for its Pub/Sub
+# report to land before falling back to the stores.
+_REPORT_GRACE_SECONDS = 15
+
+# Where the operative persists task execution state, including the partial
+# report it writes when SIGTERM interrupts a node.
+_TASK_EXECUTIONS_COLLECTION = "task_executions"
+
 
 def _parse_iso(value: str) -> datetime | None:
     try:
@@ -319,6 +327,47 @@ class LairManager:
             logger.warning("Could not delete consumed operative report %s: %s", key, exc)
         return report
 
+    async def _check_interrupted_report(
+        self, task_id: str, node_id: str, not_before: datetime | None = None
+    ) -> OperativeReport | None:
+        """Pick up the partial INTERRUPTED report an operative persisted on SIGTERM.
+
+        The operative writes it to ``task_executions/{task_id}.interrupted_report``
+        *before* publishing, precisely so a publish killed by SIGKILL still
+        leaves an authoritative record. Without reading it here the wait fell
+        through to a fabricated FAILED report with zero telemetry, and the
+        executor escalated instead of re-dispatching the interrupted node.
+        """
+        key = f"{task_id}:{node_id}"
+        try:
+            store = self._get_store()
+            data = await store.get(_TASK_EXECUTIONS_COLLECTION, task_id)
+            if not data or data.get("interrupted_node_id") != node_id or not data.get("interrupted_report"):
+                return None
+            report = OperativeReport.model_validate(data["interrupted_report"])
+        except Exception as exc:
+            logger.warning("Interrupted report check failed for %s: %s", key, exc)
+            return None
+
+        if report.node_id != node_id:
+            return None
+        if not_before is not None:
+            stamp = report.completed_at or report.started_at
+            if stamp < not_before:
+                return None
+
+        # Consume it so a re-dispatch of the same node cannot pick it up again.
+        try:
+            await self._get_store().update(
+                _TASK_EXECUTIONS_COLLECTION,
+                task_id,
+                {"interrupted_node_id": None, "interrupted_report": None},
+            )
+        except Exception as exc:
+            logger.warning("Could not clear consumed interrupted report for %s: %s", key, exc)
+        logger.warning("[LAIR] Operative for %s was interrupted; using its partial report", key)
+        return report
+
     def _fabricate_report(
         self,
         lair_id: str,
@@ -421,9 +470,13 @@ class LairManager:
                             self._pending_reports.pop(key, None)
                             return store_report
                         try:
-                            await asyncio.wait_for(event.wait(), timeout=15)
+                            await asyncio.wait_for(event.wait(), timeout=_REPORT_GRACE_SECONDS)
                         except TimeoutError:
-                            logger.warning("Report not received for %s within 15s after execution finished", key)
+                            logger.warning(
+                                "Report not received for %s within %ss after execution finished",
+                                key,
+                                _REPORT_GRACE_SECONDS,
+                            )
                         break
                 except Exception as exc:
                     logger.warning("Failed to poll execution %s: %s", execution_id, exc)
@@ -447,6 +500,13 @@ class LairManager:
         if store_report is not None:
             self._pending_reports.pop(key, None)
             return store_report
+
+        # The operative may have been interrupted and killed before its publish
+        # went out; its partial report is still authoritative.
+        interrupted_report = await self._check_interrupted_report(task_id, node_id, not_before=created_at)
+        if interrupted_report is not None:
+            self._pending_reports.pop(key, None)
+            return interrupted_report
 
         # Fallback: fabricate a non-success report from the orchestrator status.
         self._pending_reports.pop(key, None)
