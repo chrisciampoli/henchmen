@@ -89,8 +89,7 @@ class SnapshotCache:
 
         try:
             # Create the tarball in a thread to avoid blocking the event loop
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, _create_tarball, workspace_dir, tmp_path)
+            await asyncio.to_thread(_create_tarball, workspace_dir, tmp_path)
 
             object_store = self._get_object_store()
             await object_store.put_file(bucket, blob_name, tmp_path)
@@ -119,8 +118,7 @@ class SnapshotCache:
             object_store = self._get_object_store()
             await object_store.get_file(bucket, blob_name, tmp_path)
 
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, _extract_tarball, tmp_path, target_dir)
+            await asyncio.to_thread(_extract_tarball, tmp_path, target_dir)
             logger.info("Snapshot restored from %s → %s", snapshot_uri, target_dir)
         finally:
             if os.path.exists(tmp_path):
