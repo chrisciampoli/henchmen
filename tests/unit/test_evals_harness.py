@@ -485,6 +485,25 @@ class TestRunnerFailClosed:
     def test_no_test_command_is_not_applicable(self, tmp_path: Path) -> None:
         assert harness_module._run_fixture_tests(tmp_path, {"test_command": None}) == (None, None)
 
+    def test_must_fix_tests_without_test_command_fails_closed(self, tmp_path: Path) -> None:
+        """A fixture that demands passing tests but declares no runner cannot score a perfect 1.0."""
+        fixture, ws = _init_fake_fixture(
+            tmp_path,
+            {
+                "must_contain_file_change": ["sample.py"],
+                "must_fix_tests": True,
+                "expected_substrings_in_changed_code": ["return 2"],
+                "test_command": None,
+            },
+        )
+        (ws / "sample.py").write_text("def f():\n    return 2\n", encoding="utf-8")
+
+        score = score_result(fixture, ws)
+
+        assert score.tests_pass is False
+        assert score.test_runner_error is not None and "no test_command" in score.test_runner_error
+        assert score.overall_score < 1.0
+
     def test_missing_linter_scores_zero_conventions(self, tmp_path: Path) -> None:
         assert harness_module._compute_conventions(tmp_path, ["definitely-not-a-real-linter"]) == 0.0
 
