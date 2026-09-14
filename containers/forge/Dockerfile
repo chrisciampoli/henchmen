@@ -9,8 +9,12 @@ COPY containers/forge/requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 COPY src/ ./src/
-COPY pyproject.toml .
-RUN pip install --no-cache-dir --prefix=/install -e .
+# README.md is pyproject's `readme`; without it setuptools warns and builds
+# metadata with an empty long description.
+COPY pyproject.toml README.md ./
+# [observability] so init_tracing() in the lifespan can export to Cloud Trace
+# instead of always taking its ImportError branch.
+RUN pip install --no-cache-dir --prefix=/install -e ".[observability]"
 
 # --- Runtime stage ---
 FROM python:3.14.7-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f
@@ -29,7 +33,7 @@ RUN groupadd --gid 1001 henchmen && useradd --uid 1001 --gid henchmen --shell /b
 WORKDIR /app
 
 COPY src/ ./src/
-COPY pyproject.toml .
+COPY pyproject.toml README.md ./
 RUN pip install --no-cache-dir --no-deps -e .
 
 RUN chown -R henchmen:henchmen /app

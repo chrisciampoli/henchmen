@@ -330,8 +330,56 @@ def test_mastermind_image_has_no_stale_pins(stale: str) -> None:
     assert stale not in _read("containers/mastermind/requirements.txt")
 
 
-def test_every_pinned_base_image_carries_a_digest() -> None:
+# --------------------------------------------------------------------------
+# Every service image
+# --------------------------------------------------------------------------
+
+SERVICES = sorted(p.name for p in CONTAINERS_DIR.iterdir() if p.is_dir())
+
+
+def _dockerfile(service: str) -> str:
+    return _read(f"containers/{service}/Dockerfile")
+
+
+@pytest.mark.parametrize("service", SERVICES)
+def test_every_pinned_base_image_carries_a_digest(service: str) -> None:
     """Tag-only pins let a rebuilt upstream tag change the image silently."""
-    for line in _mastermind_dockerfile().splitlines():
+    for line in _dockerfile(service).splitlines():
         if line.startswith("FROM "):
             assert "@sha256:" in line, line
+
+
+@pytest.mark.parametrize("service", SERVICES)
+def test_every_image_copies_the_readme_pyproject_declares(service: str) -> None:
+    """Without README.md every `pip install -e .` warns and ships empty metadata."""
+    dockerfile = _dockerfile(service)
+    copies = [line for line in dockerfile.splitlines() if line.startswith("COPY pyproject.toml")]
+    assert copies, f"{service} never copies pyproject.toml"
+    assert all(line == "COPY pyproject.toml README.md ./" for line in copies), copies
+
+
+@pytest.mark.parametrize("service", SERVICES)
+def test_every_image_installs_the_observability_extra(service: str) -> None:
+    """Every service calls init_tracing(); without the extra it always no-ops."""
+    builder_installs = [line for line in _dockerfile(service).splitlines() if "--prefix=/install -e" in line]
+    assert builder_installs, f"{service} has no builder-stage package install"
+    assert all("observability" in line for line in builder_installs), builder_installs
+
+
+@pytest.mark.parametrize("service", SERVICES)
+@pytest.mark.parametrize("unused", ["google-adk", "google-cloud-secret-manager", "google-cloud-logging", "jira"])
+def test_image_requirements_drop_sdks_nothing_imports(service: str, unused: str) -> None:
+    requirements = _read(f"containers/{service}/requirements.txt")
+    assert not any(line.strip().startswith(unused) for line in requirements.splitlines())
+
+
+@pytest.mark.parametrize("service", SERVICES)
+def test_images_install_no_unused_curl(service: str) -> None:
+    assert " curl" not in _dockerfile(service)
+
+
+def test_ci_image_smoke_imports_the_service_entry_module() -> None:
+    """Importing only `henchmen` never touches a service's own dependencies."""
+    steps = yaml.dump(_load_yaml(".github/workflows/ci.yml")["jobs"]["docker-build"]["steps"])
+    assert "henchmen.operative.bootstrap" in steps
+    assert "henchmen.${{ matrix.service }}.server" in steps
