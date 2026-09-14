@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
 from henchmen.providers.interfaces.container_orchestrator import JobResult, JobStatus
+from henchmen.providers.settings_access import optional_setting
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -54,12 +55,6 @@ def _memory_to_mb(memory: str) -> str:
     return str(int(float(memory)))
 
 
-def _optional_setting(settings: Settings, name: str) -> str:
-    """Read an optional string setting that may not exist on this Settings class."""
-    value = getattr(settings, name, "")
-    return value.strip() if isinstance(value, str) else ""
-
-
 class ECSOrchestrator:
     """ContainerOrchestrator backed by AWS ECS Fargate."""
 
@@ -72,9 +67,9 @@ class ECSOrchestrator:
         self._security_groups: list[str] = [s.strip() for s in settings.aws_ecs_security_groups.split(",") if s.strip()]
         # Fargate refuses a task definition that uses the awslogs driver
         # without an execution role. Optional until Settings grows the field.
-        self._execution_role = _optional_setting(settings, "aws_ecs_execution_role_arn")
+        self._execution_role = optional_setting(settings, "aws_ecs_execution_role_arn")
         self._client: Any = boto3.client("ecs", region_name=self._region)
-        # task ARN -> (deadline monotonic seconds, task definition ARN)
+        # task ARN -> deadline (monotonic seconds); task ARN -> task definition ARN
         self._deadlines: dict[str, float] = {}
         self._task_definitions: dict[str, str] = {}
 

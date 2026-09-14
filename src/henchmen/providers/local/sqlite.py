@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from henchmen.providers.settings_access import optional_setting
+
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
 
@@ -45,13 +47,18 @@ def _normalize_filter_value(value: Any) -> Any:
 
 
 def default_db_path(settings: Settings) -> Path:
-    """Return the default SQLite file for this environment.
+    """Return the SQLite file for this environment.
 
-    Kept under ``<cwd>/.henchmen/`` rather than the bare working directory so
-    a ``henchmen serve`` started from a checkout does not drop database files
-    into the repository root.
+    ``local_sqlite_path`` wins when configured. Otherwise the file lives at
+    ``~/.henchmen/henchmen_<env>.db``: a working-directory-relative default
+    gave ``henchmen serve`` and ``henchmen chat`` started from different
+    directories different databases, and dropped database files into
+    whatever checkout the process was launched from.
     """
-    return Path.cwd() / ".henchmen" / f"henchmen_{settings.environment.value}.db"
+    configured = optional_setting(settings, "local_sqlite_path")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".henchmen" / f"henchmen_{settings.environment.value}.db"
 
 
 class SQLiteDocumentStore:

@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from henchmen.models.llm import FinishReason, ToolDefinition
+from henchmen.models.llm import FinishReason, ModelTier, ToolDefinition
 from henchmen.providers.tiers import is_tier_name, resolve_model_name
 
 if TYPE_CHECKING:
@@ -92,6 +92,28 @@ def resolve_provider_model(settings: Settings, model: str, provider: str) -> str
     return resolved
 
 
+def resolve_or_remap_model(
+    settings: Settings,
+    model: str,
+    provider: str,
+    foreign_prefixes: tuple[str, ...],
+) -> str:
+    """Resolve a tier, or remap a model id that belongs to another vendor.
+
+    A scheme node or a stale ``MODEL_NAME`` can still carry a concrete model
+    from a different vendor (``gemini-2.5-pro`` sent to OpenAI). Passing it
+    through only buys a 404 at request time, so names starting with one of
+    ``foreign_prefixes`` are remapped to the provider's COMPLEX tier with a
+    warning that makes the mismatch visible. Everything else — tiers and
+    native or custom model ids — goes through :func:`resolve_provider_model`.
+    """
+    if not is_tier_name(model) and model.strip().lower().startswith(foreign_prefixes):
+        default = resolve_provider_model(settings, ModelTier.COMPLEX.value, provider)
+        logger.warning("[%s] Remapping foreign model '%s' -> '%s'", provider, model, default)
+        return default
+    return resolve_provider_model(settings, model, provider)
+
+
 def parameter_schema(tool: ToolDefinition) -> tuple[dict[str, Any], list[str]]:
     """Build ``(properties, required)`` for a tool, preserving enum and array item schemas.
 
@@ -123,5 +145,6 @@ __all__ = [
     "json_schema",
     "normalize_finish_reason",
     "parameter_schema",
+    "resolve_or_remap_model",
     "resolve_provider_model",
 ]

@@ -6,6 +6,7 @@ import shlex
 from typing import TYPE_CHECKING, Any
 
 from henchmen.providers.interfaces.ci_provider import CIResult, CIStatus
+from henchmen.providers.settings_access import optional_setting
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -19,12 +20,6 @@ _GIT_IMAGE = "gcr.io/cloud-builders/git"
 _TOKEN_ENV = "GITHUB_TOKEN"
 
 
-def _optional_setting(settings: Settings, name: str) -> str:
-    """Read an optional string setting that may not exist on this Settings class."""
-    value = getattr(settings, name, "")
-    return value.strip() if isinstance(value, str) else ""
-
-
 class CloudBuildCIProvider:
     """CIProvider backed by Google Cloud Build."""
 
@@ -32,8 +27,8 @@ class CloudBuildCIProvider:
         self._project = settings.gcp_project_id
         # Optional settings: read defensively so this provider keeps working
         # against a Settings class that has not grown the fields yet.
-        self._builder_image = _optional_setting(settings, "ci_builder_image") or _DEFAULT_BUILDER_IMAGE
-        self._token_secret = _optional_setting(settings, "ci_github_token_secret")
+        self._builder_image = optional_setting(settings, "ci_builder_image") or _DEFAULT_BUILDER_IMAGE
+        self._token_secret = optional_setting(settings, "ci_github_token_secret")
         self._client: Any = None
 
     def _get_client(self) -> Any:

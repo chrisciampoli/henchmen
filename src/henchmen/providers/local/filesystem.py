@@ -6,6 +6,8 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from henchmen.providers.settings_access import optional_setting
+
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
 
@@ -23,7 +25,7 @@ class FilesystemObjectStore:
     def __init__(self, settings: Settings, base_dir: str | None = None) -> None:
         # ``local_storage_dir`` is optional on Settings; read it defensively so
         # this keeps working against a Settings class that lacks the field.
-        configured = base_dir or str(getattr(settings, "local_storage_dir", "") or "")
+        configured = base_dir or optional_setting(settings, "local_storage_dir")
         self._base = Path(configured).expanduser() if configured else _DEFAULT_STORAGE_DIR
         self._base.mkdir(parents=True, exist_ok=True)
         self._base = self._base.resolve()

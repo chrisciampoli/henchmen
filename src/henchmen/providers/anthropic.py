@@ -40,6 +40,43 @@ def _supports_temperature(model: str) -> bool:
     return name.startswith(_TEMPERATURE_PREFIXES) or bool(_TEMPERATURE_PATTERN.match(name))
 
 
+# Thinking blocks cannot carry cache_control, so the history breakpoint goes on
+# the last block of any other type.
+_UNCACHEABLE_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
+
+# Calls in a row with zero cache activity before the one-shot warning fires.
+_UNCACHED_CALLS_BEFORE_WARNING = 2
+
+
+def _with_history_breakpoint(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return ``messages`` with an ephemeral cache breakpoint on the final message.
+
+    The input is not mutated: messages may alias ``Message.provider_blocks``
+    that the caller replays on later turns, and a stale breakpoint left on an
+    older message would count against Anthropic's four-breakpoint limit.
+    """
+    if not messages:
+        return messages
+    last = messages[-1]
+    content = last.get("content")
+    if isinstance(content, str):
+        if not content:
+            return messages
+        blocks: list[Any] = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+    elif isinstance(content, list):
+        blocks = list(content)
+        for idx in range(len(blocks) - 1, -1, -1):
+            block = blocks[idx]
+            if isinstance(block, dict) and block.get("type") not in _UNCACHEABLE_BLOCK_TYPES:
+                blocks[idx] = {**block, "cache_control": {"type": "ephemeral"}}
+                break
+        else:
+            return messages
+    else:
+        return messages
+    return [*messages[:-1], {**last, "content": blocks}]
+
+
 class AnthropicProvider:
     """LLMProvider backed by the Anthropic API."""
 
@@ -49,8 +86,10 @@ class AnthropicProvider:
         self._settings = settings
         # An empty string would disable the SDK's own ANTHROPIC_API_KEY lookup,
         # so pass None when the setting is unset and let the SDK resolve it.
-        api_key = (getattr(settings, "anthropic_api_key", "") or "").strip() or None
+        api_key = settings.anthropic_api_key.strip() or None
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
+        self._uncached_calls = 0
+        self._warned_uncached = False
         models = tier_models(settings, PROVIDER_NAME)
         logger.info(
             "AnthropicProvider tier mapping: complex=%s light=%s reasoning=%s",
@@ -139,6 +178,12 @@ class AnthropicProvider:
             tool_params[-1]["cache_control"] = {"type": "ephemeral"}
             kwargs["tools"] = tool_params
 
+        # The conversation history (tool calls, tool outputs, diffs) is the
+        # bulk of an agentic loop's prompt and grows every step. A third
+        # breakpoint on the final message caches that prefix too, so the next
+        # turn re-reads it at the cache-read rate instead of full price.
+        kwargs["messages"] = _with_history_breakpoint(merged)
+
         response = await self._client.messages.create(**kwargs)
 
         stop_reason = getattr(response, "stop_reason", None)
@@ -176,6 +221,7 @@ class AnthropicProvider:
         input_tokens = uncached_input + cache_creation + cache_read
         output_tokens = int(response.usage.output_tokens or 0)
         if cache_creation or cache_read:
+            self._uncached_calls = 0
             logger.info(
                 "[anthropic] Cache: created=%d read=%d uncached=%d total_input=%d",
                 cache_creation,
@@ -183,6 +229,8 @@ class AnthropicProvider:
                 uncached_input,
                 input_tokens,
             )
+        elif input_tokens:
+            self._note_uncached_call(model, input_tokens)
 
         cost = estimate_cost(
             model,
@@ -211,6 +259,26 @@ class AnthropicProvider:
             model=model,
             finish_reason=finish_reason,
             provider_blocks=provider_blocks or None,
+        )
+
+    def _note_uncached_call(self, model: str, input_tokens: int) -> None:
+        """Warn once when consecutive calls neither write nor read the prompt cache.
+
+        A silent no-op cache is usually a prompt below the model's minimum
+        cacheable prefix, or a prefix that changes between calls; either way
+        every input token is billed at full price.
+        """
+        self._uncached_calls += 1
+        if self._uncached_calls < _UNCACHED_CALLS_BEFORE_WARNING or self._warned_uncached:
+            return
+        self._warned_uncached = True
+        logger.warning(
+            "[anthropic] %d consecutive %s calls reported no cache writes or reads (last prompt=%d tokens). "
+            "The prompt is likely below the model's minimum cacheable length, or its prefix is not "
+            "byte-stable between calls; input tokens are being billed at full price.",
+            self._uncached_calls,
+            model,
+            input_tokens,
         )
 
     @staticmethod

@@ -39,21 +39,22 @@ def _to_dynamo(value: Any) -> Any:
 
 
 def _decimal_to_native(value: Any) -> Any:
-    """Coerce DynamoDB ``Decimal`` values back to native int/float.
+    """Coerce DynamoDB ``Decimal`` values back to native int/float, recursively.
 
     The boto3 resource interface returns numeric attributes as
-    ``decimal.Decimal``. Callers of ``DocumentStore.get`` expect
-    JSON-friendly ints/floats, so we normalize on read.
+    ``decimal.Decimal`` — including numbers nested inside Map and List
+    attributes, which ``update`` writes for dict/list fields. Callers of
+    ``DocumentStore.get`` expect JSON-friendly ints/floats, so we normalize
+    on read.
     """
-    try:
-        from decimal import Decimal
-
-        if isinstance(value, Decimal):
-            if value == value.to_integral_value():
-                return int(value)
-            return float(value)
-    except ImportError:  # pragma: no cover - stdlib
-        pass
+    if isinstance(value, Decimal):
+        if value == value.to_integral_value():
+            return int(value)
+        return float(value)
+    if isinstance(value, dict):
+        return {k: _decimal_to_native(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_decimal_to_native(v) for v in value]
     return value
 
 
