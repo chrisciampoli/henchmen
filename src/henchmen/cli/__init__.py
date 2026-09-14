@@ -98,6 +98,13 @@ def main() -> None:
 
     subparsers.add_parser("chat", help="Interactive task builder REPL (uses the configured LLM provider)")
 
+    config_parser = subparsers.add_parser(
+        "config", help="Print the effective configuration (env + .env.local + defaults), secrets masked"
+    )
+    from henchmen.cli.config_cmd import add_config_arguments
+
+    add_config_arguments(config_parser)
+
     init_parser = subparsers.add_parser(
         "init",
         aliases=["setup"],
@@ -141,6 +148,10 @@ def main() -> None:
         from henchmen.cli import chat
 
         sys.exit(chat.run_chat_cli())
+    elif args.command == "config":
+        from henchmen.cli.config_cmd import run_config_cli
+
+        sys.exit(run_config_cli(args))
     elif args.command in ("init", "setup"):
         from henchmen.cli.init import run_init_cli
 
