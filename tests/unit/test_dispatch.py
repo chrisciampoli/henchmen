@@ -1422,7 +1422,7 @@ def _pubsub_request(headers=None):
         {
             "type": "http",
             "method": "POST",
-            "path": "/pubsub/task-planned",
+            "path": "/pubsub/example",
             "headers": raw,
             "query_string": b"",
             "client": ("10.0.0.1", 1234),
