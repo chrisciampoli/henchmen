@@ -58,6 +58,13 @@ def test_session_exchange_sets_a_strict_http_only_cookie(env) -> None:
     assert auth.verify_session(value)
 
 
+def test_session_cookie_persists_for_the_accepted_session_lifetime(env) -> None:
+    # Without Max-Age the cookie dies with the browser even though the server would still accept it.
+    client, _, auth, *_ = env
+    response = client.get("/console/session", params={"setup_token": "tok"})
+    assert f"Max-Age={auth.max_age_seconds}" in response.headers["set-cookie"]
+
+
 def test_session_exchange_rejects_a_wrong_token(env) -> None:
     client, *_ = env
     response = client.get("/console/session", params={"setup_token": "nope"})
@@ -122,6 +129,35 @@ def test_apply_marks_completed_and_requests_a_restart(env) -> None:
     assert response.json() == {"restarting": True}
     assert store.load().completed is True
     assert applied.calls == 1
+
+
+def test_apply_refuses_a_configuration_that_cannot_start(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    client, store, auth, applied, config = env
+    # conftest strips HENCHMEN_* already; the file alone decides the LLM provider and its key.
+    monkeypatch.delenv("HENCHMEN_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("HENCHMEN_ANTHROPIC_API_KEY", raising=False)
+    _signed_in(client, auth)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
+    config.write_text("HENCHMEN_PROVIDER=local\nHENCHMEN_LLM_PROVIDER=anthropic\n", encoding="utf-8")
+    response = client.post("/console/api/apply", headers=ORIGIN)
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert any("HENCHMEN_ANTHROPIC_API_KEY" in problem for problem in detail["problems"])
+    assert store.load().completed is False
+    assert applied.calls == 0
+
+
+def test_apply_refuses_a_configuration_that_does_not_parse(env) -> None:
+    client, store, auth, applied, config = env
+    _signed_in(client, auth)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
+    config.write_text("HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_SERVE_PORT=not-a-port\n", encoding="utf-8")
+    response = client.post("/console/api/apply", headers=ORIGIN)
+    assert response.status_code == 409
+    problems = response.json()["detail"]["problems"]
+    assert problems and any("local_serve_port" in problem for problem in problems)
+    assert store.load().completed is False
+    assert applied.calls == 0
 
 
 def test_root_serves_the_console_page(env) -> None:

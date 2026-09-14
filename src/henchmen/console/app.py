@@ -12,9 +12,10 @@ from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from henchmen import __version__
+from henchmen.config.settings import Settings
 from henchmen.console.auth import SESSION_COOKIE, ConsoleAuth, ConsoleGuard
 from henchmen.console.state import SetupState, SetupStateStore, SetupStep
 
@@ -48,6 +49,26 @@ class SetupStateUpdate(BaseModel):
     choices: dict[str, str] = Field(default_factory=dict, description="Non-secret selections")
 
 
+def _runtime_problems(config_file: Path) -> list[str]:
+    """Problems that would stop run mode starting with ``config_file`` (plus the process environment).
+
+    Settings reads the environment as well as the file, which is intended: the
+    container's environment applies in run mode too. Validation error messages
+    carry only the field and the reason, never the rejected value, which may be
+    a credential.
+    """
+    try:
+        settings = Settings(_env_file=(str(config_file),))  # type: ignore[call-arg]
+    except ValidationError as exc:
+        return [
+            f"{'.'.join(str(part) for part in error['loc']) or 'configuration'}: {error['msg']}"
+            for error in exc.errors(include_url=False, include_input=False)
+        ]
+    except ValueError as exc:
+        return [str(exc)]
+    return settings.validate_for_runtime()
+
+
 def create_console_app(
     *,
     mode: ConsoleMode,
@@ -71,7 +92,15 @@ def create_console_app(
                 status_code=403,
             )
         response = RedirectResponse("/", status_code=303)
-        response.set_cookie(SESSION_COOKIE, auth.issue_session(), httponly=True, samesite="strict", path="/")
+        # Max-Age matches what verify_session accepts, so closing the browser does not sign the user out early.
+        response.set_cookie(
+            SESSION_COOKIE,
+            auth.issue_session(),
+            max_age=auth.max_age_seconds,
+            httponly=True,
+            samesite="strict",
+            path="/",
+        )
         return response
 
     @app.get("/console/api/setup/state")
@@ -94,6 +123,14 @@ def create_console_app(
             )
         if not config_file.is_file():
             raise HTTPException(status_code=409, detail="No configuration has been saved yet.")
+        problems = _runtime_problems(config_file)
+        if problems:
+            # Marking setup complete would restart into a run mode that cannot start,
+            # and setup mode would no longer be offered to fix it.
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "The saved configuration cannot start Henchmen.", "problems": problems},
+            )
         store.mark_completed()
         background.add_task(on_apply)
         return {"restarting": True}

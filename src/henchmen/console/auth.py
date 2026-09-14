@@ -120,6 +120,11 @@ class ConsoleAuth:
         self._key = signing_key
         self._max_age = max_age_seconds
 
+    @property
+    def max_age_seconds(self) -> int:
+        """How long a session cookie stays valid after it is issued."""
+        return self._max_age
+
     @classmethod
     def load(cls, secrets_dir: Path, setup_token: str | None) -> ConsoleAuth:
         """Load (or create) the signing key; use ``setup_token`` or generate one.
@@ -127,7 +132,8 @@ class ConsoleAuth:
         A missing, empty, or too-short key file is never trusted: it is
         regenerated (never logging the key material itself).
         """
-        secrets_dir.mkdir(parents=True, exist_ok=True)
+        # Owner-only from creation: it holds the session signing key (mode ignored on Windows).
+        secrets_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         key_path = secrets_dir / _KEY_FILE_NAME
         key: bytes | None = None
         file_exists = key_path.is_file()
