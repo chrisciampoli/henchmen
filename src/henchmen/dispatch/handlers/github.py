@@ -63,7 +63,7 @@ async def handle_github_webhook(
     payload: dict[str, Any],
     normalizer: TaskNormalizer,
     settings: "Settings",
-    broker: MessageBroker | None = None,
+    broker: MessageBroker,
     dedup_key: str | None = None,
 ) -> dict[str, Any]:
     """Process GitHub webhook events.
@@ -120,7 +120,7 @@ def _is_ci_failure_on_henchmen_branch(payload: dict[str, Any]) -> bool:
 async def handle_ci_failure_webhook(
     payload: dict[str, Any],
     settings: "Settings",
-    broker: MessageBroker | None = None,
+    broker: MessageBroker,
 ) -> dict[str, Any]:
     """Handle a GitHub check_suite failure event on a Henchmen branch."""
     suite = payload.get("check_suite", {})
@@ -130,11 +130,6 @@ async def handle_ci_failure_webhook(
     head_sha = suite.get("head_sha", "")
     conclusion = suite.get("conclusion") or ""
     task_id_prefix = branch.replace("henchmen/", "", 1)
-
-    if broker is None:
-        from henchmen.providers.registry import ProviderRegistry
-
-        broker = ProviderRegistry(settings).get_message_broker()
 
     data = json.dumps(
         {
@@ -160,32 +155,24 @@ async def handle_ci_failure_webhook(
 async def handle_push_embed(
     payload: dict[str, Any],
     settings: "Settings",
-    broker: MessageBroker | None = None,
+    broker: MessageBroker,
 ) -> dict[str, Any]:
     """Handle a GitHub push event by requesting an embedding update.
 
-    Publishes a message to the embed-request Pub/Sub topic. The topic is the
-    integration point for incremental RAG indexing; there is no subscriber in
-    this repository yet, so the message is currently a no-op hook rather than
-    a live pipeline.
+    Publishes an :class:`~henchmen.dossier.embed_pipeline.EmbedRequest` to the
+    embed-request topic. Mastermind's ``/pubsub/embed-request`` push handler
+    consumes it and runs the incremental indexing pipeline; Dispatch itself
+    never clones or indexes.
     """
+    from henchmen.dossier.embed_pipeline import EmbedRequest
+
     repo = payload.get("repository", {}).get("full_name", "")
     commit_sha = payload.get("after", "")
+    if not repo:
+        return {"status": "ignored", "reason": "push event has no repository.full_name"}
 
-    if broker is None:
-        from henchmen.providers.registry import ProviderRegistry
-
-        broker = ProviderRegistry(settings).get_message_broker()
-
-    data = json.dumps(
-        {
-            "repo": repo,
-            "commit_sha": commit_sha,
-            "mode": "incremental",
-        }
-    ).encode("utf-8")
-
-    await broker.publish(settings.pubsub_topic_embed_request, data)
+    request = EmbedRequest(repo=repo, commit_sha=commit_sha, mode="incremental")
+    await broker.publish(settings.pubsub_topic_embed_request, request.model_dump_json().encode("utf-8"), repo=repo)
 
     return {
         "status": "embed_requested",

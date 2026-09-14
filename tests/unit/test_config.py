@@ -330,6 +330,23 @@ def _local_settings(monkeypatch: pytest.MonkeyPatch, **overrides: object) -> Set
     return Settings(_env_file=None, **overrides)  # type: ignore[call-arg, arg-type]
 
 
+class TestDispatchApiTokenSetting:
+    def test_defaults_to_empty(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("DISPATCH_API_TOKEN", raising=False)
+        assert _local_settings(monkeypatch).dispatch_api_token == ""
+
+    @pytest.mark.parametrize("env_name", ["HENCHMEN_DISPATCH_API_TOKEN", "DISPATCH_API_TOKEN"])
+    def test_accepts_prefixed_and_secret_mount_names(self, monkeypatch: pytest.MonkeyPatch, env_name: str):
+        monkeypatch.delenv("DISPATCH_API_TOKEN", raising=False)
+        monkeypatch.setenv(env_name, "tok")
+        assert _local_settings(monkeypatch).dispatch_api_token == "tok"
+
+    def test_is_masked_by_henchmen_config(self):
+        from henchmen.cli.config_cmd import is_secret_field
+
+        assert is_secret_field("dispatch_api_token")
+
+
 class TestOptionalProviderSettings:
     @pytest.mark.parametrize(
         ("field", "default"),
@@ -422,17 +439,6 @@ _FIELDS_AWAITING_A_READER: frozenset[str] = frozenset(
         "vertex_ai_context_cache_enabled",
         "vertex_ai_context_cache_min_tokens",
         "vertex_ai_safety_threshold",
-        # Added ahead of their consumers (dispatch rate limiter, Jira handler,
-        # dossier reranker, mastermind dead-letter drain, local SQLite store);
-        # the change that wires each one must also drop its entry here.
-        "dispatch_rate_limit_requests",
-        "dispatch_rate_limit_window_seconds",
-        "dispatch_trust_forwarded_for",
-        "jira_repo_field",
-        "jira_branch_field",
-        "dossier_semantic_rerank",
-        "dead_letter_subscription",
-        "local_sqlite_path",
     }
 )
 

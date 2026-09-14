@@ -7,7 +7,7 @@ surfacing as a 500 from deep inside the normalizer.
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from henchmen.models.task import TaskPriority
+from henchmen.models.task import TaskPriority, TaskType
 
 
 class CreateTaskRequest(BaseModel):
@@ -20,5 +20,9 @@ class CreateTaskRequest(BaseModel):
     repo: str = Field(default="", description="Target repository as 'owner/name'")
     branch: str | None = Field(default=None, description="Target branch")
     priority: TaskPriority = Field(default=TaskPriority.NORMAL, description="Task execution priority")
+    task_type: TaskType | None = Field(
+        default=None,
+        description="Explicit task type (bugfix, feature, refactor); overrides keyword scheme selection when set",
+    )
     created_by: str = Field(default="cli", description="User or system that created the task")
     id: str | None = Field(default=None, description="Caller-supplied source identifier")

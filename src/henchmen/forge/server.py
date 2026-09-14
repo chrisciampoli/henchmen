@@ -19,8 +19,13 @@ from fastapi import FastAPI, HTTPException, Request
 from henchmen.config.settings import Environment, get_settings
 from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
 from henchmen.utils.git import clone_repo
+from henchmen.utils.redaction import install_secret_redaction
 
 logger = logging.getLogger(__name__)
+
+# Redact token-shaped secrets in every log record this process emits (clone
+# URLs, CI output and GitHub errors can all carry one).
+install_secret_redaction()
 
 # Enough history for `git merge-base` against the PR base to resolve; the
 # silent-failure scan and the changed-file lint both depend on it.
@@ -65,7 +70,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     instrument_fastapi(app)
 
     registry = ProviderRegistry(settings)
-    app.state.message_broker = registry.get_message_broker()
+    # A broker injected on app.state beforehand belongs to whoever injected it;
+    # one created here is closed and dropped on shutdown.
+    owns_broker = getattr(app.state, "message_broker", None) is None
+    _get_broker()
     app.state.ci_provider = registry.get_ci_provider()
     app.state.document_store = registry.get_document_store()
 
@@ -73,6 +81,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
     shutdown_tracing()
     logger.info("[forge] Shutting down")
+    if owns_broker:
+        await _close_broker()
 
 
 app = FastAPI(title="Henchmen Forge", description="CI/merge pipeline", lifespan=lifespan)
@@ -155,13 +165,32 @@ async def forge_request_handler(request: Request) -> dict[str, str]:
 
 
 def _get_broker() -> Any:
-    """Return the shared message broker, falling back to a fresh one."""
-    broker = getattr(app.state, "message_broker", None)
-    if broker is not None:
-        return broker
-    from henchmen.providers.registry import ProviderRegistry
+    """Return the process-wide message broker, creating it on ``app.state`` once.
 
-    return ProviderRegistry(get_settings()).get_message_broker()
+    The lifespan normally creates it; this covers an app whose lifespan did
+    not run (e.g. mounted without one). A broker owns a Pub/Sub publisher
+    client, so it is never built per message.
+    """
+    broker = getattr(app.state, "message_broker", None)
+    if broker is None:
+        from henchmen.providers.registry import ProviderRegistry
+
+        broker = ProviderRegistry(get_settings()).get_message_broker()
+        app.state.message_broker = broker
+    return broker
+
+
+async def _close_broker() -> None:
+    """Release the lifespan's broker (e.g. its Pub/Sub publisher) and drop it from ``app.state``."""
+    broker = getattr(app.state, "message_broker", None)
+    app.state.message_broker = None
+    aclose = getattr(broker, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception as exc:
+        logger.warning("[forge] Failed to close message broker: %s", exc)
 
 
 async def _publish_forge_result(payload: dict[str, Any], request_id: str) -> None:
@@ -274,7 +303,14 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
         from henchmen.forge.ci_runner import CIRunner
 
         try:
-            runner = CIRunner(redact=[github_token] if github_token else [])
+            # One budget for the whole run and for any single command: the run
+            # must finish (and ack) inside the 600s Pub/Sub ack deadline.
+            budget = settings.forge_ci_timeout_seconds
+            runner = CIRunner(
+                timeout_seconds=budget,
+                total_budget_seconds=budget,
+                redact=[github_token] if github_token else [],
+            )
             result = await runner.run(workspace, base_ref=base_branch)
         except Exception as exc:
             raise await _fail(pr_url, task_id, request_id, "ci-error", str(exc), retriable=True) from exc

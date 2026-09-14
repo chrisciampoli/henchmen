@@ -50,5 +50,5 @@ module "pubsub" {
 ## Resources created
 
 - `google_pubsub_topic` — 7 topics, all `henchmen-${environment}-*`: task-intake, operative-complete, forge-request, forge-result, ci-failure, embed-request, dead-letter.
-- `google_pubsub_subscription` — Push subscriptions task-intake, operative-complete, forge-result and ci-failure (to Mastermind) and forge-request (to Forge); a pull subscription on dead-letter with exactly-once delivery; and, when enabled, build-complete from `cloud-builds` to Forge. embed-request has no subscription yet — the topic exists so the GitHub webhook publish does not fail.
+- `google_pubsub_subscription` — Push subscriptions task-intake, operative-complete, forge-result, ci-failure and embed-request (to Mastermind) and forge-request (to Forge); a pull subscription on dead-letter with exactly-once delivery; and, when enabled, build-complete from `cloud-builds` to Forge. Mastermind acknowledges an embed-request only when the re-index completed, so a partial run is retried and then dead-lettered.
 - `google_pubsub_topic_iam_member.dead_letter_publisher` / `google_pubsub_subscription_iam_member.dead_letter_subscriber` — Service agent grants that make dead-lettering work.

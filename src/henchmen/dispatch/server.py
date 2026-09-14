@@ -4,12 +4,13 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import Scope
 
@@ -22,16 +23,17 @@ from henchmen.dispatch.handlers.slack import handle_slack_event
 from henchmen.dispatch.idempotency import TTLSet
 from henchmen.dispatch.normalizer import TaskNormalizer
 from henchmen.providers.registry import ProviderRegistry
+from henchmen.utils.redaction import install_secret_redaction
 
 logger = logging.getLogger(__name__)
+
+# Redact token-shaped secrets in every log record this process emits: intake
+# payloads (Slack events, webhook bodies) can carry them.
+install_secret_redaction()
 
 # ---------------------------------------------------------------------------
 # Rate limiting middleware
 # ---------------------------------------------------------------------------
-
-# Maximum requests per window per client IP
-_RATE_LIMIT = 60
-_RATE_WINDOW_SECONDS = 60
 
 # Path prefixes the limiter guards, matched against the ROUTE-relative path so
 # the limiter still works when the app is mounted under a prefix (as
@@ -63,20 +65,45 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     :func:`~henchmen.dispatch.pubsub_auth.verify_pubsub_oidc`. State is
     per-process, so a multi-instance deployment gets ``limit`` requests per
     window per instance.
+
+    Any argument left as ``None`` comes from Settings
+    (``HENCHMEN_DISPATCH_RATE_LIMIT_REQUESTS``,
+    ``HENCHMEN_DISPATCH_RATE_LIMIT_WINDOW_SECONDS``,
+    ``HENCHMEN_DISPATCH_TRUST_FORWARDED_FOR``), read on the first request so
+    importing this module never needs a loadable configuration.
     """
 
     def __init__(
         self,
         app: FastAPI,
-        limit: int = _RATE_LIMIT,
-        window_seconds: int = _RATE_WINDOW_SECONDS,
-        trust_forwarded_for: bool = True,
+        limit: int | None = None,
+        window_seconds: float | None = None,
+        trust_forwarded_for: bool | None = None,
     ) -> None:
         super().__init__(app)
-        self._limit = limit
-        self._window_seconds = window_seconds
-        self._trust_forwarded_for = trust_forwarded_for
+        self._limit_override = limit
+        self._window_override = window_seconds
+        self._trust_override = trust_forwarded_for
+        self._configured = False
+        self._limit = 0
+        self._window_seconds = 0.0
+        self._trust_forwarded_for = False
         self._requests: dict[str, list[float]] = {}
+
+    def _configure(self) -> None:
+        """Resolve every limit not passed to the constructor from Settings (once)."""
+        if self._configured:
+            return
+        limit, window, trust = self._limit_override, self._window_override, self._trust_override
+        if limit is None or window is None or trust is None:
+            settings = get_settings()
+            limit = settings.dispatch_rate_limit_requests if limit is None else limit
+            window = settings.dispatch_rate_limit_window_seconds if window is None else window
+            trust = settings.dispatch_trust_forwarded_for if trust is None else trust
+        self._limit = limit
+        self._window_seconds = float(window)
+        self._trust_forwarded_for = trust
+        self._configured = True
 
     def _client_key(self, request: Request) -> str:
         """Return the bucket key for *request*.
@@ -98,6 +125,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not path.startswith(_RATE_LIMITED_PREFIXES):
             return await call_next(request)
 
+        self._configure()
         client_ip = self._client_key(request)
         now = time.monotonic()
         window_start = now - self._window_seconds
@@ -108,7 +136,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if len(timestamps) >= self._limit:
             self._requests[client_ip] = timestamps
             logger.warning(
-                "[rate-limit] %s exceeded %d req/%ds on %s",
+                "[rate-limit] %s exceeded %d req/%gs on %s",
                 client_ip,
                 self._limit,
                 self._window_seconds,
@@ -118,7 +146,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 content=json.dumps({"detail": "Rate limit exceeded"}),
                 status_code=429,
                 media_type="application/json",
-                headers={"Retry-After": str(self._window_seconds)},
+                # Retry-After is an integer number of seconds (RFC 9110).
+                headers={"Retry-After": str(max(1, math.ceil(self._window_seconds)))},
             )
 
         timestamps.append(now)
@@ -215,6 +244,57 @@ def _require_signing_secret(
 
 
 # ---------------------------------------------------------------------------
+# REST intake authentication
+# ---------------------------------------------------------------------------
+
+# Set once the "no API token in dev" warning has been logged, so a busy local
+# session does not log it on every request.
+_open_api_warning_logged = False
+
+# The value terraform/modules/secrets seeds every secret with so the first
+# apply yields startable revisions. It is public, so it never counts as a token.
+_SEEDED_SECRET_PLACEHOLDER = "placeholder-replace-with-a-real-value"
+
+
+async def require_api_token(request: Request) -> None:
+    """FastAPI dependency guarding ``POST /api/v1/tasks`` with a bearer token.
+
+    Every accepted request launches paid operative runs, so the route is
+    fail-closed: with ``HENCHMEN_DISPATCH_API_TOKEN`` unset it is open only in
+    DEV (with a one-time warning) and returns 401 in STAGING and PROD. The
+    token is compared in constant time and never logged or echoed.
+    """
+    global _open_api_warning_logged
+    settings = get_settings()
+    expected = settings.dispatch_api_token.strip()
+    if expected == _SEEDED_SECRET_PLACEHOLDER:
+        expected = ""
+    if not expected:
+        if settings.environment in (Environment.STAGING, Environment.PROD):
+            logger.error(
+                "[api] Refusing task creation: HENCHMEN_DISPATCH_API_TOKEN is not configured in %s",
+                settings.environment.value,
+            )
+            raise HTTPException(status_code=401, detail="Dispatch API token is not configured")
+        if not _open_api_warning_logged:
+            logger.warning(
+                "[api] HENCHMEN_DISPATCH_API_TOKEN is empty; /api/v1/tasks is unauthenticated (%s only)",
+                settings.environment.value,
+            )
+            _open_api_warning_logged = True
+        return
+
+    scheme, _, supplied = request.headers.get("Authorization", "").partition(" ")
+    supplied = supplied.strip()
+    if scheme.lower() != "bearer" or not supplied or not hmac.compare_digest(supplied.encode(), expected.encode()):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
@@ -235,13 +315,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     for problem in settings.validate_for_runtime():
         logger.warning("[dispatch] Configuration problem: %s", problem)
+    if settings.environment != Environment.DEV and not settings.dispatch_api_token:
+        logger.warning(
+            "[dispatch] Configuration problem: HENCHMEN_DISPATCH_API_TOKEN is empty, so POST /api/v1/tasks "
+            "returns 401 in %s",
+            settings.environment.value,
+        )
 
-    registry = ProviderRegistry(settings)
-    app.state.message_broker = registry.get_message_broker()
+    # One broker for the whole process: every intake route and the Slack bot
+    # publish through it. A broker injected on app.state beforehand belongs to
+    # whoever injected it; one created here is closed and dropped on shutdown.
+    owns_broker = getattr(app.state, "message_broker", None) is None
+    if owns_broker:
+        app.state.message_broker = ProviderRegistry(settings).get_message_broker()
 
     from henchmen.dispatch.slack_bot import start_socket_mode
 
-    app.state.slack_socket_handler = start_socket_mode(settings)
+    app.state.slack_socket_handler = start_socket_mode(settings, broker=app.state.message_broker)
 
     logger.info("[dispatch] Service started")
     yield
@@ -253,9 +343,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.warning("[dispatch] Slack Socket Mode handler did not close cleanly", exc_info=True)
     shutdown_tracing()
     logger.info("[dispatch] Shutting down")
+    if owns_broker:
+        await _close_broker(app)
+
+
+async def _close_broker(app: FastAPI) -> None:
+    """Release the lifespan's broker (e.g. its Pub/Sub publisher) and drop it from ``app.state``."""
+    broker = getattr(app.state, "message_broker", None)
+    app.state.message_broker = None
+    aclose = getattr(broker, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception as exc:
+        logger.warning("[dispatch] Failed to close message broker: %s", exc)
 
 
 app = FastAPI(title="Henchmen Dispatch", description="Task intake router", lifespan=lifespan)
+# Limits come from HENCHMEN_DISPATCH_RATE_LIMIT_* on the first guarded request.
 app.add_middleware(RateLimitMiddleware)  # type: ignore[arg-type]
 
 _normalizer = TaskNormalizer()
@@ -275,9 +381,9 @@ async def health() -> dict[str, Any]:
     return {"status": "ok"}
 
 
-@app.post("/api/v1/tasks")
+@app.post("/api/v1/tasks", dependencies=[Depends(require_api_token)])
 async def create_task(payload: CreateTaskRequest, request: Request) -> dict[str, Any]:
-    """CLI handler - accepts JSON task creation requests."""
+    """CLI handler - accepts JSON task creation requests (bearer-token authenticated)."""
     settings = get_settings()
     repo = payload.repo or settings.github_default_repo
     if not repo:

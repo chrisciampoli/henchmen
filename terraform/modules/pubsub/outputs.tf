@@ -19,6 +19,7 @@ output "subscription_ids" {
     forge_request      = google_pubsub_subscription.forge_request.id
     forge_result       = google_pubsub_subscription.forge_result.id
     ci_failure         = google_pubsub_subscription.ci_failure.id
+    embed_request      = google_pubsub_subscription.embed_request.id
     dead_letter        = google_pubsub_subscription.dead_letter.id
     build_complete     = try(google_pubsub_subscription.build_complete[0].id, null)
   }

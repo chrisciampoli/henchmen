@@ -97,6 +97,37 @@ class TestTaskIntake:
         statuses = [call.args[2]["status"] for call in agent.tracker._store.set.await_args_list]
         assert statuses == ["in_flight", "done"]
 
+    @pytest.mark.parametrize(
+        ("task_metrics", "expected_model"),
+        [
+            (
+                {
+                    "estimated_cost_usd": 0.5,
+                    "wall_clock_seconds": 12.0,
+                    "node_metrics": {
+                        "plan": {"model_name": "gemini-2.5-flash", "model_calls": 1},
+                        "implement_fix": {"model_name": "gemini-2.5-pro", "model_calls": 7},
+                    },
+                },
+                "gemini-2.5-pro",
+            ),
+            (None, "unknown"),
+        ],
+    )
+    def test_task_completed_metric_carries_the_primary_model(self, client, agent, task_metrics, expected_model):
+        """Cloud Monitoring breaks spend down by model; an empty label made that impossible."""
+        agent.handle_task = AsyncMock(return_value={"status": "completed", "scheme_id": "bugfix_standard"})
+        agent.tracker.get_task = AsyncMock(return_value=task_metrics)
+
+        with (
+            patch("henchmen.mastermind.server._notify_slack", new_callable=AsyncMock),
+            patch("henchmen.observability.structured_logging.emit_task_completed") as emit,
+        ):
+            resp = client.post("/pubsub/task-intake", json=_envelope(_task().model_dump(mode="json")))
+
+        assert resp.status_code == 200
+        assert emit.call_args.kwargs["model_name"] == expected_model
+
 
 # ---------------------------------------------------------------------------
 # operative-complete dedup markers
@@ -162,6 +193,79 @@ class TestCIFailure:
         assert notified_task.id == task.id
         assert result["status"] == "escalated"
         assert result["error"] == "CI still failing"
+
+
+# ---------------------------------------------------------------------------
+# embed-request
+# ---------------------------------------------------------------------------
+
+
+class TestEmbedRequest:
+    _PIPELINE = "henchmen.dossier.embed_pipeline.run_embedding_pipeline"
+
+    def test_completed_run_is_acknowledged(self, client):
+        pipeline = AsyncMock(return_value={"status": "completed", "chunks_upserted": 4, "commit_sha": "abc"})
+        with patch(self._PIPELINE, pipeline):
+            resp = client.post(
+                "/pubsub/embed-request",
+                json=_envelope({"repo": "acme/webapp", "commit_sha": "abc123", "mode": "incremental"}),
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "completed"
+        repo, mode, _settings = pipeline.await_args.args
+        assert (repo, mode) == ("acme/webapp", "incremental")
+        # The pushed head is not a diff base: incremental runs diff from the last indexed commit.
+        assert "commit_sha" not in pipeline.await_args.kwargs
+
+    def test_failed_run_is_not_acknowledged(self, client):
+        """A partial index must be redelivered (and finally dead-lettered), never acked."""
+        pipeline = AsyncMock(return_value={"status": "failed", "error": "3 of 9 chunks failed to upload"})
+        with patch(self._PIPELINE, pipeline):
+            resp = client.post("/pubsub/embed-request", json=_envelope({"repo": "acme/webapp"}))
+
+        assert resp.status_code == 500
+        assert "3 of 9 chunks failed" in resp.json()["detail"]
+
+    def test_pipeline_exception_is_not_acknowledged(self, client):
+        with patch(self._PIPELINE, AsyncMock(side_effect=RuntimeError("git missing"))):
+            resp = client.post("/pubsub/embed-request", json=_envelope({"repo": "acme/webapp"}))
+
+        assert resp.status_code == 500
+
+    @pytest.mark.parametrize(
+        "envelope",
+        [
+            {"message": {"data": "!!not base64!!"}},
+            _envelope({"mode": "full"}),
+            _envelope({"repo": "acme/webapp", "mode": "sideways"}),
+        ],
+    )
+    def test_malformed_message_is_rejected_without_running(self, client, envelope):
+        pipeline = AsyncMock()
+        with patch(self._PIPELINE, pipeline):
+            resp = client.post("/pubsub/embed-request", json=envelope)
+
+        assert resp.status_code == 400
+        pipeline.assert_not_awaited()
+
+    def test_requires_pubsub_oidc(self):
+        from fastapi import HTTPException
+
+        from henchmen.mastermind.server import app
+
+        pipeline = AsyncMock()
+        with (
+            patch(
+                "henchmen.mastermind.server.verify_pubsub_oidc",
+                new=AsyncMock(side_effect=HTTPException(status_code=401, detail="unauthorized")),
+            ),
+            patch(self._PIPELINE, pipeline),
+        ):
+            resp = TestClient(app).post("/pubsub/embed-request", json=_envelope({"repo": "acme/webapp"}))
+
+        assert resp.status_code == 401
+        pipeline.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

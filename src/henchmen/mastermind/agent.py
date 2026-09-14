@@ -24,7 +24,7 @@ from henchmen.mastermind.lair_manager import LairManager
 from henchmen.mastermind.scheme_executor import SchemeExecutor, validate_deterministic_handlers
 from henchmen.models.dossier import CodeSearchResult, Dossier, RelatedIssue
 from henchmen.models.scheme import NodeType
-from henchmen.models.task import HenchmenTask
+from henchmen.models.task import HenchmenTask, TaskType
 from henchmen.observability.tracker import TaskTracker
 from henchmen.providers.interfaces.container_orchestrator import ContainerOrchestrator
 from henchmen.providers.interfaces.document_store import DocumentStore
@@ -402,7 +402,10 @@ class MastermindAgent:
 
         Uses keyword matching for now; can be upgraded to LLM-based selection.
 
-        Priority order: goal_decomposition > bugfix > feature > default.
+        Priority order: goal_decomposition > explicit ``task_type`` > bugfix >
+        feature > default. An explicit type the requester chose (e.g. in
+        ``henchmen chat``) beats keywords in the text: a bugfix titled
+        "Add null check" is still a bugfix. Refactors run the feature scheme.
         Goal keywords are checked against the **title only** (to avoid false
         positives from incidental words in long descriptions/specs) and first,
         because phrases like "fix all" and "update all" contain the single-word
@@ -418,6 +421,11 @@ class MastermindAgent:
 
         if _matches_keyword(title_lower, _GOAL_KEYWORDS):
             return "goal_decomposition"
+
+        if task.task_type == TaskType.BUGFIX:
+            return "bugfix_standard"
+        if task.task_type in (TaskType.FEATURE, TaskType.REFACTOR):
+            return "feature_standard"
 
         if _matches_keyword(full_text, _BUGFIX_KEYWORDS):
             return "bugfix_standard"
@@ -541,16 +549,10 @@ class MastermindAgent:
         disabled, or the LLM provider cannot be built, the vector-search order
         is kept. ``rerank_semantic_chunks`` itself never raises on LLM failure.
         """
-        # getattr keeps this working before the ``dossier_semantic_rerank``
-        # Settings field lands; it defaults to enabled.
-        if not getattr(self.settings, "dossier_semantic_rerank", True):
+        if not self.settings.dossier_semantic_rerank:
             return chunks
         try:
-            # attr-defined ignore: rerank_semantic_chunks arrives with the dossier
-            # reranker change; drop the ignore once both branches are merged.
-            from henchmen.dossier.reranker import (  # type: ignore[attr-defined, unused-ignore]
-                rerank_semantic_chunks,
-            )
+            from henchmen.dossier.reranker import rerank_semantic_chunks
 
             llm_provider = self._get_llm_provider()
         except Exception as exc:
