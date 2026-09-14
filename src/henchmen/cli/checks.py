@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 import httpx
@@ -24,7 +24,7 @@ DEFAULT_TIMEOUT = 10.0
 RECOMMENDED_OLLAMA_MODELS: tuple[str, ...] = ("qwen2.5-coder:7b", "llama3.3", "deepseek-r1:8b")
 
 
-class CheckStatus(str, Enum):  # noqa: UP042 — project convention: str, Enum pattern per CLAUDE.md
+class CheckStatus(StrEnum):
     """Outcome of a single diagnostic check."""
 
     OK = "ok"
