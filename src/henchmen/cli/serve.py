@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, suppress
 from typing import TYPE_CHECKING, Any
 
+import uvicorn
 from fastapi import FastAPI
 
 if TYPE_CHECKING:
@@ -77,8 +78,8 @@ async def _aclose(resource: object, name: str) -> None:
         logger.warning("[serve] Failed to close %s", name, exc_info=True)
 
 
-def build_serve_app(settings: Settings, port: int) -> FastAPI:
-    """Build the combined local-dev app, wiring shared providers into each sub-app."""
+def build_serve_app(settings: Settings, port: int, console: FastAPI | None = None) -> FastAPI:
+    """Build the combined local app; mount ``console`` at / after the services when given."""
     from henchmen import __version__
     from henchmen.dispatch.server import app as dispatch_app
     from henchmen.forge.server import app as forge_app
@@ -145,4 +146,60 @@ def build_serve_app(settings: Settings, port: int) -> FastAPI:
     async def health() -> dict[str, object]:
         return {"status": "ok", "mode": "local", "services": ["dispatch", "mastermind", "forge"]}
 
+    if console is not None:
+        # Mounted last so it only receives paths no service or /health claims.
+        app.mount("/", console)
+
     return app
+
+
+# ---------------------------------------------------------------------------
+# Setup mode and restart-to-apply
+# ---------------------------------------------------------------------------
+
+RESTART_EXIT_CODE = 3
+
+
+class RestartSignal:
+    """Lets the Console ask the running uvicorn server to stop so the container restarts it."""
+
+    def __init__(self) -> None:
+        self.requested = False
+        self._server: Any = None
+
+    def attach(self, server: Any) -> None:
+        self._server = server
+        if self.requested:
+            server.should_exit = True
+
+    def request(self) -> None:
+        self.requested = True
+        if self._server is not None:
+            self._server.should_exit = True
+
+
+def console_url(port: int, setup_token: str) -> str:
+    """The sign-in URL the launcher opens (and serve prints for engineers)."""
+    return f"http://127.0.0.1:{port}/console/session?setup_token={setup_token}"
+
+
+def build_setup_app(console: FastAPI) -> FastAPI:
+    """Setup mode: /health plus the Console. No provider is built."""
+    from henchmen import __version__
+
+    app = FastAPI(title="Henchmen (setup)", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok", "mode": "setup"}
+
+    app.mount("/", console)
+    return app
+
+
+def serve_app(app: FastAPI, *, host: str, port: int, log_level: str, restart: RestartSignal) -> int:
+    """Run ``app`` until it stops; return the process exit code."""
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level=log_level))
+    restart.attach(server)
+    server.run()
+    return RESTART_EXIT_CODE if restart.requested else 0
