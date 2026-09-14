@@ -115,6 +115,35 @@ def test_load_creates_and_reuses_the_signing_key(tmp_path: Path) -> None:
         assert oct(os.stat(tmp_path / "secrets" / "console-session.key").st_mode & 0o777) == "0o600"
 
 
+def test_write_key_file_round_trips_newline_and_carriage_return_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for the O_BINARY fix in ``_write_key_file``.
+
+    Opening the key file without ``os.O_BINARY`` puts the descriptor in text
+    mode on Windows, which silently rewrites a lone ``\\n`` (0x0A) byte to
+    ``\\r\\n`` on write. That grows the on-disk key past its in-memory value,
+    so a second ``ConsoleAuth.load()`` reads a different key than the one that
+    signed a cookie moments earlier, and every session breaks across a
+    restart. The forged key here always contains both ``\\n`` and ``\\r`` so
+    the corruption reproduces deterministically instead of the ~1-in-8 chance
+    of it landing in a real random key.
+    """
+    key = bytes(range(30)) + b"\n\r"
+    assert len(key) == 32
+    monkeypatch.setattr("henchmen.console.auth.secrets.token_bytes", lambda n: key)
+
+    secrets_dir = tmp_path / "secrets"
+    first = ConsoleAuth.load(secrets_dir, setup_token=None)
+    key_path = secrets_dir / "console-session.key"
+
+    assert key_path.read_bytes() == key, "the byte-for-byte key must round-trip through the file"
+
+    second = ConsoleAuth.load(secrets_dir, setup_token="given")
+    cookie = first.issue_session()
+    assert second.verify_session(cookie), "a session signed before a restart must still verify after one"
+
+
 @pytest.mark.parametrize("bad_key", [b"", b"short"])
 def test_load_regenerates_an_empty_or_short_signing_key(tmp_path: Path, bad_key: bytes) -> None:
     secrets_path = tmp_path / "secrets"
