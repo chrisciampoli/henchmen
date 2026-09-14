@@ -500,3 +500,13 @@ class TestCliWiring:
         prompter = ScriptedPrompter(["1", "", "y"])
         assert run_init_cli(args, prompter=prompter) == 0
         assert EnvFile.load(env_path).get("HENCHMEN_PROVIDER") == "local"
+
+    def test_init_defaults_to_the_data_dir_config_file(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        assert InitOptions().env_file == tmp_path / "henchmen.env"
+        assert options_from_args(argparse.Namespace(env_file=None)).env_file == tmp_path / "henchmen.env"
+        assert options_from_args(argparse.Namespace(env_file="custom.env")).env_file.name == "custom.env"
+
+    def test_init_without_data_dir_still_writes_env_local(self, monkeypatch):
+        monkeypatch.delenv("HENCHMEN_DATA_DIR", raising=False)
+        assert options_from_args(argparse.Namespace(env_file=None)).env_file == Path(".env.local")

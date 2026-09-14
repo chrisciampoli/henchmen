@@ -23,6 +23,7 @@ from henchmen.cli import checks
 from henchmen.cli.checks import CheckResult, CheckStatus, SlackChannel, SlackScopeError
 from henchmen.cli.envfile import EnvFile
 from henchmen.cli.prompts import Choice, ConsolePrompter, PromptAbortedError, Prompter, mask_secret
+from henchmen.config.paths import config_file
 
 SECTIONS: tuple[str, ...] = ("mode", "llm", "github", "slack", "jira", "limits")
 EXIT_ABORTED = 130
@@ -110,7 +111,7 @@ def _settings_default(field_name: str, fallback: str) -> str:
 class InitOptions:
     """Command-line options for ``henchmen init``."""
 
-    env_file: Path = field(default_factory=lambda: Path(".env.local"))
+    env_file: Path = field(default_factory=config_file)
     yes: bool = False
     dry_run: bool = False
     sections: tuple[str, ...] = SECTIONS
@@ -760,7 +761,11 @@ def run_init(prompter: Prompter, options: InitOptions) -> int:
 
 def add_init_arguments(parser: argparse.ArgumentParser) -> None:
     """Register ``henchmen init`` flags on an argparse sub-parser."""
-    parser.add_argument("--env-file", default=".env.local", help="File to write (default: .env.local)")
+    parser.add_argument(
+        "--env-file",
+        default=None,
+        help="File to write (default: .env.local, or henchmen.env inside HENCHMEN_DATA_DIR)",
+    )
     parser.add_argument(
         "--yes", "-y", action="store_true", help="Accept defaults and existing values without prompting"
     )
@@ -776,7 +781,7 @@ def add_init_arguments(parser: argparse.ArgumentParser) -> None:
 def options_from_args(args: argparse.Namespace) -> InitOptions:
     sections = tuple(getattr(args, "section", None) or SECTIONS)
     return InitOptions(
-        env_file=Path(getattr(args, "env_file", ".env.local")),
+        env_file=Path(args.env_file) if getattr(args, "env_file", None) else config_file(),
         yes=bool(getattr(args, "yes", False)),
         dry_run=bool(getattr(args, "dry_run", False)),
         sections=sections,

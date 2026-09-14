@@ -146,6 +146,14 @@ class TestCheckEnvFile:
         monkeypatch.chdir(tmp_path)
         assert check_env_file().status == CheckStatus.WARN
 
+    def test_check_env_file_uses_the_data_dir(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        assert check_env_file().status == CheckStatus.WARN
+        (tmp_path / "henchmen.env").write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+        result = check_env_file()
+        assert result.status == CheckStatus.OK
+        assert str(tmp_path / "henchmen.env") in result.message
+
 
 # ---------------------------------------------------------------------------
 # Settings-driven checks
