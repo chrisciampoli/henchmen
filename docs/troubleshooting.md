@@ -48,7 +48,9 @@ log lines appear.
 **Diagnosis:** The bot connects over Socket Mode, which needs both the bot
 token and the app-level token. When either is missing the Dispatch service logs
 `Slack Socket Mode disabled: set HENCHMEN_SLACK_BOT_TOKEN and HENCHMEN_SLACK_APP_TOKEN to enable it`
-at startup. If you use the HTTP Events API (`/webhooks/slack`) instead, a
+at startup. This is the same under `henchmen serve` and `docker compose up`,
+which run Dispatch's startup inside the single process, so look for that line
+(or `[dispatch] Service started`) in the server log. If you use the HTTP Events API (`/webhooks/slack`) instead, a
 wrong signing secret makes Dispatch reject every event with 401.
 
 **Fix:**
