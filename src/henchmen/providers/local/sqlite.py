@@ -247,14 +247,22 @@ class SQLiteDocumentStore:
             await self.set(collection, document_id, merged)
             return True
 
-    async def close(self) -> None:
-        """Close the underlying SQLite connection."""
+    async def aclose(self) -> None:
+        """Close the underlying SQLite connection (idempotent).
+
+        ``henchmen serve`` calls this on shutdown after draining the broker, so
+        the WAL is checkpointed and the file handle released.
+        """
 
         def _close() -> None:
             with self._db_lock:
                 self._conn.close()
 
         await asyncio.to_thread(_close)
+
+    async def close(self) -> None:
+        """Alias for :meth:`aclose`."""
+        await self.aclose()
 
     @staticmethod
     def _matches_filters(data: dict[str, Any], filters: list[tuple[str, str, Any]]) -> bool:
