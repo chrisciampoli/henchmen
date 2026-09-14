@@ -54,6 +54,26 @@ requests to a target repository. Our working assumptions are:
   a trusted maintainer.
 - Denial of service against Ollama or third-party LLM APIs.
 
+## Local Deployments and the Docker Socket
+
+The local image (`docker build --target local`, published as
+`ghcr.io/<owner>/henchmen/local`) and the Docker Compose stack both mount the
+host's Docker socket (`/var/run/docker.sock`) and run as root inside the
+container, so that Henchmen can launch operative containers. Access to that
+socket is equivalent to control of the local Docker engine, and through it
+effectively root on the host: anything that compromises the Henchmen
+container can start, stop or inspect any container on the machine.
+
+- Run the local image or Compose stack only on a machine you control, not on
+  a shared or multi-tenant host.
+- Keep the port on loopback. The documented `docker run` command publishes
+  the Console and the services only on `127.0.0.1:8000`, and the Console
+  itself refuses requests whose `Host` is not `127.0.0.1`, `localhost` or
+  `[::1]`. The server listens on `0.0.0.0` *inside* the container, so it is
+  the `-p 127.0.0.1:8000:8000` mapping that keeps it off the network; the
+  bundled `docker-compose.yml` publishes `8000:8000` on every interface, so
+  change it to `127.0.0.1:8000:8000` on any machine reachable by others.
+
 ## Reporting a Vulnerability
 
 Please use GitHub Security Advisories:

@@ -202,7 +202,10 @@ jobs:
           curl -fsS http://127.0.0.1:8000/health | grep -q '"mode":"setup"'
           curl -fsS http://127.0.0.1:8000/console/api/status | grep -q '"mode":"setup"'
           test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' http://127.0.0.1:8000/console/api/status)" = "403"
-          docker logs henchmen-local 2>&1 | grep -q "console/session?setup_token=ci-token"
+          # Capture first: `docker logs | grep -q` can fail under pipefail when grep
+          # exits early and docker logs dies of SIGPIPE.
+          logs="$(docker logs henchmen-local 2>&1)"
+          grep -q "console/session?setup_token=ci-token" <<<"$logs"
 
       - name: Container logs on failure
         if: failure()
