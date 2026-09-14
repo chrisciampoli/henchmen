@@ -27,7 +27,7 @@ from henchmen.models.scheme import (
     SchemeEdge,
     SchemeNode,
 )
-from henchmen.models.task import HenchmenTask, TaskContext, TaskSource
+from henchmen.models.task import HenchmenTask, TaskContext, TaskSource, TaskType
 from henchmen.schemes.base import SchemeGraph
 from henchmen.schemes.registry import SchemeRegistry
 
@@ -760,6 +760,27 @@ class TestMastermindSelectScheme:
         agent = _make_agent()
         task = _make_task(title="Something odd", description="we should improve this someday")
         assert await agent._select_scheme(task) == "bugfix_standard"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("task_type", "title", "expected"),
+        [
+            # An explicit type beats the opposite keywords in the text.
+            (TaskType.BUGFIX, "Add null check to parseConfig", "bugfix_standard"),
+            (TaskType.FEATURE, "Fix up the onboarding flow with a new wizard", "feature_standard"),
+            (TaskType.REFACTOR, "Fix naming in the auth module", "feature_standard"),
+        ],
+    )
+    async def test_explicit_task_type_overrides_keywords(self, task_type, title, expected):
+        agent = _make_agent()
+        task = _make_task(title=title, description="details", task_type=task_type)
+        assert await agent._select_scheme(task) == expected
+
+    @pytest.mark.asyncio
+    async def test_goal_keywords_still_win_over_explicit_type(self):
+        agent = _make_agent()
+        task = _make_task(title="Migrate every service to the new logger", description="", task_type=TaskType.FEATURE)
+        assert await agent._select_scheme(task) == "goal_decomposition"
 
 
 # ===========================================================================

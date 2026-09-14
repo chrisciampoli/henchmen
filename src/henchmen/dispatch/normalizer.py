@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from henchmen.config.settings import Settings
-from henchmen.models.task import HenchmenTask, TaskContext, TaskPriority, TaskSource
+from henchmen.models.task import HenchmenTask, TaskContext, TaskPriority, TaskSource, TaskType
 from henchmen.providers.interfaces.message_broker import MessageBroker
 
 # Slack renders a user/bot mention as ``<@U0123ABC>`` (optionally ``<@U0123ABC|name>``).
@@ -77,6 +77,7 @@ class TaskNormalizer:
                 branch=data.get("branch"),
             ),
             priority=TaskPriority(data.get("priority", "normal")),
+            task_type=TaskType(data["task_type"]) if data.get("task_type") else None,
             created_by=data.get("created_by", "cli"),
         )
 

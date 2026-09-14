@@ -23,6 +23,17 @@ class TaskPriority(StrEnum):
     LOW = "low"
 
 
+class TaskType(StrEnum):
+    """The kind of work a requester explicitly asked for.
+
+    When set, it decides the Scheme instead of keyword matching on the text.
+    """
+
+    BUGFIX = "bugfix"
+    FEATURE = "feature"
+    REFACTOR = "refactor"
+
+
 class TaskStatus(StrEnum):
     PENDING = "pending"
     DISPATCHED = "dispatched"
@@ -52,6 +63,10 @@ class HenchmenTask(StrictBase):
     description: str = Field(..., description="Full task description")
     context: TaskContext = Field(..., description="Contextual information for the operative")
     priority: TaskPriority = Field(default=TaskPriority.NORMAL, description="Task execution priority")
+    task_type: TaskType | None = Field(
+        default=None,
+        description="Explicit task type chosen by the requester; overrides keyword scheme selection when set",
+    )
     # Timezone-aware only — a naive datetime round-tripped through the document
     # store would sort against UTC values incorrectly (CLAUDE.md: always UTC).
     created_at: AwareDatetime = Field(

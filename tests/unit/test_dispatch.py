@@ -65,6 +65,22 @@ class TestTaskNormalizerFromCli:
         assert task.context.branch is None
         assert task.priority == TaskPriority.NORMAL
         assert task.created_by == "cli"
+        assert task.task_type is None
+
+    def test_explicit_task_type_is_carried_through_intake(self):
+        """CreateTaskRequest -> from_cli -> HenchmenTask keeps the requester's type, and it survives Pub/Sub JSON."""
+        from henchmen.models.task import TaskType
+
+        request = CreateTaskRequest(title="Add null check", repo="acme/api", task_type="bugfix")
+        task = TaskNormalizer().from_cli(request.model_dump())
+        assert task.task_type == TaskType.BUGFIX
+        assert HenchmenTask.model_validate_json(task.model_dump_json()).task_type == TaskType.BUGFIX
+
+    def test_unknown_task_type_is_rejected_by_the_api_model(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            CreateTaskRequest(title="T", task_type="chore")
 
     def test_source_id_is_uuid_when_not_provided(self):
         n = TaskNormalizer()
