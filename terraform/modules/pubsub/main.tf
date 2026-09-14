@@ -41,9 +41,8 @@ resource "google_pubsub_topic" "forge_result" {
   labels  = var.labels
 }
 
-# Published by the Dispatch GitHub webhook handler on push events so the RAG
-# corpus can be re-embedded. No subscriber yet — the topic exists so the
-# publish does not raise NotFound.
+# Published by the Dispatch GitHub webhook handler on a push to a default
+# branch; Mastermind's /pubsub/embed-request re-indexes the RAG corpus.
 resource "google_pubsub_topic" "embed_request" {
   project = var.project_id
   name    = "henchmen-${var.environment}-embed-request"
@@ -206,6 +205,40 @@ resource "google_pubsub_subscription" "ci_failure" {
   }
 }
 
+# henchmen-embed-request → Mastermind
+#
+# The handler acks only a completed indexing run, so a partial upload is
+# redelivered and finally dead-lettered rather than silently acknowledged.
+# The upsert replaces each file's existing chunks, so a redelivery (including
+# one Pub/Sub sends when a long full re-index outlives the 600s ack deadline)
+# does not duplicate them.
+resource "google_pubsub_subscription" "embed_request" {
+  project = var.project_id
+  name    = "henchmen-${var.environment}-embed-request-sub"
+  topic   = google_pubsub_topic.embed_request.name
+
+  message_retention_duration = local.retention_duration
+  ack_deadline_seconds       = local.ack_deadline_seconds
+
+  push_config {
+    push_endpoint = "${var.push_endpoints.mastermind_url}/pubsub/embed-request"
+    oidc_token {
+      service_account_email = var.push_sa_email
+      audience              = var.push_audiences.mastermind
+    }
+  }
+
+  dead_letter_policy {
+    dead_letter_topic     = google_pubsub_topic.dead_letter.id
+    max_delivery_attempts = local.dead_letter_max_attempts
+  }
+
+  retry_policy {
+    minimum_backoff = local.retry_min_backoff
+    maximum_backoff = local.retry_max_backoff
+  }
+}
+
 # henchmen-dead-letter → pull (alerting/monitoring)
 resource "google_pubsub_subscription" "dead_letter" {
   project = var.project_id
@@ -245,6 +278,7 @@ locals {
     forge_request      = google_pubsub_subscription.forge_request.name
     forge_result       = google_pubsub_subscription.forge_result.name
     ci_failure         = google_pubsub_subscription.ci_failure.name
+    embed_request      = google_pubsub_subscription.embed_request.name
   }
 }
 

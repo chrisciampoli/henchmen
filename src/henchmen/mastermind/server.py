@@ -764,6 +764,53 @@ async def ci_failure_handler(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"CI failure handling failed: {exc}") from exc
 
 
+@app.post("/pubsub/embed-request")
+async def embed_request_handler(request: Request) -> dict[str, Any]:
+    """Re-index a repository in RAG Engine when Dispatch saw a push to its default branch.
+
+    Fail-closed: anything but a ``completed`` pipeline run returns non-2xx, so
+    Pub/Sub redelivers and finally dead-letters the request instead of
+    acknowledging an index that is missing chunks. A malformed message gets a
+    400 for the same reason — acknowledging it would drop the re-index silently.
+    """
+    settings = get_settings()
+    await verify_pubsub_oidc(request, settings)
+
+    from pydantic import ValidationError
+
+    from henchmen.dossier.embed_pipeline import EmbedRequest, run_embedding_pipeline
+
+    try:
+        envelope = await request.json()
+        data_b64 = (envelope.get("message") or {}).get("data", "")
+        embed_request = EmbedRequest.model_validate_json(base64.b64decode(data_b64))
+    except (ValueError, ValidationError, AttributeError) as exc:
+        logger.error("[EMBED] Undecodable embed-request message: %s", exc)
+        raise HTTPException(status_code=400, detail=f"Invalid embed-request message: {exc}") from exc
+
+    logger.info(
+        "[EMBED] Embed request for %s (%s, pushed %s)",
+        embed_request.repo,
+        embed_request.mode,
+        embed_request.commit_sha[:8] or "unknown",
+    )
+    try:
+        # The pushed head is not a diff base (diffing it against itself finds
+        # nothing), so incremental runs diff from the last indexed commit.
+        result = await run_embedding_pipeline(embed_request.repo, embed_request.mode, settings)
+    except Exception as exc:
+        logger.exception("[EMBED] Pipeline crashed for %s", embed_request.repo)
+        raise HTTPException(status_code=500, detail=f"Embedding pipeline failed: {exc}") from exc
+
+    if result.get("status") != "completed":
+        logger.error("[EMBED] Indexing %s did not complete: %s", embed_request.repo, result.get("error", result))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Embedding pipeline did not complete: {result.get('error', 'unknown error')}",
+        )
+    return {"status": "completed", "repo": embed_request.repo, "result": result}
+
+
 @app.get("/api/v1/metrics/summary")
 async def metrics_summary(days: int = 7) -> dict[str, Any]:
     """Return aggregated metrics for the dashboard.

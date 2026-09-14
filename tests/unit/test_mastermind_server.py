@@ -196,6 +196,79 @@ class TestCIFailure:
 
 
 # ---------------------------------------------------------------------------
+# embed-request
+# ---------------------------------------------------------------------------
+
+
+class TestEmbedRequest:
+    _PIPELINE = "henchmen.dossier.embed_pipeline.run_embedding_pipeline"
+
+    def test_completed_run_is_acknowledged(self, client):
+        pipeline = AsyncMock(return_value={"status": "completed", "chunks_upserted": 4, "commit_sha": "abc"})
+        with patch(self._PIPELINE, pipeline):
+            resp = client.post(
+                "/pubsub/embed-request",
+                json=_envelope({"repo": "acme/webapp", "commit_sha": "abc123", "mode": "incremental"}),
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "completed"
+        repo, mode, _settings = pipeline.await_args.args
+        assert (repo, mode) == ("acme/webapp", "incremental")
+        # The pushed head is not a diff base: incremental runs diff from the last indexed commit.
+        assert "commit_sha" not in pipeline.await_args.kwargs
+
+    def test_failed_run_is_not_acknowledged(self, client):
+        """A partial index must be redelivered (and finally dead-lettered), never acked."""
+        pipeline = AsyncMock(return_value={"status": "failed", "error": "3 of 9 chunks failed to upload"})
+        with patch(self._PIPELINE, pipeline):
+            resp = client.post("/pubsub/embed-request", json=_envelope({"repo": "acme/webapp"}))
+
+        assert resp.status_code == 500
+        assert "3 of 9 chunks failed" in resp.json()["detail"]
+
+    def test_pipeline_exception_is_not_acknowledged(self, client):
+        with patch(self._PIPELINE, AsyncMock(side_effect=RuntimeError("git missing"))):
+            resp = client.post("/pubsub/embed-request", json=_envelope({"repo": "acme/webapp"}))
+
+        assert resp.status_code == 500
+
+    @pytest.mark.parametrize(
+        "envelope",
+        [
+            {"message": {"data": "!!not base64!!"}},
+            _envelope({"mode": "full"}),
+            _envelope({"repo": "acme/webapp", "mode": "sideways"}),
+        ],
+    )
+    def test_malformed_message_is_rejected_without_running(self, client, envelope):
+        pipeline = AsyncMock()
+        with patch(self._PIPELINE, pipeline):
+            resp = client.post("/pubsub/embed-request", json=envelope)
+
+        assert resp.status_code == 400
+        pipeline.assert_not_awaited()
+
+    def test_requires_pubsub_oidc(self):
+        from fastapi import HTTPException
+
+        from henchmen.mastermind.server import app
+
+        pipeline = AsyncMock()
+        with (
+            patch(
+                "henchmen.mastermind.server.verify_pubsub_oidc",
+                new=AsyncMock(side_effect=HTTPException(status_code=401, detail="unauthorized")),
+            ),
+            patch(self._PIPELINE, pipeline),
+        ):
+            resp = TestClient(app).post("/pubsub/embed-request", json=_envelope({"repo": "acme/webapp"}))
+
+        assert resp.status_code == 401
+        pipeline.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # check-dlq
 # ---------------------------------------------------------------------------
 

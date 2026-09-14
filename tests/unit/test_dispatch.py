@@ -553,46 +553,6 @@ class TestDispatchServerRoutes:
 
 
 # ---------------------------------------------------------------------------
-# CLI embed command
-# ---------------------------------------------------------------------------
-
-
-class TestCliEmbedCommand:
-    @pytest.mark.asyncio
-    async def test_embed_full_mode(self):
-        from henchmen.dispatch.handlers.cli import handle_embed_command
-
-        with patch("henchmen.dispatch.handlers.cli.run_embedding_pipeline", new_callable=AsyncMock) as mock_run:
-            mock_run.return_value = {"status": "completed", "chunks_upserted": 100}
-            result = await handle_embed_command(
-                repo="acme-org/sample-repo",
-                full=True,
-                settings=MagicMock(),
-            )
-
-        mock_run.assert_awaited_once()
-        call_kwargs = mock_run.call_args[1]
-        assert call_kwargs["repo"] == "acme-org/sample-repo"
-        assert call_kwargs["mode"] == "full"
-        assert result["status"] == "completed"
-
-    @pytest.mark.asyncio
-    async def test_embed_incremental_mode(self):
-        from henchmen.dispatch.handlers.cli import handle_embed_command
-
-        with patch("henchmen.dispatch.handlers.cli.run_embedding_pipeline", new_callable=AsyncMock) as mock_run:
-            mock_run.return_value = {"status": "completed", "chunks_upserted": 5}
-            await handle_embed_command(
-                repo="acme-org/sample-repo",
-                full=False,
-                settings=MagicMock(),
-            )
-
-        call_kwargs = mock_run.call_args[1]
-        assert call_kwargs["mode"] == "incremental"
-
-
-# ---------------------------------------------------------------------------
 # GitHub push webhook for embedding
 # ---------------------------------------------------------------------------
 
@@ -641,6 +601,31 @@ class TestGitHubPushEmbed:
 
         assert result["status"] == "embed_requested"
         mock_broker.publish.assert_awaited_once()
+        # The body is the contract Mastermind's /pubsub/embed-request validates.
+        from henchmen.dossier.embed_pipeline import EmbedRequest
+
+        topic, body = mock_broker.publish.await_args.args
+        assert topic == "henchmen-dev-embed-request"
+        assert EmbedRequest.model_validate_json(body) == EmbedRequest(
+            repo="org/repo", commit_sha="abc123", mode="incremental"
+        )
+
+    @pytest.mark.asyncio
+    async def test_push_without_repository_is_ignored(self):
+        from henchmen.dispatch.handlers.github import handle_push_embed
+
+        broker = AsyncMock()
+        result = await handle_push_embed({"ref": "refs/heads/main"}, MagicMock(), broker=broker)
+
+        assert result["status"] == "ignored"
+        broker.publish.assert_not_awaited()
+
+    def test_dispatch_no_longer_hosts_the_embedding_pipeline(self):
+        """Dispatch normalizes and publishes; cloning and indexing live in dossier.embed_pipeline."""
+        import henchmen.dispatch.handlers.cli as cli_handlers
+
+        for name in ("run_embedding_pipeline", "handle_embed_command", "_collect_all_files", "clone_repo"):
+            assert not hasattr(cli_handlers, name), name
 
 
 # ---------------------------------------------------------------------------
@@ -1192,90 +1177,6 @@ class TestSlackMentionDetection:
         }
         result = await handle_slack_event(payload, TaskNormalizer(), _mock_settings(), broker=AsyncMock())
         assert result["status"] == "ignored"
-
-
-# ---------------------------------------------------------------------------
-# Embedding pipeline hygiene
-# ---------------------------------------------------------------------------
-
-
-class TestEmbeddingPipelineGuards:
-    @pytest.mark.asyncio
-    async def test_rejects_repo_that_is_not_owner_slash_name(self):
-        from henchmen.dispatch.handlers.cli import run_embedding_pipeline
-
-        result = await run_embedding_pipeline(repo="--upload-pack=evil", mode="full", settings=_mock_settings())
-        assert result["status"] == "failed"
-        assert "invalid repo name" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_clone_uses_resolved_default_branch_and_settings_token(self, monkeypatch):
-        from henchmen.dispatch.handlers import cli as cli_handlers
-
-        monkeypatch.setenv("HENCHMEN_GITHUB_TOKEN", "ghp-from-settings")
-        settings = _mock_settings()
-
-        clone = AsyncMock(side_effect=RuntimeError("stop here"))
-        monkeypatch.setattr(cli_handlers, "clone_repo", clone)
-        monkeypatch.setattr(
-            cli_handlers,
-            "_resolve_default_branch",
-            AsyncMock(return_value="develop"),
-        )
-
-        result = await cli_handlers.run_embedding_pipeline(repo="acme/api", mode="full", settings=settings)
-
-        assert result["status"] == "failed"
-        args, kwargs = clone.call_args
-        assert args[1] == "develop"
-        assert kwargs["token"] == "ghp-from-settings"
-
-    @pytest.mark.asyncio
-    async def test_failed_upsert_does_not_advance_last_indexed_commit(self, monkeypatch, tmp_path):
-        """A partial upsert must not mark the commit indexed.
-
-        The next incremental run only diffs from the last-indexed commit, so
-        advancing it past chunks that failed to upload strands them forever.
-        """
-        import subprocess
-
-        from henchmen.dispatch.handlers import cli as cli_handlers
-        from henchmen.dossier.embedder import UpsertResult
-
-        settings = _mock_settings()
-        repo_dir = tmp_path / "repo"
-        repo_dir.mkdir()
-        (repo_dir / "main.py").write_text("def hello():\n    return 1\n", encoding="utf-8")
-        # A real repo, because the pipeline reads HEAD with `git rev-parse`.
-        for cmd in (
-            ["git", "init", "-q"],
-            ["git", "config", "user.email", "t@example.com"],
-            ["git", "config", "user.name", "t"],
-            ["git", "add", "-A"],
-            ["git", "commit", "-qm", "seed"],
-        ):
-            subprocess.run(cmd, cwd=repo_dir, check=True, capture_output=True)
-
-        monkeypatch.setattr(cli_handlers, "_resolve_default_branch", AsyncMock(return_value="main"))
-        monkeypatch.setattr(cli_handlers, "clone_repo", AsyncMock())
-        monkeypatch.setattr(cli_handlers.tempfile, "mkdtemp", lambda **kw: str(repo_dir))
-        # The pipeline imports these inside the function body, so they are
-        # attributes of the embedder module, not of the handler module.
-        from henchmen.dossier import embedder
-
-        monkeypatch.setattr(
-            embedder,
-            "upsert_chunks",
-            AsyncMock(return_value=UpsertResult(uploaded=2, failed=5)),
-        )
-        set_commit = AsyncMock()
-        monkeypatch.setattr(embedder, "set_last_indexed_commit", set_commit)
-
-        result = await cli_handlers.run_embedding_pipeline(repo="acme/api", mode="full", settings=settings)
-
-        assert result["status"] == "failed"
-        assert result["chunks_failed"] == 5
-        set_commit.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

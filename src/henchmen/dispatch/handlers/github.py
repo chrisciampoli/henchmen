@@ -159,23 +159,20 @@ async def handle_push_embed(
 ) -> dict[str, Any]:
     """Handle a GitHub push event by requesting an embedding update.
 
-    Publishes a message to the embed-request Pub/Sub topic. The topic is the
-    integration point for incremental RAG indexing; there is no subscriber in
-    this repository yet, so the message is currently a no-op hook rather than
-    a live pipeline.
+    Publishes an :class:`~henchmen.dossier.embed_pipeline.EmbedRequest` to the
+    embed-request topic. Mastermind's ``/pubsub/embed-request`` push handler
+    consumes it and runs the incremental indexing pipeline; Dispatch itself
+    never clones or indexes.
     """
+    from henchmen.dossier.embed_pipeline import EmbedRequest
+
     repo = payload.get("repository", {}).get("full_name", "")
     commit_sha = payload.get("after", "")
+    if not repo:
+        return {"status": "ignored", "reason": "push event has no repository.full_name"}
 
-    data = json.dumps(
-        {
-            "repo": repo,
-            "commit_sha": commit_sha,
-            "mode": "incremental",
-        }
-    ).encode("utf-8")
-
-    await broker.publish(settings.pubsub_topic_embed_request, data)
+    request = EmbedRequest(repo=repo, commit_sha=commit_sha, mode="incremental")
+    await broker.publish(settings.pubsub_topic_embed_request, request.model_dump_json().encode("utf-8"), repo=repo)
 
     return {
         "status": "embed_requested",

@@ -98,6 +98,11 @@ def main() -> None:
 
     subparsers.add_parser("chat", help="Interactive task builder REPL (uses the configured LLM provider)")
 
+    embed_parser = subparsers.add_parser("embed", help="Index a repository into the RAG Engine corpus (owner/name)")
+    from henchmen.cli.embed import add_embed_arguments
+
+    add_embed_arguments(embed_parser)
+
     config_parser = subparsers.add_parser(
         "config", help="Print the effective configuration (env + .env.local + defaults), secrets masked"
     )
@@ -148,6 +153,10 @@ def main() -> None:
         from henchmen.cli import chat
 
         sys.exit(chat.run_chat_cli())
+    elif args.command == "embed":
+        from henchmen.cli.embed import run_embed_cli
+
+        sys.exit(run_embed_cli(args))
     elif args.command == "config":
         from henchmen.cli.config_cmd import run_config_cli
 
