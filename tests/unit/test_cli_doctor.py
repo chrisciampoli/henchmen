@@ -331,7 +331,12 @@ class TestCheckOperativeImage:
 # ---------------------------------------------------------------------------
 
 
-def _stub_all(monkeypatch: pytest.MonkeyPatch, *, docker_ok: bool = True) -> None:
+def _stub_all(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    docker_ok: bool = True,
+    operative_image_calls: list[str] | None = None,
+) -> None:
     ok = lambda name: CheckResult(name=name, status=CheckStatus.OK, message="ok")  # noqa: E731
     monkeypatch.setattr(doctor, "check_python_version", lambda: ok("python"))
     monkeypatch.setattr(
@@ -340,11 +345,18 @@ def _stub_all(monkeypatch: pytest.MonkeyPatch, *, docker_ok: bool = True) -> Non
         lambda: ok("docker") if docker_ok else CheckResult("Docker", CheckStatus.FAIL, "not installed"),
     )
     monkeypatch.setattr(doctor, "check_git_identity", lambda: ok("git"))
-    monkeypatch.setattr(doctor, "check_operative_image", lambda: ok("operative"))
+
+    def _fake_check_operative_image(image: str) -> CheckResult:
+        if operative_image_calls is not None:
+            operative_image_calls.append(image)
+        return ok("operative")
+
+    monkeypatch.setattr(doctor, "check_operative_image", _fake_check_operative_image)
 
 
 class TestRunDoctor:
     def test_returns_results_without_touching_docker_or_network(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
         _stub_all(monkeypatch)
         monkeypatch.setattr("subprocess.run", lambda *a, **kw: pytest.fail("doctor shelled out"))
         results = run_doctor(offline=True)
@@ -359,8 +371,24 @@ class TestRunDoctor:
         assert results[-1].is_failure
 
     def test_nonzero_on_any_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
         _stub_all(monkeypatch, docker_ok=False)
         assert any(r.is_failure for r in run_doctor(offline=True))
+
+    def test_operative_image_check_receives_the_configured_image(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        monkeypatch.setenv("HENCHMEN_OPERATIVE_IMAGE", "ghcr.io/acme/henchmen/operative:0.3.0")
+        calls: list[str] = []
+        _stub_all(monkeypatch, operative_image_calls=calls)
+        run_doctor(offline=True)
+        assert calls == ["ghcr.io/acme/henchmen/operative:0.3.0"]
+
+    def test_operative_image_check_defaults_to_the_local_image(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        calls: list[str] = []
+        _stub_all(monkeypatch, operative_image_calls=calls)
+        run_doctor(offline=True)
+        assert calls == ["henchmen-operative:local"]
 
 
 # ---------------------------------------------------------------------------
