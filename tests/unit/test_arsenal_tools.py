@@ -63,6 +63,42 @@ class TestRegistryHandlersAreAsync:
             assert inspect.iscoroutinefunction(tool_def.handler), f"{name} handler must be async"
 
 
+class TestRegistryUnknownCategory:
+    def test_empty_category_is_logged_at_error(self, caplog: pytest.LogCaptureFixture):
+        from henchmen.arsenal.registry import ArsenalTool
+        from henchmen.models.scheme import ArsenalRequirement
+
+        async def _handler() -> dict[str, str]:
+            return {}
+
+        ToolRegistry.clear()
+        ToolRegistry.register(ArsenalTool(name="file_read", description="d", category="code_intel", handler=_handler))
+
+        with caplog.at_level("ERROR", logger="henchmen.arsenal.registry"):
+            tools = ToolRegistry.get_tools_for_requirement(ArsenalRequirement(tool_sets=["code_intel", "jira"]))
+
+        assert [t.name for t in tools] == ["file_read"]
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1
+        assert "'jira'" in errors[0].getMessage()
+        assert "code_intel" in errors[0].getMessage()
+
+    def test_populated_categories_log_nothing(self, caplog: pytest.LogCaptureFixture):
+        from henchmen.arsenal.registry import ArsenalTool
+        from henchmen.models.scheme import ArsenalRequirement
+
+        async def _handler() -> dict[str, str]:
+            return {}
+
+        ToolRegistry.clear()
+        ToolRegistry.register(ArsenalTool(name="file_read", description="d", category="code_intel", handler=_handler))
+
+        with caplog.at_level("ERROR", logger="henchmen.arsenal.registry"):
+            ToolRegistry.get_tools_for_requirement(ArsenalRequirement(tool_sets=["code_intel"]))
+
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+
 # ---------------------------------------------------------------------------
 # code_edit
 # ---------------------------------------------------------------------------

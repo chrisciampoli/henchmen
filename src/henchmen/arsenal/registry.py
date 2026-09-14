@@ -1,10 +1,13 @@
-"""Arsenal tool registry - central store of all available MCP tools."""
+"""Arsenal tool registry - central store of all available Operative tools."""
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from henchmen.models.scheme import ArsenalRequirement
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -34,10 +37,21 @@ class ToolRegistry:
 
     @classmethod
     def get_tools_for_requirement(cls, requirement: ArsenalRequirement) -> list[ArsenalTool]:
-        """Filter tools by category membership and destructive flag."""
+        """Filter tools by category membership and destructive flag.
+
+        A requested category with no registered tools is logged at error level:
+        returning an empty list silently hands the operative no tools for a
+        scheme typo or an unimported tool module, with no trace in the logs.
+        """
         result: list[ArsenalTool] = []
         for tool_set in requirement.tool_sets:
             tool_names = cls._categories.get(tool_set, [])
+            if not tool_names:
+                logger.error(
+                    "[arsenal] Requested tool category %r has no registered tools; registered categories: %s",
+                    tool_set,
+                    sorted(cls._categories) or "none",
+                )
             for name in tool_names:
                 tool_def = cls._tools.get(name)
                 if tool_def is None:
