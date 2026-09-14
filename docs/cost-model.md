@@ -26,7 +26,8 @@ and OpenAI cached tokens. Cost is always computed with `estimate_cost` /
 `estimate_cost_for_settings` — never a second table. A scheme node stores a
 tier name, so cost is computed after resolving the tier to the active
 provider's concrete model; a model missing from `PRICE_TABLE` costs `$0.00`
-and never trips the cost ceiling (see `docs/incident-runbook.md`).
+and never trips the cost ceiling — `henchmen doctor` warns when a tier resolves
+to such a model (see `docs/incident-runbook.md`).
 
 ## Per-Task Cost Breakdown by Node
 
@@ -258,7 +259,14 @@ Query aggregated cost data (the bearer token is required in staging and prod):
 ```bash
 # Summary for the last 7 days
 curl -H "Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN" "https://mastermind-url/metrics/summary?days=7"
+
+# Dashboard view with cost per model and escalation reasons (same token rules)
+curl -H "Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN" "https://mastermind-url/api/v1/metrics/summary?days=7"
 ```
+
+Mastermind uses internal-only ingress by default, so call it from inside the
+project's network (or through `henchmen serve` locally at
+`http://localhost:8000/mastermind/...`).
 
 Response includes:
 - `total_cost_usd`: Total spend across all tasks

@@ -116,7 +116,7 @@ publishing a `forge-result` (clone failure, crash, misconfigured provider).
 **Fix:**
 
 ```bash
-TOKEN="Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN"   # omit in dev if unset
+TOKEN="Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN"   # optional only in dev with no token set
 curl -H "$TOKEN" http://localhost:8000/mastermind/metrics/summary | jq .tasks_ci_pending
 curl -H "$TOKEN" http://localhost:8000/mastermind/metrics/summary | jq .by_scheme
 ```
@@ -226,8 +226,15 @@ wallet.
 
 3. Restart the service.
 
-`curl http://localhost:8000/mastermind/metrics/summary | jq .by_scheme` shows
-which scheme is spending the most.
+Which scheme is spending the most, and which model (the metrics bearer token
+is required whenever `HENCHMEN_METRICS_AUTH_TOKEN` is set, and always in
+staging and prod):
+
+```bash
+TOKEN="Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN"
+curl -H "$TOKEN" http://localhost:8000/mastermind/metrics/summary | jq .by_scheme
+curl -H "$TOKEN" http://localhost:8000/mastermind/api/v1/metrics/summary | jq .cost_by_model
+```
 
 ---
 
