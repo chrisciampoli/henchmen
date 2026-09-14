@@ -19,7 +19,6 @@ def mock_settings():
     s.firestore_database = "(default)"
     s.vertex_ai_model_complex = "gemini-2.5-pro"
     s.vertex_ai_model_light = "gemini-2.5-flash"
-    s.vertex_ai_context_cache_enabled = False
     s.vertex_ai_safety_threshold = "BLOCK_MEDIUM_AND_ABOVE"
     s.environment = MagicMock()
     s.environment.value = "dev"
