@@ -459,7 +459,7 @@ async def _process_task(agent: MastermindAgent, task: HenchmenTask) -> None:
 
     try:
         # Emit structured metric for Cloud Monitoring
-        from henchmen.observability.structured_logging import emit_task_completed
+        from henchmen.observability.structured_logging import emit_task_completed, primary_model_name
 
         task_metrics = await agent.tracker.get_task(task.id)
         emit_task_completed(
@@ -468,6 +468,7 @@ async def _process_task(agent: MastermindAgent, task: HenchmenTask) -> None:
             final_status=result.get("result", {}).get("final_status", result.get("status", "unknown")),
             cost_usd=task_metrics.get("estimated_cost_usd", 0.0) if task_metrics else 0.0,
             wall_clock_seconds=task_metrics.get("wall_clock_seconds", 0.0) if task_metrics else 0.0,
+            model_name=primary_model_name(task_metrics) if task_metrics else "unknown",
         )
 
         # Notify Slack. Tasks from Slack get a threaded reply; everything else

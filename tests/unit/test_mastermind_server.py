@@ -97,6 +97,37 @@ class TestTaskIntake:
         statuses = [call.args[2]["status"] for call in agent.tracker._store.set.await_args_list]
         assert statuses == ["in_flight", "done"]
 
+    @pytest.mark.parametrize(
+        ("task_metrics", "expected_model"),
+        [
+            (
+                {
+                    "estimated_cost_usd": 0.5,
+                    "wall_clock_seconds": 12.0,
+                    "node_metrics": {
+                        "plan": {"model_name": "gemini-2.5-flash", "model_calls": 1},
+                        "implement_fix": {"model_name": "gemini-2.5-pro", "model_calls": 7},
+                    },
+                },
+                "gemini-2.5-pro",
+            ),
+            (None, "unknown"),
+        ],
+    )
+    def test_task_completed_metric_carries_the_primary_model(self, client, agent, task_metrics, expected_model):
+        """Cloud Monitoring breaks spend down by model; an empty label made that impossible."""
+        agent.handle_task = AsyncMock(return_value={"status": "completed", "scheme_id": "bugfix_standard"})
+        agent.tracker.get_task = AsyncMock(return_value=task_metrics)
+
+        with (
+            patch("henchmen.mastermind.server._notify_slack", new_callable=AsyncMock),
+            patch("henchmen.observability.structured_logging.emit_task_completed") as emit,
+        ):
+            resp = client.post("/pubsub/task-intake", json=_envelope(_task().model_dump(mode="json")))
+
+        assert resp.status_code == 200
+        assert emit.call_args.kwargs["model_name"] == expected_model
+
 
 # ---------------------------------------------------------------------------
 # operative-complete dedup markers
