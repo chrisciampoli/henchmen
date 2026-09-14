@@ -39,7 +39,7 @@ This page describes the GCP deployment. In local mode (`henchmen serve`) the sam
                           +-------+--------+
                           |     Forge      |  Cloud Run Service
                           | (CI Pipeline)  |  Lint, test, silent-failure scan,
-                          +-------+--------+  PR comment, merge queue
+                          +-------+--------+  PR comment
                                   |  Pub/Sub: forge-result
                                   v
                             Pull Request
@@ -55,7 +55,7 @@ CRJ = Cloud Run Job. The model tier each Lair runs on is resolved to a concrete 
 | **Mastermind** | Cloud Run Service | Central orchestrator. Selects a Scheme, builds a Dossier, walks the DAG, provisions Lairs for agentic nodes, runs the deterministic lint/test gates, opens PRs. |
 | **Operative** | Cloud Run Job (Lair) | Ephemeral agent container. Clones repo, runs an agentic tool loop against an LLM, commits and pushes changes. |
 | **Arsenal** | In-process registry (inside the Operative) | Tool system providing the `code_edit`, `code_intel`, `context`, `git_ops`, `github`, `jira`, `slack` and `test_runner` tool sets. |
-| **Forge** | Cloud Run Service | Post-PR CI pipeline. Clones the PR branch, runs lint/tests/silent-failure detection, comments on the PR, publishes results, processes the merge queue. |
+| **Forge** | Cloud Run Service | Post-PR CI pipeline. Clones the PR branch, runs lint/tests/silent-failure detection, comments on the PR, publishes `forge-result`. Never opens or merges PRs. |
 | **Dossier** | Library (in Mastermind) | Context assembly. Fetches file trees, rule files, related PRs/issues, semantic code chunks from Vertex AI RAG Engine (corpus: `henchmen-code`). |
 | **Tracker** | Library (in Mastermind) | Observability layer. Persists per-task and per-node telemetry (tokens, cost, duration) to the document store. |
 
@@ -73,7 +73,7 @@ Dispatch is the system's front door:
 - `POST /webhooks/slack` -- Slack Events API (handles `url_verification` and `app_mention`). Slack is normally connected over **Socket Mode** instead, started from the Dispatch lifespan when `HENCHMEN_SLACK_BOT_TOKEN` and `HENCHMEN_SLACK_APP_TOKEN` are both set.
 - `POST /webhooks/github` -- Repository webhook signed with `HENCHMEN_GITHUB_WEBHOOK_SECRET` (issues labelled `henchmen`, `@henchmen` comments from trusted users, CI failures, pushes)
 - `POST /webhooks/jira` -- Jira webhook signed with `HENCHMEN_JIRA_WEBHOOK_SECRET`
-- `POST /pubsub/task-planned` -- Pub/Sub push endpoint; logs the event only
+- `POST /pubsub/task-planned` -- Legacy push endpoint that only logs; Terraform no longer creates a `task-planned` topic, so nothing calls it
 
 Each handler uses the `TaskNormalizer` to convert the source-specific payload into a `HenchmenTask` Pydantic model, then publishes the serialized task to the `henchmen-{env}-task-intake` topic. GitHub CI-failure events go to `ci-failure`; push events go to `embed-request`.
 
@@ -102,7 +102,7 @@ The Mastermind is the brain of the system. It receives tasks via Pub/Sub push su
    - A per-node execution limit (2) forces `fail` if a node would run a third time.
    - A per-task cost ceiling (`HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD`) is checked before each agentic node is dispatched.
 
-4. **Task Lifecycle Tracking**: There is no separate state-machine class. A task carries a `TaskStatus` (`pending`, `dispatched`, `in_progress`, `completed`, `failed`, `escalated`), and its `task_executions` document records `final_status`, `execution_state` (`running`, `completed`, `escalated`, `stalled`) and a `last_heartbeat`. The watchdog (`POST /api/v1/watchdog`, every 5 minutes from Cloud Scheduler) re-publishes tasks whose heartbeat expired and escalates after 3 recovery attempts.
+4. **Task Lifecycle Tracking**: There is no separate state-machine class. A task carries a `TaskStatus` (`pending`, `dispatched`, `in_progress`, `completed`, `failed`, `escalated`), and its `task_executions` document records `final_status`, `execution_state` (`running`, `completed`, `escalated`, `stalled`) and a `last_heartbeat`. The watchdog (`POST /api/v1/watchdog`, every 5 minutes from Cloud Scheduler; dev sets `scheduler_enabled = false`, so call it by hand there) re-publishes tasks whose heartbeat expired and escalates after 3 recovery attempts.
 
 5. **CI Failure Loop** (`handle_ci_failure`): When CI fails on a Henchmen PR, the Mastermind can dispatch a fix operative (max 2 attempts). It extracts errors from GitHub check run annotations and dispatches a new Lair with the error context.
 
@@ -182,7 +182,7 @@ Notable tool features:
 
 The Forge handles post-PR CI validation. It does not open PRs -- the Mastermind's `create_pr` node does, then publishes `forge-request`.
 
-1. **CI Runner** (`CIRunner`): Clones the PR branch, runs `ruff check` on the Python files the PR changed, runs the tests (`pytest`, or `npm test` for a Node target), and runs the silent failure scan on the PR diff. Lint and the scan fail closed when the PR base cannot be resolved.
+1. **CI Runner** (`CIRunner`): Clones the PR branch, runs `ruff check` on the Python files the PR changed, runs the tests (`pytest`, or `npm test` for a Node target), and runs the silent failure scan on the PR diff. Lint and the scan fail closed when the PR base cannot be resolved. The result is `passed` only when every check ran and passed; a check that could not run (for example, the target's tests need a tool the Forge image lacks) makes the run `incomplete`, which the PR comment flags and Mastermind does not treat as a pass.
 
 2. **Silent Failure Detector** (`SilentFailureDetector`): Scans the git diff for patterns that indicate silent failures:
    - `critical`: Empty catch blocks, bare `except: pass`, hardcoded secrets
@@ -190,14 +190,14 @@ The Forge handles post-PR CI validation. It does not open PRs -- the Mastermind'
    - `info`: TODO/FIXME comments
    - Only critical findings cause the CI check to fail.
 
-3. **Merge Queue** (`MergeQueue`): FIFO merge serialization backed by the document store. Prevents parallel operatives from creating merge conflicts. Entries transition through states: `pending -> merging -> merged` (or `failed`).
+3. **Merge Queue** (`MergeQueue`): A claim queue in the `merge_queue` collection (`pending -> merging -> merged | failed`). Nothing in Henchmen enqueues into it today — every PR is merged by a human — so the periodic tick (`/api/v1/process-queue`) only expires `merging` claims older than their TTL and reports the queue depth.
 
 4. **Error Extractor** (`error_extractor.py`): Fetches GitHub check run annotations for failed CI suites and formats them as structured context for fix operatives.
 
 **HTTP endpoints on Forge:**
 - `POST /pubsub/forge-request` -- Receive CI run requests (clones branch, runs checks, comments on PR, publishes `forge-result`)
 - `POST /pubsub/build-complete` -- Cloud Build completion callback
-- `POST /api/v1/process-queue` -- Merge queue tick (Cloud Scheduler)
+- `POST /api/v1/process-queue` -- Merge queue maintenance tick (Cloud Scheduler): expires stale claims, reports depth
 
 ### Dossier
 
@@ -212,7 +212,7 @@ The Dossier subsystem assembles context packages for operatives:
 - **FileScorer** (`file_scorer.py`): Scores files for relevance from weighted signals (task mentions, RAG hits, directory proximity, recent changes, stack traces).
 - **Chunker/Embedder** (`chunker.py`, `embedder.py`): Indexes repository code into Vertex AI RAG Engine (corpus: `henchmen-code`) for semantic search.
 - **Reranker** (`reranker.py`): Reranks RAG chunks with the light-tier model; not yet called from the Mastermind pipeline.
-- **SnapshotCache** (`cache.py`): Caches cloned repository snapshots in the object store to speed up workspace initialization.
+- **SnapshotCache** (`cache.py`): Helpers for storing repository snapshots in the snapshots bucket. Nothing creates snapshots, so operatives always clone the repository fresh.
 
 ## Data Flow
 
@@ -257,7 +257,7 @@ The Dossier subsystem assembles context packages for operatives:
 
 ### Pub/Sub Topic Map
 
-Ten topics, each named `henchmen-{env}-<topic>`:
+Seven topics, each named `henchmen-{env}-<topic>` (`terraform/modules/pubsub`):
 
 | Topic | Publisher | Subscriber | Delivery |
 |-------|-----------|------------|----------|
@@ -267,10 +267,7 @@ Ten topics, each named `henchmen-{env}-<topic>`:
 | `forge-result` | Forge | Mastermind `/pubsub/forge-result` | Push |
 | `ci-failure` | Dispatch (GitHub webhook) | Mastermind `/pubsub/ci-failure` | Push |
 | `embed-request` | Dispatch (GitHub push) | none yet (re-embedding hook) | -- |
-| `task-planned` | none yet | Dispatch `/pubsub/task-planned` (logs only) | Push |
-| `operative-dispatch` | none yet | pull subscription, no consumer | Pull |
-| `operative-status` | none yet | pull subscription, no consumer | Pull |
-| `dead-letter` | Pub/Sub (failed deliveries) | `/api/v1/check-dlq` | Pull |
+| `dead-letter` | Pub/Sub (failed deliveries) | Mastermind `/api/v1/check-dlq` pulls `dead-letter-sub` | Pull |
 
 Forge also has a push subscription on Cloud Build's own `cloud-builds` topic (`/pubsub/build-complete`).
 
@@ -285,12 +282,12 @@ All push subscriptions authenticate with an OIDC token minted for the `sa-{env}-
 | **Cloud Run (Services)** | Dispatch, Mastermind, Forge |
 | **Cloud Run (Jobs)** | Operative Lairs -- ephemeral containers, created per agentic node |
 | **Pub/Sub** | Async message passing between all components |
-| **Firestore** | Task execution tracking, merge queue state, operative reports |
-| **Cloud Storage (GCS)** | Dossier artifacts, Terraform state, repository snapshots |
+| **Firestore** | Task execution tracking, operative reports, processed-message dedup, merge queue claims |
+| **Cloud Storage (GCS)** | Dossier artifacts, Terraform state |
 | **Secret Manager** | GitHub token, Slack tokens, Jira API token, metrics bearer token |
 | **Artifact Registry** | Docker images for all containers |
 | **VPC + Serverless VPC Access** | Private-range networking only; public egress does not traverse the VPC |
-| **Cloud Scheduler** | Stale-task cleanup, watchdog, dead-letter check, merge queue processing |
+| **Cloud Scheduler** | Stale-task cleanup, watchdog, dead-letter check, merge queue maintenance (staging/prod; off in dev) |
 | **Vertex AI** | LLM access (Gemini only) and RAG Engine corpus (`henchmen-code`) |
 
 ### Container Resources
@@ -300,7 +297,9 @@ All push subscriptions authenticate with an OIDC token minted for the `sa-{env}-
 | Mastermind | 2 vCPU | 4Gi | 3600s | 0-3 | 1-10 |
 | Dispatch | 1 vCPU | 512Mi | default | 0-3 | 1-10 |
 | Forge | 1 vCPU | 512Mi | default | 0-3 | 1-10 |
-| Operative (Lair) | `HENCHMEN_LAIR_DEFAULT_CPU` (4) | `HENCHMEN_LAIR_DEFAULT_MEMORY` (8Gi) | node `timeout_seconds` | n/a (ephemeral) | n/a (ephemeral) |
+| Operative (Lair) | `HENCHMEN_LAIR_DEFAULT_CPU` | `HENCHMEN_LAIR_DEFAULT_MEMORY` | node `timeout_seconds` | n/a (ephemeral) | n/a (ephemeral) |
+
+Lair CPU and memory come from the `lair_cpu` / `lair_memory` Terraform variables, injected into Mastermind as `HENCHMEN_LAIR_DEFAULT_*` (dev: 2 vCPU / 4Gi; the Settings defaults when unset are 4 / 8Gi).
 
 ### Terraform Module Structure
 

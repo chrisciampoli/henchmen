@@ -18,6 +18,7 @@ Henchmen is an AI agent factory. It receives tasks from Slack, Jira, GitHub, and
 pip install -e ".[local,dev]"   # Runtime extras + tooling
 henchmen init                    # Interactive setup — writes .env.local
 henchmen doctor                  # Verify the environment
+henchmen config --only-set       # Effective settings, credentials masked
 pytest tests/unit/               # Run unit tests
 ruff check src/ tests/ evals/    # Lint
 mypy src/ evals/                 # Type check
@@ -31,8 +32,8 @@ Seven components, all villain-themed:
 - **Dispatch** (`src/henchmen/dispatch/`) — Intake router. Cloud Run service. Receives tasks from Slack (Socket Mode), Jira, GitHub, CLI. Normalizes to Task model. Publishes to message broker.
 - **Operative** (`src/henchmen/operative/`) — Coding agent. Cloud Run Job. Bootstraps into ephemeral environment, executes Scheme nodes, uses Arsenal tools, reports results. TIMED_OUT stays TIMED_OUT (never upgraded to COMPLETED).
 - **Arsenal** (`src/henchmen/arsenal/`) — Tool registry. Runs inside Operative (NOT a separate service). Tool categories: `code_edit`, `code_intel`, `context`, `git_ops`, `github`, `jira`, `slack`, `test_runner`.
-- **Forge** (`src/henchmen/forge/`) — CI/merge queue. Cloud Run service. Runs CI on the PR branch Mastermind opened (ruff on changed Python files, tests, silent-failure scan on the diff), comments the results, manages the merge queue.
-- **Dossier** (`src/henchmen/dossier/`) — Context builder. Library. Gathers rules, semantic code search via Vertex AI RAG Engine (corpus: `henchmen-code`), task analysis. Caches to object store.
+- **Forge** (`src/henchmen/forge/`) — Post-PR CI. Cloud Run service. Never opens PRs — Mastermind's `create_pr` node does. Runs CI on the PR branch (ruff on changed Python files, tests, silent-failure scan on the diff), comments the result on the PR and publishes `forge-result` as `passed`, `failed`, or `incomplete` when a check could not run. `MergeQueue` exists but nothing enqueues into it; its tick only expires stale claims and reports depth.
+- **Dossier** (`src/henchmen/dossier/`) — Context builder. Library. Gathers rules, semantic code search via Vertex AI RAG Engine (corpus: `henchmen-code`), task analysis. Uploads the assembled dossier to the object store.
 - **Schemes** (`src/henchmen/schemes/`) — DAG workflow blueprints. Library. Defines execution plans: `bugfix_standard`, `feature_standard`, `goal_decomposition`.
 
 Shared data contracts live in **Models** (`src/henchmen/models/`) — Pydantic v2 models for `Task`, `Operative`, `Scheme`, `Dossier`, `LLM` (messages, tool calls, `ModelTier`) and `Evaluation`.
@@ -132,7 +133,7 @@ henchmen/
 │   ├── dispatch/              # Intake router + handlers/ + slack_bot.py
 │   ├── dossier/               # Context builder
 │   ├── evals/                 # Offline eval harness + SQLite history
-│   ├── forge/                 # CI + merge queue
+│   ├── forge/                 # Post-PR CI (lint, tests, silent-failure scan)
 │   ├── mastermind/            # Orchestrator + scheme_executor/
 │   ├── models/                # Pydantic data models (task, operative, scheme, dossier, llm, evaluation)
 │   ├── observability/         # Cost tracking, metrics API, tracing

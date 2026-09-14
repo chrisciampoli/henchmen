@@ -41,6 +41,7 @@ pip install -e ".[local,dev]"
 
 henchmen init              # interactive setup — writes .env.local
 henchmen doctor            # verify everything it just configured
+henchmen config --only-set # optional: the effective settings, credentials masked
 henchmen build-operative   # build the operative image (first run, ~3 min)
 henchmen serve             # Dispatch + Mastermind + Forge in one process
 ```
@@ -89,8 +90,9 @@ copying them into Artifact Registry for Cloud Run.
 2. Dispatch normalizes it     (unified Task model, publishes to message broker)
 3. Mastermind plans the work  (selects a Scheme, builds a Dossier with RAG context)
 4. Operative executes         (ephemeral container, LLM + Arsenal tools, commits code)
-5. Forge runs CI              (lint, tests, builds the PR)
-6. You review the PR          (human-in-the-loop, always)
+5. Mastermind gates and opens (lint + test gates must pass, then it opens the PR)
+6. Forge runs CI on the PR    (lint, tests, silent-failure scan, PR comment)
+7. You review the PR          (human-in-the-loop, always)
 ```
 
 ---
@@ -105,8 +107,9 @@ graph LR
     C --> E["Schemes\n(workflow DAG)"]
     E --> F["Operative\n(coding agent)"]
     F --> G["Arsenal\n(code tools)"]
-    F --> H["Forge\n(CI + PR)"]
-    H --> I["Pull Request\n(ready for review)"]
+    F --> C
+    C --> I["Pull Request\n(ready for review)"]
+    I --> H["Forge\n(post-PR CI)"]
 
     style A fill:#1a1a2e,stroke:#7c3aed,color:#e2e8f0
     style C fill:#1a1a2e,stroke:#7c3aed,color:#e2e8f0
@@ -124,8 +127,8 @@ graph LR
 | **Dispatch** | `src/henchmen/dispatch/` | Intake router. Normalizes tasks from all sources into a unified Task model. |
 | **Operative** | `src/henchmen/operative/` | Coding agent. Ephemeral container. Executes scheme nodes with Arsenal tools. |
 | **Arsenal** | `src/henchmen/arsenal/` | Tool registry, in-process inside the Operative. `code_edit`, `code_intel`, `context`, `git_ops`, `github`, `jira`, `slack`, `test_runner`. |
-| **Forge** | `src/henchmen/forge/` | CI + merge queue. Runs lint/tests on the opened PR, detects silent failures, comments the results. |
-| **Dossier** | `src/henchmen/dossier/` | Context builder. Rules, semantic code search via Vertex AI RAG Engine, task analysis. Caches to object store. |
+| **Forge** | `src/henchmen/forge/` | Post-PR CI. Runs lint/tests on the PR Mastermind opened, detects silent failures, comments the result (passed, failed, or incomplete when a check could not run). |
+| **Dossier** | `src/henchmen/dossier/` | Context builder. Rules, semantic code search via Vertex AI RAG Engine, task analysis. Uploads the dossier to the object store. |
 | **Schemes** | `src/henchmen/schemes/` | DAG workflow blueprints: `bugfix_standard`, `feature_standard`, `goal_decomposition`. |
 
 ---
@@ -348,6 +351,9 @@ All five must pass before submitting a PR. See [CONTRIBUTING.md](CONTRIBUTING.md
 Start with `henchmen doctor`. It builds the same `Settings` the services use,
 so it sees your `.env.local`, and it probes each configured credential against
 the real API. `henchmen doctor --offline` skips the network calls.
+`henchmen config` prints the effective settings with credentials masked;
+`--only-set` limits it to the values you changed from the defaults — the
+quickest way to see whether `.env.local` or an exported variable won.
 
 **`henchmen-operative:local` image build fails**
 Check that Docker Desktop is running with at least 4GB of RAM. Try
@@ -415,7 +421,7 @@ account, run the eval harness:
 # Run a single fixture against the provider of your choice.
 henchmen eval run --provider openai --fixture bugfix_off_by_one
 
-# Run every fixture in evals/fixtures/ (add your own there).
+# Run every fixture in evals/fixtures/ (11 ship today — add your own there).
 henchmen eval run --provider ollama
 
 # Record this run as the provider's baseline.
