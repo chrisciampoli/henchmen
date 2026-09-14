@@ -126,6 +126,22 @@ def plan_lint(stack: Stack, workspace: Path, changed: list[str]) -> LintPlan:
     raise LintScopeError(f"no lint scoping rule for stack {stack.name!r}")
 
 
+def plan_fix(stack: Stack, workspace: Path, changed: list[str]) -> LintPlan:
+    """Auto-fix commands limited to ``changed``; empty with ``skip_reason`` when no fixer applies.
+
+    Only Python (ruff) and Node (eslint) have deterministic auto-fixers. Other
+    stacks get no command rather than the old fallback of running ruff over a
+    Go, Rust or Java repository.
+    """
+    if stack.name not in ("python", "node-npm", "node-pnpm"):
+        return LintPlan(skip_reason=f"no auto-fixer for the {stack.name} stack")
+    lint = plan_lint(stack, workspace, changed)
+    return LintPlan(
+        commands=tuple(CheckCommand(argv=(*command.argv, "--fix"), cwd=command.cwd) for command in lint.commands),
+        skip_reason=lint.skip_reason,
+    )
+
+
 def _with_suffix(paths: list[str], extensions: frozenset[str]) -> list[str]:
     return [path for path in paths if PurePosixPath(path).suffix in extensions]
 

@@ -16,12 +16,14 @@ import shlex
 import shutil
 import tempfile
 from collections.abc import Callable, Coroutine
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from henchmen.mastermind.scheme_executor.lint_scope import (
     CheckCommand,
     LintScopeError,
     changed_files,
+    plan_fix,
     plan_lint,
     to_shell_script,
 )
@@ -144,40 +146,62 @@ async def handle_fix_lint(
             )
             await proc.communicate()
 
-        # Run lint with --fix
-        is_pnpm = os.path.exists(os.path.join(workspace, "pnpm-lock.yaml"))
-        is_turbo = os.path.exists(os.path.join(workspace, "turbo.json"))
-        if is_pnpm and is_turbo:
-            fix_cmd = ["pnpm", "run", "lint:fix"]
-        elif os.path.exists(os.path.join(workspace, "package.json")):
-            fix_cmd = ["npx", "eslint", ".", "--fix"]
-        else:
-            fix_cmd = ["python", "-m", "ruff", "check", ".", "--fix"]
+        # Fix only what the operative changed. Running the fixer over the whole
+        # repository used to commit rewrites of files the operative never touched.
+        stack = detect_stack(Path(workspace))
+        if stack.name == "unknown":
+            return {"condition": "fail", "message": f"fix_lint failed — could not detect the project stack for {repo}"}
+        base_branch = task.context.branch or "main"
+        try:
+            scope = await changed_files(workspace, base_branch)
+        except LintScopeError as exc:
+            detail = str(exc).replace(github_token, "***") if github_token else str(exc)
+            return {
+                "condition": "fail",
+                "message": f"fix_lint failed — could not determine the files changed against {base_branch}: {detail}",
+            }
+        plan = plan_fix(stack, Path(workspace), scope)
+        if not plan.commands:
+            logger.info("[SCHEME] fix_lint: nothing to auto-fix for task %s (%s)", task.id, plan.skip_reason)
+            return {"condition": None, "message": f"fix_lint: nothing to auto-fix ({plan.skip_reason})"}
 
-        proc = await asyncio.create_subprocess_exec(
-            *fix_cmd,
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        fix_output = stdout.decode(errors="replace")[:2000]
+        outputs: list[str] = []
+        for command in plan.commands:
+            proc = await asyncio.create_subprocess_exec(
+                *command.argv,
+                cwd=os.path.join(workspace, command.cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            outputs.append(stdout.decode(errors="replace"))
+            logger.info("[SCHEME] fix_lint ran %s for task %s (rc=%s)", command.argv[:3], task.id, proc.returncode)
+        fix_output = "\n".join(outputs)[:2000]
 
-        logger.info("[SCHEME] fix_lint auto-fix ran for task %s (rc=%s)", task.id, proc.returncode)
-
-        # Check if any files were changed by the auto-fix
+        # Stage only in-scope files; anything else the fixer touched is reverted.
         proc = await asyncio.create_subprocess_exec(
             "git",
             "status",
             "--porcelain",
+            "-z",
             cwd=workspace,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         status_out, _ = await proc.communicate()
-        status_lines = status_out.decode().strip()
+        modified = [entry[3:] for entry in status_out.decode(errors="replace").split("\0") if len(entry) > 3]
+        in_scope = sorted(set(modified) & set(scope))
+        out_of_scope = sorted(set(modified) - set(scope))
+        if out_of_scope:
+            logger.warning("[SCHEME] fix_lint: reverting auto-fixes outside the operative's changes: %s", out_of_scope)
+            returncode, revert_err = await _run_git(workspace, "checkout", "--", *out_of_scope)
+            if returncode != 0:
+                return {
+                    "condition": "fail",
+                    "message": f"fix_lint failed (could not revert out-of-scope fixes): {revert_err[:300]}",
+                }
 
-        if not status_lines:
+        if not in_scope:
             logger.info("[SCHEME] fix_lint: no files changed by auto-fix")
             return {"condition": None, "message": "fix_lint: auto-fix made no changes"}
 
@@ -188,7 +212,7 @@ async def handle_fix_lint(
         git_steps: list[tuple[str, ...]] = [
             ("config", "user.email", executor.settings.git_author_email),
             ("config", "user.name", executor.settings.git_author_name),
-            ("add", "-A"),
+            ("add", "--", *in_scope),
             ("commit", "-m", "style: auto-fix lint issues"),
             ("push", "origin", branch),
         ]

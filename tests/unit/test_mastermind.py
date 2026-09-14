@@ -527,7 +527,7 @@ class TestSchemeExecutorCIChecks:
         assert ("git", "diff", "--name-only", "origin/develop") in calls
 
     @pytest.mark.asyncio
-    async def test_fix_lint_commit_failure_is_not_reported_as_pushed(self):
+    async def test_fix_lint_commit_failure_is_not_reported_as_pushed(self, tmp_path):
         from henchmen.mastermind.scheme_executor.handlers import handle_fix_lint
 
         executor = SchemeExecutor(_linear_scheme(["fix_lint"]), MagicMock(spec=LairManager), _mock_settings())
@@ -538,14 +538,24 @@ class TestSchemeExecutorCIChecks:
             if args[0] == "git":
                 git_calls.append(args)
                 if args[1] == "status":
-                    return self._ok_proc(stdout=b" M src/app.py\n")
+                    return self._ok_proc(stdout=b" M src/app.py\0")
                 if args[1] == "commit":
                     return self._ok_proc(returncode=1, stderr=b"nothing added to commit")
             return self._ok_proc()
 
+        workspace = tmp_path / "ws"
+        (workspace / "src").mkdir(parents=True)
+        (workspace / "src" / "app.py").write_text("x = 1", encoding="utf-8")
         with (
+            patch("henchmen.mastermind.scheme_executor.handlers.tempfile.mkdtemp", return_value=str(workspace)),
+            patch("henchmen.mastermind.scheme_executor.handlers.shutil.rmtree"),
             patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
             patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=""),
+            patch("henchmen.mastermind.scheme_executor.handlers.detect_stack", return_value=_python_stack()),
+            patch(
+                "henchmen.mastermind.scheme_executor.handlers.changed_files",
+                new=AsyncMock(return_value=["src/app.py"]),
+            ),
             patch("asyncio.create_subprocess_exec", side_effect=_exec),
         ):
             result = await handle_fix_lint(executor, _make_node("fix_lint"), task, Dossier(task_id=task.id))
@@ -553,6 +563,87 @@ class TestSchemeExecutorCIChecks:
         assert result["condition"] == "fail"
         assert "git commit failed" in result["message"]
         assert not any(call[1] == "push" for call in git_calls)
+
+    @pytest.mark.asyncio
+    async def test_fix_lint_only_fixes_and_stages_files_the_operative_changed(self, tmp_path):
+        from henchmen.mastermind.scheme_executor.handlers import handle_fix_lint
+
+        executor = SchemeExecutor(_linear_scheme(["fix_lint"]), MagicMock(spec=LairManager), _mock_settings())
+        task = _make_task()
+        calls: list[tuple[str, ...]] = []
+
+        async def _exec(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ("git", "status"):
+                return self._ok_proc(stdout=b" M src/app.py\0 M src/untouched.py\0")
+            return self._ok_proc()
+
+        workspace = tmp_path / "ws"
+        (workspace / "src").mkdir(parents=True)
+        (workspace / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+        with (
+            patch("henchmen.mastermind.scheme_executor.handlers.tempfile.mkdtemp", return_value=str(workspace)),
+            patch("henchmen.mastermind.scheme_executor.handlers.shutil.rmtree"),
+            patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=""),
+            patch("henchmen.mastermind.scheme_executor.handlers.detect_stack", return_value=_python_stack()),
+            patch(
+                "henchmen.mastermind.scheme_executor.handlers.changed_files",
+                new=AsyncMock(return_value=["src/app.py"]),
+            ),
+            patch("asyncio.create_subprocess_exec", side_effect=_exec),
+        ):
+            result = await handle_fix_lint(executor, _make_node("fix_lint"), task, Dossier(task_id=task.id))
+
+        fixer = next(call for call in calls if "ruff" in call)
+        assert "--fix" in fixer
+        assert "./src/app.py" in fixer
+        assert "." not in fixer, "the fixer must not run over the whole repository"
+        assert ("git", "checkout", "--", "src/untouched.py") in calls
+        assert ("git", "add", "--", "src/app.py") in calls
+        assert result["condition"] is None
+
+    @pytest.mark.asyncio
+    async def test_fix_lint_does_not_run_ruff_on_non_python_stacks(self):
+        from henchmen.mastermind.scheme_executor.handlers import handle_fix_lint
+        from henchmen.utils.stack_detector import Stack
+
+        executor = SchemeExecutor(_linear_scheme(["fix_lint"]), MagicMock(spec=LairManager), _mock_settings())
+        task = _make_task()
+        go = Stack(name="go", test_command=["go", "test", "./..."], lint_command=["go", "vet", "./..."])
+        calls: list[tuple[str, ...]] = []
+
+        async def _exec(*args, **kwargs):
+            calls.append(args)
+            return self._ok_proc()
+
+        with (
+            patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=""),
+            patch("henchmen.mastermind.scheme_executor.handlers.detect_stack", return_value=go),
+            patch(
+                "henchmen.mastermind.scheme_executor.handlers.changed_files",
+                new=AsyncMock(return_value=["main.go"]),
+            ),
+            patch("asyncio.create_subprocess_exec", side_effect=_exec),
+        ):
+            result = await handle_fix_lint(executor, _make_node("fix_lint"), task, Dossier(task_id=task.id))
+
+        assert result["condition"] is None
+        assert "no auto-fixer" in result["message"]
+        assert not any("ruff" in call for call in calls)
+
+
+def _python_stack():
+    """The Stack detect_stack returns for a plain Python project."""
+    import tempfile
+    from pathlib import Path
+
+    from henchmen.utils.stack_detector import detect_stack
+
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+        return detect_stack(Path(tmp))
 
 
 class TestSchemeExecutorLairFailure:
