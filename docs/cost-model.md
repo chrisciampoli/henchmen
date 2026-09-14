@@ -101,7 +101,7 @@ These are ongoing GCP costs independent of task volume:
 | Pub/Sub | ~$1-5/mo | ~$5-20/mo | 7 topics, push subscriptions |
 | Firestore | ~$0-5/mo | ~$5-20/mo | `task_executions`, `operative_reports`, `processed_messages` collections |
 | Cloud Storage | ~$1/mo | ~$1-5/mo | Dossier artifacts, Terraform state |
-| Secret Manager | ~$1/mo | ~$1/mo | 6 secrets |
+| Secret Manager | ~$1/mo | ~$1/mo | 7 secrets |
 | Artifact Registry | ~$1-5/mo | ~$1-5/mo | Docker images |
 | VPC Connector | ~$7/mo | ~$7/mo | Serverless VPC access |
 

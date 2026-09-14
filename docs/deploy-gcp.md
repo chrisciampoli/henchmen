@@ -233,6 +233,12 @@ echo -n "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxx" | \
 openssl rand -hex 32 | tr -d '\n' | \
   gcloud secrets versions add henchmen-dev-metrics-auth-token --data-file=- --project=${PROJECT_ID}
 
+# Bearer token for Dispatch's POST /api/v1/tasks. Keep a copy: you send it in
+# Step 7. Cloud Run mounts it on Dispatch as DISPATCH_API_TOKEN.
+export HENCHMEN_DISPATCH_API_TOKEN=$(openssl rand -hex 32)
+echo -n "${HENCHMEN_DISPATCH_API_TOKEN}" | \
+  gcloud secrets versions add henchmen-dev-dispatch-api-token --data-file=- --project=${PROJECT_ID}
+
 # (optional) Slack bot + signing + app tokens
 echo -n "xoxb-..." | gcloud secrets versions add henchmen-dev-slack-bot-token      --data-file=- --project=${PROJECT_ID}
 echo -n "..."      | gcloud secrets versions add henchmen-dev-slack-signing-secret --data-file=- --project=${PROJECT_ID}
@@ -246,6 +252,21 @@ Then set `seed_secret_placeholders = false` in `terraform.tfvars` so a later
 apply cannot add a placeholder version that shadows your real values, and
 apply once more.
 
+Cloud Run resolves a `latest` secret when an instance starts, so instances that
+were already running keep the placeholder. Until Dispatch restarts with the
+real `dispatch-api-token`, `POST /api/v1/tasks` returns 401 in staging and prod
+(Dispatch treats the seeded placeholder as "no token"); in dev it stays open and
+logs a warning. Force new revisions after adding the versions (the throwaway
+variable only exists to create a revision; the next `terraform apply` removes
+it again, which is harmless):
+
+```bash
+for svc in dispatch mastermind forge; do
+  gcloud run services update henchmen-dev-${svc} --project=${PROJECT_ID} --region=${REGION} \
+    --update-env-vars=SECRETS_ROTATED_AT=$(date +%s)
+done
+```
+
 > Terraform owns every environment variable and secret mount on the Cloud Run
 > services. It does not strip the secrets it manages, but anything added by
 > hand with `gcloud run services update --set-env-vars` / `--set-secrets` is
@@ -256,14 +277,24 @@ apply once more.
 
 ## Step 7 — Smoke test
 
-Dispatch a tiny CLI task against your Mastermind:
+Dispatch a tiny CLI task against your Mastermind. Two tokens are involved:
+
+- **The Dispatch API token** (`HENCHMEN_DISPATCH_API_TOKEN`, from Step 6) goes in
+  `Authorization: Bearer ...`. Dispatch checks it on `POST /api/v1/tasks`.
+- **A Google identity token** is also needed while `dispatch_public_ingress` is
+  `false` (the default), because Cloud Run IAM then rejects unauthenticated
+  callers before the request reaches Dispatch. Cloud Run IAM normally reads
+  `Authorization` too, so send the identity token in
+  `X-Serverless-Authorization` instead and leave `Authorization` for Dispatch.
+  With `dispatch_public_ingress = true` drop that header.
 
 ```bash
 DISPATCH_URL=$(gcloud run services describe henchmen-dev-dispatch \
   --project=${PROJECT_ID} --region=${REGION} --format='value(status.url)')
 
 curl -X POST "${DISPATCH_URL}/api/v1/tasks" \
-  -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
+  -H "X-Serverless-Authorization: Bearer $(gcloud auth print-identity-token)" \
+  -H "Authorization: Bearer ${HENCHMEN_DISPATCH_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "title": "Fix the null check in src/auth/login.py",
@@ -271,9 +302,16 @@ curl -X POST "${DISPATCH_URL}/api/v1/tasks" \
     "repo": "your-org/your-test-repo",
     "branch": "main",
     "priority": "normal",
+    "task_type": "bugfix",
     "created_by": "you@example.com"
   }'
 ```
+
+A 401 with `Dispatch API token is not configured` means Dispatch is still on
+the placeholder secret (see the restart note in Step 6); `Missing or invalid
+bearer token` means the `Authorization` value does not match the secret. A 403
+from Cloud Run means the identity token is missing or your account lacks
+`roles/run.invoker` on Dispatch.
 
 Watch the logs stream in:
 

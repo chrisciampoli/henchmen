@@ -69,7 +69,7 @@ CRJ = Cloud Run Job. The model tier each Lair runs on is resolved to a concrete 
 
 Dispatch is the system's front door:
 
-- `POST /api/v1/tasks` -- CLI task creation (JSON body with title, description, repo)
+- `POST /api/v1/tasks` -- CLI/REST task creation (`CreateTaskRequest`: `title`, `description`, `repo`, `branch`, `priority`, optional `task_type`, `created_by`). Requires `Authorization: Bearer <HENCHMEN_DISPATCH_API_TOKEN>`; with the token empty the route is open in dev (one logged warning) and returns 401 in staging and prod.
 - `POST /webhooks/slack` -- Slack Events API (handles `url_verification` and `app_mention`). Slack is normally connected over **Socket Mode** instead, started from the Dispatch lifespan when `HENCHMEN_SLACK_BOT_TOKEN` and `HENCHMEN_SLACK_APP_TOKEN` are both set.
 - `POST /webhooks/github` -- Repository webhook signed with `HENCHMEN_GITHUB_WEBHOOK_SECRET` (issues labelled `henchmen`, `@henchmen` comments from trusted users, CI failures, pushes)
 - `POST /webhooks/jira` -- Jira webhook signed with `HENCHMEN_JIRA_WEBHOOK_SECRET`
@@ -85,7 +85,7 @@ Each handler uses the `TaskNormalizer` to convert the source-specific payload in
 
 The Mastermind is the brain of the system. It receives tasks via Pub/Sub push subscription and orchestrates the full execution lifecycle:
 
-1. **Scheme Selection** (`_select_scheme`): Keyword matching on word boundaries. Goal keywords in the title route to `goal_decomposition`, then bug keywords to `bugfix_standard`, then feature keywords to `feature_standard`; anything else defaults to `bugfix_standard`.
+1. **Scheme Selection** (`_select_scheme`): Goal keywords in the title route to `goal_decomposition` first. Otherwise an explicit `task_type` on the task wins (`bugfix` runs `bugfix_standard`; `feature` and `refactor` run `feature_standard`). Without one, keyword matching on word boundaries sends bug keywords to `bugfix_standard`, then feature keywords to `feature_standard`; anything else defaults to `bugfix_standard`.
 
 2. **Dossier Building** (`_build_dossier`): Assembles context for operatives:
    - Fetches the repository file tree from GitHub and keeps the first 50 paths for file scoring
@@ -284,7 +284,7 @@ All push subscriptions authenticate with an OIDC token minted for the `sa-{env}-
 | **Pub/Sub** | Async message passing between all components |
 | **Firestore** | Task execution tracking, operative reports, processed-message dedup, merge queue claims |
 | **Cloud Storage (GCS)** | Dossier artifacts, Terraform state |
-| **Secret Manager** | GitHub token, Slack tokens, Jira API token, metrics bearer token |
+| **Secret Manager** | GitHub token, Slack tokens, Jira API token, metrics bearer token, Dispatch API bearer token |
 | **Artifact Registry** | Docker images for all containers |
 | **VPC + Serverless VPC Access** | Private-range networking only; public egress does not traverse the VPC |
 | **Cloud Scheduler** | Stale-task cleanup, watchdog, dead-letter check, merge queue maintenance (staging/prod; off in dev) |

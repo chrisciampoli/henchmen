@@ -104,7 +104,7 @@ Terraform. The mounts it declares:
 | Service | Secrets mounted (env var ← secret) |
 |---------|-----------------------------------|
 | Mastermind | `GITHUB_TOKEN`, `SLACK_BOT_TOKEN`, `HENCHMEN_METRICS_AUTH_TOKEN` |
-| Dispatch | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_APP_TOKEN`, `JIRA_API_TOKEN`, `HENCHMEN_METRICS_AUTH_TOKEN` |
+| Dispatch | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_APP_TOKEN`, `JIRA_API_TOKEN`, `HENCHMEN_METRICS_AUTH_TOKEN`, `DISPATCH_API_TOKEN` |
 | Forge | `GITHUB_TOKEN`, `HENCHMEN_METRICS_AUTH_TOKEN` |
 | Operative (Lairs) | `GITHUB_TOKEN` (attached by LairManager when it creates each job) |
 
@@ -138,7 +138,14 @@ echo -n "ghp_YourTokenHere" | gcloud secrets versions add henchmen-dev-github-to
 
 # Slack bot token
 echo -n "xoxb-YourTokenHere" | gcloud secrets versions add henchmen-dev-slack-bot-token --data-file=-
+
+# Dispatch API bearer token (POST /api/v1/tasks returns 401 in staging/prod until this is set)
+openssl rand -hex 32 | tr -d '\n' | gcloud secrets versions add henchmen-dev-dispatch-api-token --data-file=-
 ```
+
+Dispatch treats the placeholder value Terraform seeds into
+`henchmen-<env>-dispatch-api-token` as "no token", so the route stays closed in
+staging and prod until a real version is added.
 
 Secrets are mounted as environment variables with `version = "latest"`, which
 Cloud Run resolves when an instance starts. New lairs and newly started
@@ -165,7 +172,8 @@ All settings are managed via `src/henchmen/config/settings.py` using `pydantic-s
 | `HENCHMEN_LAIR_DEFAULT_TIMEOUT` | No | `1800` | Job timeout (seconds) when a node sets none |
 | `HENCHMEN_LAIR_OPERATIVE_IMAGE_TAG` | No | `latest` | Operative image tag or digest lairs run (Terraform injects `container_image_tag`) |
 | `HENCHMEN_LAIR_SERVICE_ACCOUNT` | No | `sa-<env>-operative@<project>` | Service account lairs run as |
-| `HENCHMEN_METRICS_AUTH_TOKEN` | Staging/prod | `` | Bearer token for `/metrics` |
+| `HENCHMEN_METRICS_AUTH_TOKEN` | Staging/prod | `` | Bearer token for `/metrics/*` and `/api/v1/metrics/summary` |
+| `HENCHMEN_DISPATCH_API_TOKEN` | Staging/prod | `` | Bearer token for `POST /api/v1/tasks` (also read as `DISPATCH_API_TOKEN`) |
 | `HENCHMEN_PUBSUB_OIDC_AUDIENCE` | Staging/prod | `` | Expected OIDC audience on Pub/Sub pushes (Terraform sets `henchmen-<env>-<service>`) |
 | `HENCHMEN_GITHUB_DEFAULT_REPO` | No | `` | Default target repository (owner/repo format) |
 
@@ -184,6 +192,8 @@ Run secret mount in production and a `HENCHMEN_`-prefixed value from
 | `SLACK_SIGNING_SECRET` | `slack_signing_secret` | Dispatch |
 | `SLACK_APP_TOKEN` | `slack_app_token` | Dispatch |
 | `JIRA_API_TOKEN` | `jira_api_token` | Dispatch, Operative |
+| `DISPATCH_API_TOKEN` | `dispatch_api_token` | Dispatch (`POST /api/v1/tasks` bearer token; empty is open in dev with a warning, 401 in staging/prod) |
+| `HENCHMEN_METRICS_AUTH_TOKEN` | `metrics_auth_token` | Mastermind (`/metrics/*` and `/api/v1/metrics/summary` bearer token; Terraform also mounts it on Dispatch and Forge) |
 
 ### Operative-Specific Variables (injected by LairManager)
 
@@ -328,7 +338,17 @@ carry telemetry only — never task content.
 
 Mastermind also serves `GET /api/v1/metrics/summary?days=7`, a dashboard view
 with a different shape (`success_rate`, `escalation_rate`, `cost_by_model`,
-`escalation_reasons`). It is not behind the metrics bearer token.
+`escalation_reasons`). It applies the same bearer-token rules as `/metrics`:
+
+```bash
+curl -H "Authorization: Bearer $HENCHMEN_METRICS_AUTH_TOKEN" \
+  "http://localhost:8000/mastermind/api/v1/metrics/summary?days=7"
+```
+
+Both work under `henchmen serve` and docker compose: the single-process server
+runs each mounted service's startup and shutdown, so Mastermind registers its
+metrics router (and Dispatch connects the Slack bot) exactly as it does on
+Cloud Run.
 
 ### Merge Queue State
 

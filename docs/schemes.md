@@ -97,7 +97,7 @@ The shipped schemes contain no cycles: every retry is an explicit `*_retry` node
 ### bugfix_standard
 
 **File:** `src/henchmen/schemes/bugfix_standard.py`
-**Triggered by:** Keywords like "bug", "fix", "error", "crash", "broken" in the title or description (and the default when nothing matches)
+**Triggered by:** `task_type: "bugfix"`, or with no `task_type` the keywords "bug", "fix", "error", "crash", "broken" in the title or description (and the default when nothing matches)
 
 ```
 create_branch
@@ -141,7 +141,7 @@ create_pr
 ### feature_standard
 
 **File:** `src/henchmen/schemes/feature_standard.py`
-**Triggered by:** Keywords like "feature", "implement", "build", "create", "add", "new module", "new endpoint", "setup", "scaffold", "portal", "dashboard" — checked after the bugfix keywords, so "Fix crash when adding an item" still routes to `bugfix_standard`
+**Triggered by:** `task_type: "feature"` or `task_type: "refactor"`, or with no `task_type` keywords like "feature", "implement", "build", "create", "add", "new module", "new endpoint", "setup", "scaffold", "portal", "dashboard" — checked after the bugfix keywords, so "Fix crash when adding an item" still routes to `bugfix_standard`
 
 The graph is identical to `bugfix_standard` with `implement_feature` in place of `implement_fix`. There is no separate planning node.
 
@@ -154,7 +154,7 @@ The graph is identical to `bugfix_standard` with `implement_feature` in place of
 ### goal_decomposition
 
 **File:** `src/henchmen/schemes/goal_decomposition.py`
-**Triggered by:** Keywords in the **title** like "improve", "optimize", "refactor all", "fix all", "update all", "increase coverage", "reduce", "clean up all", "migrate" (checked first)
+**Triggered by:** Keywords in the **title** like "improve", "optimize", "refactor all", "fix all", "update all", "increase coverage", "reduce", "clean up all", "migrate" (checked first, before `task_type`)
 
 This is a lightweight planning-only scheme:
 
@@ -250,7 +250,15 @@ Alternatively, call `SchemeRegistry.auto_discover()`, which imports every non-pr
 
 ### Step 3: Add Scheme Selection Logic
 
-Scheme selection lives in `MastermindAgent._select_scheme()` in `src/henchmen/mastermind/agent.py`, driven by the module-level keyword tuples (`_GOAL_KEYWORDS`, `_BUGFIX_KEYWORDS`, `_FEATURE_KEYWORDS`). Matching is on word boundaries. Add a tuple for your scheme and check it at the right priority:
+Scheme selection lives in `MastermindAgent._select_scheme()` in `src/henchmen/mastermind/agent.py`. It checks, in order:
+
+1. `_GOAL_KEYWORDS` against the **title** → `goal_decomposition`
+2. The task's explicit `task_type` (`TaskType` in `src/henchmen/models/task.py`, sent as `task_type` on `POST /api/v1/tasks` and by `henchmen chat`): `bugfix` → `bugfix_standard`; `feature` or `refactor` → `feature_standard`
+3. `_BUGFIX_KEYWORDS` against title and description → `bugfix_standard`
+4. `_FEATURE_KEYWORDS` against title and description → `feature_standard`
+5. Otherwise `bugfix_standard`
+
+Matching is on word boundaries ("address" is not "add", "prefix" is not "fix"). An explicit type beats keywords, so a bugfix titled "Add null check" still runs `bugfix_standard`. Add a tuple for your scheme and check it at the right priority:
 
 ```python
 _REFACTOR_KEYWORDS = ("refactor", "restructure", "reorganize", "simplify")
