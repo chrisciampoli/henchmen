@@ -480,3 +480,84 @@ def test_console_auth_load_permission_error_exits_with_a_readable_error(
         _serve(_serve_args())
     assert exit_info.value.code == 2
     assert "secrets" in capsys.readouterr().err.lower()
+
+
+def test_serve_logging_redacts_the_setup_token_from_uvicorn_access_lines(capsys: pytest.CaptureFixture[str]) -> None:
+    """The sign-in URL is printed on purpose, but uvicorn must not write the token into its access log."""
+    import uvicorn
+    from fastapi import FastAPI
+
+    from henchmen.cli.serve import configure_serve_logging
+
+    original_factory = logging.getLogRecordFactory()
+    try:
+        configure_serve_logging("info")
+        # serve_app builds exactly this Config, which installs uvicorn's own logging config.
+        uvicorn.Config(FastAPI(), host="127.0.0.1", port=8000, log_level="info")
+        logging.getLogger("uvicorn.access").info(
+            '%s - "%s %s HTTP/%s" %d', "127.0.0.1:50000", "GET", "/console/session?setup_token=abc123", "1.1", 303
+        )
+    finally:
+        logging.setLogRecordFactory(original_factory)
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "abc123" not in output
+    assert "Logging error" not in output, "uvicorn's AccessFormatter needs the record's arguments intact"
+    assert "GET /console/session?setup_token=***REDACTED*** HTTP/1.1" in output
+
+
+def test_serve_installs_the_redacting_log_configuration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from unittest.mock import patch
+
+    from henchmen.cli import _serve
+
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    with (
+        patch("henchmen.cli.serve.configure_serve_logging") as configure,
+        patch("henchmen.cli.serve.serve_app", return_value=0),
+        pytest.raises(SystemExit),
+    ):
+        _serve(_serve_args())
+    configure.assert_called_once_with("info")
+
+
+def test_unreadable_setup_state_file_exits_with_a_readable_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from unittest.mock import patch
+
+    from henchmen.cli import _serve
+
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    with (
+        patch.object(SetupStateStore, "load", side_effect=PermissionError("denied")),
+        pytest.raises(SystemExit) as exit_info,
+    ):
+        _serve(_serve_args())
+    assert exit_info.value.code == 2
+    err = capsys.readouterr().err
+    assert err.startswith("ERROR:")
+    assert "denied" in err
+    assert "setup-state.json" in err
+
+
+@pytest.mark.parametrize("data_dir_install", [True, False])
+def test_invalid_settings_hint_names_the_file_setup_writes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str], data_dir_install: bool
+) -> None:
+    from henchmen.cli import _build_settings_or_exit
+
+    monkeypatch.chdir(tmp_path)
+    if data_dir_install:
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    else:
+        monkeypatch.delenv("HENCHMEN_DATA_DIR", raising=False)
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "not-a-port")
+    with pytest.raises(SystemExit) as exit_info:
+        _build_settings_or_exit()
+    assert exit_info.value.code == 2
+    err = capsys.readouterr().err
+    expected = str(tmp_path / "henchmen.env") if data_dir_install else ".env.local"
+    assert f"to (re)write {expected}." in err
