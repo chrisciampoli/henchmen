@@ -365,3 +365,18 @@ class TestWaitForCompletion:
         report = await lm.wait_for_completion("lair-does-not-exist", poll_interval=0)
 
         assert report.status is OperativeStatus.FAILED
+
+
+def test_local_mode_uses_the_prebuilt_operative_image_when_configured():
+    from henchmen.config.settings import Settings
+    from henchmen.mastermind.lair_manager import LairManager
+
+    settings = Settings(_env_file=None, provider="local", operative_image="ghcr.io/acme/henchmen/operative:0.3.0")
+    assert LairManager(settings)._build_image() == "ghcr.io/acme/henchmen/operative:0.3.0"
+
+
+def test_local_mode_falls_back_to_the_locally_built_image():
+    from henchmen.config.settings import Settings
+    from henchmen.mastermind.lair_manager import LairManager
+
+    assert LairManager(Settings(_env_file=None, provider="local"))._build_image() == "henchmen-operative:local"

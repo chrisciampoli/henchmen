@@ -489,6 +489,21 @@ class Settings(BaseSettings):
             "Empty means http://host.docker.internal:<local_serve_port>."
         ),
     )
+    local_docker_network: str = Field(
+        default="",
+        description=(
+            "Docker network operative containers join in local mode. The local image sets "
+            "`henchmen`, so operatives reach the server at http://henchmen:8000 instead of "
+            "host.docker.internal. Empty uses Docker's default bridge network."
+        ),
+    )
+    operative_image: str = Field(
+        default="",
+        description=(
+            "Operative image used in local mode, e.g. ghcr.io/<owner>/henchmen/operative:<version>. "
+            "Empty means the image built by `henchmen build-operative` (henchmen-operative:local)."
+        ),
+    )
 
     # Dispatch REST intake authentication
     dispatch_api_token: str = Field(

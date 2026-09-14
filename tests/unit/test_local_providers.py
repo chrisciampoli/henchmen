@@ -1313,6 +1313,36 @@ class TestDockerOrchestratorRuntime:
         assert exec_id in orch._processes
         assert exec_id not in orch._finished
 
+    @pytest.mark.asyncio
+    async def test_operatives_join_the_configured_network(self):
+        from henchmen.config.settings import Settings
+        from henchmen.providers.local.docker import DockerOrchestrator
+
+        commands: list[list[str]] = []
+        proc = _FakeProcess(wait_delay=30.0)
+        orch = DockerOrchestrator(Settings(_env_file=None, local_docker_network="henchmen"))
+        with self._patch_exec(proc, commands):
+            exec_id = await orch.run_job("j", "img", {}, timeout_seconds=300)
+        orch._timeout_tasks[exec_id].cancel()
+
+        run_cmd = commands[0]
+        assert run_cmd[run_cmd.index("--network") + 1] == "henchmen"
+        assert run_cmd.index("--network") < run_cmd.index("img")
+
+    @pytest.mark.asyncio
+    async def test_no_network_flag_without_the_setting(self):
+        from henchmen.config.settings import Settings
+        from henchmen.providers.local.docker import DockerOrchestrator
+
+        commands: list[list[str]] = []
+        proc = _FakeProcess(wait_delay=30.0)
+        orch = DockerOrchestrator(Settings(_env_file=None))
+        with self._patch_exec(proc, commands):
+            exec_id = await orch.run_job("j", "img", {}, timeout_seconds=300)
+        orch._timeout_tasks[exec_id].cancel()
+
+        assert "--network" not in commands[0]
+
 
 # ---------------------------------------------------------------------------
 # InMemoryMessageBroker — HTTP forwarding

@@ -414,11 +414,11 @@ def check_runtime_config(settings: Settings) -> CheckResult:
     )
 
 
-def check_operative_image() -> CheckResult:
-    """Check whether the local operative Docker image has been built."""
+def check_operative_image(image: str = "henchmen-operative:local") -> CheckResult:
+    """Check whether the operative Docker image local mode will run is present."""
     try:
         result = subprocess.run(
-            ["docker", "image", "inspect", "henchmen-operative:local"],
+            ["docker", "image", "inspect", image],
             capture_output=True,
             text=True,
             timeout=10,
@@ -430,16 +430,17 @@ def check_operative_image() -> CheckResult:
             message="Cannot inspect image (docker not available)",
         )
     if result.returncode == 0:
-        return CheckResult(
-            name="Operative image",
-            status=CheckStatus.OK,
-            message="henchmen-operative:local exists",
-        )
+        return CheckResult(name="Operative image", status=CheckStatus.OK, message=f"{image} exists")
+    hint = (
+        "Run `henchmen build-operative` to build it (~3 min on first run)."
+        if image == "henchmen-operative:local"
+        else f"Run `docker pull {image}`."
+    )
     return CheckResult(
         name="Operative image",
         status=CheckStatus.WARN,
-        message="henchmen-operative:local not built yet",
-        hint="Run `henchmen build-operative` to build it (~3 min on first run).",
+        message=f"{image} is not present",
+        hint=hint,
     )
 
 
@@ -472,7 +473,7 @@ def run_doctor(*, offline: bool = False) -> list[CheckResult]:
     results.append(check_github(settings, offline=offline))
     results.append(check_slack(settings, offline=offline))
     results.append(check_jira(settings, offline=offline))
-    results.append(check_operative_image())
+    results.append(check_operative_image(settings.operative_image or "henchmen-operative:local"))
     return results
 
 
