@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from henchmen.cli import checks
 from henchmen.cli.checks import CheckResult, CheckStatus
+from henchmen.config.settings import DEFAULT_LOCAL_OPERATIVE_IMAGE
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -414,7 +415,7 @@ def check_runtime_config(settings: Settings) -> CheckResult:
     )
 
 
-def check_operative_image(image: str = "henchmen-operative:local") -> CheckResult:
+def check_operative_image(image: str = DEFAULT_LOCAL_OPERATIVE_IMAGE) -> CheckResult:
     """Check whether the operative Docker image local mode will run is present."""
     try:
         result = subprocess.run(
@@ -433,7 +434,7 @@ def check_operative_image(image: str = "henchmen-operative:local") -> CheckResul
         return CheckResult(name="Operative image", status=CheckStatus.OK, message=f"{image} exists")
     hint = (
         "Run `henchmen build-operative` to build it (~3 min on first run)."
-        if image == "henchmen-operative:local"
+        if image == DEFAULT_LOCAL_OPERATIVE_IMAGE
         else f"Run `docker pull {image}`."
     )
     return CheckResult(
@@ -473,7 +474,7 @@ def run_doctor(*, offline: bool = False) -> list[CheckResult]:
     results.append(check_github(settings, offline=offline))
     results.append(check_slack(settings, offline=offline))
     results.append(check_jira(settings, offline=offline))
-    results.append(check_operative_image(settings.operative_image or "henchmen-operative:local"))
+    results.append(check_operative_image(settings.operative_image or DEFAULT_LOCAL_OPERATIVE_IMAGE))
     return results
 
 
