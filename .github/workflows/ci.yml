@@ -119,6 +119,33 @@ jobs:
           HENCHMEN_ENVIRONMENT: dev
         run: pytest tests/integration/ -v --tb=short
 
+  terraform:
+    name: Terraform validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Pinned to the version the committed provider lock files were produced
+      # with; required_version in the environments is ">= 1.7".
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.11.4
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive terraform/
+
+      # -backend=false: no state bucket or cloud credentials in CI.
+      # -lockfile=readonly: fail if a provider drifts from the committed lock.
+      - name: terraform validate (dev, staging)
+        run: |
+          for env in dev staging; do
+            echo "::group::$env"
+            terraform -chdir=terraform/environments/$env init -backend=false -input=false -lockfile=readonly
+            terraform -chdir=terraform/environments/$env validate
+            echo "::endgroup::"
+          done
+
   docker-build:
     name: Build image (${{ matrix.service }})
     runs-on: ubuntu-latest

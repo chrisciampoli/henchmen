@@ -111,7 +111,9 @@ done
 : "${PROJECT_ID:?PROJECT_ID is required (set env var or pass --project-id)}"
 : "${BILLING_ACCOUNT:?BILLING_ACCOUNT is required (set env var or pass --billing-account)}"
 
-STATE_BUCKET="henchmen-tfstate-${ENVIRONMENT}"
+# GCS bucket names are global across all projects; include the project id so
+# two users bootstrapping the same environment name cannot collide.
+STATE_BUCKET="henchmen-tfstate-${PROJECT_ID}-${ENVIRONMENT}"
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -274,15 +276,21 @@ cat <<EOF
 Bootstrap complete.
 
 Next steps:
-  1. Review ${ENVIRONMENT}.auto.tfvars in terraform/environments/${ENVIRONMENT}/
-     (contains the env-specific sizing/scheduler/allowlist values).
-     The shared module composition lives in terraform/environments/root/.
+  1. Create your variables file from the example and fill in the project,
+     GitHub owner and default repo. ${ENVIRONMENT}.auto.tfvars (committed)
+     holds the env-specific sizing/scheduler/allowlist values; do not
+     overwrite it. The shared module composition lives in
+     terraform/environments/root/.
+
+       cd terraform/environments/${ENVIRONMENT}
+       cp ${ENVIRONMENT}.auto.tfvars.example terraform.tfvars
+       \$EDITOR terraform.tfvars
 
   2. Initialise and apply Terraform:
 
-       cd terraform/environments/${ENVIRONMENT}
        terraform init -backend-config=bucket=${STATE_BUCKET}
-       terraform apply
+       terraform plan -out=${ENVIRONMENT}.tfplan
+       terraform apply ${ENVIRONMENT}.tfplan
 
   3. After the first apply, populate Secret Manager secrets
      (GitHub token, Slack tokens, Jira token) via:
