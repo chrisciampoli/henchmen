@@ -179,6 +179,10 @@ async def run_embedding_pipeline(
             collection_name=collection_name,
             project_id=project_id,
             region=region,
+            # A full run re-indexes every file, so it must also drop chunks of
+            # files deleted since the last index; per-file replacement alone
+            # would leave those searchable forever.
+            replace_existing=mode == "full",
         )
 
         # Fail closed: advancing the last-indexed commit after a partial or

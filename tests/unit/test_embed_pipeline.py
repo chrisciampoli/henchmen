@@ -93,6 +93,44 @@ class TestEmbeddingPipelineGuards:
         assert result["chunks_failed"] == 5
         set_commit.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("mode", "replace_existing"), [("full", True), ("incremental", False)])
+    async def test_only_a_full_run_replaces_the_whole_repo(self, monkeypatch, tmp_path, mode, replace_existing):
+        """A full re-index must drop chunks of deleted files; an incremental run replaces per file."""
+        from henchmen.dossier import embedder
+        from henchmen.dossier.embedder import UpsertResult
+
+        settings = _settings(monkeypatch)
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "main.py").write_text("def hello():\n    return 1\n", encoding="utf-8")
+        for cmd in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "t@example.com"],
+            ["git", "config", "user.name", "t"],
+            ["git", "commit", "-q", "--allow-empty", "-m", "base"],
+            ["git", "add", "-A"],
+            ["git", "commit", "-qm", "add main.py"],
+        ):
+            subprocess.run(cmd, cwd=repo_dir, check=True, capture_output=True)
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD~1"], cwd=repo_dir, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        monkeypatch.setattr(embed_pipeline, "_resolve_default_branch", AsyncMock(return_value="main"))
+        monkeypatch.setattr(embed_pipeline, "clone_repo", AsyncMock())
+        monkeypatch.setattr(embed_pipeline.tempfile, "mkdtemp", lambda **kw: str(repo_dir))
+        upsert = AsyncMock(return_value=UpsertResult(uploaded=1))
+        monkeypatch.setattr(embedder, "upsert_chunks", upsert)
+        monkeypatch.setattr(embedder, "set_last_indexed_commit", AsyncMock())
+        monkeypatch.setattr(embedder, "get_last_indexed_commit", AsyncMock(return_value=base))
+        monkeypatch.setattr(embedder, "delete_file_chunks", AsyncMock())
+
+        result = await embed_pipeline.run_embedding_pipeline(repo="acme/api", mode=mode, settings=settings)
+
+        assert result["status"] == "completed"
+        assert upsert.await_args.kwargs["replace_existing"] is replace_existing
+
 
 # ---------------------------------------------------------------------------
 # EmbedRequest contract
