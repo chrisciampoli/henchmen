@@ -105,6 +105,26 @@ push to the repository's default branch; Mastermind runs it from the
 sidecar. It mounts the Docker socket so the server can launch operative
 containers. Configure `.env.local` first — `henchmen init` is the easy way.
 
+### Local image (preview)
+
+The all-in-one image the upcoming Henchmen Desktop app runs. It starts in
+setup mode with an empty data volume:
+
+```bash
+docker network create henchmen
+docker run -d --name henchmen --network henchmen --restart unless-stopped \
+  -p 127.0.0.1:8000:8000 \
+  -v henchmen-data:/data \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e HENCHMEN_LOCAL_DOCKER_NETWORK=henchmen \
+  -e HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8000 \
+  ghcr.io/chrisciampoli/henchmen/local:latest
+docker logs henchmen | grep "Open Henchmen"
+```
+
+Open the printed link. Until the guided setup ships, write
+`henchmen.env` into the volume with `docker exec -it henchmen henchmen init`.
+
 ### Prebuilt images
 
 Each release publishes `ghcr.io/chrisciampoli/henchmen/{dispatch,mastermind,forge,operative}`

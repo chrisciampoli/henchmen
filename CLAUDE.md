@@ -109,6 +109,13 @@ Cloud Run (services: Dispatch, Mastermind, Forge), Cloud Run Jobs (Operative), P
   runtime contract the Lair injects: `TASK_ID`, `NODE_ID`, `SCHEME_ID`,
   `MODEL_NAME`, `REPO_URL`, `BRANCH`, `TASK_TITLE`, `TASK_DESCRIPTION`,
   `DOSSIER_URI`, `WORKSPACE_DIR`, `OPERATIVE_ID`, `LAIR_ID`
+- Three bootstrap variables are also read from `os.environ`, because `henchmen
+  serve` needs them before `Settings` can be built: `HENCHMEN_DATA_DIR`
+  (data-directory installs read `<dir>/henchmen.env`; see `config/paths.py`),
+  `HENCHMEN_CONSOLE_SETUP_TOKEN` (the Console sign-in token the launcher
+  passes), and `HENCHMEN_LOCAL_SERVE_PORT` (setup mode prints the Console's
+  sign-in URL and needs a port before any `Settings` exist; `--port` is copied
+  into it)
 - Credential settings accept both `HENCHMEN_X` and the bare name a Cloud Run
   secret mount injects (`GITHUB_TOKEN`, `SLACK_BOT_TOKEN`, ...) via `AliasChoices`
 
@@ -134,6 +141,7 @@ henchmen/
 │   ├── arsenal/               # Tool registry + tools/ (runs inside the operative)
 │   ├── cli/                   # init wizard, doctor, config, chat, serve, embed, eval
 │   ├── config/settings.py     # Pydantic settings (HENCHMEN_ prefix)
+│   ├── console/               # Browser setup Console (state, auth, routes)
 │   ├── dispatch/              # Intake router + handlers/ + slack_bot.py
 │   ├── dossier/               # Context builder
 │   ├── evals/                 # Offline eval harness + SQLite history

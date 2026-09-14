@@ -97,8 +97,15 @@ def is_local_origin(origin: str | None) -> bool:
 
 
 def _write_key_file(path: Path, key: bytes) -> None:
-    """Create ``path`` atomically, mode 0600 from the start (harmless flag on Windows)."""
-    fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    """Create ``path`` atomically, mode 0600 from the start (harmless flag on Windows).
+
+    ``O_BINARY`` is required on Windows: without it the file descriptor opens in
+    text mode, which silently rewrites a ``\\n`` (0x0A) byte in the random key
+    to ``\\r\\n``, corrupting roughly one key in eight and invalidating every
+    session signed with it as soon as the file is re-read.
+    """
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    fd = os.open(str(path), flags, 0o600)
     try:
         os.write(fd, key)
     finally:

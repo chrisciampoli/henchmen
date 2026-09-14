@@ -76,6 +76,23 @@ silently ignored, and the Dispatch container never ran its own HTTP app.
   model can never trip the cost ceiling.
 - Firestore composite index on `task_executions` (`execution_state`,
   `last_heartbeat`) for the stalled-task watchdog query.
+- Local all-in-one image (`ghcr.io/<owner>/henchmen/local`, built with
+  `--target local`), published for amd64 and arm64 with every other image.
+- `henchmen serve` setup mode: with `HENCHMEN_DATA_DIR` set and setup
+  incomplete, only the Console and `/health` are served. The Console is
+  localhost-only — it requires a loopback Host, an Origin whose port matches
+  the Host's on state-changing requests and every WebSocket handshake, and a
+  signed session cookie on every `/console/api/*` route except
+  `/console/api/status`. Session signing keys live at
+  `<data dir>/secrets/console-session.key` (mode 0600, at least 32 bytes,
+  regenerated if shorter). The Console persists guide progress and applies
+  setup by restarting the process into run mode: a requested restart exits 75,
+  distinct from uvicorn's own startup-failure code (3) and a clean Ctrl+C
+  (0). `henchmen serve` prints `Open Henchmen setup: <url>` in setup mode and
+  `Open Henchmen: <url>` once running, and fails closed with a readable
+  `ERROR:` and exit code 2 on a corrupt `setup-state.json`, an unwritable
+  secrets directory, or a non-integer `HENCHMEN_LOCAL_SERVE_PORT`.
+- Settings `local_docker_network` and `operative_image`.
 
 ### Changed
 - **Credential settings accept two spellings.** `github_token`,
