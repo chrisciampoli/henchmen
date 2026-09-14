@@ -892,9 +892,8 @@ async def check_dlq_handler() -> dict[str, Any]:
     """
     agent = get_agent()
     settings = agent.settings
-    # getattr: the explicit ``dead_letter_subscription`` Settings field is being
-    # added alongside this change; until it lands the derived name is used.
-    subscription_name = getattr(settings, "dead_letter_subscription", "") or f"{settings.pubsub_topic_dead_letter}-sub"
+    # An empty ``dead_letter_subscription`` falls back to the Terraform naming convention.
+    subscription_name = settings.dead_letter_subscription or f"{settings.pubsub_topic_dead_letter}-sub"
 
     try:
         messages = await agent._get_broker().pull_dlq(subscription_name, max_messages=10)

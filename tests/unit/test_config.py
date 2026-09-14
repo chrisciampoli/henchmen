@@ -423,16 +423,14 @@ _FIELDS_AWAITING_A_READER: frozenset[str] = frozenset(
         "vertex_ai_context_cache_min_tokens",
         "vertex_ai_safety_threshold",
         # Added ahead of their consumers (dispatch rate limiter, Jira handler,
-        # dossier reranker, mastermind dead-letter drain, local SQLite store);
-        # the change that wires each one must also drop its entry here.
+        # Forge CI runner); the change that wires each one must also drop its
+        # entry here.
         "dispatch_rate_limit_requests",
         "dispatch_rate_limit_window_seconds",
         "dispatch_trust_forwarded_for",
         "jira_repo_field",
         "jira_branch_field",
-        "dossier_semantic_rerank",
-        "dead_letter_subscription",
-        "local_sqlite_path",
+        "forge_ci_timeout_seconds",
     }
 )
 

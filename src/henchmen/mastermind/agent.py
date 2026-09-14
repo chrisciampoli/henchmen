@@ -541,16 +541,10 @@ class MastermindAgent:
         disabled, or the LLM provider cannot be built, the vector-search order
         is kept. ``rerank_semantic_chunks`` itself never raises on LLM failure.
         """
-        # getattr keeps this working before the ``dossier_semantic_rerank``
-        # Settings field lands; it defaults to enabled.
-        if not getattr(self.settings, "dossier_semantic_rerank", True):
+        if not self.settings.dossier_semantic_rerank:
             return chunks
         try:
-            # attr-defined ignore: rerank_semantic_chunks arrives with the dossier
-            # reranker change; drop the ignore once both branches are merged.
-            from henchmen.dossier.reranker import (  # type: ignore[attr-defined, unused-ignore]
-                rerank_semantic_chunks,
-            )
+            from henchmen.dossier.reranker import rerank_semantic_chunks
 
             llm_provider = self._get_llm_provider()
         except Exception as exc:
