@@ -157,6 +157,19 @@ def check_git_identity() -> CheckResult:
 
 def check_env_file() -> CheckResult:
     """Check that a ``.env.local`` (or ``.env`` / ``.env.example``) is discoverable."""
+    from henchmen.config.paths import config_file, data_dir
+
+    if data_dir() is not None:
+        target = config_file()
+        if target.is_file():
+            return CheckResult(name="Config file", status=CheckStatus.OK, message=f"Found {target}")
+        return CheckResult(
+            name="Config file",
+            status=CheckStatus.WARN,
+            message=f"{target} does not exist yet",
+            hint="Finish setup in the Henchmen Console, or run `henchmen init`.",
+        )
+
     cwd = Path.cwd()
     if (cwd / ".env.local").is_file():
         return CheckResult(
@@ -192,10 +205,11 @@ def load_settings() -> tuple[Settings | None, CheckResult]:
     Returns ``(settings, result)``; ``settings`` is ``None`` when construction
     failed, in which case ``result`` is a FAIL carrying pydantic's message.
     """
+    from henchmen.config.paths import env_files
     from henchmen.config.settings import Settings
 
     try:
-        settings = Settings()
+        settings = Settings(_env_file=env_files())  # type: ignore[call-arg]
     except ValueError as exc:  # pydantic ValidationError subclasses ValueError
         detail = str(exc).strip().splitlines()
         first = detail[0] if detail else "invalid settings"

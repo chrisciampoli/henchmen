@@ -639,4 +639,6 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     """Return the cached application Settings singleton."""
-    return Settings()
+    from henchmen.config.paths import env_files
+
+    return Settings(_env_file=env_files())  # type: ignore[call-arg]

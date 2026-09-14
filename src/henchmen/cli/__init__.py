@@ -184,15 +184,12 @@ def _dotenv_keys() -> set[str]:
     """
     from dotenv import dotenv_values
 
-    from henchmen.config.settings import Settings
-
-    configured = Settings.model_config.get("env_file") or ()
-    env_files: list[object] = list(configured) if isinstance(configured, tuple | list) else [configured]
+    from henchmen.config.paths import env_files
 
     keys: set[str] = set()
-    for env_file in env_files:
+    for env_file in env_files():
         try:
-            keys.update(str(key).upper() for key in dotenv_values(str(env_file)))
+            keys.update(str(key).upper() for key in dotenv_values(env_file))
         except OSError:  # pragma: no cover - unreadable dotenv
             continue
     return keys
