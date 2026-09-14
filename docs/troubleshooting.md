@@ -20,9 +20,9 @@ process on the same port.
 
 ## 1. The first task fails because `henchmen-operative:local` does not exist
 
-**Symptom:** `henchmen serve` starts normally, but the first agentic node fails
-and the server log shows a Docker error such as `Unable to find image 'henchmen-operative:local'`
-followed by `pull access denied`, and the node fails.
+**Symptom:** `henchmen serve` starts normally, but the first agentic node fails.
+The server log shows a Docker error such as
+`Unable to find image 'henchmen-operative:local'` followed by `pull access denied`.
 
 **Diagnosis:** The ephemeral operative runs inside a Docker container. The
 image has to exist locally before a task can dispatch one. `henchmen serve`
@@ -177,7 +177,8 @@ recorded as a CI pass.
 **Symptom:** The SQLite store is hundreds of MB and writes are slow.
 
 **Diagnosis:** Henchmen writes one `task_executions` row per task (with
-per-node metrics) and keeps it for 30 days. The store lives at
+per-node metrics). Its `expires_at` field only drives a Firestore TTL policy;
+SQLite has no TTL, so rows accumulate. The store lives at
 `~/.henchmen/henchmen_<environment>.db` unless `HENCHMEN_LOCAL_SQLITE_PATH`
 says otherwise. Every collection is a table of `(id, data)` rows where `data`
 is the JSON document.
