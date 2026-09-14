@@ -225,7 +225,7 @@ async def git_push(branch: str | None = None, working_dir: str = "") -> dict[str
     category="git_ops",
     description=(
         "Force-push a Henchmen branch to the remote. DESTRUCTIVE and DISABLED BY DEFAULT. "
-        "Requires HENCHMEN_ALLOW_FORCE_PUSH=1 in the environment and refuses to target any "
+        "Requires HENCHMEN_ALLOW_FORCE_PUSH=true in the operative settings and refuses to target any "
         "protected branch (main/master/develop/trunk/release*). An explicit branch name is "
         "required — current-HEAD force-pushes are rejected."
     ),
@@ -244,8 +244,9 @@ async def git_force_push(branch: str | None = None, working_dir: str = "") -> di
     if not get_settings().allow_force_push:
         return {
             "error": (
-                "git_force_push is disabled. Set HENCHMEN_ALLOW_FORCE_PUSH=1 in the "
-                "operative environment to enable. This tool is intentionally gated because "
+                "force-push refused: HENCHMEN_ALLOW_FORCE_PUSH is false. Set "
+                "HENCHMEN_ALLOW_FORCE_PUSH=true in the Mastermind settings (it is forwarded to "
+                "every operative) to enable. This tool is intentionally gated because "
                 "force-push is not part of the standard Henchmen workflow and is an effective "
                 "way for a hallucinated or injected agent action to destroy history."
             ),

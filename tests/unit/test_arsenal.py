@@ -338,7 +338,7 @@ class TestToolModulesRegisterOnImport:
 
         importlib.reload(mod)
         tools = ToolRegistry.list_tools(category="jira")
-        assert "update_issue_status" in tools
+        assert "update_issue_status" not in tools  # collapsed into transition_issue
         assert "add_comment" in tools
         assert "transition_issue" in tools
         assert "fetch_issue" in tools

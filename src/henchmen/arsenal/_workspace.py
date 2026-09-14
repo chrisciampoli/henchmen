@@ -6,9 +6,10 @@ class of guardrail bypasses where the outer :class:`OperativeGuardrails` check
 fails to trigger because a tool parameter is named differently than ``path``,
 ``file``, or ``dir``.
 
-The allowed root is read from the ``WORKSPACE_DIR`` environment variable at
-first use and cached as a realpath, so symlink escapes are blocked
-canonically. Tests can override the cached root by calling
+The allowed root is read from the ``WORKSPACE_DIR`` environment variable (part
+of the Operative runtime contract; ``initialize_workspace`` sets it to the
+task's clone) at first use and cached as a realpath, so symlink escapes are
+blocked canonically. Tests can override the cached root by calling
 ``set_workspace_root`` directly.
 """
 
@@ -18,7 +19,12 @@ import os
 import threading
 from pathlib import Path
 
-_DEFAULT_ROOT = "/workspace"
+# The container-wide workspace root. The Operative clones each task into
+# ``<DEFAULT_WORKSPACE_ROOT>/<task id>`` and then narrows ``WORKSPACE_DIR`` (and
+# this module's cached root) to that clone, so the boundary is the repository
+# itself. Every reader of the default imports this constant rather than
+# repeating the literal.
+DEFAULT_WORKSPACE_ROOT = "/workspace"
 
 _lock = threading.Lock()
 _cached_root: str | None = None
@@ -44,7 +50,7 @@ def get_workspace_root() -> str:
     global _cached_root
     with _lock:
         if _cached_root is None:
-            raw = os.environ.get("WORKSPACE_DIR", _DEFAULT_ROOT)
+            raw = os.environ.get("WORKSPACE_DIR", DEFAULT_WORKSPACE_ROOT)
             _cached_root = os.path.realpath(raw)
         return _cached_root
 
