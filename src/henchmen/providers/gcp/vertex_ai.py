@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 
 PROVIDER_NAME = "gcp"
 
+_GLOBAL_LOCATION = "global"
+# Model families Vertex AI only serves from the global endpoint.
+_GLOBAL_ONLY_MODEL_PREFIXES: tuple[str, ...] = ("gemini-3",)
+
 
 def _gemini_schema(param: ToolParameter) -> dict[str, Any]:
     """Build a Gemini parameter schema (upper-cased types, enum and array items preserved)."""
@@ -69,6 +73,17 @@ class VertexAIProvider:
             project=settings.gcp_project_id,
             location=settings.gcp_region,
         )
+        # Gemini 3 models are served from the `global` endpoint only; sending
+        # them to a regional endpoint returns 404, which would break the
+        # REASONING tier (gemini-3.1-pro by default). Building the client does
+        # no network I/O, so it is created up front alongside the regional one.
+        self._global_client = genai.Client(vertexai=True, project=settings.gcp_project_id, location=_GLOBAL_LOCATION)
+
+    def _client_for(self, model: str) -> Any:
+        """Return the client whose endpoint location can serve ``model``."""
+        if model.strip().lower().startswith(_GLOBAL_ONLY_MODEL_PREFIXES):
+            return self._global_client
+        return self._client
 
     def resolve_tier(self, tier: str) -> str:
         """Map a ModelTier to the concrete model name from settings."""
@@ -88,7 +103,8 @@ class VertexAIProvider:
 
     async def count_tokens(self, text: str, model: str) -> int:
         """Count tokens for the given text using the specified model or tier."""
-        response = await self._client.aio.models.count_tokens(model=self.resolve_tier(model), contents=text)
+        concrete = self.resolve_tier(model)
+        response = await self._client_for(concrete).aio.models.count_tokens(model=concrete, contents=text)
         return response.total_tokens or 0
 
     async def generate(
@@ -131,7 +147,7 @@ class VertexAIProvider:
             system_instruction=system_prompt,
             tools=genai_tools,
         )
-        response = await self._client.aio.models.generate_content(
+        response = await self._client_for(model).aio.models.generate_content(
             model=model,
             # google-genai's `contents` accepts a covariant Sequence; some
             # versions tighten the union enough that mypy is happy with our

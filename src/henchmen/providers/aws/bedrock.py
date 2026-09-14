@@ -7,7 +7,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from henchmen.models.llm import LLMResponse, Message, MessageRole, ModelTier, TokenUsage, ToolCall, ToolDefinition
-from henchmen.providers.llm_common import json_schema, normalize_finish_reason, resolve_provider_model
+from henchmen.providers.llm_common import json_schema, normalize_finish_reason, resolve_or_remap_model
 from henchmen.providers.pricing import estimate_cost
 from henchmen.providers.tiers import tier_models
 
@@ -18,6 +18,9 @@ logger = logging.getLogger(__name__)
 
 PROVIDER_NAME = "aws"
 
+# Model ids Bedrock cannot serve: other vendors' first-party names.
+_FOREIGN_MODEL_PREFIXES: tuple[str, ...] = ("gemini", "gpt", "claude-")
+
 
 class BedrockProvider:
     """LLMProvider backed by AWS Bedrock using the Converse API."""
@@ -26,8 +29,7 @@ class BedrockProvider:
         import boto3
 
         self._settings = settings
-        region = getattr(settings, "aws_region", "us-east-1")
-        self._client: Any = boto3.client("bedrock-runtime", region_name=region)
+        self._client: Any = boto3.client("bedrock-runtime", region_name=settings.aws_region)
         models = tier_models(settings, PROVIDER_NAME)
         logger.info(
             "BedrockProvider tier mapping: complex=%s light=%s reasoning=%s",
@@ -37,8 +39,13 @@ class BedrockProvider:
         )
 
     def resolve_tier(self, tier: str) -> str:
-        """Map a ModelTier to the configured Bedrock model ID; concrete IDs pass through."""
-        return resolve_provider_model(self._settings, tier, PROVIDER_NAME)
+        """Map a ModelTier to the configured Bedrock model ID.
+
+        First-party vendor ids (``gemini-*``, ``gpt-*``, bare ``claude-*`` —
+        Bedrock spells Claude ``anthropic.claude-*``) are remapped to the
+        COMPLEX tier with a warning; other concrete ids pass through.
+        """
+        return resolve_or_remap_model(self._settings, tier, PROVIDER_NAME, _FOREIGN_MODEL_PREFIXES)
 
     def supported_models(self) -> list[str]:
         """Return the configured tier model IDs, deduped and in tier order."""
