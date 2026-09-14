@@ -506,7 +506,7 @@ class TestDispatchServerRoutes:
     def test_create_task_route_registered(self, client):
         """Route /api/v1/tasks must exist; missing 'title' returns 422."""
         response = client.post("/api/v1/tasks", json={})
-        assert response.status_code in (200, 400, 422, 500)
+        assert response.status_code == 422
 
     def test_slack_webhook_route_url_verification(self, client):
         response = client.post(
@@ -527,16 +527,10 @@ class TestDispatchServerRoutes:
         )
         assert response.status_code != 404
 
-    def test_pubsub_task_planned_route_registered(self, client):
-        import base64
-        import json
-
-        data = base64.b64encode(json.dumps({"task_id": "t1"}).encode()).decode()
-        response = client.post(
-            "/pubsub/task-planned",
-            json={"message": {"data": data}},
-        )
-        assert response.status_code == 200
+    def test_task_planned_stub_route_is_gone(self, client):
+        """Nothing publishes task-planned; Dispatch must not expose an ack-everything stub."""
+        response = client.post("/pubsub/task-planned", json={"message": {"data": ""}})
+        assert response.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -1428,7 +1422,7 @@ def _pubsub_request(headers=None):
         {
             "type": "http",
             "method": "POST",
-            "path": "/pubsub/task-planned",
+            "path": "/pubsub/example",
             "headers": raw,
             "query_string": b"",
             "client": ("10.0.0.1", 1234),
@@ -1504,6 +1498,63 @@ class TestPubsubOidc:
             pytest.raises(HTTPException) as exc,
         ):
             await pubsub_auth.verify_pubsub_oidc(_pubsub_request({"Authorization": "Bearer jwt"}), _mock_settings())
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_valid_token_on_allow_list_is_accepted_and_claims_attached(self, monkeypatch):
+        from henchmen.dispatch import pubsub_auth
+
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "prod")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_AUDIENCE", "https://dispatch.example")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_ALLOWED_EMAILS", "pubsub@acme.iam.gserviceaccount.com")
+
+        claims = {"email": "pubsub@acme.iam.gserviceaccount.com", "aud": "https://dispatch.example"}
+        fake_id_token = MagicMock()
+        fake_id_token.verify_oauth2_token.return_value = claims
+        request = _pubsub_request({"Authorization": "Bearer good-jwt"})
+        with patch.dict(
+            "sys.modules",
+            {"google.auth.transport.requests": MagicMock(), "google.oauth2.id_token": fake_id_token},
+        ):
+            await pubsub_auth.verify_pubsub_oidc(request, _mock_settings())
+
+        assert request.state.pubsub_oidc_claims == claims
+        args = fake_id_token.verify_oauth2_token.call_args[0]
+        assert args[0] == "good-jwt"
+        assert args[2] == "https://dispatch.example"
+
+    @pytest.mark.asyncio
+    async def test_token_that_fails_verification_is_rejected(self, monkeypatch):
+        from fastapi import HTTPException
+
+        from henchmen.dispatch import pubsub_auth
+
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "prod")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_AUDIENCE", "https://dispatch.example")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_ALLOWED_EMAILS", "")
+
+        fake_id_token = MagicMock()
+        fake_id_token.verify_oauth2_token.side_effect = ValueError("Token has wrong audience")
+        with (
+            patch.dict(
+                "sys.modules",
+                {"google.auth.transport.requests": MagicMock(), "google.oauth2.id_token": fake_id_token},
+            ),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await pubsub_auth.verify_pubsub_oidc(_pubsub_request({"Authorization": "Bearer bad"}), _mock_settings())
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_non_bearer_authorization_scheme_is_rejected(self, monkeypatch):
+        from fastapi import HTTPException
+
+        from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
+
+        monkeypatch.setenv("HENCHMEN_ENVIRONMENT", "prod")
+        monkeypatch.setenv("HENCHMEN_PUBSUB_OIDC_AUDIENCE", "https://dispatch.example")
+        with pytest.raises(HTTPException) as exc:
+            await verify_pubsub_oidc(_pubsub_request({"Authorization": "Basic dXNlcjpwYXNz"}), _mock_settings())
         assert exc.value.status_code == 401
 
 

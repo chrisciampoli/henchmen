@@ -1,6 +1,5 @@
 """Dispatch service - FastAPI Cloud Run HTTP handler for task intake routing."""
 
-import base64
 import hashlib
 import hmac
 import json
@@ -22,7 +21,6 @@ from henchmen.dispatch.handlers.jira import handle_jira_webhook
 from henchmen.dispatch.handlers.slack import handle_slack_event
 from henchmen.dispatch.idempotency import TTLSet
 from henchmen.dispatch.normalizer import TaskNormalizer
-from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
 from henchmen.providers.registry import ProviderRegistry
 
 logger = logging.getLogger(__name__)
@@ -422,31 +420,3 @@ def _jira_dedup_key(payload: dict[str, Any]) -> str:
     if not (event and issue_key and timestamp):
         return ""
     return f"jira:{event}:{issue_key}:{timestamp}"
-
-
-@app.post("/pubsub/task-planned")
-async def task_planned_handler(request: Request) -> dict[str, Any]:
-    """Pub/Sub push handler for task-planned events.
-
-    Observability only: the event is authenticated, decoded and logged. No
-    state is changed and nothing is published, so an undecodable payload is
-    rejected with 400 (Pub/Sub retries, then dead-letters it) rather than
-    silently acknowledged.
-    """
-    settings = get_settings()
-    await verify_pubsub_oidc(request, settings)
-    try:
-        envelope = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}") from exc
-
-    message = envelope.get("message", {}) if isinstance(envelope, dict) else {}
-    data_b64 = message.get("data", "")
-    try:
-        data = json.loads(base64.b64decode(data_b64).decode("utf-8"))
-    except Exception as exc:
-        logger.error("[dispatch] Undecodable task-planned Pub/Sub message: %s", exc)
-        raise HTTPException(status_code=400, detail="Undecodable Pub/Sub message data") from exc
-
-    logger.info("task-planned event received: %s", data)
-    return {"status": "ok", "data": data}

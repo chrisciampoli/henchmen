@@ -19,6 +19,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from henchmen.config.settings import Settings, get_settings
+from henchmen.dispatch.idempotency import TTLSet
 from henchmen.dispatch.normalizer import TaskNormalizer
 from henchmen.models.task import HenchmenTask
 
@@ -29,6 +30,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 normalizer = TaskNormalizer()
+
+# Slack redelivers a Socket Mode event whose envelope was not acknowledged in
+# time. Each redelivery would otherwise become a fresh task and a fresh paid
+# operative run, so mentions are deduplicated on the envelope's ``event_id``
+# (the same ``slack:<event_id>`` key the HTTP intake uses).
+_delivery_guard = TTLSet()
+
+
+def _slack_dedup_key(body: dict[str, Any] | None) -> str:
+    """Return ``slack:<event_id>`` for an Events API envelope, or ``""`` if it has none."""
+    event_id = (body or {}).get("event_id")
+    return f"slack:{event_id}" if isinstance(event_id, str) and event_id else ""
+
 
 # Slack API errors that mean "nothing to do", not "something is broken".
 _BENIGN_JOIN_ERRORS = {"already_in_channel", "is_archived"}
@@ -63,8 +77,13 @@ def create_slack_app(settings: Settings | None = None) -> App:
     identity: dict[str, str] = {}
 
     @app.event("app_mention")
-    def handle_app_mention(event: dict[str, Any], say: Any, client: Any) -> None:
+    def handle_app_mention(event: dict[str, Any], say: Any, client: Any, body: dict[str, Any] | None = None) -> None:
         """Handle @henchmen mentions in channels."""
+        dedup_key = _slack_dedup_key(body)
+        if dedup_key and not _delivery_guard.add_if_absent(dedup_key):
+            logger.info("Ignoring redelivered Slack event %s", dedup_key)
+            return
+
         runtime_settings = get_settings()
         text = event.get("text", "")
         user = event.get("user", "unknown")
@@ -100,7 +119,7 @@ def create_slack_app(settings: Settings | None = None) -> App:
         # Normalize and publish
         task = normalizer.from_slack(payload, runtime_settings)
         # Synchronous publish (we're in a sync handler on a Bolt worker thread)
-        msg_id = _sync_publish(task, runtime_settings, broker=broker)
+        msg_id = _sync_publish(task, runtime_settings, broker=broker, dedup_key=dedup_key or None)
 
         # Reply in thread
         say(
@@ -117,19 +136,23 @@ def create_slack_app(settings: Settings | None = None) -> App:
     return app
 
 
-def _sync_publish(task: HenchmenTask, settings: Settings, broker: Any | None = None) -> str:
+def _sync_publish(
+    task: HenchmenTask,
+    settings: Settings,
+    broker: Any | None = None,
+    dedup_key: str | None = None,
+) -> str:
     """Synchronously publish a task via the configured MessageBroker.
 
     Bolt runs listeners on worker threads, which have no running (and on
     Python 3.12+ no implicit) event loop, so ``asyncio.run`` is used to drive
     the async broker rather than ``get_event_loop().run_until_complete``.
-    """
-    if broker is None:
-        from henchmen.providers.registry import ProviderRegistry
 
-        broker = ProviderRegistry(settings).get_message_broker()
-    data = task.model_dump_json().encode("utf-8")
-    result: str = asyncio.run(broker.publish(settings.pubsub_topic_task_intake, data, task_id=task.id))
+    Delegates to :meth:`TaskNormalizer.publish_task` so the Socket Mode path
+    attaches the same message attributes (``task_id`` and, when supplied,
+    ``dedup_key`` for Mastermind's cross-instance replay check) as HTTP intake.
+    """
+    result: str = asyncio.run(normalizer.publish_task(task, settings, broker=broker, dedup_key=dedup_key))
     return result
 
 

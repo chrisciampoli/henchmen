@@ -77,6 +77,83 @@ class TestSyncPublish:
         with patch("henchmen.providers.registry.ProviderRegistry.get_message_broker", return_value=broker):
             assert slack_bot._sync_publish(_task(), settings) == "msg-2"
 
+    def test_attaches_task_id_and_dedup_key_attributes(self, monkeypatch):
+        settings = _settings(monkeypatch)
+        broker = MagicMock()
+        broker.publish = AsyncMock(return_value="msg-3")
+        task = _task()
+
+        slack_bot._sync_publish(task, settings, broker=broker, dedup_key="slack:Ev1")
+
+        assert broker.publish.await_args.kwargs == {"task_id": task.id, "dedup_key": "slack:Ev1"}
+
+
+# ---------------------------------------------------------------------------
+# app_mention listener: Socket Mode redelivery dedup
+# ---------------------------------------------------------------------------
+
+
+class TestAppMentionDedup:
+    def _listener(self, monkeypatch, broker):
+        settings = _settings(monkeypatch, HENCHMEN_GITHUB_DEFAULT_REPO="acme/api")
+        listeners: dict[str, object] = {}
+
+        class _FakeApp:
+            def __init__(self, token: str = "", signing_secret: str = "") -> None:
+                pass
+
+            def event(self, name: str):
+                def register(func):
+                    listeners[name] = func
+                    return func
+
+                return register
+
+        with (
+            patch.dict("sys.modules", {"slack_bolt": MagicMock(App=_FakeApp)}),
+            patch("henchmen.providers.registry.ProviderRegistry.get_message_broker", return_value=broker),
+        ):
+            slack_bot.create_slack_app(settings)
+        slack_bot._delivery_guard.clear()
+        return listeners["app_mention"]
+
+    def _client(self):
+        client = MagicMock()
+        client.auth_test.return_value = {"user_id": "U0BOT"}
+        client.conversations_replies.return_value = {"messages": []}
+        return client
+
+    def test_redelivered_event_publishes_once(self, monkeypatch):
+        broker = MagicMock()
+        broker.publish = AsyncMock(return_value="msg-1")
+        listener = self._listener(monkeypatch, broker)
+        event = {"type": "app_mention", "user": "U1", "channel": "C1", "ts": "1.1", "text": "<@U0BOT> fix it"}
+        body = {"event_id": "Ev42", "event": event}
+        say = MagicMock()
+
+        listener(event=event, say=say, client=self._client(), body=body)
+        listener(event=event, say=say, client=self._client(), body=body)
+
+        broker.publish.assert_awaited_once()
+        assert broker.publish.await_args.kwargs["dedup_key"] == "slack:Ev42"
+        say.assert_called_once()
+
+    def test_distinct_events_both_publish(self, monkeypatch):
+        broker = MagicMock()
+        broker.publish = AsyncMock(return_value="msg-1")
+        listener = self._listener(monkeypatch, broker)
+        event = {"type": "app_mention", "user": "U1", "channel": "C1", "ts": "1.1", "text": "<@U0BOT> fix it"}
+
+        listener(event=event, say=MagicMock(), client=self._client(), body={"event_id": "EvA", "event": event})
+        listener(event=event, say=MagicMock(), client=self._client(), body={"event_id": "EvB", "event": event})
+
+        assert broker.publish.await_count == 2
+
+    def test_dedup_key_helper(self):
+        assert slack_bot._slack_dedup_key({"event_id": "Ev1"}) == "slack:Ev1"
+        assert slack_bot._slack_dedup_key({}) == ""
+        assert slack_bot._slack_dedup_key(None) == ""
+
 
 # ---------------------------------------------------------------------------
 # create_slack_app

@@ -197,15 +197,15 @@ async def test_rate_limiter_covers_pubsub_paths():
     app = FastAPI()
     app.add_middleware(RateLimitMiddleware)
 
-    @app.post("/pubsub/task-planned")
-    async def task_planned() -> dict[str, str]:
+    @app.post("/pubsub/example")
+    async def pubsub_example() -> dict[str, str]:
         return {"ok": "yes"}
 
     transport = ASGITransport(app=_SpoofClientIPMiddleware(app, "8.8.8.8"))  # type: ignore[arg-type]
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         for _ in range(60):
-            assert (await client.post("/pubsub/task-planned")).status_code == 200
-        assert (await client.post("/pubsub/task-planned")).status_code == 429
+            assert (await client.post("/pubsub/example")).status_code == 200
+        assert (await client.post("/pubsub/example")).status_code == 429
 
 
 @pytest.mark.asyncio
