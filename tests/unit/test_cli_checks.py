@@ -594,7 +594,7 @@ class TestJira:
         )
         result = check_jira("https://x.atlassian.net", "a@b", "tok")
         assert result.status == CheckStatus.FAIL
-        assert "401" in result.message
+        assert "email or API token is wrong" in result.message
 
     def test_network_error_fails(self, monkeypatch: pytest.MonkeyPatch):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -604,6 +604,58 @@ class TestJira:
             checks, "_http_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(handler))
         )
         assert check_jira("https://x.atlassian.net", "a@b", "tok").status == CheckStatus.FAIL
+
+
+class TestJiraDistinctErrors:
+    """F3: 401/403/404/429 must produce different, actionable messages, not one generic shape."""
+
+    @staticmethod
+    def _serve(monkeypatch: pytest.MonkeyPatch, status_code: int) -> None:
+        monkeypatch.setattr(
+            checks,
+            "_http_client",
+            lambda timeout: httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(status_code))),
+        )
+
+    def test_401_says_the_credentials_are_wrong(self, monkeypatch: pytest.MonkeyPatch):
+        self._serve(monkeypatch, 401)
+        result = check_jira("https://x.atlassian.net", "a@b", "tok")
+        assert result.status == CheckStatus.FAIL
+        assert "email or API token is wrong" in result.message
+        assert result.hint is not None and "id.atlassian.com" in result.hint
+
+    def test_403_says_no_site_access(self, monkeypatch: pytest.MonkeyPatch):
+        self._serve(monkeypatch, 403)
+        result = check_jira("https://x.atlassian.net", "a@b", "tok")
+        assert result.status == CheckStatus.FAIL
+        assert "no access to this Jira site" in result.message
+        assert result.hint is not None and "admin" in result.hint
+
+    def test_404_says_no_such_site(self, monkeypatch: pytest.MonkeyPatch):
+        self._serve(monkeypatch, 404)
+        result = check_jira("https://x.atlassian.net", "a@b", "tok")
+        assert result.status == CheckStatus.FAIL
+        assert "no Jira site at that address" in result.message
+        assert result.hint == "Check the site URL"
+
+    def test_429_says_rate_limited(self, monkeypatch: pytest.MonkeyPatch):
+        self._serve(monkeypatch, 429)
+        result = check_jira("https://x.atlassian.net", "a@b", "tok")
+        assert result.status == CheckStatus.FAIL
+        assert "rate-limiting" in result.message
+
+    def test_messages_are_all_distinct(self, monkeypatch: pytest.MonkeyPatch):
+        messages = set()
+        for status_code in (401, 403, 404, 429, 500):
+            self._serve(monkeypatch, status_code)
+            messages.add(check_jira("https://x.atlassian.net", "a@b", "tok").message)
+        assert len(messages) == 5
+
+    def test_credentials_are_never_echoed_in_the_message(self, monkeypatch: pytest.MonkeyPatch):
+        self._serve(monkeypatch, 401)
+        result = check_jira("https://x.atlassian.net", "a@b", "s3cr3t-token")
+        assert "s3cr3t-token" not in result.message
+        assert result.hint is None or "s3cr3t-token" not in result.hint
 
 
 class TestJiraLookups:
@@ -625,13 +677,28 @@ class TestJiraLookups:
             return httpx.Response(200, json={"isLast": True, "values": [{"key": "API", "name": "API"}]})
 
         self._serve(monkeypatch, handler)
-        projects = checks.list_jira_projects("https://acme.atlassian.net/", "a@b.co", "tok")
-        assert projects == [checks.JiraProject(key="API", name="API"), checks.JiraProject(key="WEB", name="Web app")]
+        listing = checks.list_jira_projects("https://acme.atlassian.net/", "a@b.co", "tok")
+        assert listing.projects == [
+            checks.JiraProject(key="API", name="API"),
+            checks.JiraProject(key="WEB", name="Web app"),
+        ]
+        assert listing.truncated is False
         assert starts == ["0", "50"]
 
-    def test_projects_unauthorized_returns_empty(self, monkeypatch: pytest.MonkeyPatch):
+    def test_projects_stopping_at_the_page_limit_is_reported_as_truncated(self, monkeypatch: pytest.MonkeyPatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            start = int(request.url.params["startAt"])
+            return httpx.Response(200, json={"isLast": False, "values": [{"key": f"P{start}", "name": "x"}]})
+
+        self._serve(monkeypatch, handler)
+        listing = checks.list_jira_projects("https://acme.atlassian.net", "a@b.co", "tok")
+        assert listing.truncated is True
+        assert len(listing.projects) == checks._JIRA_MAX_PAGES
+
+    def test_projects_unauthorized_raises_unreachable(self, monkeypatch: pytest.MonkeyPatch):
         self._serve(monkeypatch, lambda request: httpx.Response(401, json={}))
-        assert checks.list_jira_projects("https://acme.atlassian.net", "a@b.co", "tok") == []
+        with pytest.raises(checks.JiraUnreachableError):
+            checks.list_jira_projects("https://acme.atlassian.net", "a@b.co", "tok")
 
     def test_fields_sorted_by_name(self, monkeypatch: pytest.MonkeyPatch):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -652,13 +719,122 @@ class TestJiraLookups:
             checks.JiraField(id="summary", name="Summary", custom=False),
         ]
 
-    def test_network_errors_return_empty(self, monkeypatch: pytest.MonkeyPatch):
+    def test_fields_failure_raises_unreachable_not_an_empty_list(self, monkeypatch: pytest.MonkeyPatch):
+        self._serve(monkeypatch, lambda request: httpx.Response(500, json={}))
+        with pytest.raises(checks.JiraUnreachableError):
+            checks.list_jira_fields("https://acme.atlassian.net", "a@b.co", "tok")
+
+    def test_network_errors_raise_unreachable(self, monkeypatch: pytest.MonkeyPatch):
         def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("offline")
 
         self._serve(monkeypatch, handler)
-        assert checks.list_jira_projects("https://acme.atlassian.net", "a@b.co", "tok") == []
-        assert checks.list_jira_fields("https://acme.atlassian.net", "a@b.co", "tok") == []
+        with pytest.raises(checks.JiraUnreachableError):
+            checks.list_jira_projects("https://acme.atlassian.net", "a@b.co", "tok")
+        with pytest.raises(checks.JiraUnreachableError):
+            checks.list_jira_fields("https://acme.atlassian.net", "a@b.co", "tok")
+
+
+class TestGetJiraProject:
+    @staticmethod
+    def _serve(monkeypatch: pytest.MonkeyPatch, handler: Any) -> None:
+        monkeypatch.setattr(
+            checks, "_http_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(handler))
+        )
+
+    def test_found_project_is_returned(self, monkeypatch: pytest.MonkeyPatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/rest/api/3/project/OPS"
+            return httpx.Response(200, json={"key": "OPS", "name": "Operations"})
+
+        self._serve(monkeypatch, handler)
+        project = checks.get_jira_project("https://acme.atlassian.net", "a@b.co", "tok", "OPS")
+        assert project == checks.JiraProject(key="OPS", name="Operations")
+
+    def test_404_is_a_definite_no(self, monkeypatch: pytest.MonkeyPatch):
+        self._serve(monkeypatch, lambda request: httpx.Response(404, json={}))
+        assert checks.get_jira_project("https://acme.atlassian.net", "a@b.co", "tok", "NOPE") is None
+
+    def test_other_failure_raises_unreachable(self, monkeypatch: pytest.MonkeyPatch):
+        self._serve(monkeypatch, lambda request: httpx.Response(500, json={}))
+        with pytest.raises(checks.JiraUnreachableError):
+            checks.get_jira_project("https://acme.atlassian.net", "a@b.co", "tok", "OPS")
+
+    def test_network_error_raises_unreachable(self, monkeypatch: pytest.MonkeyPatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("offline")
+
+        self._serve(monkeypatch, handler)
+        with pytest.raises(checks.JiraUnreachableError):
+            checks.get_jira_project("https://acme.atlassian.net", "a@b.co", "tok", "OPS")
+
+
+class TestJiraIdentity:
+    @staticmethod
+    def _serve(monkeypatch: pytest.MonkeyPatch, handler: Any) -> None:
+        monkeypatch.setattr(
+            checks, "_http_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(handler))
+        )
+
+    def test_identity_has_account_id_and_display_name(self, monkeypatch: pytest.MonkeyPatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/rest/api/3/myself"
+            return httpx.Response(200, json={"accountId": "abc123", "displayName": "Pat Manager"})
+
+        self._serve(monkeypatch, handler)
+        identity = checks.jira_identity("https://acme.atlassian.net", "a@b.co", "tok")
+        assert identity == checks.JiraIdentity(account_id="abc123", display_name="Pat Manager")
+
+    def test_missing_account_id_is_none(self, monkeypatch: pytest.MonkeyPatch):
+        self._serve(monkeypatch, lambda request: httpx.Response(200, json={"displayName": "Pat Manager"}))
+        assert checks.jira_identity("https://acme.atlassian.net", "a@b.co", "tok") is None
+
+    def test_failure_is_none(self, monkeypatch: pytest.MonkeyPatch):
+        self._serve(monkeypatch, lambda request: httpx.Response(401, json={}))
+        assert checks.jira_identity("https://acme.atlassian.net", "a@b.co", "tok") is None
+
+    def test_network_error_is_none(self, monkeypatch: pytest.MonkeyPatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("offline")
+
+        self._serve(monkeypatch, handler)
+        assert checks.jira_identity("https://acme.atlassian.net", "a@b.co", "tok") is None
+
+
+class TestValidateJiraBaseUrl:
+    def test_https_url_is_accepted(self):
+        assert checks.validate_jira_base_url("https://acme.atlassian.net") == "https://acme.atlassian.net"
+
+    def test_loopback_http_is_accepted(self):
+        checks.validate_jira_base_url("http://localhost:2990")
+
+    def test_plain_http_on_a_real_host_is_refused(self):
+        """F6: unlike the GitHub validator, no Docker-Compose-service-name exception for Jira."""
+        with pytest.raises(ValueError):
+            checks.validate_jira_base_url("http://fakes:9000")
+
+    def test_missing_scheme_is_refused(self):
+        with pytest.raises(ValueError):
+            checks.validate_jira_base_url("acme.atlassian.net")
+
+    def test_query_string_is_refused(self):
+        with pytest.raises(ValueError):
+            checks.validate_jira_base_url("https://acme.atlassian.net?x=1")
+
+    def test_fragment_is_refused(self):
+        with pytest.raises(ValueError):
+            checks.validate_jira_base_url("https://acme.atlassian.net#frag")
+
+    def test_url_parameters_are_refused(self):
+        with pytest.raises(ValueError):
+            checks.validate_jira_base_url("https://acme.atlassian.net/path;param=1")
+
+    def test_credentials_in_the_url_are_refused(self):
+        with pytest.raises(ValueError):
+            checks.validate_jira_base_url("https://user:pass@acme.atlassian.net")
+
+    def test_plain_path_is_still_accepted(self):
+        assert checks.validate_jira_base_url("https://acme.atlassian.net/jira") == "https://acme.atlassian.net/jira"
 
 
 # ---------------------------------------------------------------------------

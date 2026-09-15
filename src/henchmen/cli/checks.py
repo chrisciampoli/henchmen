@@ -4,7 +4,11 @@ Every ``check_*`` function returns a :class:`CheckResult` and never raises:
 network errors, authentication failures and missing optional SDKs all become
 ``FAIL`` or ``WARN`` results with an actionable ``hint``. ``list_*`` helpers
 return an empty list on any failure so callers can fall back to free-text
-input.
+input -- except :func:`list_jira_projects` and :func:`list_jira_fields`,
+which raise :class:`JiraUnreachableError` instead (ruling F4): a listing
+failure after credentials already checked out (a 5xx, a timeout, a rate
+limit) must never be read as "zero projects" by a caller that would then
+offer fail-open advice like "ask a Jira admin for Browse access".
 
 SDK clients are built through small module-level factories (``_anthropic_client``
 and friends) so tests can substitute fakes without touching the network.
@@ -13,15 +17,17 @@ and friends) so tests can substitute fakes without touching the network.
 from __future__ import annotations
 
 import base64
+import ipaddress
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
-from henchmen.config.settings import Settings
+from henchmen.config.settings import Settings, require_secure_github_url
 from henchmen.providers.pricing import PRICE_TABLE
 from henchmen.providers.tiers import TIER_FIELDS
 from henchmen.utils.redaction import redact
@@ -738,6 +744,23 @@ def post_slack_message(token: str, channel_id: str, text: str, *, timeout: float
 _JIRA_PAGE_SIZE = 50
 _JIRA_MAX_PAGES = 20
 
+# Jira never needs the loopback-http "Docker Compose service name" exception
+# ``require_secure_github_url`` allows for a fake GitHub host in end-to-end
+# tests, so it is narrowed away here rather than weakening that validator.
+_JIRA_LOOPBACK_NAMES = frozenset({"localhost"})
+
+
+class JiraUnreachableError(Exception):
+    """Raised when a Jira listing/lookup could not be completed at all.
+
+    Covers a non-2xx response (a 5xx, a rate limit, an expired session) and a
+    network-level failure (timeout, connection error) alike -- distinguished
+    from a definite empty result (Jira answered 200 with no items, or 404 for
+    "no such project") so a caller never reads "the call failed" as "there is
+    nothing there" and offers fail-open advice (e.g. "ask a Jira admin for
+    Browse access") for what is really a connectivity or rate-limit problem.
+    """
+
 
 @dataclass(frozen=True)
 class JiraProject:
@@ -756,9 +779,99 @@ class JiraField:
     custom: bool
 
 
+@dataclass(frozen=True)
+class JiraProjectListing:
+    """Projects visible to the account, and whether ``_JIRA_MAX_PAGES`` cut the listing short."""
+
+    projects: list[JiraProject]
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class JiraIdentity:
+    """A stable id for a Jira account -- never a display name.
+
+    Display names (a check's "authenticated as Pat Manager") can be changed
+    by the account holder at any time and are not guaranteed unique, so a
+    caller that must notice "this token now authenticates a different Jira
+    account" fingerprints on ``account_id`` instead.
+    """
+
+    account_id: str
+    display_name: str
+
+
 def _jira_headers(email: str, api_token: str) -> dict[str, str]:
     auth = base64.b64encode(f"{email}:{api_token}".encode()).decode()
     return {"Authorization": f"Basic {auth}", "Accept": "application/json"}
+
+
+def _is_loopback_host(host: str) -> bool:
+    """``localhost``, or any address in ``127.0.0.0/8``/``::1`` written as a canonical IP literal."""
+    if host in _JIRA_LOOPBACK_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_jira_base_url(value: str) -> str:
+    """A usable Jira site address, or ``ValueError`` (ruling F6).
+
+    Reuses (never re-implements) :func:`~henchmen.config.settings.require_secure_github_url`
+    for the https-except-loopback and no-embedded-credentials rules, then
+    narrows further for Jira specifically:
+
+    * that validator's loopback-*or*-Docker-Compose-service-name exception
+      (added for a fake GitHub host in end-to-end tests) is narrowed to
+      loopback only -- a real Jira site is never a bare single-label
+      hostname reached over plain http;
+    * a query string, a fragment or (legacy) URL parameters are refused -- a
+      Jira site address is an origin plus, at most, a path, never something
+      with its own ``?``/``#``/``;`` component.
+    """
+    checked = require_secure_github_url(value)
+    parts = urlparse(checked)
+    if parts.query or parts.fragment or parts.params:
+        raise ValueError("must not contain a query string, a fragment or URL parameters")
+    host = (parts.hostname or "").lower()
+    if parts.scheme == "http" and not _is_loopback_host(host):
+        raise ValueError("must use https (plain http is allowed only for loopback)")
+    return checked
+
+
+_JIRA_STATUS_PROBLEMS: dict[int, tuple[str, str]] = {
+    401: (
+        "the email or API token is wrong",
+        "Create a new API token at id.atlassian.com/manage-profile/security/api-tokens",
+    ),
+    403: (
+        "this account is signed in but has no access to this Jira site",
+        "Ask a Jira admin to grant this account access to the site",
+    ),
+    404: ("no Jira site at that address", "Check the site URL"),
+    429: ("Jira is rate-limiting this account", "Wait a moment, then try again"),
+}
+
+
+def _jira_status_result(base_url: str, status_code: int) -> CheckResult:
+    """Distinguish why ``GET /rest/api/3/myself`` failed rather than one "returned HTTP <code>" message (ruling F3).
+
+    Collapsing 401 (bad credentials), 403 (no site access), 404 (no such
+    site) and 429 (rate limited) into a single shape sends the user to create
+    a new API token even when the real problem is a typo'd site address, a
+    permission request to a Jira admin, or nothing more than "try again in a
+    minute".
+    """
+    reason, hint = _JIRA_STATUS_PROBLEMS.get(
+        status_code,
+        (
+            f"returned HTTP {status_code}",
+            "Create an API token at id.atlassian.com/manage-profile/security/api-tokens",
+        ),
+    )
+    return CheckResult("Jira", CheckStatus.FAIL, redact(f"{base_url}: {reason}"), hint=hint)
 
 
 def check_jira(base_url: str, email: str, api_token: str, *, timeout: float = DEFAULT_TIMEOUT) -> CheckResult:
@@ -773,12 +886,7 @@ def check_jira(base_url: str, email: str, api_token: str, *, timeout: float = DE
     except Exception as exc:
         return CheckResult(name, CheckStatus.FAIL, f"cannot reach {base_url}: {_short(exc)}")
     if response.status_code != 200:
-        return CheckResult(
-            name,
-            CheckStatus.FAIL,
-            f"{base_url} returned HTTP {response.status_code}",
-            hint="Create an API token at id.atlassian.com/manage-profile/security/api-tokens",
-        )
+        return _jira_status_result(base_url, response.status_code)
     try:
         display_name = str(response.json().get("displayName", email))
     except Exception:
@@ -786,12 +894,49 @@ def check_jira(base_url: str, email: str, api_token: str, *, timeout: float = DE
     return CheckResult(name, CheckStatus.OK, f"authenticated as {display_name}")
 
 
+def jira_identity(
+    base_url: str, email: str, api_token: str, *, timeout: float = DEFAULT_TIMEOUT
+) -> JiraIdentity | None:
+    """``/rest/api/3/myself``'s ``accountId``/``displayName``; ``None`` on any failure or missing id.
+
+    A second call to the same endpoint :func:`check_jira` already uses,
+    alongside it -- the same pattern as :func:`slack_bot_identity` alongside
+    :func:`check_slack_bot_token` -- rather than a change to ``check_jira``'s
+    return shape, so every existing caller and test of ``check_jira`` stays
+    unaffected. Fails closed: a caller comparing identities across two calls
+    must treat ``None`` as "cannot prove this is the same account", never as
+    "unchanged".
+    """
+    url = f"{base_url.rstrip('/')}/rest/api/3/myself"
+    try:
+        with _http_client(timeout) as client:
+            response = client.get(url, headers=_jira_headers(email, api_token))
+        if response.status_code != 200:
+            return None
+        raw = response.json()
+    except Exception:
+        return None
+    account_id = str(raw.get("accountId", ""))
+    if not account_id:
+        return None
+    return JiraIdentity(account_id=account_id, display_name=str(raw.get("displayName", "")))
+
+
 def list_jira_projects(
     base_url: str, email: str, api_token: str, *, timeout: float = DEFAULT_TIMEOUT
-) -> list[JiraProject]:
-    """Projects the account can browse (``GET /rest/api/3/project/search``), sorted by key; ``[]`` on failure."""
+) -> JiraProjectListing:
+    """Projects the account can browse (``GET /rest/api/3/project/search``), sorted by key.
+
+    Stops after ``_JIRA_MAX_PAGES`` (20) pages of ``_JIRA_PAGE_SIZE`` (50)
+    each rather than trusting ``isLast`` to eventually turn true; ``truncated``
+    is true when that limit was reached, so a project beyond this listing can
+    still be confirmed directly by key with :func:`get_jira_project`. Raises
+    :class:`JiraUnreachableError` on any non-2xx response or network failure
+    (ruling F4) -- never an empty listing for that case.
+    """
     url = f"{base_url.rstrip('/')}/rest/api/3/project/search"
     projects: list[JiraProject] = []
+    truncated = False
     try:
         with _http_client(timeout) as client:
             for page in range(_JIRA_MAX_PAGES):
@@ -801,7 +946,7 @@ def list_jira_projects(
                     headers=_jira_headers(email, api_token),
                 )
                 if response.status_code != 200:
-                    return []
+                    raise JiraUnreachableError(f"project listing returned HTTP {response.status_code}")
                 body = response.json()
                 values = body.get("values", [])
                 for raw in values:
@@ -810,22 +955,72 @@ def list_jira_projects(
                         projects.append(JiraProject(key=key, name=str(raw.get("name") or key)))
                 if body.get("isLast", True) or not values:
                     break
-    except Exception:
-        return []
-    return sorted(projects, key=lambda project: project.key)
+            else:
+                truncated = True
+                _logger.warning(
+                    "Jira project listing stopped after %d pages (%d projects seen); "
+                    "the site may have more projects than were returned",
+                    _JIRA_MAX_PAGES,
+                    len(projects),
+                )
+    except JiraUnreachableError:
+        raise
+    except Exception as exc:
+        raise JiraUnreachableError(_short(exc)) from exc
+    return JiraProjectListing(projects=sorted(projects, key=lambda project: project.key), truncated=truncated)
+
+
+def get_jira_project(
+    base_url: str, email: str, api_token: str, project_key: str, *, timeout: float = DEFAULT_TIMEOUT
+) -> JiraProject | None:
+    """Look up one project directly (``GET /rest/api/3/project/{projectIdOrKey}``), for beyond a truncated listing.
+
+    Bounded to a single call, the same pattern as :func:`get_slack_channel`.
+    Returns ``None`` only for a definite "no" answer -- Jira responds 404 both
+    for "no such project" and "you can't see this project" (it deliberately
+    does not distinguish the two, to avoid revealing existence). Raises
+    :class:`JiraUnreachableError` for anything else -- a network failure or an
+    unexpected status -- so that case is never confused with "no such project".
+    """
+    url = f"{base_url.rstrip('/')}/rest/api/3/project/{project_key}"
+    try:
+        with _http_client(timeout) as client:
+            response = client.get(url, headers=_jira_headers(email, api_token))
+    except Exception as exc:
+        raise JiraUnreachableError(_short(exc)) from exc
+    if response.status_code == 404:
+        return None
+    if response.status_code != 200:
+        raise JiraUnreachableError(f"project lookup returned HTTP {response.status_code}")
+    try:
+        raw = response.json()
+    except Exception as exc:
+        raise JiraUnreachableError(_short(exc)) from exc
+    key = str(raw.get("key", ""))
+    if not key:
+        return None
+    return JiraProject(key=key, name=str(raw.get("name") or key))
 
 
 def list_jira_fields(base_url: str, email: str, api_token: str, *, timeout: float = DEFAULT_TIMEOUT) -> list[JiraField]:
-    """Every issue field (``GET /rest/api/3/field``), sorted by display name; ``[]`` on failure."""
+    """Every issue field (``GET /rest/api/3/field``), sorted by display name.
+
+    Jira does not paginate this endpoint (it always returns the complete
+    field list in one response), so there is no truncation to report here --
+    unlike :func:`list_jira_projects`. Raises :class:`JiraUnreachableError` on
+    any non-2xx response or network failure (ruling F4).
+    """
     url = f"{base_url.rstrip('/')}/rest/api/3/field"
     try:
         with _http_client(timeout) as client:
             response = client.get(url, headers=_jira_headers(email, api_token))
         if response.status_code != 200:
-            return []
+            raise JiraUnreachableError(f"field listing returned HTTP {response.status_code}")
         raw_fields = response.json()
-    except Exception:
-        return []
+    except JiraUnreachableError:
+        raise
+    except Exception as exc:
+        raise JiraUnreachableError(_short(exc)) from exc
     fields = [
         JiraField(
             id=str(raw.get("id", "")), name=str(raw.get("name") or raw.get("id", "")), custom=bool(raw.get("custom"))
@@ -843,7 +1038,10 @@ __all__ = [
     "CheckResult",
     "CheckStatus",
     "JiraField",
+    "JiraIdentity",
     "JiraProject",
+    "JiraProjectListing",
+    "JiraUnreachableError",
     "SlackChannel",
     "SlackChannelListing",
     "SlackIdentity",
@@ -860,7 +1058,9 @@ __all__ = [
     "check_slack_bot_token",
     "check_vertex",
     "filter_openai_models",
+    "get_jira_project",
     "get_slack_channel",
+    "jira_identity",
     "join_slack_channel",
     "list_anthropic_models",
     "list_bedrock_models",
@@ -872,4 +1072,5 @@ __all__ = [
     "list_slack_channels_page",
     "post_slack_message",
     "slack_bot_identity",
+    "validate_jira_base_url",
 ]
