@@ -165,13 +165,21 @@ def _isolate_settings() -> Iterator[None]:
     that previously lived across ``test_config.py``, ``test_dispatch.py``
     and various conftest files.
 
-    Cached GitHub credentials providers are dropped the same way, since they are keyed on Settings values.
+    Cached GitHub credentials providers are dropped the same way, since they are keyed on Settings values,
+    and so are an operative's cached GitHub credentials (only when that module is already imported, so the
+    operative package is not imported into every test session).
     """
     get_settings.cache_clear()
     reset_credentials_providers()
+    operative_credentials = sys.modules.get("henchmen.operative.github_credentials")
+    if operative_credentials is not None:
+        operative_credentials.reset_operative_credentials()
     yield
     get_settings.cache_clear()
     reset_credentials_providers()
+    operative_credentials = sys.modules.get("henchmen.operative.github_credentials")
+    if operative_credentials is not None:
+        operative_credentials.reset_operative_credentials()
 
 
 @pytest.fixture(autouse=True)

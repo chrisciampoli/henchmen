@@ -1,12 +1,14 @@
 """GitHub tools - pull requests, issues, labels, assignments.
 
-Credentials come from :class:`~henchmen.config.settings.Settings` (which
-accepts both ``HENCHMEN_GITHUB_TOKEN`` and the bare ``GITHUB_TOKEN`` a Cloud
-Run secret mount injects). The repository is the one the Operative was
-dispatched against — see :mod:`henchmen.arsenal._repo`.
+Credentials come from :mod:`henchmen.operative.github_credentials`: the token
+LairManager injected (``HENCHMEN_GITHUB_TOKEN``), refreshed through the internal
+API before it expires when it is a GitHub App installation token. The
+repository is the one the Operative was dispatched against — see
+:mod:`henchmen.arsenal._repo`.
 """
 
 import asyncio
+import os
 from typing import Any
 
 from henchmen.arsenal._repo import current_repo_slug
@@ -14,15 +16,23 @@ from henchmen.arsenal.registry import tool
 
 
 def _get_github_client() -> Any:
-    """Return an authenticated PyGithub client using the configured token."""
+    """Return an authenticated PyGithub client using the operative's current token."""
     import github
 
-    from henchmen.config.settings import get_settings
+    from henchmen.operative.github_credentials import get_operative_credentials
 
-    token = get_settings().github_token
+    token = get_operative_credentials().token
     if not token:
         raise ValueError("No GitHub token configured (set HENCHMEN_GITHUB_TOKEN)")
     return github.Github(auth=github.Auth.Token(token))
+
+
+async def _refresh_github_token() -> None:
+    """Refresh an expiring installation token before a GitHub API call (never raises)."""
+    from henchmen.operative.github_credentials import get_operative_credentials
+
+    # WORKSPACE_DIR is part of the operative runtime contract: the clone whose origin follows the token.
+    await get_operative_credentials().ensure_fresh(os.environ.get("WORKSPACE_DIR") or None)
 
 
 def _get_repo(client: Any) -> Any:
@@ -60,6 +70,7 @@ async def create_pull_request(
             "title": pr.title,
         }
 
+    await _refresh_github_token()
     try:
         return await asyncio.to_thread(_sync)
     except Exception as exc:
@@ -81,6 +92,7 @@ async def comment_on_pr(pr_number: int, body: str) -> dict[str, Any]:
         comment = pr.create_issue_comment(body)
         return {"success": True, "comment_id": comment.id, "pr_number": pr_number}
 
+    await _refresh_github_token()
     try:
         return await asyncio.to_thread(_sync)
     except Exception as exc:
@@ -102,6 +114,7 @@ async def label_issue(issue_number: int, labels: list[str]) -> dict[str, Any]:
         issue.add_to_labels(*labels)
         return {"success": True, "issue_number": issue_number, "labels": labels}
 
+    await _refresh_github_token()
     try:
         return await asyncio.to_thread(_sync)
     except Exception as exc:
@@ -123,6 +136,7 @@ async def assign_issue(issue_number: int, assignees: list[str]) -> dict[str, Any
         issue.add_to_assignees(*assignees)
         return {"success": True, "issue_number": issue_number, "assignees": assignees}
 
+    await _refresh_github_token()
     try:
         return await asyncio.to_thread(_sync)
     except Exception as exc:
@@ -162,6 +176,7 @@ async def fetch_issues(
             )
         return {"success": True, "issues": issues, "count": len(issues)}
 
+    await _refresh_github_token()
     try:
         return await asyncio.to_thread(_sync)
     except Exception as exc:
