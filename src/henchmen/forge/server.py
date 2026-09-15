@@ -79,11 +79,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.document_store = registry.get_document_store()
 
     logger.info("[forge] Service started")
-    yield
-    shutdown_tracing()
-    logger.info("[forge] Shutting down")
-    if owns_broker:
-        await _close_broker()
+    try:
+        yield
+    finally:
+        # A sub-app entered after this one can fail to start; the combined app's
+        # AsyncExitStack then unwinds this lifespan by throwing that exception in at
+        # `yield`, so shutdown must run from `finally`, not after a bare `yield`.
+        try:
+            shutdown_tracing()
+            logger.info("[forge] Shutting down")
+            if owns_broker:
+                await _close_broker()
+        except Exception:
+            # Never let a shutdown-path error mask the exception (if any) already
+            # propagating through `yield`.
+            logger.warning("[forge] Shutdown raised", exc_info=True)
 
 
 app = FastAPI(title="Henchmen Forge", description="CI/merge pipeline", lifespan=lifespan)

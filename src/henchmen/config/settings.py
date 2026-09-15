@@ -618,17 +618,21 @@ class Settings(BaseSettings):
         problems: list[str] = []
         llm = active_llm_provider(self)
 
-        # ``model_post_init`` already refuses this combination at normal construction, but
-        # ``model_copy(update=...)`` (used by several call sites and test fixtures to derive
-        # per-request Settings) bypasses it, so this is checked again defensively here.
+        # ``model_post_init`` already refuses provider=gcp with no project id at normal
+        # construction, but ``model_copy(update=...)`` -- used by test fixtures (e.g.
+        # ``_mock_settings`` in test_provider_registry.py) to derive per-test Settings
+        # variants without paying construction's full validation again -- bypasses it, so
+        # this is checked again defensively here. ``elif`` avoids reporting the empty
+        # project id twice when both the provider and the LLM provider are gcp, the
+        # common case.
         if self.provider == "gcp" and not self.gcp_project_id:
             problems.append("HENCHMEN_GCP_PROJECT_ID is empty but the provider is gcp.")
+        elif llm == "gcp" and not self.gcp_project_id:
+            problems.append("HENCHMEN_GCP_PROJECT_ID is empty but the LLM provider is Vertex AI.")
         if llm == "anthropic" and not self.anthropic_api_key:
             problems.append("HENCHMEN_ANTHROPIC_API_KEY is empty but the LLM provider is anthropic.")
         if llm == "openai" and not self.openai_api_key:
             problems.append("HENCHMEN_OPENAI_API_KEY is empty but the LLM provider is openai.")
-        if llm == "gcp" and not self.gcp_project_id:
-            problems.append("HENCHMEN_GCP_PROJECT_ID is empty but the LLM provider is Vertex AI.")
         if llm == "local" and not self.llm_ollama_base_url:
             problems.append("HENCHMEN_LLM_OLLAMA_BASE_URL is empty but the LLM provider is Ollama.")
 

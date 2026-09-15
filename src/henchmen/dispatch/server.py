@@ -24,7 +24,6 @@ from henchmen.dispatch.handlers.jira import handle_jira_webhook
 from henchmen.dispatch.handlers.slack import handle_slack_event
 from henchmen.dispatch.idempotency import TTLSet
 from henchmen.dispatch.normalizer import TaskNormalizer
-from henchmen.providers.registry import ProviderRegistry
 from henchmen.utils.redaction import install_secret_redaction
 
 logger = logging.getLogger(__name__)
@@ -323,6 +322,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # One broker for the whole process: every intake route and the Slack bot
     # publish through it. A broker injected on app.state beforehand belongs to
     # whoever injected it; one created here is closed and dropped on shutdown.
+    #
+    # Imported here (like mastermind's and forge's own lifespans), not at module level:
+    # a module-level `from x import Y` binds a name in *this* module's namespace once,
+    # the first time this module is imported -- a test that monkeypatches
+    # `henchmen.providers.registry.ProviderRegistry` around a fresh import of this module
+    # would then have that mock captured here permanently, immune to the patch being
+    # undone afterward. A local import re-resolves the current attribute every call.
+    from henchmen.providers.registry import ProviderRegistry
+
     owns_broker = getattr(app.state, "message_broker", None) is None
     if owns_broker:
         app.state.message_broker = ProviderRegistry(settings).get_message_broker()
@@ -332,17 +340,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.slack_socket_handler = start_socket_mode(settings, broker=app.state.message_broker)
 
     logger.info("[dispatch] Service started")
-    yield
-    handler = getattr(app.state, "slack_socket_handler", None)
-    if handler is not None:
+    try:
+        yield
+    finally:
+        # A sub-app entered after this one (mastermind, forge) can fail to start; the
+        # combined app's AsyncExitStack then unwinds this lifespan by throwing that
+        # exception in at `yield`, so shutdown must run from `finally`, not after a bare
+        # `yield` -- otherwise the Slack Socket Mode handler (background threads) stays
+        # connected for as long as the process (through needs-attention mode included),
+        # still accepting Slack messages and publishing them to a broker nothing drains.
         try:
-            handler.close()
-        except Exception:  # pragma: no cover - shutdown best effort
-            logger.warning("[dispatch] Slack Socket Mode handler did not close cleanly", exc_info=True)
-    shutdown_tracing()
-    logger.info("[dispatch] Shutting down")
-    if owns_broker:
-        await _close_broker(app)
+            handler = getattr(app.state, "slack_socket_handler", None)
+            if handler is not None:
+                try:
+                    handler.close()
+                except Exception:  # pragma: no cover - shutdown best effort
+                    logger.warning("[dispatch] Slack Socket Mode handler did not close cleanly", exc_info=True)
+            shutdown_tracing()
+            logger.info("[dispatch] Shutting down")
+            if owns_broker:
+                await _close_broker(app)
+        except Exception:
+            # Never let a shutdown-path error mask the exception (if any) already
+            # propagating through `yield`.
+            logger.warning("[dispatch] Shutdown raised", exc_info=True)
 
 
 async def _close_broker(app: FastAPI) -> None:

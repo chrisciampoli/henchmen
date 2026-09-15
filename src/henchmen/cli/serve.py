@@ -85,6 +85,23 @@ async def _aclose(resource: object, name: str) -> None:
         logger.warning("[serve] Failed to close %s", name, exc_info=True)
 
 
+def _close_after_build_failure(resource: object, name: str) -> None:
+    """Close a resource ``build_serve_app`` already created before it failed to finish building.
+
+    No lifespan will ever run for a store or broker built this early -- the failure happens
+    before ``build_serve_app`` ever returns an app for uvicorn to run -- so it must be closed
+    here instead of leaking. ``build_serve_app`` itself is a plain (non-async) function with
+    no event loop of its own, so this spins one up just to await an async ``close``/``aclose``.
+    """
+    try:
+        asyncio.run(_aclose(resource, name))
+    except RuntimeError:
+        # Already inside a running event loop (e.g. called from async code) -- there is no
+        # safe way to synchronously await the close from here. Best effort: log and move on
+        # rather than raising a second exception out of an already-exceptional build path.
+        logger.warning("[serve] Could not close %s: already inside a running event loop", name)
+
+
 @dataclass(frozen=True)
 class DesktopRuntime:
     """What ``build_serve_app`` needs to harden a desktop (data-directory) install."""
@@ -135,80 +152,88 @@ def build_serve_app(
     registry = ProviderRegistry(settings)
     shared_store = registry.get_document_store()
 
-    # Seed state before the sub-app lifespans run: Mastermind builds its agent
-    # from whatever is already on app.state.
-    dispatch_app.state.message_broker = shared_broker
-    mastermind_app.state.message_broker = shared_broker
-    mastermind_app.state.document_store = shared_store
-    mastermind_app.state.container_orchestrator = registry.get_container_orchestrator()
-    forge_app.state.message_broker = shared_broker
-    forge_app.state.ci_provider = registry.get_ci_provider()
-    forge_app.state.document_store = shared_store
+    try:
+        # Seed state before the sub-app lifespans run: Mastermind builds its agent
+        # from whatever is already on app.state.
+        dispatch_app.state.message_broker = shared_broker
+        mastermind_app.state.message_broker = shared_broker
+        mastermind_app.state.document_store = shared_store
+        mastermind_app.state.container_orchestrator = registry.get_container_orchestrator()
+        forge_app.state.message_broker = shared_broker
+        forge_app.state.ci_provider = registry.get_ci_provider()
+        forge_app.state.document_store = shared_store
 
-    sub_apps: tuple[FastAPI, ...] = (dispatch_app, mastermind_app, forge_app)
-    tracker = health if health is not None else ServiceHealth()
+        sub_apps: tuple[FastAPI, ...] = (dispatch_app, mastermind_app, forge_app)
+        tracker = health if health is not None else ServiceHealth()
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        tracker.set_all(ServiceState.STARTING)
-        try:
-            async with AsyncExitStack() as stack:
-                with _uvicorn_owns_signals(asyncio.get_running_loop()):
-                    for name, sub_app in zip(SERVICE_NAMES, sub_apps, strict=True):
-                        try:
-                            await stack.enter_async_context(sub_app.router.lifespan_context(sub_app))
-                        except Exception as exc:
-                            # Recorded, then re-raised: uvicorn reports a startup failure and
-                            # `henchmen serve` decides whether to serve the needs-attention Console.
-                            tracker.record_startup_failure(name, exc)
-                            raise
-                # A sub-app lifespan may have replaced a shared provider with its
-                # own instance; close the duplicate and restore the shared one.
-                shared: dict[str, object] = {"message_broker": shared_broker, "document_store": shared_store}
-                for sub_app in sub_apps:
-                    for attr, instance in shared.items():
-                        current = getattr(sub_app.state, attr, None)
-                        if current is not None and current is not instance:
-                            await _aclose(current, f"{sub_app.title} {attr}")
-                            setattr(sub_app.state, attr, instance)
-                tracker.set_all(ServiceState.RUNNING)
-                logger.info("All services initialized")
-                try:
-                    yield
-                finally:
-                    tracker.set_all(ServiceState.STOPPING)
-                    await shared_broker.drain()
-                    logger.info("Shutting down")
-                # Leaving the AsyncExitStack runs the sub-app shutdowns in reverse order.
-        finally:
-            tracker.finish()
-            await _aclose(shared_store, "shared document store")
-            # A failed startup (or a normal shutdown) must not leave this run's broker as the
-            # process-wide singleton (ruling: no resource leak into a same-process fallback):
-            # a later build_serve_app call already replaces it, but a needs-attention app built
-            # after a startup failure builds no broker of its own and must never reach this one.
-            # (A startup failure happens before the success path's own drain() above ever runs,
-            # so there is nothing in flight here to wait for -- only the singleton to release.)
-            if get_shared_broker() is shared_broker:
-                set_shared_broker(None)
+        @asynccontextmanager
+        async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+            tracker.set_all(ServiceState.STARTING)
+            try:
+                async with AsyncExitStack() as stack:
+                    with _uvicorn_owns_signals(asyncio.get_running_loop()):
+                        for name, sub_app in zip(SERVICE_NAMES, sub_apps, strict=True):
+                            try:
+                                await stack.enter_async_context(sub_app.router.lifespan_context(sub_app))
+                            except Exception as exc:
+                                # Recorded, then re-raised: uvicorn reports a startup failure and
+                                # `henchmen serve` decides whether to serve the needs-attention Console.
+                                tracker.record_startup_failure(name, exc)
+                                raise
+                    # A sub-app lifespan may have replaced a shared provider with its
+                    # own instance; close the duplicate and restore the shared one.
+                    shared: dict[str, object] = {"message_broker": shared_broker, "document_store": shared_store}
+                    for sub_app in sub_apps:
+                        for attr, instance in shared.items():
+                            current = getattr(sub_app.state, attr, None)
+                            if current is not None and current is not instance:
+                                await _aclose(current, f"{sub_app.title} {attr}")
+                                setattr(sub_app.state, attr, instance)
+                    tracker.set_all(ServiceState.RUNNING)
+                    logger.info("All services initialized")
+                    try:
+                        yield
+                    finally:
+                        tracker.set_all(ServiceState.STOPPING)
+                        await shared_broker.drain()
+                        logger.info("Shutting down")
+                    # Leaving the AsyncExitStack runs the sub-app shutdowns in reverse order.
+            finally:
+                tracker.finish()
+                await _aclose(shared_store, "shared document store")
+                # A failed startup (or a normal shutdown) must not leave this run's broker as
+                # the process-wide singleton (ruling: no resource leak into a same-process
+                # fallback): a later build_serve_app call already replaces it, but a
+                # needs-attention app built after a startup failure builds no broker of its
+                # own and must never reach this one. (A startup failure happens before the
+                # success path's own drain() above ever runs, so there is nothing in flight
+                # here to wait for -- only the singleton to release.)
+                if get_shared_broker() is shared_broker:
+                    set_shared_broker(None)
 
-    app = FastAPI(title="Henchmen (Local Dev)", version=__version__, lifespan=lifespan)
-    app.mount("/dispatch", dispatch_app)
-    app.mount("/mastermind", mastermind_app)
-    app.mount("/forge", forge_app)
+        app = FastAPI(title="Henchmen (Local Dev)", version=__version__, lifespan=lifespan)
+        app.mount("/dispatch", dispatch_app)
+        app.mount("/mastermind", mastermind_app)
+        app.mount("/forge", forge_app)
 
-    @app.get("/health")
-    async def health_status() -> dict[str, object]:
-        return {"status": "ok", "mode": "local", "services": ["dispatch", "mastermind", "forge"]}
+        @app.get("/health")
+        async def health_status() -> dict[str, object]:
+            return {"status": "ok", "mode": "local", "services": ["dispatch", "mastermind", "forge"]}
 
-    if console is not None:
-        # Mounted last so it only receives paths no service or /health claims.
-        app.mount("/", console)
+        if console is not None:
+            # Mounted last so it only receives paths no service or /health claims.
+            app.mount("/", console)
 
-    if desktop is not None:
-        from henchmen.console.auth import HostAllowlistGuard
+        if desktop is not None:
+            from henchmen.console.auth import HostAllowlistGuard
 
-        app.add_middleware(HostAllowlistGuard, allowed_hostnames=desktop.allowed_hostnames)
+            app.add_middleware(HostAllowlistGuard, allowed_hostnames=desktop.allowed_hostnames)
+    except Exception:
+        # No lifespan has been built (or entered) yet for this store: build_serve_app never
+        # reached `return app`, so close it here instead of leaking the connection when the
+        # caller falls back to needs-attention mode in the same process.
+        _close_after_build_failure(shared_store, "shared document store")
+        raise
 
     return app
 
