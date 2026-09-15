@@ -214,8 +214,12 @@ class OperativeGitHubCredentials:
         self._settings.github_token = issued.token
         self._settings.github_token_expires_at = expires_iso
         if unchanged:
-            # Nothing actually changed: the origin remote (if set up at all) already
-            # points at this token, so there is nothing to log or repoint.
+            # The token itself didn't change, but an earlier refresh may still have a
+            # pending repoint (no workspace_dir yet, or a failed set-url) — retry that
+            # now rather than silently dropping it, since ensure_fresh's own retry
+            # branch is only reached when this refresh path is *not* taken.
+            if workspace_dir and self._needs_repoint:
+                await self._retry_pending_repoint(workspace_dir)
             return
         logger.info("Refreshed the GitHub token; it now expires at %s", expires_iso)
         # Not "fresh" until the remote actually points at the new token: a
