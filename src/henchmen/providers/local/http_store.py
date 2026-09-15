@@ -54,7 +54,9 @@ class HttpDocumentStore:
         return f"{self._base}/{quote(document_id, safe='')}/{action}"
 
     async def _send(self, method: str, url: str, body: Any = None) -> httpx.Response:
-        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS, transport=self._transport) as client:
+        # trust_env=False: never read HTTP(S)_PROXY / NO_PROXY from the environment for this
+        # loopback call to Mastermind. A configured proxy would otherwise receive the task token.
+        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS, transport=self._transport, trust_env=False) as client:
             return await client.request(method, url, headers=self._headers, json=body)
 
     async def get(self, collection: str, document_id: str) -> dict[str, Any] | None:

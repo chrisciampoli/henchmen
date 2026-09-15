@@ -1510,6 +1510,43 @@ class TestCostIsCountedOnce:
         await accumulator.add(1.0)
         assert await accumulator.check_ceiling() is False
 
+    @pytest.mark.asyncio
+    async def test_non_desktop_seed_error_defaults_to_zero(self):
+        """Dev on a repository checkout: a seed error is swallowed and the ceiling starts at zero."""
+        from henchmen.observability.cost_accumulator import TaskCostAccumulator
+
+        store = _make_mock_store()
+        store.get = AsyncMock(side_effect=RuntimeError("store unavailable"))
+        settings = _settings_for(environment="dev")
+        accumulator = TaskCostAccumulator(store, "task-1", ceiling_usd=6.0, settings=settings)
+
+        assert await accumulator.current_total() == 0.0
+
+    @pytest.mark.asyncio
+    async def test_desktop_posture_seed_error_fails_closed(self):
+        """A desktop install's operative must not silently start the ceiling at zero."""
+        from henchmen.observability.cost_accumulator import TaskCostAccumulator
+
+        store = _make_mock_store()
+        store.get = AsyncMock(side_effect=RuntimeError("store unavailable"))
+        settings = _settings_for(operative_task_token="t" * 64)
+        accumulator = TaskCostAccumulator(store, "task-1", ceiling_usd=6.0, settings=settings)
+
+        with pytest.raises(RuntimeError, match="store unavailable"):
+            await accumulator.current_total()
+
+    @pytest.mark.asyncio
+    async def test_missing_document_is_not_an_error_even_on_desktop(self):
+        """A 404 (no prior spend recorded yet) must not be treated as a seed failure."""
+        from henchmen.observability.cost_accumulator import TaskCostAccumulator
+
+        store = _make_mock_store()
+        store.get = AsyncMock(return_value=None)
+        settings = _settings_for(operative_task_token="t" * 64)
+        accumulator = TaskCostAccumulator(store, "task-1", ceiling_usd=6.0, settings=settings)
+
+        assert await accumulator.current_total() == 0.0
+
 
 # ---------------------------------------------------------------------------
 # Datetime filters work on every DocumentStore (SQLite compares as strings)

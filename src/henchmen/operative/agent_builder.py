@@ -8,6 +8,7 @@ import os
 import re
 from typing import TYPE_CHECKING, Any
 
+from henchmen.config.posture import is_desktop_posture
 from henchmen.config.settings import Settings
 from henchmen.models.llm import LLMResponse, Message, MessageRole, ToolCall, ToolDefinition, ToolParameter
 from henchmen.models.operative import OperativeConfig
@@ -170,12 +171,18 @@ class OperativeAgent:
                 document_store=self.document_store,
                 task_id=self.config.task_id,
                 ceiling_usd=self.settings.operative_task_cost_ceiling_usd,
+                settings=self.settings,
             )
             # Prime the cached total so the first ceiling check sees the
-            # running total from prior nodes rather than 0.
+            # running total from prior nodes rather than 0. A desktop install
+            # (or an operative it launched) fails the node closed on a
+            # genuine seed error instead of silently starting the ceiling at
+            # zero — see TaskCostAccumulator._ensure_loaded.
             try:
                 await task_cost_accumulator.current_total()
             except Exception as exc:
+                if is_desktop_posture(self.settings):
+                    raise
                 logger.warning("Could not prime task cost accumulator: %s", exc)
 
         guardrails = OperativeGuardrails(
