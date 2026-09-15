@@ -60,6 +60,55 @@ def test_unset_removes_keys(store: ConfigStore) -> None:
     assert store.get("HENCHMEN_GITHUB_DEFAULT_REPO") == "acme/app"
 
 
+def test_update_sets_and_unsets_in_one_write(store: ConfigStore) -> None:
+    store.update(
+        {"HENCHMEN_GITHUB_APP_INSTALLATION_ID": "7", "HENCHMEN_GITHUB_DEFAULT_REPO": "acme/app"}, section="GitHub"
+    )
+    previous = store.config_file.read_bytes()
+    store.update({"HENCHMEN_GITHUB_APP_ID": "42"}, section="GitHub", unset=["HENCHMEN_GITHUB_APP_INSTALLATION_ID"])
+    assert store.get("HENCHMEN_GITHUB_APP_ID") == "42"
+    assert "HENCHMEN_GITHUB_APP_INSTALLATION_ID" not in store.config_file.read_text(encoding="utf-8")
+    assert store.get("HENCHMEN_GITHUB_DEFAULT_REPO") == "acme/app"
+    # One load-modify-write: the backup is the complete previous file, not a half-applied one.
+    assert store.config_file.with_name("henchmen.env.bak").read_bytes() == previous
+
+
+def test_update_with_only_unset_on_a_missing_file_does_not_create_it(store: ConfigStore) -> None:
+    store.update({}, section="GitHub", unset=["HENCHMEN_GITHUB_APP_INSTALLATION_ID"])
+    assert not store.config_file.exists()
+
+
+@pytest.mark.parametrize(
+    ("values", "unset"),
+    [
+        ({"HENCHMEN_GITHUB_APP_ID": "42"}, ["HENCHMEN_NOT_A_SETTING"]),
+        ({"HENCHMEN_GITHUB_APP_ID": "42"}, ["HENCHMEN_OPERATIVE_TASK_TOKEN"]),
+        ({"HENCHMEN_GITHUB_APP_ID": "4\n2"}, ["HENCHMEN_GITHUB_APP_INSTALLATION_ID"]),
+        ({"HENCHMEN_GITHUB_APP_ID": "42"}, ["HENCHMEN_GITHUB_APP_ID"]),
+    ],
+)
+def test_refused_update_with_unset_leaves_the_file_byte_identical(
+    store: ConfigStore, values: dict[str, str], unset: list[str]
+) -> None:
+    store.update({"HENCHMEN_GITHUB_APP_INSTALLATION_ID": "7"}, section="GitHub")
+    before = store.config_file.read_bytes()
+    with pytest.raises(ConfigStoreError):
+        store.update(values, section="GitHub", unset=unset)
+    assert store.config_file.read_bytes() == before
+    assert not store.config_file.with_name("henchmen.env.bak").exists()
+
+
+def test_update_with_unset_does_not_call_unset(store: ConfigStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    store.update({"HENCHMEN_GITHUB_APP_INSTALLATION_ID": "7"}, section="GitHub")
+
+    def forbidden(keys: object) -> None:
+        raise AssertionError("update must remove keys inline, under its own lock acquisition")
+
+    monkeypatch.setattr(store, "unset", forbidden)
+    store.update({"HENCHMEN_GITHUB_APP_ID": "1"}, section="GitHub", unset=["HENCHMEN_GITHUB_APP_INSTALLATION_ID"])
+    assert store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == ""
+
+
 def test_unset_on_a_missing_file_does_not_create_it(store: ConfigStore) -> None:
     store.unset(["HENCHMEN_GITHUB_WEBHOOK_SECRET"])
     assert not store.config_file.exists()

@@ -188,18 +188,37 @@ class ConfigStore:
         """True when ``key`` has a non-blank value in the config file."""
         return bool(self.get(key).strip())
 
-    def update(self, values: Mapping[str, str], *, section: str) -> None:
-        """Set every key in ``values`` in one atomic write; any bad entry refuses the whole batch."""
+    def update(self, values: Mapping[str, str], *, section: str, unset: Iterable[str] = ()) -> None:
+        """Set every key in ``values`` and remove every key in ``unset`` in one atomic write.
+
+        Both happen in a single locked load-modify-write, so no reader or
+        concurrent writer ever sees the new values without the removals (or
+        the other way round) and the ``.bak`` holds the complete previous
+        file. Every key and value is checked before the file is touched: any
+        bad entry -- or a key named in both ``values`` and ``unset`` --
+        refuses the whole batch and leaves the file byte-identical.
+        """
+        removals = list(dict.fromkeys(unset))
         for key, value in values.items():
             self._check_key(key)
             if any(character in value for character in _FORBIDDEN_CHARACTERS):
                 raise ConfigStoreError(f"The value for {key} contains a line break or NUL character")
-        if not values:
+        for key in removals:
+            self._check_key(key)
+        both = sorted(set(values).intersection(removals))
+        if both:
+            raise ConfigStoreError(f"{', '.join(both)} cannot be both set and removed in one update")
+        if not values and not removals:
             return
         with self._lock:
             env = EnvFile.load(self.config_file)
+            present = set(env.keys())
+            if not values and not (env.exists and present.intersection(removals)):
+                return
             for key, value in values.items():
                 env.set(key, value, section=section)
+            for key in removals:
+                env.unset(key)
             env.write(backup=True)
 
     def unset(self, keys: Iterable[str]) -> None:

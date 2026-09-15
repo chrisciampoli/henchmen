@@ -16,6 +16,7 @@ from typing import cast
 import httpx
 from fastapi import Request
 
+from henchmen.console.callback_state import CallbackStateStore
 from henchmen.console.config_store import ConfigStore
 
 HttpClientFactory = Callable[[], httpx.AsyncClient]
@@ -23,8 +24,12 @@ DEFAULT_HTTP_TIMEOUT = 10.0
 
 
 def default_http_client() -> httpx.AsyncClient:
-    """Client for outbound API calls made directly by step routers."""
-    return httpx.AsyncClient(timeout=DEFAULT_HTTP_TIMEOUT)
+    """Client for outbound API calls made directly by step routers.
+
+    ``trust_env=False``: no proxy or netrc configuration from the environment
+    sees what these calls carry (a GitHub manifest code, an app JWT).
+    """
+    return httpx.AsyncClient(timeout=DEFAULT_HTTP_TIMEOUT, trust_env=False)
 
 
 def get_config_store(request: Request) -> ConfigStore:
@@ -36,3 +41,8 @@ def get_http_client_factory(request: Request) -> HttpClientFactory:
     """Factory for outbound ``httpx.AsyncClient`` instances (replaced in tests)."""
     factory = getattr(request.app.state, "http_client_factory", None)
     return cast(HttpClientFactory, factory) if factory is not None else default_http_client
+
+
+def get_callback_states(request: Request) -> CallbackStateStore:
+    """Single-use state values for the public GitHub callbacks."""
+    return cast(CallbackStateStore, request.app.state.callback_states)
