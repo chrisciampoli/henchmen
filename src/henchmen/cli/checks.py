@@ -17,17 +17,15 @@ and friends) so tests can substitute fakes without touching the network.
 from __future__ import annotations
 
 import base64
-import ipaddress
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 
-from henchmen.config.settings import Settings, require_secure_github_url
+from henchmen.config.settings import Settings, require_secure_service_url
 from henchmen.providers.pricing import PRICE_TABLE
 from henchmen.providers.tiers import TIER_FIELDS
 from henchmen.utils.redaction import redact
@@ -80,12 +78,21 @@ class CheckStatus(StrEnum):
 
 @dataclass
 class CheckResult:
-    """Result of a single check."""
+    """Result of a single check.
+
+    ``field`` optionally names which input the problem is about (e.g.
+    ``"base_url"`` for "no such site" versus ``"api_token"`` for "wrong
+    credentials") so a caller with several input fields for one check --
+    such as the Jira step's site/email/token form -- can route a failure to
+    the right one without parsing ``message`` text (ruling N5). ``None``
+    means "no specific field" and a caller picks its own default.
+    """
 
     name: str
     status: CheckStatus
     message: str
     hint: str | None = None
+    field: str | None = None
 
     @property
     def is_ok(self) -> bool:
@@ -744,11 +751,6 @@ def post_slack_message(token: str, channel_id: str, text: str, *, timeout: float
 _JIRA_PAGE_SIZE = 50
 _JIRA_MAX_PAGES = 20
 
-# Jira never needs the loopback-http "Docker Compose service name" exception
-# ``require_secure_github_url`` allows for a fake GitHub host in end-to-end
-# tests, so it is narrowed away here rather than weakening that validator.
-_JIRA_LOOPBACK_NAMES = frozenset({"localhost"})
-
 
 class JiraUnreachableError(Exception):
     """Raised when a Jira listing/lookup could not be completed at all.
@@ -806,52 +808,34 @@ def _jira_headers(email: str, api_token: str) -> dict[str, str]:
     return {"Authorization": f"Basic {auth}", "Accept": "application/json"}
 
 
-def _is_loopback_host(host: str) -> bool:
-    """``localhost``, or any address in ``127.0.0.0/8``/``::1`` written as a canonical IP literal."""
-    if host in _JIRA_LOOPBACK_NAMES:
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
 def validate_jira_base_url(value: str) -> str:
-    """A usable Jira site address, or ``ValueError`` (ruling F6).
+    """A usable Jira site address, or ``ValueError``.
 
-    Reuses (never re-implements) :func:`~henchmen.config.settings.require_secure_github_url`
-    for the https-except-loopback and no-embedded-credentials rules, then
-    narrows further for Jira specifically:
-
-    * that validator's loopback-*or*-Docker-Compose-service-name exception
-      (added for a fake GitHub host in end-to-end tests) is narrowed to
-      loopback only -- a real Jira site is never a bare single-label
-      hostname reached over plain http;
-    * a query string, a fragment or (legacy) URL parameters are refused -- a
-      Jira site address is an origin plus, at most, a path, never something
-      with its own ``?``/``#``/``;`` component.
+    A thin wrapper over :func:`~henchmen.config.settings.require_secure_service_url`
+    (ruling C23: Jira uses the identical host rule as GitHub -- https except
+    loopback or a dotless Docker Compose service host over http, no embedded
+    credentials, no query string, fragment or URL parameters). There is no
+    Jira-specific host logic here: one shared validator, never two near-copies.
     """
-    checked = require_secure_github_url(value)
-    parts = urlparse(checked)
-    if parts.query or parts.fragment or parts.params:
-        raise ValueError("must not contain a query string, a fragment or URL parameters")
-    host = (parts.hostname or "").lower()
-    if parts.scheme == "http" and not _is_loopback_host(host):
-        raise ValueError("must use https (plain http is allowed only for loopback)")
-    return checked
+    return require_secure_service_url(value, field="Jira site URL")
 
 
-_JIRA_STATUS_PROBLEMS: dict[int, tuple[str, str]] = {
+# (reason, hint, field) -- ``field`` names which input the problem belongs to
+# (ruling N5) so a caller with several credential inputs can route without
+# parsing ``message`` text; ``None`` leaves the choice to the caller's own default.
+_JIRA_STATUS_PROBLEMS: dict[int, tuple[str, str, str | None]] = {
     401: (
         "the email or API token is wrong",
         "Create a new API token at id.atlassian.com/manage-profile/security/api-tokens",
+        None,
     ),
     403: (
         "this account is signed in but has no access to this Jira site",
         "Ask a Jira admin to grant this account access to the site",
+        None,
     ),
-    404: ("no Jira site at that address", "Check the site URL"),
-    429: ("Jira is rate-limiting this account", "Wait a moment, then try again"),
+    404: ("no Jira site at that address", "Check the site URL", "base_url"),
+    429: ("Jira is rate-limiting this account", "Wait a moment, then try again", None),
 }
 
 
@@ -864,14 +848,15 @@ def _jira_status_result(base_url: str, status_code: int) -> CheckResult:
     permission request to a Jira admin, or nothing more than "try again in a
     minute".
     """
-    reason, hint = _JIRA_STATUS_PROBLEMS.get(
+    reason, hint, field = _JIRA_STATUS_PROBLEMS.get(
         status_code,
         (
             f"returned HTTP {status_code}",
             "Create an API token at id.atlassian.com/manage-profile/security/api-tokens",
+            None,
         ),
     )
-    return CheckResult("Jira", CheckStatus.FAIL, redact(f"{base_url}: {reason}"), hint=hint)
+    return CheckResult("Jira", CheckStatus.FAIL, redact(f"{base_url}: {reason}"), hint=hint, field=field)
 
 
 def check_jira(base_url: str, email: str, api_token: str, *, timeout: float = DEFAULT_TIMEOUT) -> CheckResult:
@@ -884,7 +869,7 @@ def check_jira(base_url: str, email: str, api_token: str, *, timeout: float = DE
         with _http_client(timeout) as client:
             response = client.get(url, headers=_jira_headers(email, api_token))
     except Exception as exc:
-        return CheckResult(name, CheckStatus.FAIL, f"cannot reach {base_url}: {_short(exc)}")
+        return CheckResult(name, CheckStatus.FAIL, f"cannot reach {base_url}: {_short(exc)}", field="base_url")
     if response.status_code != 200:
         return _jira_status_result(base_url, response.status_code)
     try:

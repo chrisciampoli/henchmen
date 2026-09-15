@@ -875,6 +875,10 @@ def test_github_urls_accept_https_loopback_and_compose_hosts(field: str, url: st
         "http://1fakes:9000",
         "http://fakes_internal:9000",
         "http://-fakes",
+        # N1: a query string, a fragment or URL parameters are refused for GitHub too.
+        "https://api.github.com?x=1",
+        "https://api.github.com#frag",
+        "https://api.github.com/path;param=1",
     ],
 )
 def test_github_urls_refuse_insecure_or_malformed_values(field: str, url: str) -> None:
