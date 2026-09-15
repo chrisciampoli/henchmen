@@ -736,5 +736,15 @@ def _serve(args: argparse.Namespace) -> None:
         llm,
         settings.environment.value,
     )
-    app = build_serve_app(settings, port, console=console)
+    desktop = None
+    if console is not None:
+        from henchmen.cli.serve import DesktopRuntime
+        from henchmen.console.auth import desktop_allowed_hostnames, forward_host_problem
+
+        desktop = DesktopRuntime(allowed_hostnames=desktop_allowed_hostnames(settings.local_container_hostname))
+        problem = forward_host_problem(settings)
+        if problem is not None:
+            logger.warning("%s", problem)
+
+    app = build_serve_app(settings, port, console=console, desktop=desktop)
     sys.exit(serve_app(app, host=args.host, port=port, log_level=args.log_level, restart=restart))

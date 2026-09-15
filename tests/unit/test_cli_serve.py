@@ -348,6 +348,7 @@ def test_serve_without_data_dir_runs_the_services(monkeypatch: pytest.MonkeyPatc
         _serve(_serve_args())
     assert exit_info.value.code == 0
     assert build.call_args.kwargs["console"] is None
+    assert build.call_args.kwargs["desktop"] is None
     assert run.call_args.kwargs["port"] == 8123
 
 
@@ -416,6 +417,8 @@ def test_serve_with_completed_setup_mounts_the_console_in_run_mode(
     console = build.call_args.kwargs["console"]
     assert console is not None
     assert TestClient(console, base_url=_LOCAL).get("/console/api/status").json()["mode"] == "run"
+    desktop = build.call_args.kwargs["desktop"]
+    assert desktop.allowed_hostnames == frozenset({"127.0.0.1", "localhost", "::1", "henchmen"})
 
 
 def test_run_mode_prints_the_port_settings_actually_resolved(
@@ -581,3 +584,77 @@ def test_invalid_settings_hint_names_the_file_setup_writes(
     err = capsys.readouterr().err
     expected = str(tmp_path / "henchmen.env") if data_dir_install else ".env.local"
     assert f"to (re)write {expected}." in err
+
+
+class TestDesktopHostAllowlist:
+    """D-P2: in desktop mode the whole combined app refuses foreign Host names (DNS rebinding)."""
+
+    @staticmethod
+    def _client(host: str) -> TestClient:
+        from henchmen.cli.serve import DesktopRuntime
+        from henchmen.config.settings import get_settings
+        from henchmen.console.auth import desktop_allowed_hostnames
+
+        desktop = DesktopRuntime(allowed_hostnames=desktop_allowed_hostnames("henchmen"))
+        app = build_serve_app(get_settings(), 8000, desktop=desktop)
+        # A bracketed IPv6 literal (e.g. "[::1]:8000") in base_url itself trips
+        # starlette's TestClient netloc parser (it splits on ":" without bracket
+        # awareness), so the Host under test is sent as an explicit header on a
+        # plain loopback base_url instead of folded into the connection URL —
+        # exercising the same scope["headers"] the middleware actually reads.
+        client = TestClient(app, base_url="http://127.0.0.1:8000")
+        client.headers["host"] = host
+        return client
+
+    @pytest.mark.parametrize("host", ["127.0.0.1:8000", "localhost:8000", "[::1]:8000", "henchmen:8000"])
+    def test_allowed_hosts_reach_every_service(self, serve_env: Path, host: str) -> None:
+        client = self._client(host)
+        for path in ("/dispatch/health", "/mastermind/health", "/forge/health"):
+            assert client.get(path).status_code == 200
+
+    @pytest.mark.parametrize("host", ["evil.example:8000", "127.0.0.1.evil.example:8000", "henchmen.evil.example"])
+    def test_other_hosts_are_refused_on_every_service(self, serve_env: Path, host: str) -> None:
+        client = self._client(host)
+        for path in ("/dispatch/health", "/mastermind/health", "/forge/health"):
+            assert client.get(path).status_code == 403
+        assert client.post("/dispatch/api/v1/tasks", json={"title": "T"}).status_code == 403
+
+    def test_health_answers_any_host(self, serve_env: Path) -> None:
+        assert self._client("evil.example:8000").get("/health").status_code == 200
+
+    def test_without_a_desktop_runtime_hosts_are_not_checked(self, serve_env: Path) -> None:
+        from henchmen.config.settings import get_settings
+
+        app = build_serve_app(get_settings(), 8000)
+        assert TestClient(app, base_url="http://evil.example:8000").get("/mastermind/health").status_code == 200
+
+
+def test_desktop_run_mode_warns_when_the_forward_host_is_not_allowed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """P3: the default local_forward_base (host.docker.internal) would be silently refused by the
+    allowlist, so _serve must log it as a WARNING at startup instead of leaving operatives to fail.
+    """
+    from unittest.mock import patch
+
+    from henchmen.cli import _serve
+    from henchmen.console.state import SetupState, SetupStep
+
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    (tmp_path / "henchmen.env").write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+    store = SetupStateStore(tmp_path / "setup-state.json")
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True))
+    with (
+        patch("henchmen.cli.serve.build_serve_app", return_value=MagicMock()),
+        patch("henchmen.cli.serve.serve_app", return_value=0),
+        caplog.at_level(logging.WARNING, logger="henchmen"),
+        pytest.raises(SystemExit),
+    ):
+        _serve(_serve_args())
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "expected a WARNING about the unreachable forward host"
+    assert "host.docker.internal" in caplog.text
+    # _serve_args() defaults to port 8123, which _serve writes to HENCHMEN_LOCAL_SERVE_PORT
+    # (overriding the pre-registered "8000") before Settings resolves local_serve_port.
+    assert "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123" in caplog.text

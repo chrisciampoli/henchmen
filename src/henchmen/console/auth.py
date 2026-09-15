@@ -30,6 +30,7 @@ import threading
 import time
 from contextlib import suppress
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -42,6 +43,9 @@ from henchmen.config.secret_files import (
     sweep_stale_sibling_files,
     write_secret_file,
 )
+
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -97,12 +101,23 @@ def _host_port(host_header: str, default_scheme: str) -> int | None:
     return parsed[1] if parsed is not None else None
 
 
-def is_local_host(host_header: str | None) -> bool:
-    """True when a Host header names this machine's loopback interface."""
+def is_allowed_host(host_header: str | None, allowed_hostnames: frozenset[str]) -> bool:
+    """True when a Host header names one of ``allowed_hostnames`` (any port; malformed or userinfo: False)."""
     if not host_header:
         return False
     parsed = _parse_netloc(host_header, default_scheme="http")
-    return parsed is not None and parsed[0] in _LOOPBACK_NAMES
+    return parsed is not None and parsed[0] in allowed_hostnames
+
+
+def is_local_host(host_header: str | None) -> bool:
+    """True when a Host header names this machine's loopback interface."""
+    return is_allowed_host(host_header, _LOOPBACK_NAMES)
+
+
+def desktop_allowed_hostnames(container_hostname: str) -> frozenset[str]:
+    """Loopback names plus the container name operatives use on the private Docker network."""
+    name = container_hostname.strip().lower()
+    return _LOOPBACK_NAMES | {name} if name else _LOOPBACK_NAMES
 
 
 def is_local_origin(origin: str | None) -> bool:
@@ -383,6 +398,71 @@ class ConsoleGuard:
             return
 
         await self.app(scope, receive, send)
+
+
+HEALTH_ONLY: frozenset[str] = frozenset({"/health"})
+
+
+class HostAllowlistGuard:
+    """ASGI middleware for the whole desktop app: refuse any Host that is not this machine or the container name.
+
+    Blocks DNS rebinding against Dispatch, Mastermind and Forge — a page on
+    ``attacker.example`` whose name resolves to 127.0.0.1 still sends
+    ``Host: attacker.example`` — while operatives on the private Docker network
+    reach ``http://henchmen:8000``. ``exempt_paths`` (``/health``) answer any
+    Host. This is not authentication: operatives can send any Host, and the
+    internal tokens authenticate them.
+    """
+
+    def __init__(
+        self, app: ASGIApp, allowed_hostnames: frozenset[str], exempt_paths: frozenset[str] = HEALTH_ONLY
+    ) -> None:
+        self.app = app
+        self.allowed_hostnames = allowed_hostnames
+        self.exempt_paths = exempt_paths
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        scope_type = scope["type"]
+        if scope_type not in {"http", "websocket"} or scope["path"] in self.exempt_paths:
+            await self.app(scope, receive, send)
+            return
+        headers = {key.decode("latin-1").lower(): value.decode("latin-1") for key, value in scope["headers"]}
+        host_header = headers.get("host")
+        if not is_allowed_host(host_header, self.allowed_hostnames):
+            logger.debug("Refusing request with disallowed Host %r (desktop allowlist).", host_header)
+            message = "Henchmen only accepts requests addressed to this machine."
+            await _deny(send, scope_type == "websocket", 403, message)
+            return
+        await self.app(scope, receive, send)
+
+
+def forward_host_problem(settings: Settings) -> str | None:
+    """A plain-language problem when operatives cannot reach this desktop install, else ``None``.
+
+    A desktop install's whole-app Host allowlist (:class:`HostAllowlistGuard`)
+    would silently refuse an operative that calls back on
+    ``settings.local_forward_base`` if that hostname is not in
+    :func:`desktop_allowed_hostnames`. The default ``local_forward_base``
+    (``http://host.docker.internal:<port>``) is exactly this case, so this
+    surfaces it instead of leaving operatives to fail with an opaque 403.
+    """
+    from henchmen.config.paths import is_desktop_install
+
+    if not is_desktop_install():
+        return None
+    try:
+        hostname = urlsplit(settings.local_forward_base).hostname
+    except ValueError:
+        hostname = None
+    if not hostname:
+        return f"HENCHMEN_LOCAL_FORWARD_BASE_URL ({settings.local_forward_base!r}) is not a usable URL."
+    if hostname.lower() in desktop_allowed_hostnames(settings.local_container_hostname):
+        return None
+    suggestion = f"http://{settings.local_container_hostname}:{settings.local_serve_port}"
+    return (
+        f"Operatives call Henchmen at {hostname}, which a desktop install refuses. "
+        f"Set HENCHMEN_LOCAL_FORWARD_BASE_URL={suggestion}"
+    )
 
 
 def _cookie(header: str, name: str) -> str | None:

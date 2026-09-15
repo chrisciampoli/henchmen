@@ -17,6 +17,7 @@ import signal
 import threading
 from collections.abc import AsyncIterator, Iterator
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, suppress
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import uvicorn
@@ -83,8 +84,20 @@ async def _aclose(resource: object, name: str) -> None:
         logger.warning("[serve] Failed to close %s", name, exc_info=True)
 
 
-def build_serve_app(settings: Settings, port: int, console: FastAPI | None = None) -> FastAPI:
-    """Build the combined local app; mount ``console`` at / after the services when given."""
+@dataclass(frozen=True)
+class DesktopRuntime:
+    """What ``build_serve_app`` needs to harden a desktop (data-directory) install."""
+
+    allowed_hostnames: frozenset[str]
+
+
+def build_serve_app(
+    settings: Settings, port: int, console: FastAPI | None = None, *, desktop: DesktopRuntime | None = None
+) -> FastAPI:
+    """Build the combined local app; mount ``console`` at / after the services when given.
+
+    ``desktop`` (data-directory installs only) adds the whole-app Host allowlist.
+    """
     from henchmen import __version__
     from henchmen.dispatch.server import app as dispatch_app
     from henchmen.forge.server import app as forge_app
@@ -154,6 +167,11 @@ def build_serve_app(settings: Settings, port: int, console: FastAPI | None = Non
     if console is not None:
         # Mounted last so it only receives paths no service or /health claims.
         app.mount("/", console)
+
+    if desktop is not None:
+        from henchmen.console.auth import HostAllowlistGuard
+
+        app.add_middleware(HostAllowlistGuard, allowed_hostnames=desktop.allowed_hostnames)
 
     return app
 

@@ -519,6 +519,13 @@ class Settings(BaseSettings):
             "as desktop posture. Never set this on a server."
         ),
     )
+    local_container_hostname: str = Field(
+        default="henchmen",
+        description=(
+            "Container name operatives use to reach the server on a desktop install (http://henchmen:8000). "
+            "The only Host name besides 127.0.0.1, localhost and ::1 the combined app accepts in desktop mode."
+        ),
+    )
 
     # Dispatch REST intake authentication
     dispatch_api_token: str = Field(

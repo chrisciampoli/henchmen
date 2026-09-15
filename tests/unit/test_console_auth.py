@@ -14,12 +14,18 @@ from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from henchmen.config import paths
+from henchmen.config.settings import Settings
 from henchmen.console.auth import (
     SESSION_COOKIE,
     SETUP_TOKEN_FILE_NAME,
     ConsoleAuth,
     ConsoleGuard,
+    HostAllowlistGuard,
     SetupTokenStore,
+    desktop_allowed_hostnames,
+    forward_host_problem,
+    is_allowed_host,
     is_local_host,
     is_local_origin,
 )
@@ -697,3 +703,86 @@ async def _run_asgi(app: Any, scope: dict[str, Any]) -> list[dict[str, Any]]:
 
     await app(scope, receive, send)
     return events
+
+
+DESKTOP_HOSTS = desktop_allowed_hostnames("henchmen")
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1:8000", "localhost", "[::1]:8000", "henchmen:8000", "HENCHMEN"])
+def test_desktop_hosts_are_allowed(host: str) -> None:
+    assert is_allowed_host(host, DESKTOP_HOSTS)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        None,
+        "",
+        "evil.example",
+        "henchmen.evil.example",
+        "127.0.0.1.evil.example",
+        "user@henchmen:8000",
+        "[",
+        "10.0.0.5",
+    ],
+)
+def test_other_hosts_are_not_allowed(host: str | None) -> None:
+    assert not is_allowed_host(host, DESKTOP_HOSTS)
+
+
+def test_blank_container_hostname_allows_only_loopback() -> None:
+    assert desktop_allowed_hostnames("  ") == frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def test_host_allowlist_guard_refuses_websockets_from_other_hosts() -> None:
+    inner = FastAPI()
+
+    @inner.websocket("/ws")
+    async def ws(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.close()
+
+    inner.add_middleware(HostAllowlistGuard, allowed_hostnames=DESKTOP_HOSTS)
+    client = TestClient(inner, base_url="http://evil.example:8000")
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/ws"):
+        pass
+
+
+def _settings(**overrides: Any) -> Settings:
+    values: dict[str, Any] = {"provider": "local"}
+    values.update(overrides)
+    return Settings(_env_file=None, **values)  # type: ignore[call-arg]
+
+
+class TestForwardHostProblem:
+    """P3: the Host allowlist must not silently refuse operatives calling back on the default forward base."""
+
+    def test_non_desktop_returns_none(self) -> None:
+        assert paths.is_desktop_install() is False
+        assert forward_host_problem(_settings()) is None
+
+    def test_desktop_with_the_default_reports_the_problem(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
+        problem = forward_host_problem(_settings())
+        assert problem is not None
+        assert "host.docker.internal" in problem
+        assert "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8000" in problem
+
+    def test_desktop_with_the_container_hostname_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
+        settings = _settings(local_forward_base_url="http://henchmen:8000")
+        assert forward_host_problem(settings) is None
+
+    def test_desktop_with_loopback_returns_none(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
+        settings = _settings(local_forward_base_url="http://127.0.0.1:8000")
+        assert forward_host_problem(settings) is None
+
+    def test_malformed_url_reports_a_problem(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
+        settings = _settings(local_forward_base_url="http://[")
+        assert forward_host_problem(settings) is not None
