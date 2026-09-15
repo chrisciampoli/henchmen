@@ -25,6 +25,7 @@ from henchmen.config.settings import Settings, get_settings
 from henchmen.dispatch.api_models import dispatch_auth_headers
 from henchmen.models.llm import Message, MessageRole, ModelTier
 from henchmen.models.task import TaskType
+from henchmen.utils.repositories import default_repository, qualify_repo
 
 if TYPE_CHECKING:
     from henchmen.providers.interfaces.llm_provider import LLMProvider
@@ -194,11 +195,9 @@ def _parse_task_block(text: str) -> dict[str, str] | None:
 
 def _print_welcome(settings: Settings, model: str, provider_name: str) -> None:
     """Print the welcome banner."""
-    org = settings.github_default_org
-    repo = settings.github_default_repo
     env = settings.environment.value
     # The Console saves github_default_repo as owner/name; only a bare name gets the org prefix.
-    repo_display = f"{org}/{repo}" if org and repo and "/" not in repo else repo or "(not set)"
+    repo_display = default_repository(settings) or "(not set)"
 
     print()
     print("henchmen chat -- interactive task builder")
@@ -333,10 +332,7 @@ async def _dispatch_task(task_data: dict[str, str], settings: Settings) -> dict[
     from henchmen.providers.registry import ProviderRegistry
 
     # Build the payload matching TaskNormalizer.from_cli() contract
-    org = settings.github_default_org
-    repo = task_data.get("repo", settings.github_default_repo or "")
-    if org and "/" not in repo:
-        repo = f"{org}/{repo}"
+    repo = qualify_repo(task_data.get("repo", settings.github_default_repo or ""), settings.github_default_org)
 
     payload: dict[str, Any] = {
         "title": task_data["title"],

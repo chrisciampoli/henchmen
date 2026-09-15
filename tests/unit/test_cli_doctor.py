@@ -485,3 +485,47 @@ def test_check_github_reports_a_partly_configured_app_even_with_a_pat(offline: b
     assert result.status == CheckStatus.FAIL
     assert "only partly configured" in result.message
     assert "ghp_personal" not in result.message
+
+
+def test_check_github_with_an_app_verifies_the_default_repository(monkeypatch, tmp_path) -> None:
+    from henchmen.utils.github_auth import GitHubCredentialsProvider
+
+    scopes: list[str | None] = []
+
+    def token(self, repo=None, *, min_ttl_seconds=300):
+        scopes.append(repo)
+        return "ghs_x"
+
+    monkeypatch.setattr(GitHubCredentialsProvider, "token", token)
+    settings = _app_settings(str(tmp_path / "key.pem")).model_copy(
+        update={"github_default_org": "acme", "github_default_repo": "widgets"}
+    )
+    result = check_github(settings)
+    assert result.status == CheckStatus.OK
+    assert scopes == ["acme/widgets"]
+    assert "acme/widgets" in result.message
+
+
+def test_check_github_reports_a_default_repository_the_app_cannot_see(monkeypatch, tmp_path) -> None:
+    from henchmen.utils.github_auth import GitHubCredentialsProvider, GitHubRepositoryAccessError
+
+    def token(self, repo=None, *, min_ttl_seconds=300):
+        raise GitHubRepositoryAccessError("GitHub refused to issue an installation token (HTTP 422)", status_code=422)
+
+    monkeypatch.setattr(GitHubCredentialsProvider, "token", token)
+    settings = _app_settings(str(tmp_path / "key.pem")).model_copy(update={"github_default_repo": "acme/secret"})
+    result = check_github(settings)
+    assert result.status == CheckStatus.FAIL
+    assert result.message == "the GitHub App can't see acme/secret"
+
+
+def test_check_github_with_an_app_refuses_a_bare_default_repository(monkeypatch, tmp_path) -> None:
+    from henchmen.utils.github_auth import GitHubCredentialsProvider
+
+    monkeypatch.setattr(
+        GitHubCredentialsProvider, "token", lambda self, repo=None, *, min_ttl_seconds=300: pytest.fail("no mint")
+    )
+    settings = _app_settings(str(tmp_path / "key.pem")).model_copy(update={"github_default_repo": "widgets"})
+    result = check_github(settings)
+    assert result.status == CheckStatus.FAIL
+    assert "owner/name" in result.message

@@ -867,6 +867,51 @@ class TestNormalizerRegressions:
         task = n.from_slack({"event": {"type": "app_mention", "text": "do it"}}, settings)
         assert task.context.repo == "acme/fallback"
 
+    def test_a_bare_default_repo_is_qualified_with_the_default_org(self):
+        from henchmen.config.settings import Settings
+
+        settings = Settings(**{"_env_file": None, "github_default_org": "acme", "github_default_repo": "webapp"})
+        n = TaskNormalizer()
+        assert n.from_cli({"title": "T"}, settings).context.repo == "acme/webapp"
+        assert n.from_slack({"event": {"type": "app_mention", "text": "do it"}}, settings).context.repo == "acme/webapp"
+        assert n.from_jira({"issue": {"key": "P-1", "fields": {"summary": "S"}}}, settings).context.repo == (
+            "acme/webapp"
+        )
+        # A task that names its repository keeps it.
+        assert n.from_cli({"title": "T", "repo": "globex/api"}, settings).context.repo == "globex/api"
+
+    def test_a_bare_default_repo_without_an_org_is_not_used(self, caplog):
+        from henchmen.config.settings import Settings
+
+        settings = Settings(**{"_env_file": None, "github_default_org": "", "github_default_repo": "webapp"})
+        with caplog.at_level("WARNING", logger="henchmen.dispatch.normalizer"):
+            task = TaskNormalizer().from_cli({"title": "T"}, settings)
+        assert task.context.repo == ""
+        assert "default repository must be owner/name" in caplog.text
+
+    def test_create_task_refuses_a_bare_default_repo(self, monkeypatch):
+        from henchmen.config.settings import Settings
+        from henchmen.dispatch import server
+
+        # Explicit instance: a developer's .env.local must not supply an org.
+        settings = Settings(
+            **{
+                "_env_file": None,
+                "provider": "local",
+                "gcp_project_id": "test-project",
+                "github_default_org": "",
+                "github_default_repo": "webapp",
+            }
+        )
+        with (
+            patch.object(server, "get_settings", return_value=settings),
+            patch.object(server, "handle_cli_request", AsyncMock(side_effect=AssertionError("not published"))),
+            TestClient(server.app) as client,
+        ):
+            response = client.post("/api/v1/tasks", json={"title": "T"})
+        assert response.status_code == 422
+        assert "owner/name" in response.json()["detail"]
+
     def test_cli_repo_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv("HENCHMEN_GITHUB_DEFAULT_REPO", "acme/fallback")
         settings = _mock_settings()

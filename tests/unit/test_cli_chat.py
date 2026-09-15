@@ -224,6 +224,34 @@ async def test_dispatch_task_sends_the_dispatch_api_token(mock_settings: Setting
     assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer s3cret"}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("org", "default_repo", "task_repo", "sent"),
+    [
+        ("acme", "webapp", None, "acme/webapp"),
+        ("acme", "globex/api", None, "globex/api"),
+        ("acme", "", "backend", "acme/backend"),
+        ("acme", "", None, ""),  # never "acme/"
+    ],
+)
+async def test_dispatch_task_qualifies_the_repository_with_the_shared_rule(
+    mock_settings: Settings, org: str, default_repo: str, task_repo: str | None, sent: str
+) -> None:
+    settings = mock_settings.model_copy(update={"github_default_org": org, "github_default_repo": default_repo})
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"task_id": "abc-123"}
+    mock_resp.raise_for_status = MagicMock()
+    post = AsyncMock(return_value=mock_resp)
+    task_data = {"title": "Fix bug", "description": "d"}
+    if task_repo is not None:
+        task_data["repo"] = task_repo
+
+    with patch("henchmen.cli.chat.httpx.AsyncClient", return_value=_http_client(post=post)):
+        await _dispatch_task(task_data, settings)
+
+    assert post.call_args.kwargs["json"]["repo"] == sent
+
+
 class TestTaskType:
     def test_known_types_are_case_insensitive(self) -> None:
         assert _task_type({"type": "Feature"}) == TaskType.FEATURE

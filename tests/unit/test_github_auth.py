@@ -960,6 +960,31 @@ def test_a_token_scoped_to_another_owner_is_an_access_error(key_file: Path, gith
         _provider(key_file, github, clock).token("globex/webapp")
 
 
+def test_a_token_repository_entry_without_identity_is_not_an_access_error(key_file: Path, clock: _Clock) -> None:
+    from henchmen.utils.github_auth import GitHubRepositoryAccessError
+
+    expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock.now + 3600))
+    body = {"token": "ghs_x", "expires_at": expires, "repositories": [{"id": 1}]}
+    provider = GitHubCredentialsProvider(
+        app=GitHubAppConfig(app_id="4242", private_key_path=key_file, installation_id="99"),
+        client_factory=lambda: httpx.Client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(201, json=body))
+        ),
+        clock=clock,
+    )
+    with pytest.raises(GitHubAuthError, match="unreadable repository list") as exc_info:
+        provider.token("acme/webapp")
+    assert not isinstance(exc_info.value, GitHubRepositoryAccessError)
+
+
+def test_a_partly_configured_app_raises_a_configuration_error() -> None:
+    from henchmen.utils.github_auth import GitHubAppConfigurationError
+
+    provider = GitHubCredentialsProvider(app=None, pat="ghp_personal", partial_app_problem="only partly configured")
+    with pytest.raises(GitHubAppConfigurationError, match="only partly configured"):
+        provider.token("acme/webapp")
+
+
 @pytest.mark.parametrize("status", [401, 403, 500, 503])
 def test_other_refusals_are_not_access_errors(key_file: Path, github: FakeGitHub, clock: _Clock, status: int) -> None:
     from henchmen.utils.github_auth import GitHubRepositoryAccessError
@@ -1003,12 +1028,24 @@ def test_server_components_do_not_read_the_pat_directly() -> None:
         "arsenal/tools/github.py",  # operative side: same
         "mastermind/lair_manager.py",  # removed from this list by Task 8
     }
+    # Attribute reads, string-keyed reads (getattr / model_dump()["github_token"]) and raw environment reads.
+    # ``\benviron\b`` so prose such as "environment sets ... GITHUB_TOKEN" is not a read.
+    patterns = (
+        re.compile(r"\.github_token\b"),
+        re.compile(r"[\"']github_token[\"']"),
+        re.compile(r"\benviron\b.*GITHUB_TOKEN"),
+    )
     root = Path(henchmen.__file__).parent
     offenders = sorted(
-        path.relative_to(root).as_posix()
+        f"{path.relative_to(root).as_posix()}: {pattern.pattern}"
         for path in root.rglob("*.py")
-        if re.search(r"\.github_token\b", path.read_text(encoding="utf-8"))
-        and path.relative_to(root).as_posix() not in allowed
+        if path.relative_to(root).as_posix() not in allowed
+        for pattern in patterns
+        if pattern.search(path.read_text(encoding="utf-8"))
     )
     assert offenders == []
+    # The patterns themselves still catch what they are meant to.
+    samples = ("settings.github_token", 'getattr(settings, "github_token")', 'os.environ.get("GITHUB_TOKEN")')
+    assert all(any(pattern.search(sample) for pattern in patterns) for sample in samples)
+    assert not any(pattern.search("environment sets ``GITHUB_TOKEN``") for pattern in patterns)
     assert not hasattr(henchmen.utils.git, "get_github_token")

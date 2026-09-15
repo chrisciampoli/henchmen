@@ -383,11 +383,34 @@ class TestRunCIForPRFailurePaths:
         assert _published(broker)[0]["reason"] == "missing-github-token"
 
     @pytest.mark.asyncio
-    async def test_github_credentials_failure_publishes_a_retriable_failure(self, forge_app):
+    @pytest.mark.parametrize(
+        ("error", "retriable"),
+        [
+            ("unreachable", True),
+            ("server-error", True),
+            ("unauthorized", False),
+            ("forbidden", False),
+            ("repository-access", False),
+            ("partial-app", False),
+        ],
+    )
+    async def test_github_credentials_failure_publishes_a_failure(self, forge_app, error, retriable):
         from henchmen.config.settings import Environment, Settings
         from henchmen.forge.server import _run_ci_for_pr
-        from henchmen.utils.github_auth import GitHubAuthError
+        from henchmen.utils.github_auth import (
+            GitHubAppConfigurationError,
+            GitHubAuthError,
+            GitHubRepositoryAccessError,
+        )
 
+        errors = {
+            "unreachable": GitHubAuthError("Could not reach GitHub for an installation token (ConnectError)"),
+            "server-error": GitHubAuthError("GitHub refused (HTTP 503)", status_code=503),
+            "unauthorized": GitHubAuthError("GitHub refused (HTTP 401)", status_code=401),
+            "forbidden": GitHubAuthError("GitHub refused (HTTP 403)", status_code=403),
+            "repository-access": GitHubRepositoryAccessError("GitHub refused (HTTP 422)", status_code=422),
+            "partial-app": GitHubAppConfigurationError("The GitHub App is only partly configured"),
+        }
         broker, _store = forge_app
         staging = Settings(**{"_env_file": None, "environment": Environment.STAGING, "gcp_project_id": "test-project"})
 
@@ -396,15 +419,52 @@ class TestRunCIForPRFailurePaths:
             patch(
                 "henchmen.forge.server.get_github_token_async",
                 new_callable=AsyncMock,
-                side_effect=GitHubAuthError("GitHub refused to issue an installation token (HTTP 401)"),
+                side_effect=errors[error],
             ),
             patch("github.Github", side_effect=AssertionError("no GitHub client without credentials")),
             pytest.raises(ForgeCIError) as exc_info,
         ):
             await _run_ci_for_pr("https://github.com/acme/repo/pull/7", "task-1", "req-1")
 
-        assert exc_info.value.retriable is True
+        assert exc_info.value.retriable is retriable
+        assert exc_info.value.published is True
         assert _published(broker)[0]["reason"] == "github-credentials"
+
+    @pytest.mark.asyncio
+    async def test_pygithub_calls_run_off_the_event_loop(self, forge_app):
+        """The PR lookup and the comment are blocking HTTP: both go through asyncio.to_thread."""
+        import threading
+
+        from henchmen.config.settings import Settings
+        from henchmen.forge import server
+        from henchmen.forge.ci_runner import CIRunner
+
+        settings = Settings(**{"_env_file": None, "provider": "gcp", "gcp_project_id": "test-project"})
+        loop_thread = threading.get_ident()
+        threads: list[int] = []
+        pr = MagicMock()
+        pr.head.ref, pr.base.ref = "feature", "main"
+        pr.create_issue_comment.side_effect = lambda body: threads.append(threading.get_ident())
+        client = MagicMock()
+
+        def _get_repo(name, lazy=False):
+            threads.append(threading.get_ident())
+            return MagicMock(get_pull=MagicMock(return_value=pr))
+
+        client.get_repo.side_effect = _get_repo
+        result = {"passed": True, "failed": [], "skipped": [], "checks": [], "summary": ""}
+        with (
+            patch.object(server, "get_settings", return_value=settings),
+            patch.object(server, "get_github_token_async", AsyncMock(return_value="ghs_x")),
+            patch("github.Github", return_value=client),
+            patch.object(server, "clone_repo", AsyncMock()),
+            patch.object(CIRunner, "run", AsyncMock(return_value=result)),
+        ):
+            await server._run_ci_for_pr("https://github.com/acme/repo/pull/7", "task-1", "req-1")
+
+        assert len(threads) == 3  # lookup get_repo, comment get_repo, create_issue_comment
+        assert loop_thread not in threads
+        assert [call.kwargs.get("lazy") for call in client.get_repo.call_args_list] == [None, True]
 
     @pytest.mark.asyncio
     async def test_the_pr_comment_uses_a_freshly_fetched_token(self, forge_app):

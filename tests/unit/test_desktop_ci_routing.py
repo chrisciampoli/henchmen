@@ -755,11 +755,24 @@ class TestGateCredentials:
     async def test_a_gate_timeout_beyond_the_token_cap_is_warned_about(self, caplog: pytest.LogCaptureFixture) -> None:
         settings = _settings(lair_default_timeout=3600)
         provider = AsyncMock(return_value=INSTALLATION_TOKEN)
-        with patch.object(handlers, "get_github_token_async", provider), caplog.at_level("WARNING"):
+        with (
+            patch.object(handlers, "get_github_token_async", provider),
+            patch.object(handlers, "get_credentials_provider", return_value=MagicMock(uses_app=True)),
+            caplog.at_level("WARNING"),
+        ):
             assert await handlers._gate_github_token(settings, "acme/widgets") == INSTALLATION_TOKEN
         assert "may expire before a long gate finishes" in caplog.text
         assert INSTALLATION_TOKEN not in caplog.text
         assert provider.await_args.kwargs["min_ttl_seconds"] == 3900
+
+    @pytest.mark.asyncio
+    async def test_a_pat_only_config_gets_no_token_expiry_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        settings = _settings(lair_default_timeout=3600)  # PAT, no GitHub App: the real provider returns it
+        with caplog.at_level("WARNING"):
+            assert await handlers._gate_github_token(settings, "acme/widgets") == TOKEN
+        assert "may expire" not in caplog.text
+        assert "installation tokens last an hour" not in caplog.text
+        assert TOKEN not in caplog.text
 
     @pytest.mark.asyncio
     async def test_forge_desktop_token_outlives_the_ci_budget(self, forge_state: AsyncMock) -> None:

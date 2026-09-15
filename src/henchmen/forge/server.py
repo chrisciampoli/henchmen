@@ -22,7 +22,14 @@ from henchmen.dispatch.pubsub_auth import require_internal_caller, verify_pubsub
 from henchmen.providers.local.memory import FORWARD_TIMEOUT_SECONDS
 from henchmen.providers.registry import orchestrator_is_local
 from henchmen.utils.git import clone_repo
-from henchmen.utils.github_auth import MAX_MIN_TTL_SECONDS, GitHubAuthError, get_github_token_async
+from henchmen.utils.github_auth import (
+    MAX_MIN_TTL_SECONDS,
+    GitHubAppConfigurationError,
+    GitHubAuthError,
+    GitHubRepositoryAccessError,
+    get_credentials_provider,
+    get_github_token_async,
+)
 from henchmen.utils.lifespan import run_shutdown
 from henchmen.utils.message_dedup import claim_message, mark_message_done, release_message_claim
 from henchmen.utils.redaction import install_secret_redaction
@@ -322,6 +329,43 @@ def _parse_pr_url(pr_url: str) -> tuple[str, int]:
     return f"{owner}/{repo_name}", pr_number
 
 
+def _github_client(token: str) -> Any:
+    """A PyGithub client for ``token`` (anonymous when empty, the dev fail-open path)."""
+    from github import Auth, Github
+
+    return Github(auth=Auth.Token(token)) if token else Github()
+
+
+def _pr_branches(token: str, full_repo: str, pr_number: int) -> tuple[str, str]:
+    """``(head, base)`` branch names of the PR. Blocking; call through ``asyncio.to_thread``."""
+    pr = _github_client(token).get_repo(full_repo).get_pull(pr_number)
+    return pr.head.ref, pr.base.ref
+
+
+def _comment_on_pr(token: str, full_repo: str, pr_number: int, body: str) -> None:
+    """Post ``body`` on the PR with a client built for ``token``. Blocking; call through ``asyncio.to_thread``."""
+    _github_client(token).get_repo(full_repo, lazy=True).get_pull(pr_number).create_issue_comment(body)
+
+
+def _uses_github_app(settings: Settings) -> bool:
+    """True when GitHub tokens come from a GitHub App (only those expire within the hour)."""
+    try:
+        return get_credentials_provider(settings).uses_app
+    except GitHubAuthError:
+        return False
+
+
+def _credentials_failure_is_retriable(exc: GitHubAuthError) -> bool:
+    """A redelivery can only help with a transient failure (GitHub unreachable, a 5xx).
+
+    GitHub refusing the repository, a partly configured App and a 401/403
+    refusal fail identically until someone changes the configuration.
+    """
+    if isinstance(exc, GitHubRepositoryAccessError | GitHubAppConfigurationError):
+        return False
+    return exc.status_code not in (401, 403)
+
+
 async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
     """Clone the PR branch, run CI checks, comment on the PR, and publish results.
 
@@ -352,7 +396,7 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
     # An installation token scoped to this repository when a GitHub App is configured, else the PAT.
     # It clones at the start and (on desktop) goes into the gate, so it must outlive the whole run.
     min_ttl = int(budget) + _DESKTOP_FORWARD_HEADROOM_SECONDS
-    if min_ttl > MAX_MIN_TTL_SECONDS:
+    if min_ttl > MAX_MIN_TTL_SECONDS and _uses_github_app(settings):
         logger.warning(
             "[FORGE] The CI budget (%ss) is longer than a GitHub installation token is guaranteed to last (%ss); "
             "a GitHub App token may expire before CI finishes",
@@ -363,7 +407,14 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
         github_token = await get_github_token_async(full_repo, settings=settings, min_ttl_seconds=min_ttl)
     except GitHubAuthError as exc:
         logger.error("[FORGE] GitHub credentials unavailable for %s: %s", pr_url, exc)
-        raise await _fail(pr_url, task_id, request_id, "github-credentials", str(exc), retriable=True) from exc
+        raise await _fail(
+            pr_url,
+            task_id,
+            request_id,
+            "github-credentials",
+            str(exc),
+            retriable=_credentials_failure_is_retriable(exc),
+        ) from exc
     if not github_token and not fail_open_allowed(settings):
         raise await _fail(
             pr_url,
@@ -377,14 +428,9 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
     workspace = tempfile.mkdtemp(prefix="forge-ci-")
     try:
         # --- Get PR metadata from GitHub -----------------------------------
+        # PyGithub is synchronous HTTP: it runs in a worker thread, never on the event loop.
         try:
-            from github import Auth, Github
-
-            client = Github(auth=Auth.Token(github_token)) if github_token else Github()
-            github_repo = client.get_repo(full_repo)
-            pr = github_repo.get_pull(pr_number)
-            head_branch = pr.head.ref
-            base_branch = pr.base.ref
+            head_branch, base_branch = await asyncio.to_thread(_pr_branches, github_token, full_repo, pr_number)
         except Exception as exc:
             logger.error("[FORGE] GitHub lookup failed for %s: %s", pr_url, exc)
             raise await _fail(pr_url, task_id, request_id, "github-api-error", str(exc), retriable=True) from exc
@@ -432,9 +478,9 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
         # A fresh token and client: the run can outlast the token the lookup used (ruling PI-15).
         try:
             comment_token = await get_github_token_async(full_repo, settings=settings)
-            comment_client = Github(auth=Auth.Token(comment_token)) if comment_token else Github()
-            comment_pr = comment_client.get_repo(full_repo).get_pull(pr_number)
-            comment_pr.create_issue_comment(_build_comment(result, task_id))
+            await asyncio.to_thread(
+                _comment_on_pr, comment_token, full_repo, pr_number, _build_comment(result, task_id)
+            )
         except Exception as exc:
             logger.warning("[FORGE] Failed to comment on PR: %s", exc)
 
