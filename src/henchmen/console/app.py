@@ -1,26 +1,43 @@
 """FastAPI application for the Console.
 
-Phase 1 provides the skeleton every later screen builds on: status, the setup
-token exchange, persisted guide state and the apply-and-restart transition.
+Status, the one-time sign-in exchange, persisted guide state, the per-step
+validation routers (``henchmen.console.steps``) and the apply-and-restart
+transition.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Mapping
 from enum import StrEnum
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from henchmen import __version__
 from henchmen.config.settings import Settings
 from henchmen.console.auth import SESSION_COOKIE, ConsoleAuth, ConsoleGuard
-from henchmen.console.state import SetupState, SetupStateStore, SetupStep
+from henchmen.console.state import OPTIONAL_STEPS, SetupState, SetupStateStore, SetupStep
+from henchmen.console.steps import STEP_ROUTE_PREFIX, StepRoutes, discover_step_routes
+from henchmen.utils.redaction import redact
 
 _STATIC_DIR = Path(__file__).parent / "static"
-_PUBLIC_PATHS = frozenset({"/console/api/status"})
+
+#: The single declaration of Console API paths served without a session. Step
+#: modules add their own session-less routes only through their
+#: ``PUBLIC_ROUTE_PATHS`` (henchmen.console.steps.discover_step_routes), never
+#: by widening this set directly.
+PUBLIC_PATHS: frozenset[str] = frozenset({"/console/api/status"})
+
+_CHOICE_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SECRET_KEY_SEGMENTS = frozenset({"token", "secret", "password", "passwd", "credential", "credentials", "pem"})
+_SECRET_KEY_SUFFIXES = ("api_key", "private_key", "signing_key", "access_key")
+_MAX_CHOICES = 32
+_MAX_CHOICE_VALUE_CHARS = 256
 
 
 class ConsoleMode(StrEnum):
@@ -39,14 +56,45 @@ class ConsoleStatus(BaseModel):
 
 
 class SetupStateUpdate(BaseModel):
-    """Client-writable part of the setup state. `completed` is set only by apply."""
+    """Client-writable part of the setup state.
+
+    Step completion is recorded only by a step's own validation route
+    (``henchmen.console.steps.step_succeeded`` ->
+    ``SetupStateStore.record_step_complete``) and ``completed`` only by apply,
+    and ``server_choices`` only by the server itself
+    (``SetupStateStore.set_server_choices``), so none of those three fields is
+    accepted here -- ``extra="forbid"`` turns any of them into a 422 instead
+    of being silently dropped.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     current_step: SetupStep = Field(..., description="Step the guide should show")
-    completed_steps: list[SetupStep] = Field(default_factory=list, description="Steps finished successfully")
-    skipped_steps: list[SetupStep] = Field(default_factory=list, description="Optional steps skipped")
+    skipped_steps: list[SetupStep] = Field(default_factory=list, description="Optional steps the user skipped")
     choices: dict[str, str] = Field(default_factory=dict, description="Non-secret selections")
+
+    @field_validator("skipped_steps")
+    @classmethod
+    def _only_optional_steps_can_be_skipped(cls, steps: list[SetupStep]) -> list[SetupStep]:
+        refused = [step.value for step in steps if step not in OPTIONAL_STEPS]
+        if refused:
+            raise ValueError("these steps cannot be skipped: " + ", ".join(refused))
+        return list(dict.fromkeys(steps))
+
+    @field_validator("choices")
+    @classmethod
+    def _choices_are_not_secrets(cls, choices: dict[str, str]) -> dict[str, str]:
+        if len(choices) > _MAX_CHOICES:
+            raise ValueError(f"at most {_MAX_CHOICES} choices can be saved")
+        for key, value in choices.items():
+            if not _CHOICE_KEY.fullmatch(key):
+                raise ValueError(f"choice name {key!r} is not allowed")
+            looks_secret = bool(set(key.split("_")) & _SECRET_KEY_SEGMENTS) or key.endswith(_SECRET_KEY_SUFFIXES)
+            if looks_secret or redact(value) != value:
+                raise ValueError(f"choice {key!r} looks like a credential; credentials are never kept in setup state")
+            if len(value) > _MAX_CHOICE_VALUE_CHARS:
+                raise ValueError(f"choice {key!r} is longer than {_MAX_CHOICE_VALUE_CHARS} characters")
+        return choices
 
 
 def _runtime_problems(config_file: Path) -> list[str]:
@@ -76,9 +124,23 @@ def create_console_app(
     auth: ConsoleAuth,
     config_file: Path,
     on_apply: Callable[[], None],
+    step_routes: Mapping[SetupStep, StepRoutes] | None = None,
 ) -> FastAPI:
-    """Build the Console app. ``on_apply`` is called after apply's response is sent."""
+    """Build the Console app. ``on_apply`` is called after apply's response is sent.
+
+    ``step_routes`` defaults to every ``henchmen.console.steps.<step>`` module found
+    (:func:`henchmen.console.steps.discover_step_routes`).
+    """
     app = FastAPI(title="Henchmen Console", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.setup_store = store
+
+    @app.exception_handler(RequestValidationError)
+    async def _on_validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
+        # FastAPI's default handler echoes the rejected value back in each error's "input"
+        # key, which would leak a credential-shaped choice value straight into the 422
+        # body. Every validation error on this app is reported without it.
+        errors = [{key: value for key, value in error.items() if key != "input"} for error in exc.errors()]
+        return JSONResponse({"detail": jsonable_encoder(errors)}, status_code=422)
 
     @app.get("/console/api/status")
     async def status() -> ConsoleStatus:
@@ -142,9 +204,15 @@ def create_console_app(
         background.add_task(on_apply)
         return {"restarting": True}
 
+    steps = discover_step_routes() if step_routes is None else step_routes
+    public_paths = set(PUBLIC_PATHS)
+    for step, routes in steps.items():
+        app.include_router(routes.router, prefix=f"{STEP_ROUTE_PREFIX}/{step.value}")
+        public_paths |= routes.public_paths
+
     @app.get("/", response_model=None)
     async def index() -> FileResponse:
         return FileResponse(_STATIC_DIR / "index.html", media_type="text/html")
 
-    app.add_middleware(ConsoleGuard, auth=auth, public_paths=_PUBLIC_PATHS)
+    app.add_middleware(ConsoleGuard, auth=auth, public_paths=frozenset(public_paths))
     return app

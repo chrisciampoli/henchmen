@@ -80,24 +80,79 @@ def test_state_requires_a_session(env) -> None:
 def test_state_round_trip(env) -> None:
     client, store, auth, *_ = env
     _signed_in(client, auth)
-    update = {
-        "current_step": "github",
-        "completed_steps": ["welcome", "ai_provider"],
-        "skipped_steps": [],
-        "choices": {"llm_provider": "anthropic"},
-    }
+    update = {"current_step": "github", "skipped_steps": ["slack"], "choices": {"llm_provider": "anthropic"}}
     assert client.put("/console/api/setup/state", json=update, headers=ORIGIN).status_code == 200
-    assert store.load().current_step == SetupStep.GITHUB
+    loaded = store.load()
+    assert loaded.current_step == SetupStep.GITHUB
+    assert loaded.skipped_steps == [SetupStep.SLACK]
     assert client.get("/console/api/setup/state").json()["choices"] == {"llm_provider": "anthropic"}
 
 
-def test_state_update_cannot_mark_setup_completed(env) -> None:
+@pytest.mark.parametrize(
+    "extra",
+    [{"completed": True}, {"completed_steps": ["ai_provider", "github"]}],
+    ids=["completed", "completed_steps"],
+)
+def test_clients_cannot_write_completion(env, extra) -> None:
     client, store, auth, *_ = env
     _signed_in(client, auth)
-    update = {"current_step": "welcome", "completed_steps": [], "skipped_steps": [], "choices": {}, "completed": True}
-    response = client.put("/console/api/setup/state", json=update, headers=ORIGIN)
-    assert response.status_code == 422
-    assert store.load().completed is False
+    update = {"current_step": "welcome", "skipped_steps": [], "choices": {}, **extra}
+    assert client.put("/console/api/setup/state", json=update, headers=ORIGIN).status_code == 422
+    loaded = store.load()
+    assert loaded.completed is False
+    assert loaded.completed_steps == []
+
+
+@pytest.mark.parametrize("step", ["ai_provider", "github", "welcome"])
+def test_only_optional_steps_can_be_skipped(env, step) -> None:
+    client, store, auth, *_ = env
+    _signed_in(client, auth)
+    update = {"current_step": "welcome", "skipped_steps": [step]}
+    assert client.put("/console/api/setup/state", json=update, headers=ORIGIN).status_code == 422
+    assert store.load().skipped_steps == []
+
+
+@pytest.mark.parametrize(
+    "choices",
+    [
+        {"github_token": "x"},
+        {"anthropic_api_key": "x"},
+        {"slack_signing_secret": "x"},
+        {"note": "sk-ant-" + "a" * 30},
+        {"Bad-Key": "x"},
+        {"model": "x" * 257},
+    ],
+    ids=["token-key", "api-key", "secret-key", "secret-value", "bad-name", "too-long"],
+)
+def test_choices_refuse_anything_secret_or_malformed(env, choices) -> None:
+    client, store, auth, *_ = env
+    _signed_in(client, auth)
+    resp = client.put("/console/api/setup/state", json={"current_step": "welcome", "choices": choices}, headers=ORIGIN)
+    assert resp.status_code == 422
+    assert store.load().choices == {}
+
+
+def test_choice_rejection_names_the_key_and_never_the_value(env) -> None:
+    """A secret-shaped value must never appear in the 422 body -- only the key name may
+    (Ruling 4: the error text names the key, never the value)."""
+    client, store, auth, *_ = env
+    _signed_in(client, auth)
+    distinctive_secret = "ghp_" + "Z9x8W7v6U5t4S3r2Q1p0" * 2
+    update = {"current_step": "welcome", "choices": {"github_token": distinctive_secret}}
+    resp = client.put("/console/api/setup/state", json=update, headers=ORIGIN)
+    assert resp.status_code == 422
+    assert distinctive_secret not in resp.text
+    assert "github_token" in resp.text
+    assert store.load().choices == {}
+
+
+def test_non_secret_choices_such_as_a_jira_project_key_are_accepted(env) -> None:
+    client, store, auth, *_ = env
+    _signed_in(client, auth)
+    choices = {"jira_project_key": "HEN", "llm_provider": "anthropic"}
+    resp = client.put("/console/api/setup/state", json={"current_step": "jira", "choices": choices}, headers=ORIGIN)
+    assert resp.status_code == 200
+    assert store.load().choices == choices
 
 
 def test_apply_refuses_without_required_steps(env) -> None:
