@@ -444,6 +444,44 @@ class TestSlack:
         assert listing.truncated is True
         assert len(listing.channels) == checks.MAX_LIST_PAGES
 
+    def test_list_channels_page_network_error_raises_unreachable(self, monkeypatch: pytest.MonkeyPatch):
+        def conversations_list(**kw: Any) -> dict[str, Any]:
+            raise ConnectionError("connection refused")
+
+        monkeypatch.setattr(
+            checks, "_slack_client", lambda token, timeout: _slack_client(conversations_list=conversations_list)
+        )
+        with pytest.raises(checks.SlackUnreachableError):
+            checks.list_slack_channels_page("xoxb-1")
+
+    def test_list_channels_missing_sdk_still_returns_empty_listing(self, monkeypatch: pytest.MonkeyPatch):
+        """Unlike a mid-page network error, a missing SDK keeps the pre-existing silent-empty contract."""
+
+        def missing(token: str, timeout: float) -> Any:
+            raise ImportError("slack_sdk")
+
+        monkeypatch.setattr(checks, "_slack_client", missing)
+        listing = checks.list_slack_channels_page("xoxb-1")
+        assert listing == checks.SlackChannelListing(channels=[], truncated=False)
+
+    def test_slack_bot_identity_ok(self, monkeypatch: pytest.MonkeyPatch):
+        client = _slack_client(auth_test=lambda: {"ok": True, "team_id": "T123", "user_id": "U456", "bot_id": "B789"})
+        monkeypatch.setattr(checks, "_slack_client", lambda token, timeout: client)
+        identity = checks.slack_bot_identity("xoxb-1")
+        assert identity == checks.SlackIdentity(team_id="T123", user_id="U456", bot_id="B789")
+
+    def test_slack_bot_identity_missing_ids_is_none(self, monkeypatch: pytest.MonkeyPatch):
+        client = _slack_client(auth_test=lambda: {"ok": True})
+        monkeypatch.setattr(checks, "_slack_client", lambda token, timeout: client)
+        assert checks.slack_bot_identity("xoxb-1") is None
+
+    def test_slack_bot_identity_failure_is_none(self, monkeypatch: pytest.MonkeyPatch):
+        def boom() -> Any:
+            raise _SlackApiError("invalid_auth")
+
+        monkeypatch.setattr(checks, "_slack_client", lambda token, timeout: _slack_client(auth_test=boom))
+        assert checks.slack_bot_identity("xoxb-1") is None
+
     def test_get_slack_channel_ok(self, monkeypatch: pytest.MonkeyPatch):
         client = _slack_client(
             conversations_info=lambda channel: {
@@ -462,19 +500,30 @@ class TestSlack:
         monkeypatch.setattr(checks, "_slack_client", lambda token, timeout: _slack_client(conversations_info=boom))
         assert checks.get_slack_channel("xoxb-1", "C9999") is None
 
-    def test_get_slack_channel_missing_scope_fails_closed(self, monkeypatch: pytest.MonkeyPatch):
+    def test_get_slack_channel_missing_scope_raises(self, monkeypatch: pytest.MonkeyPatch):
         def boom(channel: str) -> Any:
             raise _SlackApiError("missing_scope", needed="channels:read")
 
         monkeypatch.setattr(checks, "_slack_client", lambda token, timeout: _slack_client(conversations_info=boom))
-        assert checks.get_slack_channel("xoxb-1", "C9999") is None
+        with pytest.raises(checks.SlackScopeError) as excinfo:
+            checks.get_slack_channel("xoxb-1", "C9999")
+        assert "channels:read" in str(excinfo.value)
 
-    def test_get_slack_channel_missing_sdk_returns_none(self, monkeypatch: pytest.MonkeyPatch):
+    def test_get_slack_channel_missing_sdk_raises_unreachable(self, monkeypatch: pytest.MonkeyPatch):
         def missing(token: str, timeout: float) -> Any:
             raise ImportError("slack_sdk")
 
         monkeypatch.setattr(checks, "_slack_client", missing)
-        assert checks.get_slack_channel("xoxb-1", "C9999") is None
+        with pytest.raises(checks.SlackUnreachableError):
+            checks.get_slack_channel("xoxb-1", "C9999")
+
+    def test_get_slack_channel_network_error_raises_unreachable(self, monkeypatch: pytest.MonkeyPatch):
+        def boom(channel: str) -> Any:
+            raise ConnectionError("connection refused")
+
+        monkeypatch.setattr(checks, "_slack_client", lambda token, timeout: _slack_client(conversations_info=boom))
+        with pytest.raises(checks.SlackUnreachableError):
+            checks.get_slack_channel("xoxb-1", "C9999")
 
     def test_post_message_ok(self, monkeypatch: pytest.MonkeyPatch):
         posted: list[dict[str, Any]] = []

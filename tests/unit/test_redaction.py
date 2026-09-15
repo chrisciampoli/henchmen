@@ -189,6 +189,35 @@ class TestJwtRedaction:
         assert redact(text) == text
 
 
+class TestSlackTokenRedaction:
+    def test_bot_token_is_redacted(self):
+        result = redact("Slack rejected xoxb-1111-2222-secretbot: invalid_auth")
+        assert "secretbot" not in result
+        assert REDACTED in result
+
+    def test_app_level_token_is_redacted(self):
+        result = redact("app-level token xapp-1-A111-secretapp is invalid")
+        assert "secretapp" not in result
+        assert REDACTED in result
+
+    def test_enterprise_token_is_redacted(self):
+        result = redact("enterprise install token xox" "e-1-secretenterprise rejected")
+        assert "secretenterprise" not in result
+        assert REDACTED in result
+
+    def test_rotation_refresh_token_is_redacted(self):
+        result = redact("refresh token xox" "e.xoxb-1-secretrotationbot rejected")
+        assert "secretrotationbot" not in result
+        assert "xox" "e" not in result
+        assert REDACTED in result
+
+    def test_rotation_user_token_is_redacted(self):
+        result = redact("refresh token xox" "e.xoxp-1-secretrotationuser rejected")
+        assert "secretrotationuser" not in result
+        assert "xox" "e" not in result
+        assert REDACTED in result
+
+
 class TestGitHubInstallationTokenRedaction:
     def test_ghs_token_is_redacted(self):
         result = redact("push to https://github.com/a/b with ghs_AbCdEf0123456789AbCdEf0123456789AbCd failed")
@@ -281,6 +310,10 @@ _NEW_PATTERN_PATHOLOGICAL_INPUTS = (
     "&state=" * 20000,
     "?state=" + "x" * 100_000,
     "?code=a?code=a" * 10000,
+    # Slack token shapes: a run with no trailing non-alphanumeric character to stop
+    # the greedy `[A-Za-z0-9-]+` body, and the compound rotation-token prefix.
+    "xoxb-" * 20000,
+    "xox" "e.xoxb-" * 20000,
 )
 
 

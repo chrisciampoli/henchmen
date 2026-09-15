@@ -9,8 +9,17 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from henchmen.cli import checks
-from henchmen.cli.checks import CheckResult, CheckStatus, SlackChannel, SlackChannelListing, SlackScopeError
+from henchmen.cli.checks import (
+    CheckResult,
+    CheckStatus,
+    SlackChannel,
+    SlackChannelListing,
+    SlackIdentity,
+    SlackScopeError,
+    SlackUnreachableError,
+)
 from henchmen.console.state import SetupStep
+from henchmen.console.steps import slack as slack_step
 from henchmen.console.steps.slack import ADMIN_REQUEST_MESSAGE, TEST_MESSAGE
 from tests.unit.console_harness import ConsoleHarness, make_harness
 
@@ -24,6 +33,7 @@ CHANNELS = [
     SlackChannel(id="G0003", name="secret-project", is_private=True, is_member=False),
 ]
 DEFAULT_WORKSPACE_MESSAGE = "authenticated as @henchmen in workspace Acme"
+DEFAULT_IDENTITY = SlackIdentity(team_id="T1", user_id="U1", bot_id="B1")
 
 
 class FakeSlack:
@@ -31,10 +41,12 @@ class FakeSlack:
         self.calls: list[tuple[str, tuple[str, ...]]] = []
         self.bot_ok = True
         self.workspace_message = DEFAULT_WORKSPACE_MESSAGE
+        self.identity: SlackIdentity | None = DEFAULT_IDENTITY
         self.channels: list[SlackChannel] = list(CHANNELS)
         self.truncated = False
         self.unlisted_channel: SlackChannel | None = None
         self.scope_error: str | None = None
+        self.unreachable = False
         self.post_ok = True
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -53,14 +65,22 @@ class FakeSlack:
             self.calls.append(("check_app", (token,)))
             return CheckResult("Slack app token", CheckStatus.OK, "Socket Mode token valid")
 
+        def bot_identity(token: str, *, timeout: float = checks.DEFAULT_TIMEOUT) -> SlackIdentity | None:
+            self.calls.append(("identity", (token,)))
+            return self.identity
+
         def list_channels_page(token: str, *, timeout: float = checks.DEFAULT_TIMEOUT) -> SlackChannelListing:
             self.calls.append(("list", (token,)))
+            if self.unreachable:
+                raise SlackUnreachableError("connection refused")
             if self.scope_error:
                 raise SlackScopeError(self.scope_error)
             return SlackChannelListing(channels=list(self.channels), truncated=self.truncated)
 
         def get_channel(token: str, channel_id: str, *, timeout: float = checks.DEFAULT_TIMEOUT) -> SlackChannel | None:
             self.calls.append(("get_channel", (token, channel_id)))
+            if self.unreachable:
+                raise SlackUnreachableError("connection refused")
             if self.unlisted_channel is not None and self.unlisted_channel.id == channel_id:
                 return self.unlisted_channel
             return None
@@ -86,6 +106,7 @@ class FakeSlack:
 
         monkeypatch.setattr(checks, "check_slack_bot_token", check_bot)
         monkeypatch.setattr(checks, "check_slack_app_token", check_app)
+        monkeypatch.setattr(checks, "slack_bot_identity", bot_identity)
         monkeypatch.setattr(checks, "list_slack_channels_page", list_channels_page)
         monkeypatch.setattr(checks, "get_slack_channel", get_channel)
         monkeypatch.setattr(checks, "join_slack_channel", join)
@@ -104,8 +125,20 @@ def harness(tmp_path: Path) -> ConsoleHarness:
     return make_harness(tmp_path)
 
 
+@pytest.fixture(autouse=True)
+def _clear_test_message_cooldown() -> None:
+    slack_step._last_test_message.clear()
+    yield
+    slack_step._last_test_message.clear()
+
+
 def _save_tokens(harness: ConsoleHarness) -> None:
     harness.config_store.update({"HENCHMEN_SLACK_BOT_TOKEN": BOT, "HENCHMEN_SLACK_APP_TOKEN": APP}, section="Slack")
+
+
+def _save_and_complete(harness: ConsoleHarness, channel_id: str = "C0001") -> None:
+    assert harness.post(f"{BASE}/tokens", {"bot_token": BOT, "app_token": APP}).json()["ok"] is True
+    assert harness.post(f"{BASE}/channel", {"channel_id": channel_id}).json()["ok"] is True
 
 
 def test_requires_a_session(tmp_path: Path) -> None:
@@ -156,6 +189,14 @@ def test_app_token_in_the_bot_field_is_caught_before_calling_slack(harness: Cons
     assert slack.calls == []
 
 
+def test_bot_token_in_the_app_field_is_caught_before_calling_slack(harness: ConsoleHarness, slack: FakeSlack) -> None:
+    body = harness.post(f"{BASE}/tokens", {"bot_token": BOT, "app_token": BOT}).json()
+    assert body["ok"] is False
+    assert body["problems"][0]["field"] == "app_token"
+    assert "xapp-" in body["problems"][0]["message"]
+    assert slack.calls == []
+
+
 def test_missing_app_token_explains_socket_mode(harness: ConsoleHarness, slack: FakeSlack) -> None:
     body = harness.post(f"{BASE}/tokens", {"bot_token": BOT}).json()
     assert body["ok"] is False
@@ -193,6 +234,7 @@ def test_rejected_bot_token_saves_nothing(harness: ConsoleHarness, slack: FakeSl
         }
     ]
     assert not harness.config_store.config_file.exists()
+    assert not any(name == "identity" for name, _ in slack.calls)
 
 
 def test_check_again_reuses_saved_tokens(harness: ConsoleHarness, slack: FakeSlack) -> None:
@@ -201,23 +243,43 @@ def test_check_again_reuses_saved_tokens(harness: ConsoleHarness, slack: FakeSla
     assert ("check_bot", (BOT,)) in slack.calls
 
 
-def test_changing_the_workspace_reopens_a_completed_step(harness: ConsoleHarness, slack: FakeSlack) -> None:
-    assert harness.post(f"{BASE}/tokens", {"bot_token": BOT, "app_token": APP}).json()["ok"] is True
-    assert harness.post(f"{BASE}/channel", {"channel_id": "C0001"}).json()["ok"] is True
+def test_changing_the_workspace_id_reopens_a_completed_step(harness: ConsoleHarness, slack: FakeSlack) -> None:
+    """F1: the fingerprint is `team_id:user_id`, not the display name."""
+    _save_and_complete(harness)
     assert SetupStep.SLACK in harness.setup_store.load().completed_steps
 
-    slack.workspace_message = "authenticated as @henchmen in workspace OtherCo"
+    # Same display name/message, but a genuinely different workspace and bot user.
+    slack.identity = SlackIdentity(team_id="T2", user_id="U2", bot_id="B2")
     body = harness.post(f"{BASE}/tokens", {"bot_token": OTHER_BOT, "app_token": APP}).json()
     assert body["ok"] is True
+    assert body["details"]["workspace"] == DEFAULT_WORKSPACE_MESSAGE
     assert SetupStep.SLACK not in harness.setup_store.load().completed_steps
-    assert harness.config_store.get("HENCHMEN_SLACK_BOT_TOKEN") == OTHER_BOT
+
+
+def test_missing_identity_fails_closed_and_reopens_the_step(harness: ConsoleHarness, slack: FakeSlack) -> None:
+    """F1: when the ids can't be confirmed, treat it as a change rather than trust it."""
+    _save_and_complete(harness)
+    slack.identity = None
+    body = harness.post(f"{BASE}/tokens", {"bot_token": BOT, "app_token": APP}).json()
+    assert body["ok"] is True
+    assert SetupStep.SLACK not in harness.setup_store.load().completed_steps
+    assert harness.config_store.get("HENCHMEN_SLACK_NOTIFICATION_CHANNEL") == ""
 
 
 def test_saving_the_same_workspace_again_does_not_reopen_the_step(harness: ConsoleHarness, slack: FakeSlack) -> None:
-    assert harness.post(f"{BASE}/tokens", {"bot_token": BOT, "app_token": APP}).json()["ok"] is True
-    assert harness.post(f"{BASE}/channel", {"channel_id": "C0001"}).json()["ok"] is True
+    _save_and_complete(harness)
     assert harness.post(f"{BASE}/tokens", {"bot_token": BOT, "app_token": APP}).json()["ok"] is True
     assert SetupStep.SLACK in harness.setup_store.load().completed_steps
+    assert harness.config_store.get("HENCHMEN_SLACK_NOTIFICATION_CHANNEL") == "C0001"
+
+
+def test_workspace_change_clears_the_saved_channel(harness: ConsoleHarness, slack: FakeSlack) -> None:
+    """F2: the channel is cleared in the same locked write that reopens the step."""
+    _save_and_complete(harness)
+    slack.identity = SlackIdentity(team_id="T2", user_id="U2", bot_id="B2")
+    body = harness.post(f"{BASE}/tokens", {"bot_token": OTHER_BOT, "app_token": APP}).json()
+    assert body["ok"] is True
+    assert harness.config_store.get("HENCHMEN_SLACK_NOTIFICATION_CHANNEL") == ""
 
 
 def test_channels_need_saved_tokens(harness: ConsoleHarness, slack: FakeSlack) -> None:
@@ -255,6 +317,26 @@ def test_missing_channel_scope_is_explained(harness: ConsoleHarness, slack: Fake
     assert body["ok"] is False
     assert "channels:read" in body["problems"][0]["message"]
     assert "reinstall" in body["problems"][0]["action"]
+
+
+def test_unreachable_slack_is_a_distinct_problem_for_channels(harness: ConsoleHarness, slack: FakeSlack) -> None:
+    """F8: a connection-level failure is not the same as "no channels found"."""
+    _save_tokens(harness)
+    slack.unreachable = True
+    body = harness.get(f"{BASE}/channels").json()
+    assert body["ok"] is False
+    assert "could not be reached" in body["problems"][0]["message"]
+
+
+def test_unreachable_slack_is_a_distinct_problem_for_choosing_a_channel(
+    harness: ConsoleHarness, slack: FakeSlack
+) -> None:
+    _save_tokens(harness)
+    slack.unreachable = True
+    body = harness.post(f"{BASE}/channel", {"channel_id": "C0001"}).json()
+    assert body["ok"] is False
+    assert "could not be reached" in body["problems"][0]["message"]
+    assert "/invite" not in body["problems"][0]["action"]
 
 
 def test_choosing_a_joined_channel_posts_and_completes(harness: ConsoleHarness, slack: FakeSlack) -> None:
@@ -336,3 +418,78 @@ def test_status_masks_tokens(harness: ConsoleHarness, slack: FakeSlack) -> None:
         "completed": False,
     }
     assert BOT not in response.text
+
+
+def test_status_completed_requires_tokens_and_channel_all_set(harness: ConsoleHarness, slack: FakeSlack) -> None:
+    """F5."""
+    _save_and_complete(harness)
+    assert harness.get(BASE).json()["details"]["completed"] is True
+
+    harness.config_store.unset(["HENCHMEN_SLACK_NOTIFICATION_CHANNEL"])
+    assert harness.get(BASE).json()["details"]["completed"] is False
+
+
+def test_status_completed_is_false_if_a_token_is_missing(harness: ConsoleHarness, slack: FakeSlack) -> None:
+    """F5."""
+    _save_and_complete(harness)
+    harness.config_store.unset(["HENCHMEN_SLACK_APP_TOKEN"])
+    assert harness.get(BASE).json()["details"]["completed"] is False
+
+
+def test_channel_choice_is_refused_if_the_bot_token_changed_meanwhile(
+    harness: ConsoleHarness, slack: FakeSlack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F4: every network call happens before the locked compare-and-write."""
+    _save_tokens(harness)
+
+    def post_and_swap(
+        token: str, channel_id: str, text: str, *, timeout: float = checks.DEFAULT_TIMEOUT
+    ) -> CheckResult:
+        harness.config_store.update({"HENCHMEN_SLACK_BOT_TOKEN": OTHER_BOT}, section="Slack")
+        return CheckResult("Slack test message", CheckStatus.OK, f"posted a test message to {channel_id}")
+
+    monkeypatch.setattr(checks, "post_slack_message", post_and_swap)
+    body = harness.post(f"{BASE}/channel", {"channel_id": "C0001"}).json()
+    assert body["ok"] is False
+    assert harness.config_store.get("HENCHMEN_SLACK_NOTIFICATION_CHANNEL") == ""
+    assert SetupStep.SLACK not in harness.setup_store.load().completed_steps
+    assert harness.config_store.get("HENCHMEN_SLACK_BOT_TOKEN") == OTHER_BOT
+
+
+def test_reselecting_the_same_completed_channel_skips_the_test_message(
+    harness: ConsoleHarness, slack: FakeSlack
+) -> None:
+    """F6: an already-confirmed channel for the current workspace needs no second post."""
+    _save_and_complete(harness)
+    posts_before = sum(1 for name, _ in slack.calls if name == "post")
+
+    body = harness.post(f"{BASE}/channel", {"channel_id": "C0001"}).json()
+    assert body["ok"] is True
+    posts_after = sum(1 for name, _ in slack.calls if name == "post")
+    assert posts_after == posts_before
+
+
+def test_cooldown_skips_a_second_post_to_the_same_channel_within_30_seconds(
+    harness: ConsoleHarness, slack: FakeSlack
+) -> None:
+    """F6: a per-process cooldown protects a channel even when the step isn't marked complete yet."""
+    _save_tokens(harness)
+    assert harness.post(f"{BASE}/channel", {"channel_id": "C0002"}).json()["ok"] is True
+    posts_before = sum(1 for name, _ in slack.calls if name == "post")
+
+    # Simulate the "not yet recorded complete" race the cooldown exists for.
+    harness.setup_store.record_step_incomplete(SetupStep.SLACK)
+    assert harness.post(f"{BASE}/channel", {"channel_id": "C0002"}).json()["ok"] is True
+    posts_after = sum(1 for name, _ in slack.calls if name == "post")
+    assert posts_after == posts_before
+
+
+def test_cooldown_is_per_channel(harness: ConsoleHarness, slack: FakeSlack) -> None:
+    _save_tokens(harness)
+    assert harness.post(f"{BASE}/channel", {"channel_id": "C0001"}).json()["ok"] is True
+    posts_before = sum(1 for name, _ in slack.calls if name == "post")
+
+    # A different channel is not covered by C0001's cooldown or completion.
+    assert harness.post(f"{BASE}/channel", {"channel_id": "C0002"}).json()["ok"] is True
+    posts_after = sum(1 for name, _ in slack.calls if name == "post")
+    assert posts_after == posts_before + 1
