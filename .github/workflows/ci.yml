@@ -177,6 +177,16 @@ jobs:
           docker run --rm --entrypoint python "henchmen-${{ matrix.service }}:ci" \
             -c "import importlib, henchmen; importlib.import_module('${module}'); print('henchmen', henchmen.__version__, '${module} OK')"
 
+      # This is the actual image a local gate container runs by default
+      # (`operative_image` / DEFAULT_LOCAL_OPERATIVE_IMAGE) — unlike the
+      # docker-local job's mastermind/local image smoke check below, this
+      # proves the module imports and runs inside the real default image.
+      - name: Smoke-test the ci_gate module inside the operative image
+        if: matrix.service == 'operative'
+        run: |
+          docker run --rm --entrypoint python henchmen-operative:ci \
+            -m henchmen.mastermind.scheme_executor.ci_gate --help
+
   docker-local:
     name: Local image (setup mode smoke)
     runs-on: ubuntu-latest
@@ -186,6 +196,19 @@ jobs:
 
       - name: docker build --target local
         run: docker build -f containers/mastermind/Dockerfile --target local -t henchmen-local:ci .
+
+      # ci_gate is the module a local gate container runs (scheme_executor's
+      # local lint/test gates, D-P9); this image carries the whole `henchmen`
+      # package, so --help (argparse, exit 0) proves the module actually
+      # imports and runs inside it. Note: gates default to `operative_image`
+      # (henchmen-operative:local / the docker-build matrix's
+      # henchmen-operative:ci below), not this mastermind/local image — this
+      # step exercises the module import/CLI wiring, not the exact image tag
+      # gates use by default.
+      - name: Smoke-test the ci_gate module inside the local image
+        run: |
+          docker run --rm --entrypoint python henchmen-local:ci \
+            -m henchmen.mastermind.scheme_executor.ci_gate --help
 
       # Starts with an empty data volume, so it must come up in setup mode,
       # answer /health and the public Console status, refuse a non-loopback

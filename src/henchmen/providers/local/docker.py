@@ -55,8 +55,7 @@ class DockerOrchestrator:
             cmd.extend(["--network", self._settings.local_docker_network])
         for k, v in env_vars.items():
             cmd.extend(["-e", f"{k}={v}"])
-        mem = memory.lower().replace("gi", "g").replace("mi", "m")
-        cmd.extend(["--memory", mem])
+        cmd.extend(["--memory", _memory_limit(memory)])
         cpu_limit = _cpu_limit(cpu)
         if cpu_limit:
             cmd.extend(["--cpus", cpu_limit])
@@ -194,6 +193,11 @@ class DockerOrchestrator:
             return
         for line in list(buffer):
             yield line
+
+
+def _memory_limit(memory: str) -> str:
+    """Return a ``--memory`` value docker accepts, converting Gi/Mi suffixes to its g/m."""
+    return memory.lower().replace("gi", "g").replace("mi", "m")
 
 
 def _cpu_limit(cpu: str) -> str:

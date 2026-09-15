@@ -492,16 +492,22 @@ class TestSchemeExecutorCIChecks:
 
         executor = SchemeExecutor(_linear_scheme(["run_lint"]), MagicMock(spec=LairManager), _mock_settings())
 
+        # The cloud path clones/detects via ci_gate.plan_gate (shared with the
+        # local gate container), not directly from handlers — patch it there.
         with (
             patch("henchmen.config.settings.get_settings", return_value=_mock_settings()),
-            patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
+            patch("henchmen.mastermind.scheme_executor.ci_gate.clone_repo", new_callable=AsyncMock) as clone_repo_mock,
             patch("asyncio.create_subprocess_exec", return_value=self._ok_proc()),
-            patch("henchmen.mastermind.scheme_executor.handlers.detect_stack", return_value=Stack(name="unknown")),
+            patch(
+                "henchmen.mastermind.scheme_executor.ci_gate.detect_stack", return_value=Stack(name="unknown")
+            ) as detect_stack_mock,
         ):
             result = await _run_ci_check(executor, _make_task(), "lint")
 
         assert result["condition"] == "fail"
         assert "could not detect" in result["message"]
+        clone_repo_mock.assert_awaited_once()
+        detect_stack_mock.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_verify_changes_diffs_against_the_task_base_branch(self):
