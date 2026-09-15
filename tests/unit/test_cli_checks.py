@@ -606,6 +606,61 @@ class TestJira:
         assert check_jira("https://x.atlassian.net", "a@b", "tok").status == CheckStatus.FAIL
 
 
+class TestJiraLookups:
+    @staticmethod
+    def _serve(monkeypatch: pytest.MonkeyPatch, handler: Any) -> None:
+        monkeypatch.setattr(
+            checks, "_http_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(handler))
+        )
+
+    def test_projects_follow_pages_and_sort_by_key(self, monkeypatch: pytest.MonkeyPatch):
+        starts: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/rest/api/3/project/search"
+            assert request.headers["authorization"].startswith("Basic ")
+            starts.append(request.url.params["startAt"])
+            if request.url.params["startAt"] == "0":
+                return httpx.Response(200, json={"isLast": False, "values": [{"key": "WEB", "name": "Web app"}]})
+            return httpx.Response(200, json={"isLast": True, "values": [{"key": "API", "name": "API"}]})
+
+        self._serve(monkeypatch, handler)
+        projects = checks.list_jira_projects("https://acme.atlassian.net/", "a@b.co", "tok")
+        assert projects == [checks.JiraProject(key="API", name="API"), checks.JiraProject(key="WEB", name="Web app")]
+        assert starts == ["0", "50"]
+
+    def test_projects_unauthorized_returns_empty(self, monkeypatch: pytest.MonkeyPatch):
+        self._serve(monkeypatch, lambda request: httpx.Response(401, json={}))
+        assert checks.list_jira_projects("https://acme.atlassian.net", "a@b.co", "tok") == []
+
+    def test_fields_sorted_by_name(self, monkeypatch: pytest.MonkeyPatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/rest/api/3/field"
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": "summary", "name": "Summary", "custom": False},
+                    {"id": "customfield_10042", "name": "Repository", "custom": True},
+                    {"id": "customfield_10043", "name": "branch", "custom": True},
+                ],
+            )
+
+        self._serve(monkeypatch, handler)
+        assert checks.list_jira_fields("https://acme.atlassian.net", "a@b.co", "tok") == [
+            checks.JiraField(id="customfield_10043", name="branch", custom=True),
+            checks.JiraField(id="customfield_10042", name="Repository", custom=True),
+            checks.JiraField(id="summary", name="Summary", custom=False),
+        ]
+
+    def test_network_errors_return_empty(self, monkeypatch: pytest.MonkeyPatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("offline")
+
+        self._serve(monkeypatch, handler)
+        assert checks.list_jira_projects("https://acme.atlassian.net", "a@b.co", "tok") == []
+        assert checks.list_jira_fields("https://acme.atlassian.net", "a@b.co", "tok") == []
+
+
 # ---------------------------------------------------------------------------
 # Model catalogs (Vertex AI, OpenAI filter)
 # ---------------------------------------------------------------------------
