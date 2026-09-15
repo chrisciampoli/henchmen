@@ -225,9 +225,10 @@ async def test_repository_listing_follows_pages() -> None:
         return httpx.Response(200, json={"repositories": repositories})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        repositories = await github_app.list_installation_repositories(client, API, "ghs_x")
-    assert len(repositories) == 101
-    assert repositories[0].full_name == "acme/repo-1-000"
+        listing = await github_app.list_installation_repositories(client, API, "ghs_x")
+    assert len(listing.repositories) == 101
+    assert listing.repositories[0].full_name == "acme/repo-1-000"
+    assert listing.truncated is False
 
 
 @pytest.mark.asyncio
@@ -397,7 +398,9 @@ def test_startup_cleanup_keeps_a_relative_effective_key_reference(
         ({"app_id": "", "app_slug": "Henchmen-Test"}, "4242", "henchmen-test", True),
         ({"app_id": "4242", "app_slug": "henchmen-test"}, "4242", "", True),
         ({"app_id": "999", "app_slug": "henchmen-test"}, "4242", "henchmen-test", False),
-        ({"app_id": "4242", "app_slug": "other-app"}, "4242", "henchmen-test", False),
+        # GitHub's app_id is authoritative: a stale saved slug never refuses the right App ...
+        ({"app_id": "4242", "app_slug": "other-app"}, "4242", "henchmen-test", True),
+        ({"app_id": "", "app_slug": "other-app"}, "4242", "henchmen-test", False),
         ({"app_id": "", "app_slug": ""}, "4242", "henchmen-test", False),
         ({"app_id": "4242", "app_slug": "henchmen-test"}, "", "", False),
     ],
@@ -422,3 +425,69 @@ async def test_installation_carries_the_app_identity_github_returns() -> None:
     assert (installation.app_id, installation.app_slug) == ("4242", "henchmen-test")
     assert odd is not None
     assert odd.app_id == ""
+
+
+@pytest.mark.asyncio
+async def test_repository_listing_reports_truncation_at_the_page_bound() -> None:
+    pages: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        pages.append(page)
+        repositories = [{"full_name": f"acme/repo-{page:02d}-{index:03d}"} for index in range(100)]
+        return httpx.Response(200, json={"repositories": repositories})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        listing = await github_app.list_installation_repositories(client, API, "ghs_x")
+    assert pages == list(range(1, github_app.MAX_REPO_PAGES + 1))
+    assert len(listing.repositories) == github_app.MAX_REPO_PAGES * 100
+    assert listing.truncated is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("total_count", "truncated"), [(3, True), (2, False), (None, False)])
+async def test_repository_listing_reports_truncation_from_total_count(total_count: int | None, truncated: bool) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body: dict[str, object] = {"repositories": [{"full_name": "acme/a"}, {"full_name": "acme/b"}]}
+        if total_count is not None:
+            body["total_count"] = total_count
+        return httpx.Response(200, json=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        listing = await github_app.list_installation_repositories(client, API, "ghs_x")
+    assert listing.truncated is truncated
+
+
+@pytest.mark.asyncio
+async def test_a_single_repository_is_confirmed_only_for_the_installation_account() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        repos = {
+            "/repos/acme/webapp": {"full_name": "acme/webapp", "default_branch": "trunk", "owner": {"login": "acme"}},
+            "/repos/acme/renamed": {"full_name": "other/renamed", "owner": {"login": "other"}},
+        }
+        body = repos.get(request.url.path.lower())
+        return httpx.Response(200, json=body) if body else httpx.Response(404, json={"message": "Not Found"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        found = await github_app.get_installation_repository(client, API, "ghs_x", "Acme/WebApp", "ACME")
+        wrong_account = await github_app.get_installation_repository(client, API, "ghs_x", "acme/webapp", "globex")
+        moved = await github_app.get_installation_repository(client, API, "ghs_x", "acme/renamed", "acme")
+        missing = await github_app.get_installation_repository(client, API, "ghs_x", "acme/nope", "acme")
+    assert found is not None
+    assert (found.full_name, found.default_branch) == ("acme/webapp", "trunk")
+    assert wrong_account is None
+    assert moved is None
+    assert missing is None
+    assert all(request.headers["authorization"] == "Bearer ghs_x" for request in seen)
+
+
+@pytest.mark.asyncio
+async def test_a_single_repository_lookup_raises_on_an_unexpected_answer() -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(500, json={"message": "boom"}))
+    ) as client:
+        with pytest.raises(github_app.GitHubAppApiError):
+            await github_app.get_installation_repository(client, API, "ghs_x", "acme/webapp", "acme")

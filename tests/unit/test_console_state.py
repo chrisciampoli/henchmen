@@ -85,6 +85,29 @@ def test_record_step_complete_adds_once_in_guide_order_and_unskips(tmp_path: Pat
     assert returned.completed_steps == loaded.completed_steps
 
 
+def test_record_step_incomplete_removes_only_that_step(tmp_path: Path) -> None:
+    store = SetupStateStore(tmp_path / "setup-state.json")
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], choices={"llm_provider": "x"}))
+    returned = store.record_step_incomplete(SetupStep.GITHUB)
+    loaded = store.load()
+    assert loaded.completed_steps == [SetupStep.AI_PROVIDER]
+    assert loaded.choices == {"llm_provider": "x"}
+    assert returned.completed_steps == loaded.completed_steps
+
+
+def test_record_step_incomplete_of_a_step_that_is_not_complete_is_a_no_op(tmp_path: Path) -> None:
+    path = tmp_path / "setup-state.json"
+    store = SetupStateStore(path)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER]))
+    before = path.read_bytes()
+    returned = store.record_step_incomplete(SetupStep.GITHUB)
+    assert path.read_bytes() == before
+    assert returned.completed_steps == [SetupStep.AI_PROVIDER]
+    fresh = SetupStateStore(tmp_path / "other.json")
+    assert fresh.record_step_incomplete(SetupStep.GITHUB).completed_steps == []
+    assert not (tmp_path / "other.json").exists()
+
+
 def test_set_server_choices_merges_and_persists(tmp_path: Path) -> None:
     store = SetupStateStore(tmp_path / "setup-state.json")
     store.set_server_choices({"github_app_slug": "henchmen-laptop"})

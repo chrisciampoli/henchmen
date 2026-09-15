@@ -197,7 +197,8 @@ def _print_welcome(settings: Settings, model: str, provider_name: str) -> None:
     org = settings.github_default_org
     repo = settings.github_default_repo
     env = settings.environment.value
-    repo_display = f"{org}/{repo}" if org and repo else repo or "(not set)"
+    # The Console saves github_default_repo as owner/name; only a bare name gets the org prefix.
+    repo_display = f"{org}/{repo}" if org and repo and "/" not in repo else repo or "(not set)"
 
     print()
     print("henchmen chat -- interactive task builder")

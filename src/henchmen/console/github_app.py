@@ -118,14 +118,16 @@ class Installation(BaseModel):
     def belongs_to(self, *, app_id: str, slug: str) -> bool:
         """True when GitHub says this installation is of the App ``app_id`` / ``slug``.
 
-        An identity is comparable when both GitHub's answer and the expected
-        value carry it. At least one must be comparable, and every comparable
-        one must match: an installation id from a query string is never
-        trusted on its own, and an answer naming a different App is refused.
+        When GitHub's answer carries an ``app_id``, that id alone decides (a
+        saved slug can be stale; the App id cannot be renamed). Only an answer
+        without an ``app_id`` is matched on its slug (case-insensitively). An
+        expected value that is blank never matches: an installation id from a
+        query string is never trusted on its own.
         """
-        checks = [(self.app_id, app_id.strip()), (self.app_slug.lower(), slug.strip().lower())]
-        comparable = [(have, want) for have, want in checks if have and want]
-        return bool(comparable) and all(have == want for have, want in comparable)
+        if self.app_id:
+            return bool(app_id.strip()) and self.app_id == app_id.strip()
+        wanted_slug = slug.strip().lower()
+        return bool(self.app_slug) and bool(wanted_slug) and self.app_slug.lower() == wanted_slug
 
 
 class InstalledRepository(BaseModel):
@@ -136,6 +138,15 @@ class InstalledRepository(BaseModel):
     full_name: str = Field(..., description="owner/name")
     default_branch: str = Field(default="main", description="Default branch")
     private: bool = Field(default=False, description="Whether the repository is private")
+
+
+class RepositoryListing(BaseModel):
+    """The repositories an installation can access, as far as the bounded listing read."""
+
+    model_config = ConfigDict(frozen=True)
+
+    repositories: list[InstalledRepository] = Field(default_factory=list, description="Sorted by full name")
+    truncated: bool = Field(default=False, description="True when the installation can access more than listed")
 
 
 def github_endpoints(config_file: Path, *, seeded_env: Mapping[str, str] | None = None) -> GitHubEndpoints:
@@ -434,9 +445,15 @@ async def get_app_slug(client: httpx.AsyncClient, api_url: str, app_jwt: str) ->
 
 async def list_installation_repositories(
     client: httpx.AsyncClient, api_url: str, installation_token: str
-) -> list[InstalledRepository]:
-    """``GET /installation/repositories`` with an installation token, following pages."""
+) -> RepositoryListing:
+    """``GET /installation/repositories`` with an installation token, following at most ``MAX_REPO_PAGES`` pages.
+
+    ``truncated`` is true when the last page fetched was still full at the page
+    bound, or when GitHub's ``total_count`` exceeds what was returned.
+    """
     repositories: list[InstalledRepository] = []
+    total_count = 0
+    truncated = True
     for page in range(1, MAX_REPO_PAGES + 1):
         response = await _send(
             client,
@@ -452,20 +469,70 @@ async def list_installation_repositories(
             )
         body = _json(response)
         items = body.get("repositories", []) if isinstance(body, dict) else []
+        raw_total = body.get("total_count") if isinstance(body, dict) else None
+        if isinstance(raw_total, int) and not isinstance(raw_total, bool):
+            total_count = max(total_count, raw_total)
         if not isinstance(items, list):
             items = []
         for item in items:
-            if isinstance(item, dict) and item.get("full_name"):
-                repositories.append(
-                    InstalledRepository(
-                        full_name=str(item["full_name"]),
-                        default_branch=str(item.get("default_branch") or "main"),
-                        private=bool(item.get("private", False)),
-                    )
-                )
+            repository = _repository(item)
+            if repository is not None:
+                repositories.append(repository)
         if len(items) < _REPO_PAGE_SIZE:
+            truncated = False
             break
-    return sorted(repositories, key=lambda repository: repository.full_name.lower())
+    return RepositoryListing(
+        repositories=sorted(repositories, key=lambda repository: repository.full_name.lower()),
+        truncated=truncated or total_count > len(repositories),
+    )
+
+
+def _repository(item: object) -> InstalledRepository | None:
+    if not isinstance(item, dict) or not isinstance(item.get("full_name"), str) or not item["full_name"]:
+        return None
+    return InstalledRepository(
+        full_name=item["full_name"],
+        default_branch=str(item.get("default_branch") or "main"),
+        private=bool(item.get("private", False)),
+    )
+
+
+async def get_installation_repository(
+    client: httpx.AsyncClient, api_url: str, installation_token: str, full_name: str, account_login: str
+) -> InstalledRepository | None:
+    """``GET /repos/{owner}/{name}`` with an installation token: the repository if the installation can see it.
+
+    Used when the listing was truncated. ``None`` unless GitHub answers 200 for
+    exactly that repository and its owner is the installation's account
+    ``account_login`` (case-insensitive). Other failures raise.
+    """
+    owner, _, name = full_name.partition("/")
+    if not owner or not name or "/" in name or name in {".", ".."} or not account_login:
+        return None
+    response = await _send(
+        client,
+        "GET",
+        f"{api_url}/repos/{quote(owner, safe='')}/{quote(name, safe='')}",
+        headers=api_headers(installation_token),
+    )
+    if response.status_code == 404:
+        return None
+    if response.status_code != 200:
+        raise GitHubAppApiError(
+            f"Could not read the repository ({github_error_detail(response)})", response.status_code
+        )
+    body = _json(response)
+    repository = _repository(body)
+    raw_owner = body.get("owner") if isinstance(body, dict) else None
+    login = raw_owner.get("login") if isinstance(raw_owner, dict) else None
+    if (
+        repository is None
+        or repository.full_name.lower() != full_name.lower()
+        or not isinstance(login, str)
+        or login.lower() != account_login.lower()
+    ):
+        return None
+    return repository
 
 
 async def bot_identity(client: httpx.AsyncClient, api_url: str, slug: str) -> tuple[str, str]:

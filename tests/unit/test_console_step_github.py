@@ -706,7 +706,6 @@ def test_an_approval_request_never_saves_a_query_installation_id(tmp_path: Path,
         {"installation_id": "77", "setup_action": "install"},
         {"installation_id": "77", "setup_action": "request"},
         {},
-        {"installation_id": "77", "state": "x" * 5000},
         {"installation_id": "77", "state": "forged", "redirect": "https://evil.example", "next": "//evil.example"},
     ],
 )
@@ -791,7 +790,6 @@ def test_installed_callback_refuses_an_installation_github_does_not_know(tmp_pat
     [
         {"app_slug": "someone-elses-app", "app_id": "999"},
         {"app_slug": "henchmen-test", "app_id": "999"},
-        {"app_slug": "someone-elses-app", "app_id": "4242"},
     ],
 )
 def test_installed_callback_refuses_an_installation_of_another_app(
@@ -1050,6 +1048,7 @@ def test_repositories_lists_what_the_installation_can_see(tmp_path: Path, github
         {"full_name": "acme/api", "default_branch": "develop", "private": True},
         {"full_name": REPO, "default_branch": "main", "private": True},
     ]
+    assert response.json()["details"]["truncated"] is False
     assert "ghs_" not in response.text
     # Listed with an installation token minted for the listing, never the app JWT.
     listing = [request for request in github.requests if request.url.path == "/installation/repositories"]
@@ -1156,3 +1155,180 @@ def test_repository_must_be_owner_slash_name(tmp_path: Path, github: FakeGitHub)
     assert harness.post(f"{BASE}/repository", {"repo": "webapp"}).status_code == 422
     assert harness.post(f"{BASE}/repository", {"repo": REPO, "extra": "x"}).status_code == 422
     assert github.requests == []
+
+
+# -- review fixes: completion invalidation, authoritative app id, truncation, bounds ---------
+
+
+def _complete_the_step(harness: ConsoleHarness, github: FakeGitHub) -> None:
+    _ready_to_choose(harness, github)
+    assert harness.post(f"{BASE}/repository", {"repo": REPO}).json()["ok"] is True
+    assert SetupStep.GITHUB in harness.setup_store.load().completed_steps
+
+
+def test_recreating_the_app_reopens_a_completed_step(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _complete_the_step(harness, github)
+    _add_conversion(github)
+
+    response = harness.get(CALLBACK, code="code123", state=_issue_manifest_state(harness))
+
+    assert response.headers["location"].startswith(f"https://github.com/apps/{SLUG}/installations/new?state=")
+    assert SetupStep.GITHUB not in harness.setup_store.load().completed_steps
+    assert harness.get(BASE).json()["details"]["completed"] is False
+
+
+def test_a_failed_reopen_after_recreating_the_app_fails_closed(
+    tmp_path: Path, github: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _add_conversion(github)
+    state = _issue_manifest_state(harness)
+
+    def fail(step: SetupStep) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(harness.setup_store, "record_step_incomplete", fail)
+    response = harness.get(CALLBACK, code="code123", state=state)
+    assert response.headers["location"] == "/?step=github&github_error=storage"
+
+
+def test_a_different_installation_from_the_callback_reopens_the_step(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _complete_the_step(harness, github)
+    github.installations["78"] = FakeGitHub.installation("78", "acme")
+    harness.client.cookies.clear()
+
+    same = harness.get(INSTALLED, installation_id="77", state=_install_state(harness, github))
+    assert same.headers["location"] == "/?step=github&github=installed"
+    assert SetupStep.GITHUB in harness.setup_store.load().completed_steps
+
+    changed = harness.get(INSTALLED, installation_id="78", state=_install_state(harness, github))
+    assert changed.headers["location"] == "/?step=github&github=installed"
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == "78"
+    assert SetupStep.GITHUB not in harness.setup_store.load().completed_steps
+
+
+def test_a_different_installation_from_check_again_reopens_the_step(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _complete_the_step(harness, github)
+
+    assert harness.post(f"{BASE}/installation/check").json()["details"]["installation_id"] == "77"
+    assert SetupStep.GITHUB in harness.setup_store.load().completed_steps
+
+    del github.installations["77"]
+    github.installations["79"] = FakeGitHub.installation("79", "acme")
+    body = harness.post(f"{BASE}/installation/check").json()
+    assert body["details"]["installation_id"] == "79"
+    assert SetupStep.GITHUB not in harness.setup_store.load().completed_steps
+    assert harness.get(BASE).json()["details"]["completed"] is False
+
+
+def test_status_completed_needs_an_installation_and_a_default_repo(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    harness.setup_store.record_step_complete(SetupStep.GITHUB)
+    assert harness.get(BASE).json()["details"]["completed"] is False
+    harness.config_store.update({"HENCHMEN_GITHUB_APP_INSTALLATION_ID": "77"}, section="GitHub")
+    assert harness.get(BASE).json()["details"]["completed"] is False
+    harness.config_store.update({"HENCHMEN_GITHUB_DEFAULT_REPO": REPO}, section="GitHub")
+    assert harness.get(BASE).json()["details"]["completed"] is True
+
+
+def test_a_stale_saved_slug_never_refuses_the_right_app(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _created_app(harness, github)
+    # The saved slug (and the one bound into the state) is App A's; GitHub says App B -- ours by app_id.
+    harness.setup_store.set_server_choices({"github_app_slug": "henchmen-old-name"})
+    github.installations["77"] = FakeGitHub.installation("77", "acme", app_slug="henchmen-new-name")
+    state = harness.app.state.callback_states.issue(
+        INSTALL_PURPOSE, {"slug": "henchmen-old-name", "api_url": API_URL, "web_url": WEB_URL}
+    )
+
+    response = harness.get(INSTALLED, installation_id="77", setup_action="install", state=state)
+
+    assert response.headers["location"] == "/?step=github&github=installed"
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == "77"
+    (tmp_path / "second").mkdir()
+    signed_in = _harness(tmp_path / "second", github)
+    _created_app(signed_in, github)
+    signed_in.setup_store.set_server_choices({"github_app_slug": "henchmen-old-name"})
+    assert signed_in.post(f"{BASE}/installation/check").json()["details"]["installation_id"] == "77"
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"installation_id": "77", "state": "x" * 513},
+        {"installation_id": "7" * 33, "state": "s"},
+        {"installation_id": "77", "setup_action": "i" * 33, "state": "s"},
+    ],
+)
+def test_installed_callback_parameters_are_length_bounded(
+    tmp_path: Path, github: FakeGitHub, params: dict[str, str]
+) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _installable(harness, github)
+    config_before = harness.config_store.config_file.read_bytes()
+    response = harness.get(INSTALLED, **params)
+    assert response.status_code == 422
+    assert "location" not in response.headers
+    assert github.requests == []
+    assert harness.config_store.config_file.read_bytes() == config_before
+
+
+def test_repositories_report_a_truncated_listing(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _ready_to_choose(harness, github)
+    details = harness.get(f"{BASE}/repositories").json()["details"]
+    assert details["truncated"] is False
+    github.repository_total_count = 5000
+    details = harness.get(f"{BASE}/repositories").json()["details"]
+    assert details["truncated"] is True
+    assert [item["full_name"] for item in details["repositories"]] == [REPO]
+
+
+def test_a_repository_beyond_a_truncated_listing_is_confirmed_with_github(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _ready_to_choose(harness, github)
+    github.repository_total_count = 5000
+    github.unlisted_repositories = [FakeGitHub.repository("acme/far-away", default_branch="trunk")]
+
+    response = harness.post(f"{BASE}/repository", {"repo": "ACME/far-away"})
+
+    body = response.json()
+    assert body["ok"] is True
+    assert body["details"]["default_repo"] == "acme/far-away"
+    assert body["details"]["default_branch"] == "trunk"
+    assert harness.config_store.get("HENCHMEN_GITHUB_DEFAULT_REPO") == "acme/far-away"
+    lookups = [request for request in github.requests if request.url.path.startswith("/repos/")]
+    assert len(lookups) == 1
+    assert lookups[0].headers["authorization"].startswith("Bearer ghs_")
+    assert "ghs_" not in response.text
+    assert SetupStep.GITHUB in harness.setup_store.load().completed_steps
+
+
+@pytest.mark.parametrize("unlisted", [[], [{"full_name": "globex/far-away"}]])
+def test_a_repository_github_does_not_confirm_is_refused(
+    tmp_path: Path, github: FakeGitHub, unlisted: list[dict[str, object]]
+) -> None:
+    harness = _harness(tmp_path, github)
+    _ready_to_choose(harness, github)
+    github.repository_total_count = 5000
+    github.unlisted_repositories = unlisted
+    repo = "globex/far-away" if unlisted else "acme/far-away"
+
+    body = harness.post(f"{BASE}/repository", {"repo": repo}).json()
+
+    assert body["ok"] is False
+    assert body["problems"][0]["field"] == "repo"
+    assert harness.config_store.get("HENCHMEN_GITHUB_DEFAULT_REPO") == ""
+    assert SetupStep.GITHUB not in harness.setup_store.load().completed_steps
+
+
+def test_an_untruncated_listing_is_never_second_guessed(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _ready_to_choose(harness, github)
+    github.unlisted_repositories = [FakeGitHub.repository("acme/far-away")]
+    body = harness.post(f"{BASE}/repository", {"repo": "acme/far-away"}).json()
+    assert body["ok"] is False
+    assert not [request for request in github.requests if request.url.path.startswith("/repos/")]

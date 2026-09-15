@@ -121,6 +121,22 @@ class SetupStateStore:
                 )
             )
 
+    def record_step_incomplete(self, step: SetupStep) -> SetupState:
+        """Mark ``step`` no longer complete (its saved configuration was invalidated).
+
+        Server-only, like :meth:`record_step_complete` and under the same lock:
+        called when a step's route replaces what the completion relied on (e.g. a
+        re-created GitHub App). The state PUT can never reach it. A step that is
+        not complete is left alone and nothing is written.
+        """
+        with self._lock:
+            state = self.load()
+            if step not in state.completed_steps:
+                return state
+            return self.save(
+                state.model_copy(update={"completed_steps": [s for s in state.completed_steps if s != step]})
+            )
+
     def update_client_fields(
         self, *, current_step: SetupStep, skipped_steps: list[SetupStep], choices: dict[str, str]
     ) -> SetupState:
