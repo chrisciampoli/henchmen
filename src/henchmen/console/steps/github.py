@@ -32,18 +32,19 @@ if the configuration changes in between.
 ``manifest-callback`` stores, in this order:
 
 1. the install state (if it cannot be saved, nothing is written);
-2. the private key in ``secrets/github-app-<app id>.pem``
+2. the GitHub step is reopened (``record_step_incomplete``) *before* anything
+   else is written: the new App has no installation or verified repository
+   yet. If this fails, nothing is written;
+3. the private key in ``secrets/github-app-<app id>.pem``
    (``ConfigStore.write_secret_file``: 0600, atomic). A reconnect never
    overwrites the key the running process still signs with; key files no
    configuration references are removed at the next run-mode start, before
    any service is built (:func:`github_app.remove_unused_app_keys_at_startup`);
-3. one atomic ``ConfigStore.update`` setting ``github_app_id``,
+4. one atomic ``ConfigStore.update`` setting ``github_app_id``,
    ``github_app_private_key_path`` and ``github_webhook_secret`` and removing
    ``github_app_installation_id`` (an installation belongs to one App) and, when
    the new App has none, the old webhook secret. If this write fails, the new
    key file is deleted again;
-4. the GitHub step is marked incomplete (``record_step_incomplete``): the new
-   App has no installation or verified repository yet;
 5. the App slug and owner in ``server_choices`` -- display values only, so a
    failure is logged and the browser still goes on to install the App.
 
@@ -52,8 +53,8 @@ if the configuration changes in between.
 trusts the ``installation_id`` query parameter: it reads
 ``/app/installations/{id}`` with this App's JWT and requires GitHub's answer to
 name this App (its ``app_id``, or its slug only when GitHub sends no id) before
-one atomic ``ConfigStore.update`` saves the id. Saving a *different*
-installation id (here or in Check again) marks the step incomplete.
+one atomic ``ConfigStore.update`` saves the id. A *different* installation id
+(here or in Check again) reopens the step first, then is saved.
 ``setup_action=request`` (an organisation owner must approve) saves nothing and
 sends the UI to its waiting state.
 
@@ -68,7 +69,8 @@ The session routes resolve the GitHub URLs fresh on every call:
   ``github_app.MAX_REPO_PAGES``);
 * ``POST /repository`` checks the installation still belongs to this App and
   may write contents and pull requests, validates the chosen repository
-  against GitHub's list (never the client's spelling), saves it with the App's
+  against GitHub's list (never the client's spelling) -- or, beyond a
+  truncated list, by minting a token scoped to that repository -- saves it with the App's
   bot account as the git author and only then completes the step
   (``step_succeeded``).
 """
@@ -82,6 +84,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
 
+import httpx
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -330,6 +333,15 @@ async def manifest_callback(
         logger.warning("Could not save the install state for GitHub App %s (%s)", conversion.slug, type(exc).__name__)
         return back_to_console(github_error=ERROR_STORAGE)
 
+    # 2. Reopen the step before anything is written: a new App has no installation or verified
+    # repository yet, and a step must never stay complete over a configuration it did not verify.
+    try:
+        setup.record_step_incomplete(STEP)
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not reopen the GitHub step for App %s (%s)", conversion.slug, type(exc).__name__)
+        states.consume(github_app.INSTALL_PURPOSE, install_state)
+        return back_to_console(github_error=ERROR_STORAGE)
+
     values = {APP_ID_KEY: conversion.app_id}
     unset = [INSTALLATION_ID_KEY]
     if conversion.webhook_secret:
@@ -342,7 +354,7 @@ async def manifest_callback(
     with config.locked():
         previous_key = config.get(PRIVATE_KEY_PATH_KEY).strip()
         try:
-            # 2. The new App's own key file, beside -- never over -- the key currently in use.
+            # 3. The new App's own key file, beside -- never over -- the key currently in use.
             key_path = config.write_secret_file(
                 github_app.private_key_file_name(conversion.app_id), conversion.pem.encode("utf-8")
             )
@@ -352,7 +364,7 @@ async def manifest_callback(
             return back_to_console(github_error=ERROR_STORAGE)
         values[PRIVATE_KEY_PATH_KEY] = str(key_path)
         try:
-            # 3. One atomic write (ruling PM-7).
+            # 4. One atomic write (ruling PM-7).
             config.update(values, section=CONFIG_SECTION, unset=unset)
         except (OSError, ConfigStoreError, ValueError) as exc:
             logger.warning("Could not save GitHub App %s (%s)", conversion.slug, type(exc).__name__)
@@ -360,13 +372,6 @@ async def manifest_callback(
                 _remove_quietly(key_path)
             states.consume(github_app.INSTALL_PURPOSE, install_state)
             return back_to_console(github_error=ERROR_STORAGE)
-    # 4. A new App has no installation or verified repository yet: the step is no longer complete.
-    try:
-        setup.record_step_incomplete(STEP)
-    except (OSError, ValueError) as exc:
-        logger.warning("Could not reopen the GitHub step for App %s (%s)", conversion.slug, type(exc).__name__)
-        states.consume(github_app.INSTALL_PURPOSE, install_state)
-        return back_to_console(github_error=ERROR_STORAGE)
     # 5. Display-only values: the App is stored, so a failure here must not strand the user.
     try:
         setup.set_server_choices({SLUG_CHOICE: conversion.slug, ACCOUNT_CHOICE: conversion.owner_login})
@@ -469,18 +474,21 @@ def _record_account(setup: SetupStateStore, installation: github_app.Installatio
 
 
 def _save_installation(config: ConfigStore, setup: SetupStateStore, installation_id: str) -> None:
-    """Save the installation id atomically; a *different* id un-completes the step.
+    """Save ``installation_id``; a *different* id first reopens the step, then is written atomically.
 
     The default repository was verified against the previous installation, so
-    the step must be completed again for the new one. Raises on a failed write
-    (the caller fails closed).
+    the step must be completed again for a new one. The step is reopened
+    *before* the id is written: if reopening fails, nothing is saved, and if
+    the write then fails the step merely stays open (both fail closed). Both
+    happen under the config file's lock, which covers only synchronous file
+    I/O (never an ``await``). The same id is left untouched. Raises on any
+    failed write; the caller reports it.
     """
     with config.locked():
-        previous = config.get(INSTALLATION_ID_KEY).strip()
-        if previous != installation_id:
-            config.update({INSTALLATION_ID_KEY: installation_id}, section=CONFIG_SECTION)
-    if previous != installation_id:
+        if config.get(INSTALLATION_ID_KEY).strip() == installation_id:
+            return
         setup.record_step_incomplete(STEP)
+        config.update({INSTALLATION_ID_KEY: installation_id}, section=CONFIG_SECTION)
 
 
 def _installation_context(
@@ -513,6 +521,29 @@ def _installation_context(
     except GitHubAuthError as exc:
         return step_failed(STEP, _credentials_problem(exc))
     return endpoints, provider
+
+
+async def _confirm_unlisted_repository(
+    provider: GitHubCredentialsProvider,
+    client: httpx.AsyncClient,
+    api_url: str,
+    repo: str,
+    account_login: str,
+) -> github_app.InstalledRepository | None:
+    """Confirm a repository beyond a truncated listing; ``None`` when the installation cannot access it.
+
+    Access is proven by minting a token scoped to ``repo``: GitHub refuses
+    (422) a repository outside the installation's selection, and the provider
+    checks the repositories GitHub scoped the token to. ``GET /repos`` alone
+    proves nothing -- it answers 200 for any public repository -- so it is used
+    only, with the scoped token, for the canonical name and default branch.
+    """
+    try:
+        scoped_token = await provider.token_async(repo)
+    except GitHubAuthError as exc:
+        logger.info("GitHub would not scope an installation token to the chosen repository: %s", redact(str(exc)))
+        return None
+    return await github_app.get_installation_repository(client, api_url, scoped_token, repo, account_login)
 
 
 @router.get("/installed", include_in_schema=False)
@@ -714,9 +745,8 @@ async def choose_repository(
             # Validated against GitHub's list, and saved in GitHub's spelling -- never the client's.
             match = next((item for item in listing.repositories if item.full_name.lower() == body.repo.lower()), None)
             if match is None and listing.truncated:
-                # Beyond the bounded listing: GitHub must confirm the installation sees exactly this repository.
-                match = await github_app.get_installation_repository(
-                    client, endpoints.api_url, token, body.repo, installation.account_login
+                match = await _confirm_unlisted_repository(
+                    provider, client, endpoints.api_url, body.repo, installation.account_login
                 )
             if match is not None:
                 if github_app.is_valid_slug(installation.app_slug):
