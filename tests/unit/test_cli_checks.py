@@ -441,3 +441,87 @@ class TestJira:
             checks, "_http_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(handler))
         )
         assert check_jira("https://x.atlassian.net", "a@b", "tok").status == CheckStatus.FAIL
+
+
+# ---------------------------------------------------------------------------
+# Model catalogs (Vertex AI, OpenAI filter)
+# ---------------------------------------------------------------------------
+
+
+class TestModelCatalog:
+    def test_vertex_models_are_gemini_only(self):
+        assert checks.VERTEX_MODELS
+        assert all(model.startswith("gemini-") for model in checks.VERTEX_MODELS)
+
+    def test_openai_filter_keeps_chat_models_only(self):
+        models = ["gpt-4.1", "gpt-4.1-mini", "o3", "gpt-4o-realtime-preview", "text-embedding-3-small", "dall-e-3"]
+        assert checks.filter_openai_models(models) == ["gpt-4.1", "gpt-4.1-mini", "o3"]
+
+
+# ---------------------------------------------------------------------------
+# AWS Bedrock
+# ---------------------------------------------------------------------------
+
+
+class TestBedrock:
+    @staticmethod
+    def _client(foundation: list[str], profiles_pages: list[list[str]]) -> Any:
+        pages = list(profiles_pages)
+
+        def list_foundation_models(**kwargs: Any) -> dict[str, Any]:
+            assert kwargs == {"byOutputModality": "TEXT"}
+            return {"modelSummaries": [{"modelId": model} for model in foundation]}
+
+        def list_inference_profiles(**kwargs: Any) -> dict[str, Any]:
+            page = pages.pop(0)
+            response: dict[str, Any] = {"inferenceProfileSummaries": [{"inferenceProfileId": p} for p in page]}
+            if pages:
+                response["nextToken"] = "next"
+            return response
+
+        return SimpleNamespace(
+            list_foundation_models=list_foundation_models, list_inference_profiles=list_inference_profiles
+        )
+
+    def test_missing_region_fails_without_a_client(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(checks, "_bedrock_client", lambda *a, **k: pytest.fail("must not build client"))
+        assert checks.check_bedrock("").status == CheckStatus.FAIL
+
+    def test_lists_models_and_inference_profiles(self, monkeypatch: pytest.MonkeyPatch):
+        client = self._client(
+            ["anthropic.claude-sonnet-4-20250514-v1:0"],
+            [["us.anthropic.claude-sonnet-4-20250514-v1:0"], ["us.anthropic.claude-haiku-4-5-20251001-v1:0"]],
+        )
+        monkeypatch.setattr(checks, "_bedrock_client", lambda region, timeout: client)
+        result = checks.check_bedrock("us-east-1")
+        assert result.status == CheckStatus.OK
+        assert "3 models" in result.message
+
+    def test_list_bedrock_models_sorted_and_deduplicated(self, monkeypatch: pytest.MonkeyPatch):
+        client = self._client(["b-model", "a-model"], [["a-model", "c-profile"]])
+        monkeypatch.setattr(checks, "_bedrock_client", lambda region, timeout: client)
+        assert checks.list_bedrock_models("us-east-1") == ["a-model", "b-model", "c-profile"]
+
+    def test_credentials_error_fails_with_a_hint(self, monkeypatch: pytest.MonkeyPatch):
+        def broken(region: str, timeout: float) -> Any:
+            raise RuntimeError("Unable to locate credentials")
+
+        monkeypatch.setattr(checks, "_bedrock_client", broken)
+        result = checks.check_bedrock("us-east-1")
+        assert result.status == CheckStatus.FAIL
+        assert "Unable to locate credentials" in result.message
+        assert result.hint and "bedrock:ListFoundationModels" in result.hint
+        assert checks.list_bedrock_models("us-east-1") == []
+
+    def test_no_text_models_fails(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(checks, "_bedrock_client", lambda region, timeout: self._client([], [[]]))
+        assert checks.check_bedrock("us-east-1").status == CheckStatus.FAIL
+
+    def test_missing_sdk_warns(self, monkeypatch: pytest.MonkeyPatch):
+        def missing(region: str, timeout: float) -> Any:
+            raise ImportError("No module named 'boto3'")
+
+        monkeypatch.setattr(checks, "_bedrock_client", missing)
+        result = checks.check_bedrock("us-east-1")
+        assert result.status == CheckStatus.WARN
+        assert "aws" in (result.hint or "")
