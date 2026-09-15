@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from henchmen.config.internal_auth import desktop_internal_auth
 from henchmen.config.settings import DEFAULT_LOCAL_OPERATIVE_IMAGE
 from henchmen.models.llm import ModelTier
 from henchmen.models.operative import OperativeReport, OperativeStatus
@@ -181,6 +182,13 @@ class LairManager:
             # Also expose the bare name for tooling (git, gh) that reads it directly.
             if self.settings.github_token:
                 env["GITHUB_TOKEN"] = self.settings.github_token
+
+            # Desktop install: a token valid only for this task authenticates the
+            # operative's report and its task-state calls (D-P4). The internal push
+            # token never enters an operative (amendment A2).
+            internal = desktop_internal_auth()
+            if internal is not None:
+                env["HENCHMEN_OPERATIVE_TASK_TOKEN"] = internal.task_token(task.id)
 
         return env
 

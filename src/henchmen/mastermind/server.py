@@ -26,7 +26,7 @@ import henchmen.schemes.bugfix_standard  # noqa: F401
 import henchmen.schemes.feature_standard  # noqa: F401
 import henchmen.schemes.goal_decomposition  # noqa: F401
 from henchmen.config.settings import get_settings
-from henchmen.dispatch.pubsub_auth import require_internal_caller, verify_pubsub_oidc
+from henchmen.dispatch.pubsub_auth import require_internal_caller, verify_operative_report, verify_pubsub_oidc
 from henchmen.mastermind.agent import MastermindAgent
 from henchmen.mastermind.scheme_executor import validate_deterministic_handlers
 from henchmen.models.task import HenchmenTask
@@ -615,7 +615,7 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
     Feeds the real OperativeReport (with tokens, cost, files_changed) to the
     LairManager so wait_for_completion() returns accurate telemetry.
     """
-    await verify_pubsub_oidc(request, get_settings())
+    await verify_operative_report(request, get_settings())
     try:
         envelope = await request.json()
 
@@ -633,6 +633,21 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
         from henchmen.models.operative import OperativeReport
 
         report = OperativeReport.model_validate(data)
+
+        # On a desktop install with a task token, request.state.operative_task_id is the
+        # only identifier verify_operative_report trusts. The report's own task_id came
+        # from this same envelope's data, so it must match -- a mismatch means whatever
+        # parsed the token and whatever parsed the report disagree, and that is refused
+        # rather than trusted.
+        verified_task_id = getattr(request.state, "operative_task_id", None)
+        if verified_task_id is not None and report.task_id != verified_task_id:
+            logger.warning(
+                "[MASTERMIND] Operative report task_id %s does not match its verified task token (%s) — refusing",
+                report.task_id,
+                verified_task_id,
+            )
+            raise HTTPException(status_code=401, detail="Report task_id does not match the verified task token")
+
         agent = get_agent()
 
         # Write to DocumentStore so any Mastermind instance can pick it up
@@ -667,6 +682,8 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
         # Two-phase dedup: only now is the message really processed.
         await _mark_message_done(message_id, handler="operative-complete")
         return {"status": "ok"}
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("Failed to process operative-complete: %s", exc)
         return {"status": "error", "detail": str(exc)}

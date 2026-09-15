@@ -98,6 +98,9 @@ class InMemoryMessageBroker:
         # event loop only holds weak references and background tasks can be
         # garbage collected mid-run (silent message loss in local dev).
         self._background_tasks: set[asyncio.Task[None]] = set()
+        # Operative containers on a desktop install authenticate with their task token.
+        if settings is not None and settings.operative_task_token.strip():
+            self._forward_token = settings.operative_task_token.strip()
         # Operative containers: forward to the host when explicitly configured.
         if settings is not None and settings.local_forward_base_url:
             self.set_forward_map(default_forward_map(settings, settings.local_forward_base_url))

@@ -174,6 +174,20 @@ class TestBuildEnvVars:
         assert not any(internal.push_token in v for v in env.values())
         assert not any("PUSH_TOKEN" in key.upper() for key in env)
 
+    def test_desktop_install_env_never_carries_a_token_for_another_task(self, monkeypatch, tmp_path):
+        """Ruling 3: the same substring check as B2, but for a sibling task's token."""
+        from henchmen.config.internal_auth import clear_cache, load_internal_auth
+
+        clear_cache()
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        internal = load_internal_auth(tmp_path / "secrets")
+        other_task_token = internal.task_token("some-other-task")
+        settings = _settings(provider="local", gcp_project_id="")
+
+        env = LairManager(settings)._build_env_vars(_task(), _node(), "lair-1")
+
+        assert not any(other_task_token in v for v in env.values())
+
     def test_lair_manager_module_never_references_the_push_token(self):
         """Belt-and-suspenders: even if env-building changes shape, the module must not name it."""
         import inspect
@@ -404,3 +418,29 @@ def test_local_mode_falls_back_to_the_locally_built_image():
     from henchmen.mastermind.lair_manager import LairManager
 
     assert LairManager(Settings(_env_file=None, provider="local"))._build_image() == "henchmen-operative:local"
+
+
+def test_desktop_lairs_receive_a_token_for_their_own_task_only(monkeypatch, tmp_path):
+    from henchmen.config.internal_auth import load_internal_auth
+
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    task = _task()
+    env = LairManager(_settings(provider="local", gcp_project_id=""))._build_env_vars(task, _node(), "lair-1")
+
+    internal = load_internal_auth(tmp_path / "secrets")
+    token = env["HENCHMEN_OPERATIVE_TASK_TOKEN"]
+    assert internal.verify_task_token(task.id, token)
+    assert not internal.verify_task_token("another-task", token)
+    assert internal.push_token not in env.values(), "operatives never receive the internal push token"
+
+
+def test_no_task_token_outside_a_desktop_install(monkeypatch):
+    monkeypatch.delenv("HENCHMEN_DATA_DIR", raising=False)
+    env = LairManager(_settings(provider="local", gcp_project_id=""))._build_env_vars(_task(), _node(), "lair-1")
+    assert "HENCHMEN_OPERATIVE_TASK_TOKEN" not in env
+
+
+def test_cloud_lairs_never_receive_a_task_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    env = LairManager(_settings(provider="gcp"))._build_env_vars(_task(), _node(), "lair-1")
+    assert "HENCHMEN_OPERATIVE_TASK_TOKEN" not in env
