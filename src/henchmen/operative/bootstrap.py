@@ -842,12 +842,37 @@ async def publish_report(report: OperativeReport, settings: Settings, broker: Me
 
     Uses the provided MessageBroker provider when available. Falls back to a
     direct Pub/Sub call if no broker is supplied so legacy callers continue to work.
+
+    On a desktop install the broker is a separate-process ``InMemoryMessageBroker``
+    forwarding to the host over HTTP: its ``publish`` schedules that forward as a
+    background task and returns immediately, which is correct for the shared
+    server-side broker but fatal here — this process exits right after this
+    call returns, cancelling the in-flight forward before it ever reaches
+    Mastermind (ruling P8). So when the broker is that kind and has a forward
+    URL configured for this topic, delivery is awaited directly via
+    ``publish_and_confirm`` and a failed delivery raises, taking this operative
+    down non-zero rather than silently losing the report. Every other broker
+    (GCP, AWS, or an in-memory broker with nothing to forward to) keeps its
+    existing non-blocking-from-the-caller's-perspective path.
     """
     data = report.model_dump_json().encode("utf-8")
     topic = settings.pubsub_topic_operative_complete
 
     if broker is not None:
-        await broker.publish(topic, data, task_id=report.task_id)
+        from henchmen.providers.local.memory import InMemoryMessageBroker
+
+        if isinstance(broker, InMemoryMessageBroker) and broker.has_forward_target(topic):
+            delivered = await broker.publish_and_confirm(topic, data, task_id=report.task_id)
+            if not delivered:
+                # No token or secret is interpolated here — only the task id, which is not sensitive.
+                logger.error(
+                    "Failed to deliver operative report for task %s (status=%s) — exiting non-zero",
+                    report.task_id,
+                    report.status,
+                )
+                raise RuntimeError(f"Failed to deliver operative completion report for task {report.task_id}")
+        else:
+            await broker.publish(topic, data, task_id=report.task_id)
     else:
         # Fallback: direct Pub/Sub publish (legacy path, avoid in new code)
         from google.cloud import pubsub_v1  # type: ignore[attr-defined]
@@ -861,10 +886,21 @@ async def publish_report(report: OperativeReport, settings: Settings, broker: Me
 
 
 def main() -> None:
-    """Entrypoint for the container."""
+    """Entrypoint for the container.
+
+    Fail-closed (ruling P8): any exception escaping ``run_operative`` --
+    including an undeliverable completion report -- is logged at ERROR (never
+    with a token; ``install_log_redaction`` also covers this line) and turned
+    into a non-zero exit, rather than letting the process exit 0 having lost
+    its report.
+    """
     logging.basicConfig(level=logging.INFO)
     install_log_redaction()
-    asyncio.run(run_operative())
+    try:
+        asyncio.run(run_operative())
+    except Exception as exc:
+        logger.error("[operative] Fatal error, exiting non-zero: %s", exc)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":
