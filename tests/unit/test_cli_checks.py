@@ -416,6 +416,101 @@ class TestSlack:
         assert len(channels) == checks.MAX_LIST_PAGES
         assert any("stopped after" in record.getMessage() for record in caplog.records)
 
+    def test_list_channels_page_reports_no_truncation_when_complete(self, monkeypatch: pytest.MonkeyPatch):
+        def conversations_list(**kw: Any) -> dict[str, Any]:
+            return {
+                "channels": [{"id": "C1", "name": "alpha", "is_private": False, "is_member": True}],
+                "response_metadata": {"next_cursor": ""},
+            }
+
+        monkeypatch.setattr(
+            checks, "_slack_client", lambda token, timeout: _slack_client(conversations_list=conversations_list)
+        )
+        listing = checks.list_slack_channels_page("xoxb-1")
+        assert listing.truncated is False
+        assert [c.name for c in listing.channels] == ["alpha"]
+
+    def test_list_channels_page_reports_truncation_when_bounded(self, monkeypatch: pytest.MonkeyPatch):
+        def conversations_list(**kw: Any) -> dict[str, Any]:
+            return {
+                "channels": [{"id": "C1", "name": "always-more", "is_private": False, "is_member": False}],
+                "response_metadata": {"next_cursor": "always-more"},
+            }
+
+        monkeypatch.setattr(
+            checks, "_slack_client", lambda token, timeout: _slack_client(conversations_list=conversations_list)
+        )
+        listing = checks.list_slack_channels_page("xoxb-1")
+        assert listing.truncated is True
+        assert len(listing.channels) == checks.MAX_LIST_PAGES
+
+    def test_get_slack_channel_ok(self, monkeypatch: pytest.MonkeyPatch):
+        client = _slack_client(
+            conversations_info=lambda channel: {
+                "ok": True,
+                "channel": {"id": "C9999", "name": "overflow", "is_private": False, "is_member": True},
+            }
+        )
+        monkeypatch.setattr(checks, "_slack_client", lambda token, timeout: client)
+        channel = checks.get_slack_channel("xoxb-1", "C9999")
+        assert channel == SlackChannel(id="C9999", name="overflow", is_private=False, is_member=True)
+
+    def test_get_slack_channel_unknown_id_returns_none(self, monkeypatch: pytest.MonkeyPatch):
+        def boom(channel: str) -> Any:
+            raise _SlackApiError("channel_not_found")
+
+        monkeypatch.setattr(checks, "_slack_client", lambda token, timeout: _slack_client(conversations_info=boom))
+        assert checks.get_slack_channel("xoxb-1", "C9999") is None
+
+    def test_get_slack_channel_missing_scope_fails_closed(self, monkeypatch: pytest.MonkeyPatch):
+        def boom(channel: str) -> Any:
+            raise _SlackApiError("missing_scope", needed="channels:read")
+
+        monkeypatch.setattr(checks, "_slack_client", lambda token, timeout: _slack_client(conversations_info=boom))
+        assert checks.get_slack_channel("xoxb-1", "C9999") is None
+
+    def test_get_slack_channel_missing_sdk_returns_none(self, monkeypatch: pytest.MonkeyPatch):
+        def missing(token: str, timeout: float) -> Any:
+            raise ImportError("slack_sdk")
+
+        monkeypatch.setattr(checks, "_slack_client", missing)
+        assert checks.get_slack_channel("xoxb-1", "C9999") is None
+
+    def test_post_message_ok(self, monkeypatch: pytest.MonkeyPatch):
+        posted: list[dict[str, Any]] = []
+        client = _slack_client(chat_postMessage=lambda **kwargs: posted.append(kwargs) or {"ok": True})
+        monkeypatch.setattr(checks, "_slack_client", lambda token, timeout: client)
+        result = checks.post_slack_message("xoxb-1", "C123", "hello")
+        assert result.status == CheckStatus.OK
+        assert posted == [{"channel": "C123", "text": "hello"}]
+
+    def test_post_message_not_in_channel(self, monkeypatch: pytest.MonkeyPatch):
+        def fail(**kwargs: Any) -> Any:
+            raise _SlackApiError("not_in_channel")
+
+        monkeypatch.setattr(checks, "_slack_client", lambda token, timeout: _slack_client(chat_postMessage=fail))
+        result = checks.post_slack_message("xoxb-1", "C123", "hello")
+        assert result.status == CheckStatus.FAIL
+        assert "/invite" in (result.hint or "")
+
+    def test_post_message_missing_scope(self, monkeypatch: pytest.MonkeyPatch):
+        def fail(**kwargs: Any) -> Any:
+            raise _SlackApiError("missing_scope", needed="chat:write")
+
+        monkeypatch.setattr(checks, "_slack_client", lambda token, timeout: _slack_client(chat_postMessage=fail))
+        result = checks.post_slack_message("xoxb-1", "C123", "hello")
+        assert result.status == CheckStatus.FAIL
+        assert "chat:write" in result.message
+
+    def test_post_message_missing_sdk_warns(self, monkeypatch: pytest.MonkeyPatch):
+        def missing(token: str, timeout: float) -> Any:
+            raise ImportError("slack_sdk")
+
+        monkeypatch.setattr(checks, "_slack_client", missing)
+        result = checks.post_slack_message("xoxb-1", "C123", "hello")
+        assert result.status == CheckStatus.WARN
+        assert ".[slack]" in (result.hint or "")
+
 
 # ---------------------------------------------------------------------------
 # Jira

@@ -501,18 +501,32 @@ def check_slack_app_token(app_token: str, *, timeout: float = DEFAULT_TIMEOUT) -
     return CheckResult(name, CheckStatus.OK, "Socket Mode token valid")
 
 
-def list_slack_channels(token: str, *, timeout: float = DEFAULT_TIMEOUT) -> list[SlackChannel]:
-    """Return every non-archived public/private channel visible to the bot, sorted by name.
+@dataclass(frozen=True)
+class SlackChannelListing:
+    """Channels visible to the bot, and whether ``MAX_LIST_PAGES`` cut the listing short."""
 
-    Raises :class:`SlackScopeError` when the token lacks ``channels:read`` /
-    ``groups:read``; returns ``[]`` for other failures.
+    channels: list[SlackChannel]
+    truncated: bool
+
+
+def list_slack_channels_page(token: str, *, timeout: float = DEFAULT_TIMEOUT) -> SlackChannelListing:
+    """Return every non-archived channel visible to the bot, sorted by name, and a truncation flag.
+
+    Stops after ``MAX_LIST_PAGES`` pages rather than trusting a cursor to
+    eventually come back empty; ``truncated`` is true when that limit was
+    reached, so a channel beyond this listing can still be confirmed
+    directly by id with :func:`get_slack_channel`. Raises
+    :class:`SlackScopeError` when the token lacks ``channels:read`` /
+    ``groups:read``; any other failure returns an empty, non-truncated
+    listing.
     """
     try:
         client = _slack_client(token, timeout)
     except ImportError:
-        return []
+        return SlackChannelListing(channels=[], truncated=False)
     channels: list[SlackChannel] = []
     cursor: str | None = None
+    truncated = False
     try:
         for page in range(1, MAX_LIST_PAGES + 1):
             response = client.conversations_list(
@@ -534,6 +548,7 @@ def list_slack_channels(token: str, *, timeout: float = DEFAULT_TIMEOUT) -> list
             if not cursor:
                 break
             if page == MAX_LIST_PAGES:
+                truncated = True
                 _logger.warning(
                     "Slack channel listing stopped after %d pages (%d channels seen); "
                     "the workspace may have more channels than were returned",
@@ -543,8 +558,46 @@ def list_slack_channels(token: str, *, timeout: float = DEFAULT_TIMEOUT) -> list
     except Exception as exc:
         if _slack_error_code(exc) == "missing_scope":
             raise SlackScopeError(_slack_needed_scope(exc) or "channels:read") from exc
-        return []
-    return sorted(channels, key=lambda c: c.name)
+        return SlackChannelListing(channels=[], truncated=False)
+    return SlackChannelListing(channels=sorted(channels, key=lambda c: c.name), truncated=truncated)
+
+
+def list_slack_channels(token: str, *, timeout: float = DEFAULT_TIMEOUT) -> list[SlackChannel]:
+    """Return every non-archived public/private channel visible to the bot, sorted by name.
+
+    A thin wrapper over :func:`list_slack_channels_page` for callers
+    (``henchmen init``/``doctor``) that only need the channels themselves,
+    not whether ``MAX_LIST_PAGES`` truncated the listing.
+
+    Raises :class:`SlackScopeError` when the token lacks ``channels:read`` /
+    ``groups:read``; returns ``[]`` for other failures.
+    """
+    return list_slack_channels_page(token, timeout=timeout).channels
+
+
+def get_slack_channel(token: str, channel_id: str, *, timeout: float = DEFAULT_TIMEOUT) -> SlackChannel | None:
+    """Look up one channel directly (``conversations.info``); ``None`` on any failure.
+
+    For confirming access to a channel beyond a truncated
+    :func:`list_slack_channels_page` result by id: bounded to a single call,
+    and fails closed -- an unknown id, a missing scope, a network error or a
+    missing SDK are all "can't see it", never treated as a pass.
+    """
+    try:
+        client = _slack_client(token, timeout)
+        response = client.conversations_info(channel=channel_id)
+    except Exception:
+        return None
+    raw = response.get("channel") or {}
+    found_id = str(raw.get("id", ""))
+    if not found_id:
+        return None
+    return SlackChannel(
+        id=found_id,
+        name=str(raw.get("name", "")),
+        is_private=bool(raw.get("is_private", False)),
+        is_member=bool(raw.get("is_member", False)),
+    )
 
 
 def join_slack_channel(token: str, channel_id: str, *, timeout: float = DEFAULT_TIMEOUT) -> CheckResult:
@@ -576,6 +629,34 @@ def join_slack_channel(token: str, channel_id: str, *, timeout: float = DEFAULT_
         return CheckResult(name, CheckStatus.FAIL, f"could not join {channel_id}: {code}")
     channel_name = (response.get("channel") or {}).get("name", channel_id)
     return CheckResult(name, CheckStatus.OK, f"joined #{channel_name}")
+
+
+def post_slack_message(token: str, channel_id: str, text: str, *, timeout: float = DEFAULT_TIMEOUT) -> CheckResult:
+    """Post ``text`` to a channel as the bot -- the setup guide's test message."""
+    name = "Slack test message"
+    try:
+        _slack_client(token, timeout).chat_postMessage(channel=channel_id, text=text)
+    except ImportError as exc:
+        return _sdk_missing(name, "slack", exc)
+    except Exception as exc:
+        code = _slack_error_code(exc)
+        if code == "not_in_channel":
+            return CheckResult(
+                name,
+                CheckStatus.FAIL,
+                f"the bot is not a member of {channel_id}",
+                hint="In Slack, open the channel and run: /invite @Henchmen",
+            )
+        if code == "missing_scope":
+            needed = _slack_needed_scope(exc) or "chat:write"
+            return CheckResult(
+                name,
+                CheckStatus.FAIL,
+                f"bot token is missing the '{needed}' scope",
+                hint="Add the scope under OAuth & Permissions, then reinstall the app",
+            )
+        return CheckResult(name, CheckStatus.FAIL, f"could not post to {channel_id}: {code}")
+    return CheckResult(name, CheckStatus.OK, f"posted a test message to {channel_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +697,7 @@ __all__ = [
     "CheckResult",
     "CheckStatus",
     "SlackChannel",
+    "SlackChannelListing",
     "SlackScopeError",
     "check_anthropic_key",
     "check_bedrock",
@@ -628,10 +710,13 @@ __all__ = [
     "check_slack_bot_token",
     "check_vertex",
     "filter_openai_models",
+    "get_slack_channel",
     "join_slack_channel",
     "list_anthropic_models",
     "list_bedrock_models",
     "list_ollama_models",
     "list_openai_models",
     "list_slack_channels",
+    "list_slack_channels_page",
+    "post_slack_message",
 ]
