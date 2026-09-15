@@ -13,6 +13,7 @@ and friends) so tests can substitute fakes without touching the network.
 from __future__ import annotations
 
 import base64
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -23,10 +24,18 @@ import httpx
 from henchmen.config.settings import Settings
 from henchmen.providers.pricing import PRICE_TABLE
 from henchmen.providers.tiers import TIER_FIELDS
+from henchmen.utils.redaction import redact
 
 DEFAULT_TIMEOUT = 10.0
 
+# Every cursor/next-token paging loop in this module stops after this many
+# pages rather than trusting a remote API to eventually return an empty
+# cursor -- a misbehaving or malicious server otherwise hangs the check.
+MAX_LIST_PAGES = 50
+
 RECOMMENDED_OLLAMA_MODELS: tuple[str, ...] = ("qwen2.5-coder:7b", "llama3.3", "deepseek-r1:8b")
+
+_logger = logging.getLogger(__name__)
 
 # Vertex AI has no per-key model listing Henchmen can use; these are the Gemini
 # models the tier defaults and the price table know. No Claude on Vertex AI.
@@ -174,8 +183,15 @@ def _slack_needed_scope(exc: BaseException) -> str:
 
 
 def _short(exc: BaseException, limit: int = 160) -> str:
+    """First line of the exception text, redacted, truncated to ``limit`` characters.
+
+    Every ``check_*`` function surfaces exception text to the user through
+    this helper, so redacting here (rather than at each call site) protects
+    every check at once from leaking a credential or an AWS account id
+    embedded in an SDK error message.
+    """
     text = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
-    return text[:limit]
+    return redact(text)[:limit]
 
 
 def _sdk_missing(name: str, extra: str, exc: ImportError) -> CheckResult:
@@ -367,7 +383,7 @@ def _bedrock_model_ids(client: Any) -> list[str]:
         if model_id:
             ids.add(model_id)
     next_token: str | None = None
-    while True:
+    for _page in range(MAX_LIST_PAGES):
         kwargs: dict[str, Any] = {"maxResults": 100}
         if next_token:
             kwargs["nextToken"] = next_token
@@ -379,6 +395,8 @@ def _bedrock_model_ids(client: Any) -> list[str]:
         next_token = page.get("nextToken") or None
         if not next_token:
             break
+    else:
+        raise RuntimeError(f"Bedrock inference profiles are still paging after {MAX_LIST_PAGES} pages")
     return sorted(ids)
 
 
@@ -496,7 +514,7 @@ def list_slack_channels(token: str, *, timeout: float = DEFAULT_TIMEOUT) -> list
     channels: list[SlackChannel] = []
     cursor: str | None = None
     try:
-        while True:
+        for page in range(1, MAX_LIST_PAGES + 1):
             response = client.conversations_list(
                 types="public_channel,private_channel",
                 exclude_archived=True,
@@ -515,6 +533,13 @@ def list_slack_channels(token: str, *, timeout: float = DEFAULT_TIMEOUT) -> list
             cursor = (response.get("response_metadata") or {}).get("next_cursor") or None
             if not cursor:
                 break
+            if page == MAX_LIST_PAGES:
+                _logger.warning(
+                    "Slack channel listing stopped after %d pages (%d channels seen); "
+                    "the workspace may have more channels than were returned",
+                    MAX_LIST_PAGES,
+                    len(channels),
+                )
     except Exception as exc:
         if _slack_error_code(exc) == "missing_scope":
             raise SlackScopeError(_slack_needed_scope(exc) or "channels:read") from exc

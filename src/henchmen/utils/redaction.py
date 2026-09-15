@@ -45,6 +45,20 @@ _TOKEN_ENV_VAR_PATTERN = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*_TOKEN)=(\S+)", re
 # length like the other patterns in this module.
 _TOKEN_QUOTED_KV_PATTERN = re.compile(r"(['\"])([A-Za-z][A-Za-z0-9_]*_TOKEN)\1(\s*:\s*)(['\"])[^'\"]*\4", re.IGNORECASE)
 
+# AWS ARNs embed the 12-digit account id as their 5th colon-separated field
+# (e.g. an IAM AccessDenied message: "User: arn:aws:iam::123456789012:user/x
+# is not authorized ..."). The whole ARN is replaced, which necessarily takes
+# the account id with it; the trailing ``\S+`` is a single bounded quantifier
+# (stops at the next whitespace) so this stays linear in input length.
+_AWS_ARN_PATTERN = re.compile(r"arn:aws[a-z-]*:[a-z0-9-]*:[a-z0-9-]*:\d{12}:\S+")
+
+# A bare account id outside an ARN, as AWS error messages often print it
+# ("... (Account: 123456789012)" / "account 123456789012"). Anchored on the
+# word "account" so an ordinary 12-digit number elsewhere in a message is
+# left alone; the "account" word itself is kept (captured and replayed via
+# \1) so the redacted text still reads "Account: ***REDACTED***".
+_AWS_ACCOUNT_ID_PATTERN = re.compile(r"(?i)(\baccount\b\s*:?\s*)\d{12}\b")
+
 # (pattern, replacement) pairs, applied in order. Every pattern but the bearer
 # one replaces the whole match outright; the bearer pattern captures the word
 # itself (case preserved, whatever whitespace separated it from the token) so
@@ -63,6 +77,8 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"sk-[A-Za-z0-9]{32,}"), REDACTED),  # OpenAI / generic secret keys
     (re.compile(r"AIza[A-Za-z0-9_-]{30,}"), REDACTED),  # Google API keys
     (re.compile(r"x-access-token:[^@\s]+"), REDACTED),  # Authenticated git clone URLs
+    (_AWS_ARN_PATTERN, REDACTED),  # AWS ARNs (carries the 12-digit account id)
+    (_AWS_ACCOUNT_ID_PATTERN, r"\1" + REDACTED),  # bare AWS account id after "account"
     # Internal push / task / API bearer tokens: case-insensitive scheme name,
     # any run of whitespace, value redacted -- "Bearer"/"bearer"/"BEARER" all
     # match and the captured word is kept in the output.
