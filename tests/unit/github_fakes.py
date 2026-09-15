@@ -59,6 +59,9 @@ class FakeGitHub:
         self.conversions: dict[str, dict[str, Any]] = {}
         self.installations: dict[str, dict[str, Any]] = {}
         self.repositories: list[dict[str, Any]] = []
+        # Repositories the installation can access beyond the listing (found only by GET /repos/{owner}/{name}).
+        self.unlisted_repositories: list[dict[str, Any]] = []
+        self.repository_total_count: int | None = None
         self.users: dict[str, dict[str, Any]] = {}
 
     # -- builders ------------------------------------------------------------
@@ -165,7 +168,18 @@ class FakeGitHub:
                 return httpx.Response(401, json={"message": "Bad credentials"})
             page = int(request.url.params.get("page", "1"))
             repositories = self.repositories if page == 1 else []
-            return httpx.Response(200, json={"total_count": len(self.repositories), "repositories": repositories})
+            total = len(self.repositories) if self.repository_total_count is None else self.repository_total_count
+            return httpx.Response(200, json={"total_count": total, "repositories": repositories})
+
+        if method == "GET" and len(parts) == 3 and parts[0] == "repos":
+            if not self._valid_installation_token(request):
+                return httpx.Response(401, json={"message": "Bad credentials"})
+            wanted = f"{parts[1]}/{parts[2]}".lower()
+            for repository in [*self.repositories, *self.unlisted_repositories]:
+                if repository["full_name"].lower() == wanted:
+                    owner = repository["full_name"].split("/", 1)[0]
+                    return httpx.Response(200, json={**repository, "owner": {"login": owner}})
+            return httpx.Response(404, json={"message": "Not Found"})
 
         if method == "GET" and len(parts) == 2 and parts[0] == "users":
             user = self.users.get(parts[1])

@@ -14,6 +14,7 @@ from henchmen.cli.chat import (
     _dispatch_task,
     _local_dispatch_url,
     _parse_task_block,
+    _print_welcome,
     _read_multiline_input,
     _resolve_chat_model,
     _task_type,
@@ -485,3 +486,25 @@ async def test_chat_in_the_container_uses_the_token_apply_generated(monkeypatch,
     with patch("henchmen.cli.chat.httpx.AsyncClient", return_value=_http_client(post=post)):
         await _dispatch_task({"title": "Fix bug", "description": "d", "repo": "acme/backend"}, settings)
     assert post.call_args.kwargs["headers"] == {"Authorization": f"Bearer {settings.dispatch_api_token}"}
+
+
+# --- _print_welcome ---
+
+
+@pytest.mark.parametrize(
+    ("org", "repo", "shown"),
+    [
+        ("acme", "acme/webapp", "acme/webapp"),
+        ("acme", "webapp", "acme/webapp"),
+        ("", "acme/webapp", "acme/webapp"),
+        ("acme", "", "(not set)"),
+    ],
+)
+def test_welcome_banner_never_doubles_the_owner(
+    mock_settings: Settings, capsys: pytest.CaptureFixture[str], org: str, repo: str, shown: str
+) -> None:
+    settings = mock_settings.model_copy(update={"github_default_org": org, "github_default_repo": repo})
+    _print_welcome(settings, "model-x", "provider-x")
+    out = capsys.readouterr().out
+    assert f"  Repo:    {shown}\n" in out
+    assert "acme/acme" not in out

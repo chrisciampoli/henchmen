@@ -42,16 +42,20 @@ if the configuration changes in between.
    ``github_app_installation_id`` (an installation belongs to one App) and, when
    the new App has none, the old webhook secret. If this write fails, the new
    key file is deleted again;
-4. the App slug and owner in ``server_choices`` -- display values only, so a
+4. the GitHub step is marked incomplete (``record_step_incomplete``): the new
+   App has no installation or verified repository yet;
+5. the App slug and owner in ``server_choices`` -- display values only, so a
    failure is logged and the browser still goes on to install the App.
 
 ``installed`` (GitHub's return from the install page) consumes an
 ``INSTALL_PURPOSE`` state and uses only the GitHub URLs bound into it. It never
 trusts the ``installation_id`` query parameter: it reads
 ``/app/installations/{id}`` with this App's JWT and requires GitHub's answer to
-name this App (``app_id``/``app_slug``) before one atomic ``ConfigStore.update``
-saves the id. ``setup_action=request`` (an organisation owner must approve)
-saves nothing and sends the UI to its waiting state.
+name this App (its ``app_id``, or its slug only when GitHub sends no id) before
+one atomic ``ConfigStore.update`` saves the id. Saving a *different*
+installation id (here or in Check again) marks the step incomplete.
+``setup_action=request`` (an organisation owner must approve) saves nothing and
+sends the UI to its waiting state.
 
 The session routes resolve the GitHub URLs fresh on every call:
 
@@ -78,7 +82,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -212,7 +216,10 @@ async def status(config: ConfigDep, setup: SetupDep) -> StepSuccess:
             "installed": config.is_set(INSTALLATION_ID_KEY),
             "default_repo": config.get(DEFAULT_REPO_KEY),
             "private_key": CONFIGURED if created else "",
-            "completed": STEP in state.completed_steps,
+            # A recorded completion counts only while what it verified is still configured.
+            "completed": STEP in state.completed_steps
+            and config.is_set(INSTALLATION_ID_KEY)
+            and config.is_set(DEFAULT_REPO_KEY),
         },
     )
 
@@ -353,7 +360,14 @@ async def manifest_callback(
                 _remove_quietly(key_path)
             states.consume(github_app.INSTALL_PURPOSE, install_state)
             return back_to_console(github_error=ERROR_STORAGE)
-    # 4. Display-only values: the App is stored, so a failure here must not strand the user.
+    # 4. A new App has no installation or verified repository yet: the step is no longer complete.
+    try:
+        setup.record_step_incomplete(STEP)
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not reopen the GitHub step for App %s (%s)", conversion.slug, type(exc).__name__)
+        states.consume(github_app.INSTALL_PURPOSE, install_state)
+        return back_to_console(github_error=ERROR_STORAGE)
+    # 5. Display-only values: the App is stored, so a failure here must not strand the user.
     try:
         setup.set_server_choices({SLUG_CHOICE: conversion.slug, ACCOUNT_CHOICE: conversion.owner_login})
     except (OSError, ValueError) as exc:
@@ -454,6 +468,21 @@ def _record_account(setup: SetupStateStore, installation: github_app.Installatio
         logger.warning("Could not record the GitHub account name (%s)", type(exc).__name__)
 
 
+def _save_installation(config: ConfigStore, setup: SetupStateStore, installation_id: str) -> None:
+    """Save the installation id atomically; a *different* id un-completes the step.
+
+    The default repository was verified against the previous installation, so
+    the step must be completed again for the new one. Raises on a failed write
+    (the caller fails closed).
+    """
+    with config.locked():
+        previous = config.get(INSTALLATION_ID_KEY).strip()
+        if previous != installation_id:
+            config.update({INSTALLATION_ID_KEY: installation_id}, section=CONFIG_SECTION)
+    if previous != installation_id:
+        setup.record_step_incomplete(STEP)
+
+
 def _installation_context(
     config: ConfigStore, http: HttpClientFactory, seeded_env: dict[str, str]
 ) -> tuple[github_app.GitHubEndpoints, GitHubCredentialsProvider] | StepFailure:
@@ -492,9 +521,9 @@ async def installed(
     setup: SetupDep,
     states: StatesDep,
     http: HttpDep,
-    installation_id: str = "",
-    setup_action: str = "",
-    state: str = "",
+    installation_id: Annotated[str, Query(max_length=32)] = "",
+    setup_action: Annotated[str, Query(max_length=32)] = "",
+    state: Annotated[str, Query(max_length=512)] = "",
 ) -> RedirectResponse:
     """Public: GitHub's return from the install page; verify the installation is this App's, then save it."""
     data = states.consume(github_app.INSTALL_PURPOSE, state)
@@ -529,7 +558,7 @@ async def installed(
         logger.warning("Refused GitHub installation %s: GitHub does not list it as this App's", installation_id)
         return back_to_console(github_error=ERROR_INSTALLATION)
     try:
-        config.update({INSTALLATION_ID_KEY: installation.installation_id}, section=CONFIG_SECTION)
+        _save_installation(config, setup, installation.installation_id)
     except (OSError, ConfigStoreError, ValueError) as exc:
         logger.warning("Could not save GitHub App installation %s (%s)", installation_id, type(exc).__name__)
         return back_to_console(github_error=ERROR_STORAGE)
@@ -599,7 +628,7 @@ async def check_installation(
             message = "Henchmen is not installed on your GitHub account yet."
         return step_failed(STEP, StepProblem(message=message, action=_install_request(endpoints.web_url, slug)))
     try:
-        config.update({INSTALLATION_ID_KEY: chosen.installation_id}, section=CONFIG_SECTION)
+        _save_installation(config, setup, chosen.installation_id)
     except (OSError, ConfigStoreError, ValueError) as exc:
         logger.warning("Could not save GitHub App installation %s (%s)", chosen.installation_id, type(exc).__name__)
         return step_failed(STEP, _storage_problem())
@@ -619,7 +648,7 @@ async def repositories(
     try:
         token = await provider.token_async()
         async with http() as client:
-            found = await github_app.list_installation_repositories(client, endpoints.api_url, token)
+            listing = await github_app.list_installation_repositories(client, endpoints.api_url, token)
     except GitHubAuthError as exc:
         return step_failed(STEP, _credentials_problem(exc))
     except github_app.GitHubAppApiError as exc:
@@ -627,7 +656,8 @@ async def repositories(
     return StepSuccess(
         step=STEP,
         details={
-            "repositories": [repository.model_dump() for repository in found],
+            "repositories": [repository.model_dump() for repository in listing.repositories],
+            "truncated": listing.truncated,
             "account": setup.load().server_choices.get(ACCOUNT_CHOICE, ""),
         },
     )
@@ -680,9 +710,14 @@ async def choose_repository(
     try:
         token = await provider.token_async()
         async with http() as client:
-            found = await github_app.list_installation_repositories(client, endpoints.api_url, token)
+            listing = await github_app.list_installation_repositories(client, endpoints.api_url, token)
             # Validated against GitHub's list, and saved in GitHub's spelling -- never the client's.
-            match = next((item for item in found if item.full_name.lower() == body.repo.lower()), None)
+            match = next((item for item in listing.repositories if item.full_name.lower() == body.repo.lower()), None)
+            if match is None and listing.truncated:
+                # Beyond the bounded listing: GitHub must confirm the installation sees exactly this repository.
+                match = await github_app.get_installation_repository(
+                    client, endpoints.api_url, token, body.repo, installation.account_login
+                )
             if match is not None:
                 if github_app.is_valid_slug(installation.app_slug):
                     slug = installation.app_slug
