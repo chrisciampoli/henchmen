@@ -121,17 +121,23 @@ def resolve_github_endpoints(
 ) -> GitHubEndpoints:
     """The GitHub endpoints the configuration names right now (uncached); :class:`EndpointError` if invalid."""
     file_keys: set[str] = set()
-    if config_file is not None and config_file.is_file():
-        try:
+    try:
+        if config_file is not None and config_file.is_file():
             file_keys = {str(key).upper() for key in dotenv_values(config_file)}
-        except OSError:
-            file_keys = set()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise EndpointError(
+            GITHUB_ENDPOINT_FIELDS[0], f"could not be read from the configuration file ({type(exc).__name__})"
+        ) from None
     seeded = {key.upper() for key in (seeded_env or {})}
     masked = frozenset(field for field in GITHUB_ENDPOINT_FIELDS if f"HENCHMEN_{field.upper()}" in seeded & file_keys)
     settings_cls = _endpoint_settings_class(masked)
     env_file = str(config_file) if config_file is not None else None
     try:
         resolved = settings_cls(_env_file=env_file)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise EndpointError(
+            GITHUB_ENDPOINT_FIELDS[0], f"could not be read from the configuration file ({type(exc).__name__})"
+        ) from None
     except ValidationError as exc:
         error = exc.errors(include_url=False, include_input=False)[0]
         field = str(error["loc"][0]) if error["loc"] else GITHUB_ENDPOINT_FIELDS[0]

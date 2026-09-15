@@ -35,8 +35,8 @@ if the configuration changes in between.
 2. the private key in ``secrets/github-app-<app id>.pem``
    (``ConfigStore.write_secret_file``: 0600, atomic). A reconnect never
    overwrites the key the running process still signs with; key files no
-   configuration references are removed at apply
-   (:func:`github_app.remove_unreferenced_app_keys`);
+   configuration references are removed at the next run-mode start, before
+   any service is built (:func:`github_app.remove_unused_app_keys_at_startup`);
 3. one atomic ``ConfigStore.update`` setting ``github_app_id``,
    ``github_app_private_key_path`` and ``github_webhook_secret`` and removing
    ``github_app_installation_id`` (an installation belongs to one App) and, when

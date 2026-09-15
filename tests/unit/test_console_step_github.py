@@ -593,3 +593,23 @@ def test_status_after_the_app_is_created(tmp_path: Path, github: FakeGitHub) -> 
     assert details["private_key"] == "configured"
     for secret in _secret_texts():
         assert secret not in response.text
+
+
+def test_an_unreadable_config_file_fails_the_manifest_instead_of_a_500(
+    tmp_path: Path, github: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from henchmen.utils import endpoints
+
+    _write_config(tmp_path, "HENCHMEN_GITHUB_WEB_URL=https://ghe.example.test\n")
+    harness = _harness(tmp_path, github)
+
+    def denied(*args: object, **kwargs: object) -> dict[str, str]:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(endpoints, "dotenv_values", denied)
+    response = harness.post(f"{BASE}/manifest", {"account_type": "personal"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    assert body["problems"][0]["field"] == "github_api_url"
+    assert not harness.app.state.callback_states.path.exists()

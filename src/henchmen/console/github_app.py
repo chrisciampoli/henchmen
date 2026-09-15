@@ -180,6 +180,27 @@ def remove_unreferenced_app_keys(secrets_dir: Path, referenced: Iterable[str | P
     return removed
 
 
+def remove_unused_app_keys_at_startup(config_file: Path, secrets_dir: Path, effective_key_path: str) -> list[Path]:
+    """Run-mode startup housekeeping: remove GitHub App keys that nothing references any more.
+
+    Called by ``henchmen serve`` once, before any service is built -- so no
+    running process can still be signing with a key this removes (a reconnect
+    leaves the previous App's ``github-app-<id>.pem`` behind until then). Keeps
+    the key named by the config file's ``HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH``
+    and by the effective ``Settings.github_app_private_key_path`` (the
+    environment can outrank the file). Never raises: a problem is logged and
+    nothing is removed.
+    """
+    from henchmen.cli.envfile import EnvFile
+
+    try:
+        file_reference = EnvFile.load(config_file).get("HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH")
+        return remove_unreferenced_app_keys(secrets_dir, [file_reference, effective_key_path])
+    except Exception as exc:  # housekeeping must never stop the server from starting
+        logger.warning("Could not clean up unused GitHub App keys (%s)", type(exc).__name__)
+        return []
+
+
 def _is_rsa_private_key(pem: str) -> bool:
     """True when ``pem`` parses as an unencrypted RSA private key (GitHub App keys are RSA)."""
     try:
