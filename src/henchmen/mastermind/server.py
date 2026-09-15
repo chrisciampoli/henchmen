@@ -28,6 +28,7 @@ import henchmen.schemes.goal_decomposition  # noqa: F401
 from henchmen.config.settings import get_settings
 from henchmen.dispatch.pubsub_auth import require_internal_caller, verify_operative_report, verify_pubsub_oidc
 from henchmen.mastermind.agent import MastermindAgent
+from henchmen.mastermind.internal_api import router as internal_router
 from henchmen.mastermind.scheme_executor import validate_deterministic_handlers
 from henchmen.models.task import HenchmenTask
 from henchmen.observability.api import create_metrics_router, require_metrics_auth
@@ -148,6 +149,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Henchmen Mastermind", description="Task orchestration engine", lifespan=lifespan)
+
+# Task-scoped operative routes (desktop installs only; 404 elsewhere).
+app.include_router(internal_router)
 
 
 async def _acquire_watchdog_lease(

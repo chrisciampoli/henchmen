@@ -79,6 +79,11 @@ class ProviderRegistry:
 
             return DynamoDBDocumentStore(self._settings)
         if name == "local":
+            if self._settings.operative_task_token.strip():
+                # An operative launched by a desktop install: task state over HTTP, never the data volume.
+                from henchmen.providers.local.http_store import HttpDocumentStore
+
+                return HttpDocumentStore(self._settings)
             from henchmen.providers.local.sqlite import SQLiteDocumentStore
 
             return SQLiteDocumentStore(self._settings)
