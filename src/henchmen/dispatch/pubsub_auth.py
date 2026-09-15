@@ -22,11 +22,12 @@ The verifier:
 - uses ``google.oauth2.id_token.verify_oauth2_token`` to validate the signature
 - checks the ``aud`` claim matches the configured audience (the service URL)
 - optionally checks the ``email`` claim is in an allow-list of publisher SAs
-- in DEV on a repository checkout, logs a warning and allows the request
-  through if verification is not configured (so that local
-  ``docker-compose`` and the in-memory broker continue to work) — never on a
-  desktop (data-directory) install; see :mod:`henchmen.config.posture`
-- in STAGING/PROD, and on every desktop install, any verification failure raises 401
+- when fail-open is allowed (``HENCHMEN_ENVIRONMENT=dev`` on a repository
+  checkout, see :func:`henchmen.config.posture.fail_open_allowed`), logs a
+  warning and allows the request through if verification is not configured
+  (so that local ``docker-compose`` and the in-memory broker continue to
+  work) — never on a desktop (data-directory) install
+- otherwise (STAGING, PROD and every desktop install) any verification failure raises 401
 """
 
 from __future__ import annotations
@@ -49,8 +50,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # A real OperativeReport, base64-encoded inside a Pub/Sub-style envelope, is
-# normally a few KB; ``git_diff`` can be sizable for a large change. 4 MiB is
-# generous headroom for that while still bounding memory use per request.
+# normally a few KB; ``git_diff`` is capped by the operative
+# (``henchmen.operative.bootstrap.MAX_REPORT_GIT_DIFF_BYTES``, 512 KiB). 4 MiB is
+# generous headroom for that while still bounding memory use per request. A
+# larger body is answered 413 once the bearer's shape is valid.
 MAX_OPERATIVE_REPORT_BYTES = 4 * 1024 * 1024
 
 # HMAC-SHA256 hex digest: exactly 64 lowercase hex characters. Anything else
@@ -60,8 +63,13 @@ MAX_OPERATIVE_REPORT_BYTES = 4 * 1024 * 1024
 _TASK_TOKEN_FORMAT = re.compile(r"^[0-9a-f]{64}$")
 
 
-def _split_bearer(header_value: str | None) -> str | None:
-    """Extract the bearer token from an Authorization header value."""
+def split_bearer(header_value: str | None) -> str | None:
+    """Extract the bearer token from an Authorization header value.
+
+    The one bearer parser in Henchmen: the scheme is matched case-insensitively
+    (RFC 7235) and separated from the token by any whitespace; a missing
+    header, another scheme or an empty token is ``None``.
+    """
     if not header_value:
         return None
     parts = header_value.split(None, 1)
@@ -70,7 +78,7 @@ def _split_bearer(header_value: str | None) -> str | None:
     return parts[1].strip() or None
 
 
-def _load_desktop_internal_auth() -> InternalAuth | None:
+def load_desktop_internal_auth() -> InternalAuth | None:
     """``desktop_internal_auth()``, turned into a 503 (never an unhandled 500) on a secrets I/O failure.
 
     A permissions problem or a full disk while reading or creating the internal secret files under
@@ -85,37 +93,20 @@ def _load_desktop_internal_auth() -> InternalAuth | None:
         raise HTTPException(status_code=503, detail="Internal credentials unavailable") from exc
 
 
-def local_push_auth(settings: Settings) -> InternalAuth | None:
-    """This install's internal push credentials, for a desktop install on any broker provider.
-
-    A thin alias of :func:`desktop_internal_auth` (via :func:`_load_desktop_internal_auth`), kept so
-    callers that already carry a ``Settings`` instance (:func:`verify_pubsub_oidc`) have a single
-    name to call. ``settings`` is accepted only for that interface convenience and is never
-    consulted: ``henchmen serve`` always wires the shared in-memory broker as the transport for
-    every desktop install's ``/pubsub/*`` pushes, whatever ``message_broker_provider`` resolves to
-    in ``henchmen.env`` -- a desktop install naming a cloud broker there does not mean Google
-    Pub/Sub, rather than this process's own broker, is what actually delivers the push. So a
-    desktop install accepts *only* the internal push token here, never OIDC or the DEV fail-open,
-    regardless of its broker setting (controller ruling).
-    """
-    return _load_desktop_internal_auth()
-
-
 async def require_internal_caller(request: Request) -> None:
-    """FastAPI dependency guarding Henchmen's own maintenance routes (amendment A8).
+    """FastAPI dependency guarding Henchmen's own maintenance routes (amendment B8).
 
     In the cloud these routes (watchdog, DLQ check, cleanup, merge-queue tick)
     are invoked by Cloud Scheduler behind Cloud Run IAM, which this dependency
-    leaves unchanged. On *every* desktop install -- whatever the message
-    broker provider resolves to -- anyone who can reach the port can otherwise
-    call them, so the check is based on :func:`desktop_internal_auth` directly
-    rather than on :func:`local_push_auth`. Without a data directory this is a
-    no-op.
+    leaves unchanged. On a desktop install anyone who can reach the port could
+    otherwise call them, so there they require the internal push token,
+    whatever the message broker provider resolves to. Without a data
+    directory this is a no-op.
     """
-    internal = _load_desktop_internal_auth()
+    internal = load_desktop_internal_auth()
     if internal is None:
         return
-    if not internal.verify_push_token(_split_bearer(request.headers.get("Authorization"))):
+    if not internal.verify_push_token(split_bearer(request.headers.get("Authorization"))):
         logger.warning(
             "[pubsub-auth] Desktop install: refusing maintenance request without the internal push token from %s",
             request.client.host if request.client else "unknown",
@@ -134,10 +125,13 @@ async def verify_pubsub_oidc(request: Request, settings: Settings) -> None:
     except that a request with no audience configured and no token is let
     through with a logged warning when ``fail_open_allowed(settings)`` is
     true (dev, and not a desktop install) so local dev loops (in-memory
-    broker, docker-compose) keep working. A desktop install never reaches
-    this function for a push at all -- :func:`verify_operative_report` and
-    :func:`verify_pubsub_oidc`'s own internal-push-token branch above handle
-    it first.
+    broker, docker-compose) keep working.
+
+    On a desktop install the only valid caller is this server's own shared
+    in-memory broker, whatever ``message_broker_provider`` resolves to
+    (``henchmen serve`` always wires that broker as the transport), so this
+    function accepts only the internal push token there and never reaches
+    the OIDC or fail-open branches below.
 
     Settings consumed:
 
@@ -153,13 +147,13 @@ async def verify_pubsub_oidc(request: Request, settings: Settings) -> None:
     allowed_emails = {e.strip() for e in allowed_raw.split(",") if e.strip()}
     env = settings.environment
 
-    token = _split_bearer(request.headers.get("Authorization"))
+    token = split_bearer(request.headers.get("Authorization"))
 
     # Any desktop install, whatever the message broker provider resolves to:
     # the only valid caller is this server's own shared broker, which carries
     # the internal push token. No OIDC, no fail-open, and an operative's task
     # token is not accepted here.
-    internal = local_push_auth(settings)
+    internal = load_desktop_internal_auth()
     if internal is not None:
         if internal.verify_push_token(token):
             request.state.pubsub_internal_caller = True
@@ -170,12 +164,13 @@ async def verify_pubsub_oidc(request: Request, settings: Settings) -> None:
         )
         raise HTTPException(status_code=401, detail="Missing or invalid internal push token")
 
-    # Development escape hatch: in DEV, if no audience is configured and no
-    # token is present, we assume the caller is the local in-memory broker
-    # and log a loud warning. STAGING/PROD never take this path.
+    # Development escape hatch: when fail-open is allowed (dev on a repository
+    # checkout), if no audience is configured and no token is present, we assume
+    # the caller is the local in-memory broker and log a loud warning. STAGING,
+    # PROD and desktop installs never take this path.
     if fail_open_allowed(settings) and not audience and not token:
         logger.warning(
-            "[pubsub-auth] DEV mode: allowing unauthenticated /pubsub/* request from %s — "
+            "[pubsub-auth] Fail-open (dev checkout): allowing unauthenticated /pubsub/* request from %s — "
             "configure HENCHMEN_PUBSUB_OIDC_AUDIENCE to enforce verification",
             request.client.host if request.client else "unknown",
         )
@@ -203,9 +198,9 @@ async def verify_pubsub_oidc(request: Request, settings: Settings) -> None:
         from google.oauth2 import id_token
     except ImportError as exc:
         logger.error("[pubsub-auth] google-auth not available: %s", exc)
-        # In DEV we still let the request through with a warning.
+        # Only when fail-open is allowed (dev checkout) is the request still let through.
         if fail_open_allowed(settings):
-            logger.warning("[pubsub-auth] DEV mode: google-auth missing; skipping OIDC verification")
+            logger.warning("[pubsub-auth] Fail-open (dev checkout): google-auth missing; skipping OIDC verification")
             return
         raise HTTPException(status_code=500, detail="OIDC verifier unavailable") from exc
 
@@ -231,7 +226,16 @@ async def verify_pubsub_oidc(request: Request, settings: Settings) -> None:
     request.state.pubsub_oidc_claims = claims
 
 
-async def _read_capped_body(request: Request, max_bytes: int) -> None:
+def _body_too_large(request: Request, max_bytes: int) -> HTTPException:
+    logger.warning(
+        "[pubsub-auth] Desktop install: refusing an operative request body over %d bytes from %s",
+        max_bytes,
+        request.client.host if request.client else "unknown",
+    )
+    return HTTPException(status_code=413, detail="Operative report body too large")
+
+
+async def read_capped_body(request: Request, max_bytes: int) -> None:
     """Read *request*'s body from the raw ASGI stream, rejecting past ``max_bytes``.
 
     Reading via :meth:`Request.stream` rather than :meth:`Request.body` means an
@@ -260,12 +264,7 @@ async def _read_capped_body(request: Request, max_bytes: int) -> None:
         async for chunk in request.stream():
             total += len(chunk)
             if total > max_bytes:
-                logger.warning(
-                    "[pubsub-auth] Desktop install: refusing an operative report body over %d bytes from %s",
-                    max_bytes,
-                    request.client.host if request.client else "unknown",
-                )
-                raise HTTPException(status_code=401, detail="Operative report body too large")
+                raise _body_too_large(request, max_bytes)
             chunks.append(chunk)
     except ClientDisconnect as exc:
         logger.debug(
@@ -307,18 +306,19 @@ async def verify_operative_report(request: Request, settings: Settings) -> None:
     The body is never read for a caller that cannot possibly be a legitimate
     operative: a missing bearer, or one that is neither the push token nor
     shaped like a task token (64 lowercase hex characters -- an HMAC-SHA256
-    hex digest), is rejected before any body access at all. Once the shape
-    checks out, an oversized body is rejected by ``Content-Length`` when
-    present, and unconditionally by :func:`_read_capped_body` while streaming
-    -- so a request with no credentials, or with a malformed one, can never
-    make the server buffer or JSON-parse an unbounded body.
+    hex digest), is rejected (401) before any body access at all. Once the
+    shape checks out, an oversized body is rejected (413) by
+    ``Content-Length`` when present, and unconditionally by
+    :func:`read_capped_body` while streaming -- so a request with no
+    credentials, or with a malformed one, can never make the server buffer or
+    JSON-parse an unbounded body.
     """
     client_host = request.client.host if request.client else "unknown"
-    internal = local_push_auth(settings)
+    internal = load_desktop_internal_auth()
     if internal is None:
         await verify_pubsub_oidc(request, settings)
         return
-    token = _split_bearer(request.headers.get("Authorization"))
+    token = split_bearer(request.headers.get("Authorization"))
     if internal.verify_push_token(token):
         request.state.pubsub_internal_caller = True
         return
@@ -336,14 +336,9 @@ async def verify_operative_report(request: Request, settings: Settings) -> None:
         except ValueError:
             declared_length = None
         if declared_length is not None and declared_length > MAX_OPERATIVE_REPORT_BYTES:
-            logger.warning(
-                "[pubsub-auth] Desktop install: refusing an operative report declaring %s bytes from %s",
-                content_length,
-                client_host,
-            )
-            raise HTTPException(status_code=401, detail="Operative report body too large")
+            raise _body_too_large(request, MAX_OPERATIVE_REPORT_BYTES)
 
-    await _read_capped_body(request, MAX_OPERATIVE_REPORT_BYTES)
+    await read_capped_body(request, MAX_OPERATIVE_REPORT_BYTES)
 
     task_id = await _reported_task_id(request)
     if task_id and internal.verify_task_token(task_id, token):

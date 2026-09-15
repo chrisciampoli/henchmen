@@ -28,7 +28,6 @@ fail closed with 401 in STAGING, PROD and on every desktop install.
 """
 
 import logging
-import secrets
 from collections.abc import Callable, Coroutine
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -36,6 +35,8 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 
+from henchmen.config.secret_files import tokens_match
+from henchmen.dispatch.pubsub_auth import split_bearer
 from henchmen.observability.tracker import SUCCESS_STATUSES
 
 if TYPE_CHECKING:
@@ -160,22 +161,20 @@ _MetricsAuthDependency = Callable[..., Coroutine[Any, Any, None]]
 def build_metrics_auth_dependency(settings: "Settings") -> _MetricsAuthDependency:
     """Return the FastAPI dependency guarding the /metrics router.
 
-    Fail-closed: an unset token means "open" only in DEV on a repository
-    checkout, never in STAGING, PROD or on a desktop install. The token itself
-    is never logged.
+    Fail-closed: an unset token means "open" only when
+    ``fail_open_allowed(settings)`` (dev on a repository checkout), never in
+    STAGING, PROD or on a desktop install. The token itself is never logged.
     """
-    from henchmen.config.paths import is_desktop_install
+    from henchmen.config.posture import fail_open_allowed
 
     return _build_metrics_auth(
-        (settings.metrics_auth_token or "").strip(), settings.environment.value, is_desktop_install()
+        (settings.metrics_auth_token or "").strip(), settings.environment.value, fail_open_allowed(settings)
     )
 
 
-def _build_metrics_auth(token: str, environment: str, desktop: bool) -> _MetricsAuthDependency:
-    from henchmen.config.settings import Environment
-
+def _build_metrics_auth(token: str, environment: str, fail_open: bool) -> _MetricsAuthDependency:
     if not token:
-        if environment in (Environment.STAGING.value, Environment.PROD.value) or desktop:
+        if not fail_open:
 
             async def _deny(authorization: str = Header(default="")) -> None:
                 raise HTTPException(
@@ -202,10 +201,8 @@ def _build_metrics_auth(token: str, environment: str, desktop: bool) -> _Metrics
 
         return _allow
 
-    expected = f"Bearer {token}"
-
     async def _require_bearer(authorization: str = Header(default="")) -> None:
-        if not secrets.compare_digest(authorization.strip(), expected):
+        if not tokens_match(split_bearer(authorization), token):
             raise HTTPException(
                 status_code=401,
                 detail="Invalid or missing bearer token for /metrics.",
@@ -227,12 +224,12 @@ async def require_metrics_auth(authorization: str = Header(default="")) -> None:
     time (``@app.get(..., dependencies=[Depends(require_metrics_auth)])``) and
     applies exactly the bearer-token rules of the ``/metrics`` router.
     """
-    from henchmen.config.paths import is_desktop_install
+    from henchmen.config.posture import fail_open_allowed
     from henchmen.config.settings import get_settings
 
     settings = get_settings()
     check = _cached_metrics_auth(
-        (settings.metrics_auth_token or "").strip(), settings.environment.value, is_desktop_install()
+        (settings.metrics_auth_token or "").strip(), settings.environment.value, fail_open_allowed(settings)
     )
     await check(authorization)
 

@@ -790,6 +790,7 @@ def _serve_data_dir(
             store=store,
             auth=auth,
             config_file=paths.config_file(),
+            secrets_dir=secrets_dir,
             on_apply=restart.request,
             seeded_env=seeded_env,
             problems=problems,

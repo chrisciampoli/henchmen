@@ -26,6 +26,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from henchmen.config.posture import is_desktop_posture
+from henchmen.observability.tracker import TASK_EXECUTIONS_COLLECTION
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -33,7 +34,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_COLLECTION = "task_executions"
 _COST_FIELD = "estimated_cost_usd"
 
 
@@ -74,7 +74,7 @@ class TaskCostAccumulator:
         if self._loaded:
             return
         try:
-            doc = await self._store.get(_COLLECTION, self._task_id)
+            doc = await self._store.get(TASK_EXECUTIONS_COLLECTION, self._task_id)
             if doc is not None:
                 self._total_usd = float(doc.get(_COST_FIELD, 0.0) or 0.0)
         except Exception as exc:

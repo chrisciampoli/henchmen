@@ -215,7 +215,7 @@ class TestPubsubOnDesktop:
 
     @pytest.mark.asyncio
     async def test_secrets_directory_failure_is_a_503_not_a_crash(
-        self, desktop, monkeypatch: pytest.MonkeyPatch
+        self, desktop, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Ruling: an OSError loading the internal auth inside a request fails closed as 503, and
         the log line never carries secret content."""
@@ -226,10 +226,12 @@ class TestPubsubOnDesktop:
 
         monkeypatch.setattr(pubsub_auth_module, "desktop_internal_auth", _boom)
         request = _request({"Authorization": f"Bearer {desktop.push_token}"})
-        with pytest.raises(HTTPException) as exc:
+        with caplog.at_level("ERROR", logger="henchmen.dispatch.pubsub_auth"), pytest.raises(HTTPException) as exc:
             await pubsub_auth_module.verify_pubsub_oidc(request, _settings())
         assert exc.value.status_code == 503
         assert desktop.push_token not in str(exc.value.detail)
+        assert "permission denied" in caplog.text
+        assert desktop.push_token not in caplog.text
 
 
 class TestMaintenanceGuardIgnoresBrokerProvider:
@@ -266,7 +268,7 @@ class TestMaintenanceGuardIgnoresBrokerProvider:
 
     @pytest.mark.asyncio
     async def test_secrets_directory_failure_is_a_503_not_a_crash(
-        self, desktop, monkeypatch: pytest.MonkeyPatch
+        self, desktop, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         import henchmen.dispatch.pubsub_auth as pubsub_auth_module
 
@@ -274,12 +276,14 @@ class TestMaintenanceGuardIgnoresBrokerProvider:
             raise OSError("permission denied")
 
         monkeypatch.setattr(pubsub_auth_module, "desktop_internal_auth", _boom)
-        with pytest.raises(HTTPException) as exc:
+        with caplog.at_level("ERROR", logger="henchmen.dispatch.pubsub_auth"), pytest.raises(HTTPException) as exc:
             await pubsub_auth_module.require_internal_caller(
                 _request({"Authorization": f"Bearer {desktop.push_token}"})
             )
         assert exc.value.status_code == 503
         assert desktop.push_token not in str(exc.value.detail)
+        assert "permission denied" in caplog.text
+        assert desktop.push_token not in caplog.text
 
 
 def _report_body(task_id: str) -> bytes:
@@ -353,7 +357,7 @@ class TestOperativeReportAuth:
         }
         with pytest.raises(HTTPException) as exc:
             await verify_operative_report(_forbidden_read_request(headers), _settings())
-        assert exc.value.status_code == 401
+        assert exc.value.status_code == 413
 
     @pytest.mark.asyncio
     async def test_oversized_body_is_rejected_while_streaming_without_content_length(
@@ -367,6 +371,16 @@ class TestOperativeReportAuth:
         request = _streaming_request(headers, [b"01234567", b"89"])
         with pytest.raises(HTTPException) as exc:
             await pubsub_auth_module.verify_operative_report(request, _settings())
+        assert exc.value.status_code == 413
+
+    @pytest.mark.asyncio
+    async def test_an_oversized_body_without_a_valid_bearer_shape_is_still_401(self, desktop) -> None:
+        """413 is only for a caller whose bearer already looks right; anyone else learns nothing more."""
+        from henchmen.dispatch.pubsub_auth import MAX_OPERATIVE_REPORT_BYTES, verify_operative_report
+
+        headers = {"Authorization": "Bearer not-a-task-token", "Content-Length": str(MAX_OPERATIVE_REPORT_BYTES + 1)}
+        with pytest.raises(HTTPException) as exc:
+            await verify_operative_report(_forbidden_read_request(headers), _settings())
         assert exc.value.status_code == 401
 
     @pytest.mark.asyncio
@@ -437,3 +451,67 @@ def test_operative_task_token_json_repr_is_redacted() -> None:
     assert token not in redacted
     assert '"HENCHMEN_OPERATIVE_TASK_TOKEN":"***REDACTED***"' in redacted
     assert '"task_id":"task-1"' in redacted
+
+
+def test_bearer_redaction_never_spans_a_line_break() -> None:
+    """D6: only spaces and tabs separate the scheme from the token; a word "bearer" ending a
+    line must not swallow whatever the next line starts with."""
+    line = "the bearer\nof_this_long_identifier_value_stays_visible"
+    assert redact(line) == line
+
+
+@pytest.mark.asyncio
+async def test_google_auth_missing_on_a_desktop_install_is_refused_not_fail_open(
+    desktop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D2: a desktop install never reaches the OIDC verifier, so a missing google-auth can never open it."""
+    import builtins
+
+    from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
+
+    real_import = builtins.__import__
+
+    def _no_google(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name.startswith("google"):
+            raise ImportError("google-auth is not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_google)
+    oidc_looking = "eyJhbGciOiJSUzI1NiJ9." + "e" * 40 + "." + "s" * 40
+    settings = _settings(message_broker_provider="gcp", pubsub_oidc_audience="https://x")
+    with pytest.raises(HTTPException) as exc:
+        await verify_pubsub_oidc(_request({"Authorization": f"Bearer {oidc_looking}"}), settings)
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_google_auth_missing_outside_fail_open_is_a_500(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D2 companion: off a desktop install and outside dev, a missing verifier is a 500, never a pass."""
+    import builtins
+
+    from henchmen.config.settings import Environment
+    from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
+
+    monkeypatch.delenv("HENCHMEN_DATA_DIR", raising=False)
+    real_import = builtins.__import__
+
+    def _no_google(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name.startswith("google"):
+            raise ImportError("google-auth is not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_google)
+    settings = _settings(environment=Environment.STAGING, gcp_project_id="p", pubsub_oidc_audience="https://x")
+    with pytest.raises(HTTPException) as exc:
+        await verify_pubsub_oidc(_request({"Authorization": "Bearer abc.def.ghi"}), settings)
+    assert exc.value.status_code == 500
+
+
+def test_split_bearer_is_the_shared_parser() -> None:
+    from henchmen.dispatch.pubsub_auth import split_bearer
+
+    assert split_bearer("Bearer abc") == "abc"
+    assert split_bearer("bearer   abc  ") == "abc"
+    assert split_bearer("Basic abc") is None
+    assert split_bearer("Bearer ") is None
+    assert split_bearer(None) is None

@@ -59,8 +59,10 @@ def routes(internal: InternalAuth) -> Iterator[tuple[TestClient, MagicMock]]:
     store = MagicMock()
     store.get = AsyncMock(return_value={"estimated_cost_usd": 2.5, "task_payload": {"title": "not for operatives"}})
     store.update = AsyncMock()
+    store.update_if = AsyncMock(return_value=True)
     agent = MagicMock()
     agent.tracker._store = store
+    agent.lair_manager.accepts_report_from = MagicMock(return_value=True)
     with patch.object(server, "get_agent", return_value=agent):
         yield TestClient(server.app, raise_server_exceptions=False), store
 
@@ -96,7 +98,7 @@ class TestRoutes:
             assert resp.status_code == 401
             assert resp.headers["WWW-Authenticate"] == "Bearer"
         store.get.assert_not_awaited()
-        store.update.assert_not_awaited()
+        store.update_if.assert_not_awaited()
 
     def test_heartbeat_is_stamped_by_the_server(self, routes, internal) -> None:
         client, store = routes
@@ -106,8 +108,9 @@ class TestRoutes:
             json={"last_heartbeat": "2999-01-01T00:00:00+00:00"},
         )
         assert resp.status_code == 204
-        collection, task_id, fields = store.update.await_args.args
+        collection, task_id, field, expected, fields = store.update_if.await_args.args
         assert (collection, task_id, list(fields)) == ("task_executions", TASK, ["last_heartbeat"])
+        assert (field, expected) == ("execution_state", None)
         stamped = datetime.fromisoformat(fields["last_heartbeat"])
         assert stamped.tzinfo is not None and stamped.year < 2999
 
@@ -120,7 +123,7 @@ class TestRoutes:
             content=report.model_dump_json(),
         )
         assert resp.status_code == 204
-        _, _, fields = store.update.await_args.args
+        _, _, _, _, fields = store.update_if.await_args.args
         assert set(fields) == {"interrupted_node_id", "interrupted_at", "interrupted_report", "execution_state"}
         assert fields["interrupted_node_id"] == "implement_fix"
         assert fields["execution_state"] == "interrupted"
@@ -137,7 +140,7 @@ class TestRoutes:
             f"/internal/tasks/{TASK}/interrupted-report", headers=_auth(internal), content=report.model_dump_json()
         )
         assert resp.status_code == 422
-        store.update.assert_not_awaited()
+        store.update_if.assert_not_awaited()
 
     def test_authentication_is_checked_before_the_body(self, routes) -> None:
         client, _ = routes
@@ -185,7 +188,7 @@ class TestRoutes:
         store.get.return_value = None
         resp = client.post(f"/internal/tasks/{TASK}/heartbeat", headers=_auth(internal))
         assert resp.status_code == 404
-        store.update.assert_not_awaited()
+        store.update_if.assert_not_awaited()
 
     @pytest.mark.parametrize("state", ["completed", "escalated"])
     def test_heartbeat_on_a_finished_task_is_409(self, routes, internal, state: str) -> None:
@@ -193,7 +196,7 @@ class TestRoutes:
         store.get.return_value = {"execution_state": state}
         resp = client.post(f"/internal/tasks/{TASK}/heartbeat", headers=_auth(internal))
         assert resp.status_code == 409
-        store.update.assert_not_awaited()
+        store.update_if.assert_not_awaited()
 
     def test_interrupted_report_missing_task_document_is_404(self, routes, internal) -> None:
         client, store = routes
@@ -204,7 +207,7 @@ class TestRoutes:
             content=_report().model_dump_json(),
         )
         assert resp.status_code == 404
-        store.update.assert_not_awaited()
+        store.update_if.assert_not_awaited()
 
     @pytest.mark.parametrize("state", ["completed", "escalated"])
     def test_interrupted_report_on_a_finished_task_is_409(self, routes, internal, state: str) -> None:
@@ -216,7 +219,7 @@ class TestRoutes:
             content=_report().model_dump_json(),
         )
         assert resp.status_code == 409
-        store.update.assert_not_awaited()
+        store.update_if.assert_not_awaited()
 
     @pytest.mark.parametrize("field", ["started_at", "completed_at"])
     def test_interrupted_report_with_a_future_timestamp_is_422(self, routes, internal, field: str) -> None:
@@ -228,7 +231,7 @@ class TestRoutes:
         )
         assert resp.status_code == 422
         store.get.assert_not_awaited()
-        store.update.assert_not_awaited()
+        store.update_if.assert_not_awaited()
 
     def test_oversized_body_is_rejected_before_being_fully_read(self, routes, internal) -> None:
         from henchmen.dispatch.pubsub_auth import MAX_OPERATIVE_REPORT_BYTES
@@ -236,15 +239,57 @@ class TestRoutes:
         client, store = routes
         oversized = b"a" * (MAX_OPERATIVE_REPORT_BYTES + 1)
         resp = client.put(f"/internal/tasks/{TASK}/interrupted-report", headers=_auth(internal), content=oversized)
-        assert resp.status_code == 401
+        assert resp.status_code == 413
         store.get.assert_not_awaited()
-        store.update.assert_not_awaited()
+        store.update_if.assert_not_awaited()
 
     def test_malformed_body_is_422_not_500(self, routes, internal) -> None:
         client, store = routes
         resp = client.put(f"/internal/tasks/{TASK}/interrupted-report", headers=_auth(internal), content=b"not json")
         assert resp.status_code == 422
+        store.update_if.assert_not_awaited()
+
+    @pytest.mark.parametrize("state", ["stalled", "interrupted", "running", None])
+    def test_heartbeat_on_a_running_stalled_or_interrupted_task_is_recorded(self, routes, internal, state) -> None:
+        """D8: only a terminal state refuses a heartbeat; the write is conditional on the state just read."""
+        client, store = routes
+        store.get.return_value = {"execution_state": state} if state is not None else {}
+        resp = client.post(f"/internal/tasks/{TASK}/heartbeat", headers=_auth(internal))
+        assert resp.status_code == 204
+        _, _, field, expected, fields = store.update_if.await_args.args
+        assert (field, expected) == ("execution_state", state)
+        assert list(fields) == ["last_heartbeat"]
         store.update.assert_not_awaited()
+
+    @pytest.mark.parametrize("route", ["heartbeat", "interrupted-report"])
+    def test_a_task_that_finishes_between_read_and_write_is_409(self, routes, internal, route) -> None:
+        """D8: the read-then-update race is closed by the conditional write."""
+        client, store = routes
+        store.get.return_value = {"execution_state": "running"}
+        store.update_if.return_value = False
+        if route == "heartbeat":
+            resp = client.post(f"/internal/tasks/{TASK}/heartbeat", headers=_auth(internal))
+        else:
+            resp = client.put(
+                f"/internal/tasks/{TASK}/interrupted-report",
+                headers=_auth(internal),
+                content=_report().model_dump_json(),
+            )
+        assert resp.status_code == 409
+        store.update.assert_not_awaited()
+
+    def test_interrupted_report_from_a_lair_that_was_never_launched_is_409(self, routes, internal) -> None:
+        """B4: a valid task token alone does not let an operative report for any node of the task."""
+        from henchmen.mastermind import server
+
+        client, store = routes
+        server.get_agent().lair_manager.accepts_report_from.return_value = False
+        resp = client.put(
+            f"/internal/tasks/{TASK}/interrupted-report", headers=_auth(internal), content=_report().model_dump_json()
+        )
+        assert resp.status_code == 409
+        server.get_agent().lair_manager.accepts_report_from.assert_called_once_with(TASK, "implement_fix", "op-1")
+        store.update_if.assert_not_awaited()
 
     def test_routes_do_not_exist_outside_a_desktop_install(self, monkeypatch, tmp_path) -> None:
         from henchmen.mastermind import server
@@ -366,6 +411,7 @@ async def test_operative_code_round_trips_through_the_real_routes(internal: Inte
         await backing.set("task_executions", TASK, {"estimated_cost_usd": 1.25})
         agent = MagicMock()
         agent.tracker._store = backing
+        agent.lair_manager.accepts_report_from = MagicMock(return_value=True)
         parent = FastAPI()
         parent.mount("/mastermind", server.app)
         store = HttpDocumentStore(_settings(internal.task_token(TASK)), transport=httpx.ASGITransport(app=parent))
@@ -381,3 +427,67 @@ async def test_operative_code_round_trips_through_the_real_routes(internal: Inte
         assert doc["estimated_cost_usd"] == 1.25
     finally:
         await backing.aclose()
+
+
+class TestReportSizeOnTheOperative:
+    """B1: the operative caps its diff and treats 413 as undeliverable."""
+
+    def test_a_small_diff_is_left_alone_and_none_stays_none(self) -> None:
+        from henchmen.operative.bootstrap import cap_report_git_diff
+
+        assert cap_report_git_diff(None) is None
+        assert cap_report_git_diff("diff --git a/x b/x\n") == "diff --git a/x b/x\n"
+
+    def test_a_huge_diff_is_truncated_with_a_marker_within_the_cap(self) -> None:
+        from henchmen.operative.bootstrap import MAX_REPORT_GIT_DIFF_BYTES, cap_report_git_diff
+
+        diff = "é" * MAX_REPORT_GIT_DIFF_BYTES  # 2 bytes per character: twice the cap
+        capped = cap_report_git_diff(diff)
+        assert capped is not None
+        assert len(capped.encode("utf-8")) <= MAX_REPORT_GIT_DIFF_BYTES
+        assert capped.endswith(
+            f"[henchmen: git diff truncated to {MAX_REPORT_GIT_DIFF_BYTES} of {2 * MAX_REPORT_GIT_DIFF_BYTES} bytes]\n"
+        )
+        assert capped.startswith("é")
+
+    def test_the_capped_report_fits_the_server_limit(self) -> None:
+        from henchmen.dispatch.pubsub_auth import MAX_OPERATIVE_REPORT_BYTES
+        from henchmen.operative.bootstrap import MAX_REPORT_GIT_DIFF_BYTES, cap_report_git_diff
+
+        report = _report().model_copy(update={"git_diff": cap_report_git_diff("+x\n" * MAX_REPORT_GIT_DIFF_BYTES)})
+        # base64 inside the envelope inflates by 4/3.
+        assert len(report.model_dump_json().encode()) * 4 // 3 < MAX_OPERATIVE_REPORT_BYTES
+
+    @pytest.mark.asyncio
+    async def test_a_413_answer_is_undeliverable_and_raises(self, caplog) -> None:
+        from henchmen.operative.bootstrap import publish_report
+        from henchmen.providers.local.memory import InMemoryMessageBroker, set_shared_broker
+
+        settings = _settings("t" * 64)
+        set_shared_broker(None)
+        broker = InMemoryMessageBroker(settings)
+        seen: list[int] = []
+
+        class _Client:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> _Client:
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                return None
+
+            async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+                seen.append(413)
+                return httpx.Response(413, request=httpx.Request("POST", url))
+
+        with (
+            patch("henchmen.providers.local.memory.httpx.AsyncClient", _Client),
+            caplog.at_level(logging.WARNING),
+            pytest.raises(RuntimeError, match="Failed to deliver"),
+        ):
+            await publish_report(_report(status=OperativeStatus.COMPLETED), settings, broker=broker)
+        assert seen == [413], "a 413 is final: never retried"
+        assert "returned 413" in caplog.text
+        assert "t" * 64 not in caplog.text

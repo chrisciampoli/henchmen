@@ -452,3 +452,87 @@ def test_desktop_with_a_gcp_container_orchestrator_override_gets_no_task_token(m
     settings = _settings(provider="local", gcp_project_id="", container_orchestrator_provider="gcp")
     env = LairManager(settings)._build_env_vars(_task(), _node(), "lair-1")
     assert "HENCHMEN_OPERATIVE_TASK_TOKEN" not in env
+
+
+class TestReportBinding:
+    """B4: a report is accepted only for a lair this manager launched and still waits on."""
+
+    @staticmethod
+    def _manager():
+        from datetime import UTC, datetime
+
+        from henchmen.config.settings import Settings
+        from henchmen.mastermind.lair_manager import LairManager
+
+        manager = LairManager(Settings(_env_file=None, provider="local", lair_default_timeout=600))
+        manager._active_lairs["lair-abc-implement-fix-1a2b3c"] = {
+            "execution_id": "exec-1",
+            "task_id": "task-1",
+            "node_id": "implement_fix",
+            "timeout_seconds": 600,
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        return manager
+
+    def test_the_launched_lair_is_accepted(self):
+        manager = self._manager()
+        assert manager.accepts_report_from("task-1", "implement_fix", "lair-abc-implement-fix-1a2b3c") is True
+        assert manager.accepts_report_from("task-1", "implement_fix") is True
+
+    @pytest.mark.parametrize(
+        ("task_id", "node_id", "operative_id"),
+        [("task-2", "implement_fix", None), ("task-1", "fix_tests", None), ("task-1", "implement_fix", "lair-other")],
+    )
+    def test_anything_else_is_refused(self, task_id, node_id, operative_id):
+        assert self._manager().accepts_report_from(task_id, node_id, operative_id) is False
+
+    def test_a_superseded_lair_cannot_report_over_its_replacement(self):
+        from datetime import UTC, datetime, timedelta
+
+        manager = self._manager()
+        manager._active_lairs["lair-abc-implement-fix-1a2b3c"]["created_at"] = (
+            datetime.now(UTC) - timedelta(seconds=30)
+        ).isoformat()
+        manager._active_lairs["lair-abc-implement-fix-9z8y7x"] = {
+            "execution_id": "exec-2",
+            "task_id": "task-1",
+            "node_id": "implement_fix",
+            "timeout_seconds": 600,
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        assert manager.accepts_report_from("task-1", "implement_fix", "lair-abc-implement-fix-9z8y7x") is True
+        assert manager.accepts_report_from("task-1", "implement_fix", "lair-abc-implement-fix-1a2b3c") is False
+
+    def test_a_lair_past_its_wait_window_is_refused(self):
+        from datetime import UTC, datetime, timedelta
+
+        manager = self._manager()
+        long_ago = datetime.now(UTC) - timedelta(seconds=600 + 300 + 15 + 60)
+        manager._active_lairs["lair-abc-implement-fix-1a2b3c"]["created_at"] = long_ago.isoformat()
+        assert manager.accepts_report_from("task-1", "implement_fix") is False
+
+    @pytest.mark.asyncio
+    async def test_create_lair_registers_what_the_binding_checks(self):
+        from henchmen.config.settings import Settings
+        from henchmen.mastermind.lair_manager import LairManager
+        from henchmen.models.scheme import SchemeNode
+
+        orchestrator = MagicMock()
+        orchestrator.run_job = AsyncMock(return_value="exec-9")
+        store = MagicMock()
+        store.delete = AsyncMock()
+        manager = LairManager(Settings(_env_file=None, provider="gcp", gcp_project_id="p"), orchestrator, store)
+        task = MagicMock()
+        task.id = "task-9"
+        task.context.repo = "acme/api"
+        task.context.branch = "main"
+        task.title = "t"
+        task.description = "d"
+        task.branch_name = "henchmen/task-9"
+        node = MagicMock(spec=SchemeNode)
+        node.id = "implement_fix"
+        node.timeout_seconds = 120
+        node.model_name = None
+        lair_id = await manager.create_lair(task, node)
+        assert manager.accepts_report_from("task-9", "implement_fix", lair_id) is True
+        assert manager.accepts_report_from("task-9", "implement_fix", "lair-forged") is False

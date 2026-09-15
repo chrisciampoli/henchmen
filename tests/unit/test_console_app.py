@@ -27,7 +27,14 @@ def env(tmp_path: Path):
     auth = ConsoleAuth(setup_token="tok", signing_key=b"k" * 32)
     applied = _ApplyRecorder()
     config = tmp_path / "henchmen.env"
-    app = create_console_app(mode=ConsoleMode.SETUP, store=store, auth=auth, config_file=config, on_apply=applied)
+    app = create_console_app(
+        mode=ConsoleMode.SETUP,
+        store=store,
+        auth=auth,
+        config_file=config,
+        secrets_dir=tmp_path / "secrets",
+        on_apply=applied,
+    )
     client = TestClient(app, base_url=LOCAL, follow_redirects=False)
     return client, store, auth, applied, config
 
@@ -262,6 +269,7 @@ def test_apply_validates_the_file_not_the_seeded_default(tmp_path: Path, monkeyp
         store=store,
         auth=auth,
         config_file=config,
+        secrets_dir=tmp_path / "secrets",
         on_apply=lambda: None,
         seeded_env={"HENCHMEN_PROVIDER": "local"},
     )
@@ -283,7 +291,14 @@ def test_apply_refuses_a_bad_forward_host_and_does_not_restart(tmp_path: Path, m
     auth = ConsoleAuth(setup_token="tok", signing_key=b"k" * 32)
     config = tmp_path / "henchmen.env"
     applied = _ApplyRecorder()
-    app = create_console_app(mode=ConsoleMode.SETUP, store=store, auth=auth, config_file=config, on_apply=applied)
+    app = create_console_app(
+        mode=ConsoleMode.SETUP,
+        store=store,
+        auth=auth,
+        config_file=config,
+        secrets_dir=tmp_path / "secrets",
+        on_apply=applied,
+    )
     client = _signed_in(TestClient(app, base_url=LOCAL, follow_redirects=False), auth)
     store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
     # The default forward base (host.docker.internal) is exactly the P3 default problem.
@@ -396,6 +411,7 @@ def test_session_exchange_with_a_file_backed_token_store_is_one_time(tmp_path: P
         store=store,
         auth=auth,
         config_file=tmp_path / "henchmen.env",
+        secrets_dir=tmp_path / "secrets",
         on_apply=lambda: None,
     )
     client = TestClient(app, base_url=LOCAL, follow_redirects=False)
@@ -433,23 +449,40 @@ def _console(tmp_path: Path, mode: ConsoleMode, **kwargs):
         store=SetupStateStore(tmp_path / "setup-state.json"),
         auth=ConsoleAuth(setup_token="tok", signing_key=b"k" * 32),
         config_file=tmp_path / "henchmen.env",
+        secrets_dir=tmp_path / "secrets",
         on_apply=lambda: None,
         **kwargs,
     )
 
 
-def test_attention_mode_status_carries_redacted_problems(tmp_path: Path) -> None:
+def test_attention_mode_status_carries_redacted_problems_for_a_signed_in_session(tmp_path: Path) -> None:
     leaked = "sk-ant-" + "x" * 30
     app = _console(tmp_path, ConsoleMode.ATTENTION, problems=["HENCHMEN_ANTHROPIC_API_KEY is empty.", f"boom {leaked}"])
-    body = TestClient(app, base_url=LOCAL).get("/console/api/status").json()
+    client = _signed_in(TestClient(app, base_url=LOCAL), ConsoleAuth(setup_token="tok", signing_key=b"k" * 32))
+    body = client.get("/console/api/status").json()
     assert body["mode"] == "attention"
     assert body["problems"][0] == "HENCHMEN_ANTHROPIC_API_KEY is empty."
     assert leaked not in body["problems"][1]
 
 
+@pytest.mark.parametrize("cookie", [None, "garbage", "1.deadbeef"])
+def test_attention_problems_are_withheld_without_a_valid_session(tmp_path: Path, cookie: str | None) -> None:
+    """Decision C17: an unauthenticated status poll learns the mode, never the problem list."""
+    app = _console(tmp_path, ConsoleMode.ATTENTION, problems=["HENCHMEN_ANTHROPIC_API_KEY is empty."])
+    client = TestClient(app, base_url=LOCAL)
+    if cookie is not None:
+        client.cookies.set(SESSION_COOKIE, cookie)
+    response = client.get("/console/api/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "attention"
+    assert body["problems"] == []
+
+
 def test_problems_are_reported_only_in_attention_mode(tmp_path: Path) -> None:
     app = _console(tmp_path, ConsoleMode.RUN, problems=["stale"])
-    assert TestClient(app, base_url=LOCAL).get("/console/api/status").json()["problems"] == []
+    client = _signed_in(TestClient(app, base_url=LOCAL), ConsoleAuth(setup_token="tok", signing_key=b"k" * 32))
+    assert client.get("/console/api/status").json()["problems"] == []
 
 
 def test_run_mode_status_reports_the_live_service_snapshot(tmp_path: Path) -> None:
@@ -473,3 +506,104 @@ def test_attention_mode_exposes_no_service_routes(tmp_path: Path) -> None:
     client = TestClient(app, base_url=LOCAL)
     assert client.get("/console/api/status").status_code == 200
     assert client.get("/", headers={"host": "evil.example"}).status_code == 403
+
+
+def test_apply_uses_the_secrets_dir_it_was_given_not_one_next_to_the_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B3: the config file's parent is not where the install keeps its secrets."""
+    import henchmen.console.app as app_module
+
+    store = SetupStateStore(tmp_path / "state" / "setup-state.json")
+    store.path.parent.mkdir()
+    auth = ConsoleAuth(setup_token="tok", signing_key=b"k" * 32)
+    config = tmp_path / "config" / "henchmen.env"
+    config.parent.mkdir()
+    config.write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+    secrets_dir = tmp_path / "data" / "secrets"
+    constructed: list[tuple[Path, Path]] = []
+    real_store = app_module.ConfigStore
+
+    def _recording_store(config_file: Path, secrets: Path) -> object:
+        constructed.append((config_file, secrets))
+        return real_store(config_file, secrets)
+
+    monkeypatch.setattr(app_module, "ConfigStore", _recording_store)
+    app = create_console_app(
+        mode=ConsoleMode.SETUP,
+        store=store,
+        auth=auth,
+        config_file=config,
+        secrets_dir=secrets_dir,
+        on_apply=lambda: None,
+    )
+    client = _signed_in(TestClient(app, base_url=LOCAL, follow_redirects=False), auth)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
+    assert client.post("/console/api/apply", headers=ORIGIN).status_code == 202
+    assert constructed == [(config, secrets_dir)]
+
+
+def test_apply_on_desktop_refuses_a_blank_environment_token_that_would_shadow_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C8: a generated token written to the file would still lose to a blank environment variable."""
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("HENCHMEN_DISPATCH_API_TOKEN", "")
+    store = SetupStateStore(tmp_path / "setup-state.json")
+    auth = ConsoleAuth(setup_token="tok", signing_key=b"k" * 32)
+    config = tmp_path / "henchmen.env"
+    config.write_text(
+        "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8000\n"
+        "HENCHMEN_LOCAL_DOCKER_NETWORK=henchmen\n",
+        encoding="utf-8",
+    )
+    applied = _ApplyRecorder()
+    app = create_console_app(
+        mode=ConsoleMode.SETUP,
+        store=store,
+        auth=auth,
+        config_file=config,
+        secrets_dir=tmp_path / "secrets",
+        on_apply=applied,
+    )
+    client = _signed_in(TestClient(app, base_url=LOCAL, follow_redirects=False), auth)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
+    before = config.read_bytes()
+
+    response = client.post("/console/api/apply", headers=ORIGIN)
+
+    assert response.status_code == 409
+    problems = response.json()["detail"]["problems"]
+    assert any("HENCHMEN_DISPATCH_API_TOKEN is empty or a placeholder" in p for p in problems)
+    assert applied.calls == 0 and store.load().completed is False
+    assert config.read_bytes() == before
+
+
+def test_session_route_refuses_when_consuming_the_token_hits_a_full_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D4: the claim already spent the token; a failed replacement write is a 403, not a 500 or a session."""
+    import henchmen.console.auth as auth_module
+
+    auth = ConsoleAuth.load(tmp_path / "secrets", setup_token=None)
+    token = auth.setup_token
+    app = create_console_app(
+        mode=ConsoleMode.SETUP,
+        store=SetupStateStore(tmp_path / "setup-state.json"),
+        auth=auth,
+        config_file=tmp_path / "henchmen.env",
+        secrets_dir=tmp_path / "secrets",
+        on_apply=lambda: None,
+    )
+
+    def _disk_full(path: object, data: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(auth_module, "create_secret_file", _disk_full)
+    client = TestClient(app, base_url=LOCAL, follow_redirects=False)
+    response = client.get("/console/session", params={"setup_token": token})
+    assert response.status_code == 403
+    assert SESSION_COOKIE not in response.cookies
+    monkeypatch.undo()
+    # The token stays spent: the same link never grants a session afterwards.
+    assert client.get("/console/session", params={"setup_token": token}).status_code == 403

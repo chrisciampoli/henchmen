@@ -20,7 +20,7 @@ from typing import Any
 
 REDACTED = "***REDACTED***"
 
-_BEARER_PATTERN = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{16,}")
+_BEARER_PATTERN = re.compile(r"(?i)\b(bearer)[ \t]+[A-Za-z0-9._~+/=-]{16,}")
 
 # Any environment-variable-style ``SOMETHING_TOKEN=value`` assignment. This is
 # the shape a Docker `-e` command line, an ``os.environ`` dump, or a crash

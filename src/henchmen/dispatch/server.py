@@ -16,7 +16,8 @@ from starlette.types import Scope
 
 from henchmen.config.paths import is_desktop_install
 from henchmen.config.posture import fail_open_allowed
-from henchmen.config.settings import Environment, get_settings
+from henchmen.config.secret_files import tokens_match
+from henchmen.config.settings import Settings, get_settings
 from henchmen.dispatch.api_models import CreateTaskRequest
 from henchmen.dispatch.handlers.cli import handle_cli_request
 from henchmen.dispatch.handlers.github import handle_github_webhook
@@ -24,6 +25,8 @@ from henchmen.dispatch.handlers.jira import handle_jira_webhook
 from henchmen.dispatch.handlers.slack import handle_slack_event
 from henchmen.dispatch.idempotency import TTLSet
 from henchmen.dispatch.normalizer import TaskNormalizer
+from henchmen.dispatch.pubsub_auth import split_bearer
+from henchmen.utils.lifespan import run_shutdown
 from henchmen.utils.redaction import install_secret_redaction
 
 logger = logging.getLogger(__name__)
@@ -215,41 +218,46 @@ def _verify_jira_signature(body: bytes, signature_header: str, secret: str) -> b
 
 
 def _require_signing_secret(
-    env: Environment,
+    settings: Settings,
     secret: str,
     *,
     integration: str,
 ) -> None:
     """Raise 401 if a signing secret is required but missing.
 
-    Fail-closed policy: STAGING, PROD and every desktop (data-directory) install
-    must have a signing secret configured. DEV on a repository checkout
-    tolerates missing secrets for local iteration but logs a warning.
+    Fail-closed policy: a signing secret is required unless
+    ``fail_open_allowed(settings)`` (dev on a repository checkout), which
+    tolerates a missing secret for local iteration but logs a warning. STAGING,
+    PROD and every desktop (data-directory) install always refuse.
     """
     if secret:
         return
-    if env in (Environment.STAGING, Environment.PROD) or is_desktop_install():
+    if not fail_open_allowed(settings):
         logger.error(
-            "[%s] Refusing request: signing secret is not configured in %s environment",
+            "[%s] Refusing request: signing secret is not configured (%s)",
             integration,
-            env.value,
+            _fail_closed_reason(settings),
         )
         raise HTTPException(
             status_code=401,
             detail=f"{integration} webhook signing secret is not configured",
         )
     logger.warning(
-        "[%s] Signing secret is empty; accepting request in %s environment only",
+        "[%s] Signing secret is empty; accepting the request because fail-open is allowed (dev checkout)",
         integration,
-        env.value,
     )
+
+
+def _fail_closed_reason(settings: Settings) -> str:
+    """Why a fail-open path is refused, for log lines: a desktop install, or the environment."""
+    return "on a desktop install" if is_desktop_install() else f"in the {settings.environment.value} environment"
 
 
 # ---------------------------------------------------------------------------
 # REST intake authentication
 # ---------------------------------------------------------------------------
 
-# Set once the "no API token in dev" warning has been logged, so a busy local
+# Set once the "no API token while fail-open is allowed" warning has been logged, so a busy local
 # session does not log it on every request.
 _open_api_warning_logged = False
 
@@ -271,21 +279,19 @@ async def require_api_token(request: Request) -> None:
     if not expected:
         if not fail_open_allowed(settings):
             logger.error(
-                "[api] Refusing task creation: HENCHMEN_DISPATCH_API_TOKEN is not configured (environment=%s)",
-                settings.environment.value,
+                "[api] Refusing task creation: HENCHMEN_DISPATCH_API_TOKEN is not configured (%s)",
+                _fail_closed_reason(settings),
             )
             raise HTTPException(status_code=401, detail="Dispatch API token is not configured")
         if not _open_api_warning_logged:
             logger.warning(
-                "[api] HENCHMEN_DISPATCH_API_TOKEN is empty; /api/v1/tasks is unauthenticated (%s only)",
-                settings.environment.value,
+                "[api] HENCHMEN_DISPATCH_API_TOKEN is empty; /api/v1/tasks is unauthenticated because "
+                "fail-open is allowed (dev checkout)"
             )
             _open_api_warning_logged = True
         return
 
-    scheme, _, supplied = request.headers.get("Authorization", "").partition(" ")
-    supplied = supplied.strip()
-    if scheme.lower() != "bearer" or not supplied or not hmac.compare_digest(supplied.encode(), expected.encode()):
+    if not tokens_match(split_bearer(request.headers.get("Authorization")), expected):
         raise HTTPException(
             status_code=401,
             detail="Missing or invalid bearer token",
@@ -317,8 +323,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if not fail_open_allowed(settings) and not settings.dispatch_api_token:
         logger.warning(
             "[dispatch] Configuration problem: HENCHMEN_DISPATCH_API_TOKEN is empty, so POST /api/v1/tasks "
-            "returns 401 in %s",
-            settings.environment.value,
+            "returns 401 %s",
+            _fail_closed_reason(settings),
         )
 
     # One broker for the whole process: every intake route and the Slack bot
@@ -342,8 +348,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.slack_socket_handler = start_socket_mode(settings, broker=app.state.message_broker)
 
     logger.info("[dispatch] Service started")
+
+    async def _shutdown() -> None:
+        handler = getattr(app.state, "slack_socket_handler", None)
+        if handler is not None:
+            try:
+                handler.close()
+            except Exception:  # pragma: no cover - shutdown best effort
+                logger.warning("[dispatch] Slack Socket Mode handler did not close cleanly", exc_info=True)
+        shutdown_tracing()
+        logger.info("[dispatch] Shutting down")
+        if owns_broker:
+            await _close_broker(app)
+
+    original: BaseException | None = None
     try:
         yield
+    except BaseException as exc:
+        original = exc
+        raise
     finally:
         # A sub-app entered after this one (mastermind, forge) can fail to start; the
         # combined app's AsyncExitStack then unwinds this lifespan by throwing that
@@ -351,21 +374,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # `yield` -- otherwise the Slack Socket Mode handler (background threads) stays
         # connected for as long as the process (through needs-attention mode included),
         # still accepting Slack messages and publishing them to a broker nothing drains.
-        try:
-            handler = getattr(app.state, "slack_socket_handler", None)
-            if handler is not None:
-                try:
-                    handler.close()
-                except Exception:  # pragma: no cover - shutdown best effort
-                    logger.warning("[dispatch] Slack Socket Mode handler did not close cleanly", exc_info=True)
-            shutdown_tracing()
-            logger.info("[dispatch] Shutting down")
-            if owns_broker:
-                await _close_broker(app)
-        except Exception:
-            # Never let a shutdown-path error mask the exception (if any) already
-            # propagating through `yield`.
-            logger.warning("[dispatch] Shutdown raised", exc_info=True)
+        # A shutdown-path error (a CancelledError included) never masks `original`.
+        await run_shutdown("dispatch", _shutdown, original=original)
 
 
 async def _close_broker(app: FastAPI) -> None:
@@ -436,7 +446,7 @@ async def slack_webhook(request: Request) -> dict[str, Any]:
         return {"challenge": payload.get("challenge")}
 
     # Verify Slack request signature (fail-closed in staging/prod).
-    _require_signing_secret(settings.environment, settings.slack_signing_secret, integration="slack")
+    _require_signing_secret(settings, settings.slack_signing_secret, integration="slack")
     if settings.slack_signing_secret:
         ts = request.headers.get("X-Slack-Request-Timestamp", "")
         sig = request.headers.get("X-Slack-Signature", "")
@@ -470,7 +480,7 @@ async def github_webhook(request: Request) -> dict[str, Any]:
     body = await request.body()
 
     # Verify GitHub webhook signature (fail-closed in staging/prod).
-    _require_signing_secret(settings.environment, settings.github_webhook_secret, integration="github")
+    _require_signing_secret(settings, settings.github_webhook_secret, integration="github")
     if settings.github_webhook_secret:
         sig = request.headers.get("X-Hub-Signature-256", "")
         if not _verify_github_signature(body, sig, settings.github_webhook_secret):
@@ -505,7 +515,7 @@ async def jira_webhook(request: Request) -> dict[str, Any]:
     body = await request.body()
 
     # Verify Jira webhook signature (fail-closed in staging/prod).
-    _require_signing_secret(settings.environment, settings.jira_webhook_secret, integration="jira")
+    _require_signing_secret(settings, settings.jira_webhook_secret, integration="jira")
     if settings.jira_webhook_secret:
         # Jira Cloud sends X-Hub-Signature; the Atlassian-specific name is
         # kept as a fallback for older/self-hosted configurations.

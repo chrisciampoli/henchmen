@@ -81,6 +81,7 @@ def console(tmp_path: Path):
         store=store,
         auth=auth,
         config_file=tmp_path / "henchmen.env",
+        secrets_dir=tmp_path / "secrets",
         on_apply=lambda: None,
         step_routes={SetupStep.GITHUB: StepRoutes(router=_github_router(), public_paths=GITHUB_PUBLIC)},
     )
@@ -171,6 +172,7 @@ def test_create_console_app_validates_injected_step_routes_too(tmp_path: Path) -
             store=store,
             auth=auth,
             config_file=tmp_path / "henchmen.env",
+            secrets_dir=tmp_path / "secrets",
             on_apply=lambda: None,
             step_routes=bad_routes,
         )
