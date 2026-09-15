@@ -43,7 +43,7 @@ from henchmen.models.task import HenchmenTask
 from henchmen.providers.local.docker import cpu_limit as docker_cpu_limit
 from henchmen.providers.local.docker import memory_limit as docker_memory_limit
 from henchmen.providers.registry import orchestrator_is_local
-from henchmen.utils.git import clone_repo
+from henchmen.utils.git import WORKFLOW_PUSH_REFUSED_MESSAGE, clone_repo, is_workflow_push_refusal
 from henchmen.utils.github_auth import (
     MAX_MIN_TTL_SECONDS,
     GitHubAuthError,
@@ -251,6 +251,12 @@ async def handle_fix_lint(
         ]
         for step in git_steps:
             returncode, step_err = await _run_git(workspace, *step)
+            if returncode != 0 and step[0] == "push" and is_workflow_push_refusal(step_err):
+                return {
+                    "condition": "fail",
+                    "message": WORKFLOW_PUSH_REFUSED_MESSAGE,
+                    "escalation_reason": WORKFLOW_PUSH_REFUSED_MESSAGE,
+                }
             if returncode != 0:
                 err = step_err[:300]
                 if github_token:
@@ -294,6 +300,12 @@ async def _fix_lint_in_container(
         logger.warning("fix_lint failed for task %s: %s", task.id, detail)
         return {"condition": "fail", "message": f"fix_lint failed (error: {detail})"}
     if result["condition"] != "pass":
+        if is_workflow_push_refusal(f"{result.get('message', '')}\n{result.get('output', '')}"):
+            return {
+                "condition": "fail",
+                "message": WORKFLOW_PUSH_REFUSED_MESSAGE,
+                "escalation_reason": WORKFLOW_PUSH_REFUSED_MESSAGE,
+            }
         logger.warning("[SCHEME] fix_lint failed for task %s: %s", task.id, result["message"])
         return result
     logger.info("[SCHEME] %s for task %s", result["message"], task.id)

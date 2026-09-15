@@ -27,6 +27,7 @@ from typing import Any
 from henchmen.arsenal._process import run_command
 from henchmen.arsenal._workspace import current_workspace_dir, ensure_in_workspace
 from henchmen.arsenal.registry import tool
+from henchmen.utils.git import WORKFLOW_PUSH_TOOL_ERROR, is_workflow_push_refusal
 
 # Branches that MUST NEVER be pushed to by an operative. Match is
 # case-insensitive and applied after stripping ``origin/`` and any leading
@@ -111,6 +112,19 @@ async def _refresh_github_credentials(working_dir: str) -> None:
     from henchmen.operative.github_credentials import get_operative_credentials
 
     await get_operative_credentials().ensure_fresh(working_dir or current_workspace_dir())
+
+
+async def _push(*args: str, working_dir: str) -> dict[str, Any]:
+    """Run ``git push``; explain a workflow-change refusal so the agent can undo that change.
+
+    The GitHub App is never granted the ``workflows`` permission (amendment A4), so GitHub refuses a
+    push whose commits change ``.github/workflows/``. Retrying or force-pushing cannot fix that — the
+    agent has to undo the workflow change itself — so the tool's error tells it exactly that.
+    """
+    result = await _run_git(*args, working_dir=working_dir)
+    if not result.get("success") and is_workflow_push_refusal(str(result.get("stderr", ""))):
+        result["error"] = WORKFLOW_PUSH_TOOL_ERROR
+    return result
 
 
 @tool(
@@ -240,7 +254,7 @@ async def git_push(branch: str | None = None, working_dir: str = "") -> dict[str
     except PermissionError as exc:
         return {"error": f"access denied: {exc}", "success": False}
     await _refresh_github_credentials(safe_working_dir)
-    return await _run_git("push", "--set-upstream", "origin", branch or "HEAD", working_dir=safe_working_dir)
+    return await _push("push", "--set-upstream", "origin", branch or "HEAD", working_dir=safe_working_dir)
 
 
 @tool(
@@ -292,7 +306,7 @@ async def git_force_push(branch: str | None = None, working_dir: str = "") -> di
         return {"error": f"access denied: {exc}", "success": False}
     await _refresh_github_credentials(safe_working_dir)
     # Use --force-with-lease to avoid clobbering concurrent pushes.
-    return await _run_git("push", "--force-with-lease", "origin", branch, working_dir=safe_working_dir)
+    return await _push("push", "--force-with-lease", "origin", branch, working_dir=safe_working_dir)
 
 
 @tool(

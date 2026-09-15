@@ -508,6 +508,40 @@ class TestSchemeExecutorAgentic:
         assert mock_lair.create_lair.await_count == 2
         assert result["node_results"]["agent_step"]["condition"] == "fail"
 
+    @pytest.mark.asyncio
+    async def test_workflow_push_refusal_escalates_immediately(self):
+        """A BLOCKED report naming the workflow-push refusal stops the scheme at that node (A4, PI-10)."""
+        from henchmen.utils.git import WORKFLOW_PUSH_REFUSED_MESSAGE
+
+        graph = _linear_scheme(["implement_fix", "create_pr"], {"implement_fix": NodeType.AGENTIC})
+        mock_lair = AsyncMock(spec=LairManager)
+        mock_lair.create_lair.return_value = "lair-1"
+        now = datetime.now(UTC)
+        mock_lair.wait_for_completion.return_value = OperativeReport(
+            task_id="task-001",
+            scheme_id="test_scheme",
+            node_id="implement_fix",
+            operative_id="lair-1",
+            status=OperativeStatus.BLOCKED,
+            summary="done",
+            confidence_score=0.0,
+            error=WORKFLOW_PUSH_REFUSED_MESSAGE,
+            block_reason=WORKFLOW_PUSH_REFUSED_MESSAGE,
+            started_at=now,
+            completed_at=now,
+        )
+        executor = SchemeExecutor(graph, mock_lair, _mock_settings())
+        task = _make_task()
+
+        with patch("henchmen.mastermind.scheme_executor.handlers.get_github_token_async") as create_pr_token:
+            result = await executor.execute(task, Dossier(task_id=task.id))
+
+        assert result["final_status"] == "escalated"
+        assert result["escalation_node"] == "implement_fix"
+        assert result["node_results"]["implement_fix"]["escalation_reason"] == WORKFLOW_PUSH_REFUSED_MESSAGE
+        assert "create_pr" not in result["node_results"]
+        create_pr_token.assert_not_called()
+
 
 class TestSchemeExecutorCIChecks:
     """Test that CI check failures are fail-closed."""
@@ -739,6 +773,52 @@ class TestSchemeExecutorCIChecks:
         assert result["condition"] is None
         assert "no auto-fixer" in result["message"]
         assert not any("ruff" in call for call in calls)
+
+    @pytest.mark.asyncio
+    async def test_fix_lint_push_refused_for_workflows_escalates(self, tmp_path):
+        """The cloud fix_lint push loop escalates instead of failing plainly (A4, PI-10).
+
+        The auto-fix itself only ever touches the operative's changed Python/JS files —
+        ``plan_fix`` has no fixer for YAML — so what actually reaches GitHub's refusal
+        here is the *push*, refused because the branch carries an earlier, still-unpushed
+        commit that changed ``.github/workflows/``.
+        """
+        from henchmen.mastermind.scheme_executor.handlers import handle_fix_lint
+        from henchmen.utils.git import WORKFLOW_PUSH_REFUSED_MESSAGE
+
+        executor = SchemeExecutor(_linear_scheme(["fix_lint"]), MagicMock(spec=LairManager), _mock_settings())
+        task = _make_task()
+
+        async def _exec(*args, **kwargs):
+            if args[0] == "git" and args[1] == "status":
+                return self._ok_proc(stdout=b" M src/app.py\0")
+            if args[0] == "git" and args[1] == "push":
+                return self._ok_proc(
+                    returncode=1,
+                    stderr=b"refusing to allow a GitHub App to create or update workflow "
+                    b"`.github/workflows/ci.yml` without `workflows` permission",
+                )
+            return self._ok_proc()
+
+        workspace = tmp_path / "ws"
+        (workspace / "src").mkdir(parents=True)
+        (workspace / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+        with (
+            patch("henchmen.mastermind.scheme_executor.handlers.tempfile.mkdtemp", return_value=str(workspace)),
+            patch("henchmen.mastermind.scheme_executor.handlers.shutil.rmtree"),
+            patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token_async", return_value=""),
+            patch("henchmen.mastermind.scheme_executor.handlers.detect_stack", return_value=_python_stack()),
+            patch(
+                "henchmen.mastermind.scheme_executor.handlers.changed_files",
+                new=AsyncMock(return_value=["src/app.py"]),
+            ),
+            patch("asyncio.create_subprocess_exec", side_effect=_exec),
+        ):
+            result = await handle_fix_lint(executor, _make_node("fix_lint"), task, Dossier(task_id=task.id))
+
+        assert result["condition"] == "fail"
+        assert result["escalation_reason"] == WORKFLOW_PUSH_REFUSED_MESSAGE
 
 
 def _python_stack():

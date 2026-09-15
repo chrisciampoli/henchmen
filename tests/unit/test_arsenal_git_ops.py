@@ -187,6 +187,20 @@ class TestGitPush:
         assert result["success"] is False
         fake_git.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_workflow_refusal_tells_the_agent_what_to_do(self, fake_git: AsyncMock):
+        fake_git.return_value = {
+            "stdout": "",
+            "stderr": "refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` "
+            "without `workflows` permission",
+            "return_code": 1,
+            "success": False,
+        }
+        result = await git_ops.git_push(branch="henchmen/task-1")
+        assert result["success"] is False
+        assert ".github/workflows" in result["error"]
+        assert "Undo" in result["error"]
+
 
 # ---------------------------------------------------------------------------
 # git_force_push
@@ -207,6 +221,23 @@ class TestGitForcePush:
         result = await git_ops.git_force_push(branch="henchmen/task-1")
         assert result["success"] is True
         assert fake_git.await_args.args == ("push", "--force-with-lease", "origin", "henchmen/task-1")
+
+    @pytest.mark.asyncio
+    async def test_workflow_refusal_tells_the_agent_what_to_do(
+        self, fake_git: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("HENCHMEN_ALLOW_FORCE_PUSH", "true")
+        fake_git.return_value = {
+            "stdout": "",
+            "stderr": "refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` "
+            "without `workflows` permission",
+            "return_code": 1,
+            "success": False,
+        }
+        result = await git_ops.git_force_push(branch="henchmen/task-1")
+        assert result["success"] is False
+        assert ".github/workflows" in result["error"]
+        assert "Undo" in result["error"]
 
     @pytest.mark.asyncio
     async def test_refuses_implicit_head_when_enabled(self, fake_git: AsyncMock, monkeypatch: pytest.MonkeyPatch):

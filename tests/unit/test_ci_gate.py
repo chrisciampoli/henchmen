@@ -1085,6 +1085,37 @@ class TestRunFix:
             assert not any(args[0] == "push" for args, _ in harness.git_calls)
 
     @pytest.mark.asyncio
+    async def test_workflow_push_refusal_survives_the_message_truncation(self, tmp_path: Path) -> None:
+        """``fail()`` truncates to 300 chars (ci_gate.py); the refusal phrase must still be detectable (PI-10)."""
+        from henchmen.utils.git import is_workflow_push_refusal
+
+        refusal = (
+            "To https://github.com/acme/widgets.git\n"
+            " ! [remote rejected] henchmen/t -> henchmen/t (refusing to allow a GitHub App to create or "
+            "update workflow `.github/workflows/ci.yml` without `workflows` permission)\n"
+            "error: failed to push some refs to 'https://github.com/acme/widgets.git'"
+        )
+        harness = _FixHarness(status=" M src/app.py\0")
+
+        async def git(
+            git_dir: str, workspace: str, private: str, *args: str, token: str | None = None
+        ) -> tuple[int, str, str]:
+            harness.events.append(("git", args))
+            name = next(arg for arg in args if arg in {"status", "checkout", "add", "commit", "push"})
+            harness.git_calls.append((args[args.index(name) :], token))
+            if name == "status":
+                return 0, harness._status, ""
+            if name == "push":
+                return 1, "", refusal
+            return 0, "", ""
+
+        harness.git = git  # type: ignore[method-assign]
+        with harness.patches():
+            result = await _fix(tmp_path)
+        assert result.condition == "fail"
+        assert is_workflow_push_refusal(result.message)
+
+    @pytest.mark.asyncio
     async def test_a_crashing_fixer_still_kills_every_unprivileged_process(self, tmp_path: Path) -> None:
         harness = _FixHarness(status="", fixer_error=FileNotFoundError("npx"))
         with harness.patches(), pytest.raises(FileNotFoundError):
