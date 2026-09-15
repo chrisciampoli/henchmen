@@ -16,21 +16,42 @@ longer set, even if the step was previously recorded complete.
 
 Credentials are saved only through
 :class:`~henchmen.console.config_store.ConfigStore` and the token is never
-echoed back; ``status`` reports only ``"configured"``/``""`` for it. Unlike a
-Slack bot token, the Jira site and account are already visible in the
-credentials themselves (``base_url``, ``email``), so saving credentials that
-point at a different site or a different account reopens a previously
-completed step, and clears the saved project and custom fields, *before* the
-new credentials are written -- the same reopen-before-write ordering as the
-GitHub and Slack steps -- so a reconnect to a different Jira site never
-leaves a stale "done" badge, or the old site's project/field choices, behind.
+echoed back; ``status`` reports only ``"configured"``/``""`` for it.
+:func:`connect` fingerprints the Jira site and account on the Atlassian
+``accountId`` (:func:`~henchmen.cli.checks.jira_identity`) paired with the
+site address, never a display name (an account holder can rename themselves
+at any time) -- the same "stable id, never a display name" rule as the Slack
+step's ``team_id:user_id``. Saving credentials that resolve to a different
+site or a different account reopens a previously completed step, and clears
+the saved project and custom fields, *before* the new credentials are
+written -- the same reopen-before-write ordering as the GitHub and Slack
+steps -- so a reconnect to a different Jira site never leaves a stale "done"
+badge, or the old site's project/field choices, behind. The intake label is
+deliberately *not* cleared on a site or account change: it is a Henchmen-side
+label name, not a value that means anything to a particular Jira site, so it
+carries over unchanged (ruling F8). When the account id cannot be confirmed
+at all, the change is assumed (fail closed) rather than trusted, exactly like
+the Slack step's workspace identity.
 
-:func:`~henchmen.cli.checks.list_jira_projects` and
-:func:`~henchmen.cli.checks.list_jira_fields` are page-bounded by
-``MAX_LIST_PAGES``; a project or field outside that listing can still be
-saved by key or id -- :func:`save` re-checks every choice against a fresh
-listing before writing anything, so a truncated dropdown never silently
-blocks a valid choice.
+:func:`~henchmen.cli.checks.list_jira_projects` is page-bounded by
+``checks._JIRA_MAX_PAGES`` (20 pages of ``checks._JIRA_PAGE_SIZE`` (50) each);
+``connect`` and ``options`` report that as ``details.truncated`` so the UI can
+say "showing the first N projects", and :func:`save` still lets a project
+beyond that listing be chosen by key -- confirmed directly with
+:func:`~henchmen.cli.checks.get_jira_project` (bounded to one call, fails
+closed) rather than trusted from the client. ``/rest/api/3/field`` is not
+paginated by Jira at all, so there is no truncation concept for custom
+fields.
+
+A listing failure after the credentials already checked out (a 5xx, a
+timeout, a rate limit) raises
+:class:`~henchmen.cli.checks.JiraUnreachableError`, reported as "Henchmen
+could not list Jira projects and fields" -- distinct from a genuine empty
+listing, so it is never mistaken for "no projects" and never produces "ask a
+Jira admin for Browse access" advice for what is really a connectivity
+problem (ruling F4). A credentials failure is itself distinguished by cause
+(unreachable, wrong credentials, no site access, no such site, rate limited)
+by :func:`~henchmen.cli.checks.check_jira` (ruling F3).
 
 :func:`save` re-checks, under the config file's lock and only after every
 network call, that the saved credentials are still the ones it started with
@@ -50,13 +71,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from henchmen.cli import checks
-from henchmen.cli.checks import CheckResult, CheckStatus, JiraField, JiraProject
-from henchmen.config.settings import require_secure_github_url
+from henchmen.cli.checks import CheckResult, CheckStatus, JiraField, JiraIdentity, JiraProject
 from henchmen.console.check_problems import problem_from_check
 from henchmen.console.config_store import CONFIGURED, ConfigStore, ConfigStoreError
 from henchmen.console.deps import get_config_store
 from henchmen.console.state import SetupStateStore, SetupStep
 from henchmen.console.steps import StepFailure, StepProblem, StepSuccess, get_setup_store, step_failed, step_succeeded
+from henchmen.utils.redaction import redact
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +93,13 @@ BRANCH_FIELD_KEY = "HENCHMEN_JIRA_BRANCH_FIELD"
 INTAKE_LABEL_KEY = "HENCHMEN_JIRA_INTAKE_LABEL"
 TOKEN_PAGE_URL = "https://id.atlassian.com/manage-profile/security/api-tokens"
 DEFAULT_INTAKE_LABEL = "henchmen"
+
+# `base_url:account_id` from the last successful credentials check (server-only,
+# like the GitHub step's app slug/account and the Slack step's workspace choice),
+# used only to notice a real site or account change on the next connect. Never a
+# display name (an account holder can rename themselves) and never trusted as a
+# real credential.
+JIRA_ACCOUNT_CHOICE = "jira_account"
 
 ConfigDep = Annotated[ConfigStore, Depends(get_config_store)]
 SetupDep = Annotated[SetupStateStore, Depends(get_setup_store)]
@@ -89,8 +117,8 @@ class JiraCredentials(BaseModel):
     @field_validator("base_url", mode="after")
     @classmethod
     def _valid_base_url(cls, value: str) -> str:
-        """The same https/host rules the GitHub endpoint validator uses (no separate copy)."""
-        return require_secure_github_url(value)
+        """Jira-specific tightening of the shared https/host rules (ruling F6; no separate copy)."""
+        return checks.validate_jira_base_url(value)
 
 
 class JiraChoices(BaseModel):
@@ -110,30 +138,66 @@ class JiraChoices(BaseModel):
     )
 
 
-def _lookup(base_url: str, email: str, api_token: str) -> tuple[CheckResult, list[JiraProject], list[JiraField]]:
-    """Blocking credential check plus lookups (run in a worker thread)."""
+def _lookup(base_url: str, email: str, api_token: str) -> tuple[CheckResult, list[JiraProject], list[JiraField], bool]:
+    """Blocking credential check plus lookups (run in a worker thread), for ``options``/``save``.
+
+    Raises :class:`~henchmen.cli.checks.JiraUnreachableError` when the
+    credentials check out but the project or field listing itself fails
+    (ruling F4) -- never a silent empty list for that case.
+    """
     result = checks.check_jira(base_url, email, api_token)
     if result.status != CheckStatus.OK:
-        return result, [], []
-    projects = checks.list_jira_projects(base_url, email, api_token)
+        return result, [], [], False
+    listing = checks.list_jira_projects(base_url, email, api_token)
     fields = [field for field in checks.list_jira_fields(base_url, email, api_token) if field.custom]
-    return result, projects, fields
+    return result, listing.projects, fields, listing.truncated
 
 
-def _options(result: CheckResult, projects: list[JiraProject], fields: list[JiraField]) -> dict[str, Any]:
+def _connect_lookup(
+    base_url: str, email: str, api_token: str
+) -> tuple[CheckResult, JiraIdentity | None, list[JiraProject], list[JiraField], bool]:
+    """Blocking credential check, account identity and lookups (run in a worker thread), for ``connect``.
+
+    Raises :class:`~henchmen.cli.checks.JiraUnreachableError` on a listing
+    failure, the same as :func:`_lookup`.
+    """
+    result = checks.check_jira(base_url, email, api_token)
+    if result.status != CheckStatus.OK:
+        return result, None, [], [], False
+    identity = checks.jira_identity(base_url, email, api_token)
+    listing = checks.list_jira_projects(base_url, email, api_token)
+    fields = [field for field in checks.list_jira_fields(base_url, email, api_token) if field.custom]
+    return result, identity, listing.projects, fields, listing.truncated
+
+
+def _options(
+    result: CheckResult, projects: list[JiraProject], fields: list[JiraField], truncated: bool
+) -> dict[str, Any]:
     return {
         "account": result.message,
         "projects": [{"key": project.key, "name": project.name} for project in projects],
         "fields": [{"id": field.id, "name": field.name} for field in fields],
+        "truncated": truncated,
     }
 
 
 def _credentials_problem(result: CheckResult) -> StepProblem:
-    problem = problem_from_check(result, field="api_token")
+    # `check_jira` already distinguishes unreachable/wrong-credentials/no-access/no-such-site/
+    # rate-limited (ruling F3); a "no such site" message points at the address field, not the token.
+    field = "base_url" if "no Jira site at that address" in result.message else "api_token"
+    problem = problem_from_check(result, field=field)
     if problem.action:
         return problem
     return problem.model_copy(
         update={"action": f"Check the site address and email, or create a new API token at {TOKEN_PAGE_URL}"}
+    )
+
+
+def _listing_problem(exc: Exception) -> StepProblem:
+    """A listing failure after credentials already checked out (ruling F4) -- distinct from "no projects"."""
+    return StepProblem(
+        message=redact(f"Henchmen could not list Jira projects and fields ({exc})."),
+        action="Try again in a moment. If this keeps happening, check Jira's own status page.",
     )
 
 
@@ -151,6 +215,11 @@ def _saved_credentials(config: ConfigStore) -> tuple[str, str, str] | None:
 
 def _connect_first() -> StepProblem:
     return StepProblem(message="Connect Jira first.", action="Enter your Jira site address, email and API token.")
+
+
+def _account_fingerprint(base_url: str, identity: JiraIdentity | None) -> str:
+    """``base_url:account_id``, or ``""`` when the identity could not be confirmed (fail closed)."""
+    return f"{base_url}:{identity.account_id}" if identity is not None else ""
 
 
 @router.get("")
@@ -189,21 +258,31 @@ async def connect(body: JiraCredentials, config: ConfigDep, setup: SetupDep) -> 
         )
         return step_failed(STEP, problem)
     base_url = body.base_url.rstrip("/")
-    result, projects, fields = await run_in_threadpool(_lookup, base_url, body.email, token)
+    try:
+        result, identity, projects, fields, truncated = await run_in_threadpool(
+            _connect_lookup, base_url, body.email, token
+        )
+    except checks.JiraUnreachableError as exc:
+        return step_failed(STEP, _listing_problem(exc))
     if result.status != CheckStatus.OK:
         return step_failed(STEP, _credentials_problem(result))
+    new_fingerprint = _account_fingerprint(base_url, identity)
     try:
         # Reopen a completed step -- and clear its saved project and custom fields,
         # which belonged to the old site or account -- before writing credentials that
-        # point at a different site or account, never after: the same ordering as the
-        # GitHub and Slack steps' reopen-before-write. `record_step_incomplete` touches
-        # a different file, but is called only while nothing else can also be mutating
-        # this config file (no `await` inside the lock).
+        # resolve to a different site or account, never after: the same ordering as
+        # the GitHub and Slack steps' reopen-before-write. Fingerprinted on the
+        # Atlassian account id paired with the site address (never a display name),
+        # since one Atlassian account can hold projects on more than one Jira site.
+        # The intake label is deliberately left out of `unset`: it names nothing
+        # site-specific, so it survives a reconnect unchanged (ruling F8).
+        # `identity is None` (the id could not be confirmed) is itself treated as a
+        # change: fail closed rather than assume nothing moved. `record_step_incomplete`
+        # touches a different file, but is called only while nothing else can also be
+        # mutating this config file (no `await` inside the lock).
         with config.locked():
-            previous_base_url, previous_email = config.get(BASE_URL_KEY), config.get(EMAIL_KEY)
-            changed = bool(previous_base_url or previous_email) and (
-                previous_base_url != base_url or previous_email != body.email
-            )
+            previous_fingerprint = setup.load().server_choices.get(JIRA_ACCOUNT_CHOICE, "")
+            changed = identity is None or (previous_fingerprint and previous_fingerprint != new_fingerprint)
             if changed:
                 setup.record_step_incomplete(STEP)
                 config.update(
@@ -216,7 +295,13 @@ async def connect(body: JiraCredentials, config: ConfigDep, setup: SetupDep) -> 
     except (OSError, ConfigStoreError, ValueError) as exc:
         logger.warning("Could not save Jira credentials (%s)", type(exc).__name__)
         return step_failed(STEP, _storage_problem())
-    return StepSuccess(step=STEP, details=_options(result, projects, fields))
+    try:
+        # Display-only, for the next connect's account-change check: a failure here
+        # is logged but must not strand the user, since the credentials are already saved.
+        setup.set_server_choices({JIRA_ACCOUNT_CHOICE: new_fingerprint})
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not record the Jira account identity (%s)", type(exc).__name__)
+    return StepSuccess(step=STEP, details=_options(result, projects, fields, truncated))
 
 
 @router.get("/options")
@@ -225,10 +310,13 @@ async def options(config: ConfigDep) -> StepSuccess | StepFailure:
     saved = _saved_credentials(config)
     if saved is None:
         return step_failed(STEP, _connect_first())
-    result, projects, fields = await run_in_threadpool(_lookup, *saved)
+    try:
+        result, projects, fields, truncated = await run_in_threadpool(_lookup, *saved)
+    except checks.JiraUnreachableError as exc:
+        return step_failed(STEP, _listing_problem(exc))
     if result.status != CheckStatus.OK:
         return step_failed(STEP, _credentials_problem(result))
-    return StepSuccess(step=STEP, details=_options(result, projects, fields))
+    return StepSuccess(step=STEP, details=_options(result, projects, fields, truncated))
 
 
 @router.post("")
@@ -240,12 +328,25 @@ async def save(body: JiraChoices, config: ConfigDep, setup: SetupDep) -> StepSuc
     saved = _saved_credentials(config)
     if saved is None:
         return step_failed(STEP, _connect_first())
-    result, projects, fields = await run_in_threadpool(_lookup, *saved)
+    try:
+        result, projects, fields, truncated = await run_in_threadpool(_lookup, *saved)
+    except checks.JiraUnreachableError as exc:
+        return step_failed(STEP, _listing_problem(exc))
     if result.status != CheckStatus.OK:
         return step_failed(STEP, _credentials_problem(result))
 
     problems: list[StepProblem] = []
-    if body.project_key not in {project.key for project in projects}:
+    project_keys = {project.key for project in projects}
+    if body.project_key not in project_keys and truncated:
+        # The listing was cut short (ruling F5): confirm directly before giving up,
+        # the same pattern as the Slack step's `get_slack_channel` fallback.
+        try:
+            direct = await run_in_threadpool(checks.get_jira_project, *saved, body.project_key)
+        except checks.JiraUnreachableError as exc:
+            return step_failed(STEP, _listing_problem(exc))
+        if direct is not None:
+            project_keys = {*project_keys, direct.key}
+    if body.project_key not in project_keys:
         problems.append(
             StepProblem(
                 field="project_key",
