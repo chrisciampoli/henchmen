@@ -22,8 +22,9 @@ and numeric telemetry only.
 
 Access is gated on ``HENCHMEN_METRICS_AUTH_TOKEN``. When the token is set every
 request must carry ``Authorization: Bearer <token>``. When it is empty the
-endpoints stay open in DEV (with a startup warning) and fail closed with 401 in
-STAGING/PROD.
+endpoints stay open only when ``henchmen.config.posture.fail_open_allowed``
+is true (dev, and not a desktop install) -- with a startup warning -- and
+fail closed with 401 in STAGING, PROD and on every desktop install.
 """
 
 import logging

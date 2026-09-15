@@ -258,9 +258,11 @@ async def require_api_token(request: Request) -> None:
     """FastAPI dependency guarding ``POST /api/v1/tasks`` with a bearer token.
 
     Every accepted request launches paid operative runs, so the route is
-    fail-closed: with ``HENCHMEN_DISPATCH_API_TOKEN`` unset it is open only in
-    DEV (with a one-time warning) and returns 401 in STAGING and PROD. The
-    token is compared in constant time and never logged or echoed.
+    fail-closed: with ``HENCHMEN_DISPATCH_API_TOKEN`` unset it is open only
+    when ``fail_open_allowed(settings)`` is true (dev, and not a desktop
+    install) -- with a one-time warning -- and returns 401 in STAGING, PROD
+    and on every desktop install. The token is compared in constant time and
+    never logged or echoed.
     """
     global _open_api_warning_logged
     settings = get_settings()

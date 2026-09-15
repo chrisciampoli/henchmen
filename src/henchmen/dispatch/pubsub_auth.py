@@ -130,14 +130,20 @@ async def require_internal_caller(request: Request) -> None:
 async def verify_pubsub_oidc(request: Request, settings: Settings) -> None:
     """Verify the OIDC bearer token on a Pub/Sub push request.
 
-    Raises :class:`fastapi.HTTPException` (401) on any verification failure
-    in STAGING/PROD. In DEV, logs a warning and returns without raising so
-    that local dev loops (in-memory broker, docker-compose) keep working.
+    Raises :class:`fastapi.HTTPException` (401) on any verification failure,
+    except that a request with no audience configured and no token is let
+    through with a logged warning when ``fail_open_allowed(settings)`` is
+    true (dev, and not a desktop install) so local dev loops (in-memory
+    broker, docker-compose) keep working. A desktop install never reaches
+    this function for a push at all -- :func:`verify_operative_report` and
+    :func:`verify_pubsub_oidc`'s own internal-push-token branch above handle
+    it first.
 
     Settings consumed:
 
-    - ``pubsub_oidc_audience`` — expected ``aud`` claim. If empty in DEV, the
-      check is skipped; if empty in STAGING/PROD, raises 401.
+    - ``pubsub_oidc_audience`` — expected ``aud`` claim. If empty and
+      ``fail_open_allowed(settings)`` is true, the check is skipped;
+      otherwise raises 401.
     - ``pubsub_oidc_allowed_emails`` — optional comma-separated allow-list of
       publisher service-account emails. If set, the token's ``email`` claim
       must match one of the entries.

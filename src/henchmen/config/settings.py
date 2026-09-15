@@ -318,8 +318,9 @@ class Settings(BaseSettings):
         default="",
         description=(
             "Expected 'aud' claim on OIDC tokens presented by Pub/Sub push subscriptions. "
-            "Must match the value configured on the subscription. Empty in DEV disables "
-            "verification with a logged warning; empty in STAGING/PROD causes 401."
+            "Must match the value configured on the subscription. Empty disables verification "
+            "with a logged warning only on a dev, non-desktop install (fail_open_allowed); "
+            "empty in STAGING/PROD, or on any desktop install, causes 401."
         ),
     )
     pubsub_oidc_allowed_emails: str = Field(
@@ -532,8 +533,9 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("HENCHMEN_DISPATCH_API_TOKEN", "DISPATCH_API_TOKEN"),
         description=(
-            "Bearer token POST /api/v1/tasks requires (Authorization: Bearer <token>). Empty in DEV leaves the "
-            "route open with a warning; empty in STAGING/PROD makes it return 401."
+            "Bearer token POST /api/v1/tasks requires (Authorization: Bearer <token>). Empty leaves the "
+            "route open with a warning only on a dev, non-desktop install (fail_open_allowed); empty in "
+            "STAGING/PROD, or on any desktop install, makes it return 401."
         ),
     )
 
@@ -558,8 +560,9 @@ class Settings(BaseSettings):
     metrics_auth_token: str = Field(
         default="",
         description=(
-            "Bearer token required by the /metrics endpoints. Empty in DEV leaves them open with a warning; "
-            "empty in STAGING/PROD makes them return 401."
+            "Bearer token required by the /metrics endpoints. Empty leaves them open with a warning only on "
+            "a dev, non-desktop install (fail_open_allowed); empty in STAGING/PROD, or on any desktop "
+            "install, makes them return 401."
         ),
     )
 
