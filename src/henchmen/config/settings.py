@@ -18,6 +18,36 @@ from typing import Literal
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def require_secure_github_url(value: str) -> str:
+    """``value`` if it is a usable GitHub base URL, else ``ValueError``.
+
+    GitHub App JWTs and installation tokens travel to ``github_api_url``, and
+    the Console sends browsers (with a single-use ``state``) to
+    ``github_web_url``, so both must be ``https``. Plain ``http`` is accepted
+    only for a host that cannot be reached across a network boundary by name:
+    a loopback address, or a dotless hostname -- a Docker Compose service name
+    such as ``http://fakes:9000``, which is how the Phase 2C end-to-end suite
+    addresses its fake GitHub inside the compose network. Any dotted host
+    (``github.example.com``, ``10.0.0.5``) must use ``https``.
+    """
+    from urllib.parse import urlsplit
+
+    text = value.strip()
+    try:
+        parts = urlsplit(text)
+        host = (parts.hostname or "").lower()
+        parts.port  # noqa: B018 - raises ValueError on an invalid port
+    except ValueError:
+        raise ValueError("must be an http(s) URL with a host") from None
+    if not host or parts.scheme not in ("https", "http") or parts.username or parts.password:
+        raise ValueError("must be an https URL with a host and no credentials")
+    if parts.scheme == "http" and host not in _LOOPBACK_HOSTS and "." in host:
+        raise ValueError("must use https (plain http is allowed only for loopback or a dotless compose service host)")
+    return text
+
 
 class Environment(StrEnum):
     DEV = "dev"
@@ -607,6 +637,12 @@ class Settings(BaseSettings):
     # Derived helpers
     # ------------------------------------------------------------------
 
+    @field_validator("github_api_url", "github_web_url", mode="after")
+    @classmethod
+    def _github_urls_are_secure(cls, value: str) -> str:
+        """GitHub base URLs must be https (http only for loopback or a dotless compose host)."""
+        return require_secure_github_url(value)
+
     @field_validator(*_SEEDED_SECRET_FIELDS, mode="after")
     @classmethod
     def _seeded_placeholder_is_unset(cls, value: str) -> str:
@@ -667,17 +703,27 @@ class Settings(BaseSettings):
         if missing_tiers:
             problems.append(f"No model configured for LLM tier(s): {', '.join(sorted(missing_tiers))}.")
 
-        app_values = {
-            "HENCHMEN_GITHUB_APP_ID": self.github_app_id,
-            "HENCHMEN_GITHUB_APP_INSTALLATION_ID": self.github_app_installation_id,
-            "HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH": self.github_app_private_key_path,
-        }
-        missing_app = [name for name, value in app_values.items() if not value.strip()]
-        if missing_app and len(missing_app) < len(app_values):
-            problems.append(f"The GitHub App is only partly configured; set {', '.join(missing_app)} as well.")
+        from henchmen.config.secret_files import SecretFileError, check_secret_path
+        from henchmen.utils.github_auth import partial_app_message
+
+        partial_app = partial_app_message(
+            self.github_app_id, self.github_app_private_key_path, self.github_app_installation_id
+        )
+        if partial_app:
+            problems.append(partial_app)
         key_path = self.github_app_private_key_path.strip()
-        if key_path and not Path(key_path).is_file():
-            problems.append("HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH does not point to a readable file.")
+        if key_path:
+            # The same checks the runtime key loader (github_auth.load_app_private_key) applies.
+            try:
+                check_secret_path(Path(key_path))
+                key_is_file = Path(key_path).is_file()
+            except SecretFileError as exc:
+                problems.append(f"HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH cannot be used: {exc}")
+            except OSError:
+                problems.append("HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH does not point to a readable file.")
+            else:
+                if not key_is_file:
+                    problems.append("HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH does not point to a readable file.")
 
         if self.environment in (Environment.STAGING, Environment.PROD):
             if not self.pubsub_oidc_audience:

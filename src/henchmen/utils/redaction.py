@@ -33,11 +33,13 @@ _BEARER_PATTERN = re.compile(r"(?i)\b(bearer)[ \t]+[A-Za-z0-9._~+/=-]{16,}")
 # Linear by construction: the header label is bounded (``{0,40}``); the body
 # is one greedy loop in which every character is matched by exactly one
 # branch (a non-hyphen, or a hyphen not followed by four more), so it never
-# backtracks; and the footer is *optional*, so a truncated block (an error
-# message cut at 200 characters) is still redacted up to where it stops, and
-# a run of headers with no footer (``"-----BEGIN PRIVATE KEY-----" * N``)
-# ends each match at the next ``-----`` instead of rescanning to the end of
-# the input from every header.
+# backtracks; and the footer is *optional*. An unterminated block (an error
+# message cut at 200 characters) is therefore redacted from its header up to
+# the next ``-----`` or, when there is none, to the end of the text -- which
+# can take ordinary text after the key with it (deliberate: fail closed). A
+# run of headers with no footer (``"-----BEGIN PRIVATE KEY-----" * N``) ends
+# each match at the next ``-----`` instead of rescanning to the end of the
+# input from every header.
 _PEM_PRIVATE_KEY_PATTERN = re.compile(
     r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----(?:[^-]|-(?!----))*(?:-----END [A-Z ]{0,40}PRIVATE KEY-----)?"
 )

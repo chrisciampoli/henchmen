@@ -36,6 +36,7 @@ from henchmen.utils.github_auth import (
     github_error_detail,
     load_app_private_key,
     parse_expiry,
+    parse_repository,
 )
 from tests.unit.github_fakes import FakeGitHub, app_key_pair
 
@@ -228,18 +229,109 @@ def test_repository_scoped_tokens_are_cached_separately(key_file: Path, github: 
     assert [record["repositories"] for record in github.minted] == [["webapp"], None]
 
 
-def test_clone_url_is_scoped_to_its_repository(key_file: Path, github: FakeGitHub, clock: _Clock) -> None:
-    _provider(key_file, github, clock).token("https://github.com/acme/webapp.git")
+@pytest.mark.parametrize(
+    ("repo", "expected"),
+    [
+        ("acme/webapp", ("acme", "webapp")),
+        ("  acme/web.app_1-x  ", ("acme", "web.app_1-x")),
+        ("https://github.com/acme/webapp", ("acme", "webapp")),
+        ("https://github.com/acme/webapp.git", ("acme", "webapp")),
+        ("https://ghe.example.test:8443/acme/webapp.git", ("acme", "webapp")),
+        ("git@github.com:acme/webapp.git", ("acme", "webapp")),
+        ("git@github.com:acme/webapp", ("acme", "webapp")),
+        (None, None),
+        ("", None),
+    ],
+)
+def test_parse_repository_accepted_shapes(repo: str | None, expected: tuple[str, str] | None) -> None:
+    assert parse_repository(repo) == expected
+
+
+@pytest.mark.parametrize(
+    "repo",
+    [
+        "webapp",
+        "acme/web app",
+        "acme/..",
+        "acme/we$b",
+        "acme/webapp/tree/main",
+        "https://github.com/acme/webapp/tree/main",
+        "https://github.com/webapp.git",
+        "http://github.com/acme/webapp.git",
+        "https://x-access-token:ghs_x@github.com/acme/webapp.git",
+        "ssh://git@github.com/acme/webapp.git",
+        "git@github.com:acme/webapp/extra.git",
+        "acme/webapp.git",
+        "-acme/webapp",
+    ],
+)
+def test_invalid_repository_never_reaches_github(key_file: Path, github: FakeGitHub, clock: _Clock, repo: str) -> None:
+    with pytest.raises(GitHubAuthError, match="owner/name or a GitHub clone URL"):
+        _provider(key_file, github, clock).token(repo)
+    assert github.requests == []
+
+
+@pytest.mark.parametrize("repo", ["https://github.com/acme/webapp.git", "git@github.com:acme/webapp.git"])
+def test_clone_urls_are_scoped_to_their_repository(
+    key_file: Path, github: FakeGitHub, clock: _Clock, repo: str
+) -> None:
+    provider = _provider(key_file, github, clock)
+    assert provider.token(repo) == "ghs_fake0001"
+    assert provider.token("acme/webapp") == "ghs_fake0001"  # same cache entry as owner/name
     assert [record["repositories"] for record in github.minted] == [["webapp"]]
 
 
-@pytest.mark.parametrize("repo", ["acme/web app", "acme/..", "acme/we$b"])
-def test_invalid_repository_name_never_widens_to_the_installation(
-    key_file: Path, github: FakeGitHub, clock: _Clock, repo: str
-) -> None:
-    with pytest.raises(GitHubAuthError, match="repository name"):
-        _provider(key_file, github, clock).token(repo)
-    assert github.requests == []
+def test_token_scoped_to_another_owner_is_refused(key_file: Path, github: FakeGitHub, clock: _Clock) -> None:
+    github.installations["99"] = FakeGitHub.installation("99", "someone-else")
+    provider = _provider(key_file, github, clock)
+    with pytest.raises(GitHubAuthError, match="different repository"):
+        provider.token("acme/webapp")
+    with pytest.raises(GitHubAuthError, match="different repository"):
+        provider.token("acme/webapp")  # nothing was cached
+    assert len(_mints(github)) == 2
+
+
+@pytest.mark.parametrize(
+    "repositories",
+    [
+        [{"full_name": "other/webapp"}],
+        [{"owner": {"login": "other"}, "name": "webapp"}],
+        [{"name": "api"}],
+        [{"full_name": "acme/webapp"}, {"full_name": "acme/api"}],
+        [{"id": 1}],
+        [],
+        "acme/webapp",
+    ],
+)
+def test_unexpected_token_repositories_are_refused(key_file: Path, clock: _Clock, repositories: object) -> None:
+    expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock.now + 3600))
+    body = {"token": "ghs_x", "expires_at": expires, "repositories": repositories}
+    provider = GitHubCredentialsProvider(
+        app=GitHubAppConfig(app_id="4242", private_key_path=key_file, installation_id="99"),
+        client_factory=lambda: httpx.Client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(201, json=body))
+        ),
+        clock=clock,
+    )
+    with pytest.raises(GitHubAuthError):
+        provider.token("acme/webapp")
+
+
+def test_matching_token_repositories_are_accepted_case_insensitively(key_file: Path, clock: _Clock) -> None:
+    expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock.now + 3600))
+    body = {
+        "token": "ghs_x",
+        "expires_at": expires,
+        "repositories": [{"full_name": "ACME/WebApp", "owner": {"login": "Acme"}, "name": "webapp"}],
+    }
+    provider = GitHubCredentialsProvider(
+        app=GitHubAppConfig(app_id="4242", private_key_path=key_file, installation_id="99"),
+        client_factory=lambda: httpx.Client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(201, json=body))
+        ),
+        clock=clock,
+    )
+    assert provider.token("acme/webapp") == "ghs_x"
 
 
 def test_minimum_lifetime_forces_a_fresh_token(key_file: Path, github: FakeGitHub, clock: _Clock) -> None:
@@ -258,14 +350,38 @@ def test_minimum_lifetime_above_an_hour_is_capped(
         assert provider.token(min_ttl_seconds=7200) == "ghs_fake0001"
     assert str(MAX_MIN_TTL_SECONDS) in caplog.text
     assert len([record for record in caplog.records if record.levelno == logging.WARNING]) == 1
-    clock.now += 3600 - MAX_MIN_TTL_SECONDS + 1  # 3299s or less left: below the capped minimum
+    clock.now += 3600 - MAX_MIN_TTL_SECONDS + 1  # just under the capped minimum left
     assert provider.token(min_ttl_seconds=7200) == "ghs_fake0002"
+
+
+def test_ttl_cap_leaves_ten_minutes_for_clock_skew() -> None:
+    assert MAX_MIN_TTL_SECONDS == 3000
+    assert 3600 - MAX_MIN_TTL_SECONDS >= 600
+
+
+@pytest.mark.parametrize("min_ttl", [3000, 7200])
+def test_maximum_lifetime_request_tolerates_clock_skew(key_file: Path, clock: _Clock, min_ttl: int) -> None:
+    """Our clock 500 s ahead of GitHub's: a fresh one-hour token has about 3100 s left here, still enough."""
+    github = FakeGitHub(clock=lambda: clock.now - 500)
+    github.installations["99"] = FakeGitHub.installation("99", "acme")
+    provider = _provider(key_file, github, clock)
+    assert provider.token("acme/webapp", min_ttl_seconds=min_ttl) == "ghs_fake0001"
+    assert provider.token("acme/webapp", min_ttl_seconds=min_ttl) == "ghs_fake0001"
+    assert len(_mints(github)) == 1
 
 
 def test_a_token_that_is_already_too_short_lived_is_refused(key_file: Path, github: FakeGitHub, clock: _Clock) -> None:
     github.token_lifetime_seconds = 60
     with pytest.raises(GitHubAuthError, match="check the server clock"):
         _provider(key_file, github, clock).token()
+
+
+def test_a_token_shorter_than_the_capped_minimum_is_refused(key_file: Path, github: FakeGitHub, clock: _Clock) -> None:
+    github.token_lifetime_seconds = MAX_MIN_TTL_SECONDS - 10
+    provider = _provider(key_file, github, clock)
+    with pytest.raises(GitHubAuthError, match="check the server clock"):
+        provider.token("acme/webapp", min_ttl_seconds=7200)
+    assert provider.token("acme/webapp") == "ghs_fake0002"  # enough for the default minimum
 
 
 def test_invalidate_forgets_cached_tokens(key_file: Path, github: FakeGitHub, clock: _Clock) -> None:
@@ -285,6 +401,33 @@ def test_api_url_is_configurable(key_file: Path, github: FakeGitHub, clock: _Clo
     provider.token()
     (request,) = _mints(github)
     assert str(request.url) == "https://ghe.example.test/app/installations/99/access_tokens"
+
+
+@pytest.mark.parametrize(
+    "api_url", ["http://api.github.com", "ftp://api.github.com", "https://user:pw@api.github.com", "not a url"]
+)
+def test_provider_refuses_an_insecure_api_url(api_url: str) -> None:
+    with pytest.raises(GitHubAuthError, match="GitHub API URL"):
+        GitHubCredentialsProvider(app=None, api_url=api_url)
+
+
+@pytest.mark.parametrize("api_url", ["http://127.0.0.1:9000", "http://localhost:9000/", "http://fakes:9000/github/api"])
+def test_provider_accepts_loopback_and_compose_http_urls(api_url: str, key_file: Path, clock: _Clock) -> None:
+    seen: list[str] = []
+    expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock.now + 3600))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(201, json={"token": "ghs_x", "expires_at": expires})
+
+    provider = GitHubCredentialsProvider(
+        app=GitHubAppConfig(app_id="4242", private_key_path=key_file, installation_id="99"),
+        api_url=api_url,
+        client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)),
+        clock=clock,
+    )
+    assert provider.token() == "ghs_x"
+    assert seen == [api_url.rstrip("/") + "/app/installations/99/access_tokens"]
 
 
 def test_default_clients_ignore_the_environment_and_time_out() -> None:
@@ -563,9 +706,168 @@ async def test_a_configured_app_that_fails_never_falls_back_to_the_pat(
         await get_github_token_async("acme/webapp", settings=settings)
 
 
-def test_partly_configured_app_is_a_runtime_problem() -> None:
-    problems = Settings(**{"_env_file": None, "github_app_id": "1"}).validate_for_runtime()
-    assert any("GitHub App is only partly configured" in problem for problem in problems)
+_APP_FIELDS = {
+    "github_app_id": ("HENCHMEN_GITHUB_APP_ID", "4242"),
+    "github_app_installation_id": ("HENCHMEN_GITHUB_APP_INSTALLATION_ID", "99"),
+    "github_app_private_key_path": ("HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH", "<key file>"),
+}
+_PARTIAL_COMBINATIONS = [
+    ("github_app_id",),
+    ("github_app_installation_id",),
+    ("github_app_private_key_path",),
+    ("github_app_id", "github_app_installation_id"),
+    ("github_app_id", "github_app_private_key_path"),
+    ("github_app_installation_id", "github_app_private_key_path"),
+]
+
+
+def _partial_settings(present: tuple[str, ...], key_file: Path) -> Settings:
+    values: dict[str, Any] = {"_env_file": None, "github_token": "ghp_personal"}
+    for field in _APP_FIELDS:
+        if field in present:
+            values[field] = str(key_file) if field == "github_app_private_key_path" else _APP_FIELDS[field][1]
+        else:
+            values[field] = "   "  # blank counts as unset
+    return Settings(**values)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("present", _PARTIAL_COMBINATIONS)
+async def test_partly_configured_app_never_uses_the_pat(
+    monkeypatch: pytest.MonkeyPatch, key_file: Path, present: tuple[str, ...]
+) -> None:
+    def no_http() -> httpx.Client:
+        raise AssertionError("no HTTP for a partly configured App")
+
+    monkeypatch.setattr(github_auth, "_default_client", no_http)
+    monkeypatch.setattr(github_auth, "_default_async_client", no_http)
+    settings = _partial_settings(present, key_file)
+    provider = get_credentials_provider(settings)
+    missing = sorted(_APP_FIELDS[field][0] for field in _APP_FIELDS if field not in present)
+
+    calls = [
+        lambda: provider.token("acme/webapp"),
+        lambda: provider.installation_token("acme/webapp"),
+        lambda: get_github_token("acme/webapp", settings=settings),
+    ]
+    errors: list[GitHubAuthError] = []
+    for call in calls:
+        with pytest.raises(GitHubAuthError, match="only partly configured") as exc_info:
+            call()
+        errors.append(exc_info.value)
+    for coroutine_call in (
+        lambda: provider.token_async("acme/webapp"),
+        lambda: provider.installation_token_async("acme/webapp"),
+        lambda: get_github_token_async("acme/webapp", settings=settings),
+        lambda: get_installation_token_async("acme/webapp", settings=settings),
+    ):
+        with pytest.raises(GitHubAuthError, match="only partly configured") as exc_info:
+            await coroutine_call()
+        errors.append(exc_info.value)
+
+    for error in errors:
+        message = str(error)
+        assert sorted(name for name in (entry[0] for entry in _APP_FIELDS.values()) if name in message) == missing
+        for value in ("ghp_personal", "4242", "99", str(key_file)):
+            assert value not in message
+    assert not provider.uses_app
+
+
+@pytest.mark.parametrize("present", _PARTIAL_COMBINATIONS)
+def test_partly_configured_app_is_a_runtime_problem(key_file: Path, present: tuple[str, ...]) -> None:
+    problems = _partial_settings(present, key_file).validate_for_runtime()
+    (problem,) = [problem for problem in problems if "only partly configured" in problem]
+    for field, (env_name, _value) in _APP_FIELDS.items():
+        assert (env_name in problem) is (field not in present)
+
+
+def test_partial_app_message_ignores_non_strings() -> None:
+    assert github_auth.partial_app_message(MagicMock(), MagicMock(), MagicMock()) is None
+    assert github_auth.partial_app_message("", "", "") is None
+    assert github_auth.partial_app_message("1", "/k.pem", "2") is None
+
+
+def test_key_file_validation_matches_the_loader(key_file: Path, tmp_path: Path) -> None:
+    """validate_for_runtime refuses exactly what load_app_private_key refuses."""
+    link = tmp_path / "link.pem"
+    candidates = [key_file, tmp_path / "missing.pem", tmp_path]
+    try:
+        os.symlink(key_file, link)
+        candidates.append(link)
+    except (OSError, NotImplementedError):
+        pass  # symbolic links cannot be created here; the other cases still compare both checks
+    for path in candidates:
+        settings = Settings(
+            **{
+                "_env_file": None,
+                "github_app_id": "1",
+                "github_app_installation_id": "2",
+                "github_app_private_key_path": str(path),
+            }
+        )
+        flagged = any("HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH" in problem for problem in settings.validate_for_runtime())
+        try:
+            load_app_private_key(path)
+            loads = True
+        except GitHubAuthError:
+            loads = False
+        assert flagged is not loads, path
+
+
+def test_symlinked_key_file_is_a_runtime_problem(key_file: Path, tmp_path: Path) -> None:
+    link = tmp_path / "link.pem"
+    try:
+        os.symlink(key_file, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links cannot be created here")
+    settings = Settings(
+        **{
+            "_env_file": None,
+            "github_app_id": "1",
+            "github_app_installation_id": "2",
+            "github_app_private_key_path": str(link),
+        }
+    )
+    assert any("symbolic link" in problem for problem in settings.validate_for_runtime())
+
+
+@pytest.mark.parametrize("field", ["github_api_url", "github_web_url"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.github.com",
+        "https://ghe.example.test/api/v3/",
+        "http://127.0.0.1:9000",
+        "http://localhost:9000/github",
+        "http://[::1]:9000",
+        "http://fakes:9000/github/api",
+    ],
+)
+def test_github_urls_accept_https_loopback_and_compose_hosts(field: str, url: str) -> None:
+    assert getattr(Settings(**{"_env_file": None, field: url}), field) == url
+
+
+@pytest.mark.parametrize("field", ["github_api_url", "github_web_url"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://api.github.com",
+        "http://10.0.0.5:9000",
+        "http://fakes.internal:9000",
+        "ftp://api.github.com",
+        "https://user:secret@api.github.com",
+        "https://",
+        "api.github.com",
+        "",
+        "https://api.github.com:99999",
+    ],
+)
+def test_github_urls_refuse_insecure_or_malformed_values(field: str, url: str) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(**{"_env_file": None, field: url})
+    assert field in str(exc_info.value)
 
 
 def test_fully_configured_app_is_not_a_runtime_problem(key_file: Path) -> None:
