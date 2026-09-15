@@ -30,6 +30,7 @@ STARTUP_FAILURE = 3
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
+    from henchmen.console.services import ServiceHealth
 
 logger = logging.getLogger("henchmen")
 
@@ -93,17 +94,30 @@ class DesktopRuntime:
 
 
 def build_serve_app(
-    settings: Settings, port: int, console: FastAPI | None = None, *, desktop: DesktopRuntime | None = None
+    settings: Settings,
+    port: int,
+    console: FastAPI | None = None,
+    *,
+    desktop: DesktopRuntime | None = None,
+    health: ServiceHealth | None = None,
 ) -> FastAPI:
     """Build the combined local app; mount ``console`` at / after the services when given.
 
-    ``desktop`` (data-directory installs only) adds the whole-app Host allowlist.
+    ``desktop`` (data-directory installs only) adds the whole-app Host allowlist
+    and authenticates internal pushes. ``health`` records each service's state
+    and a startup failure for ``/console/api/status`` and needs-attention mode.
     """
     from henchmen import __version__
+    from henchmen.console.services import SERVICE_NAMES, ServiceHealth, ServiceState
     from henchmen.dispatch.server import app as dispatch_app
     from henchmen.forge.server import app as forge_app
     from henchmen.mastermind.server import app as mastermind_app
-    from henchmen.providers.local.memory import InMemoryMessageBroker, default_forward_map, set_shared_broker
+    from henchmen.providers.local.memory import (
+        InMemoryMessageBroker,
+        default_forward_map,
+        get_shared_broker,
+        set_shared_broker,
+    )
     from henchmen.providers.registry import ProviderRegistry
 
     # One broker for every mounted service. InMemoryMessageBroker() returns the
@@ -132,14 +146,22 @@ def build_serve_app(
     forge_app.state.document_store = shared_store
 
     sub_apps: tuple[FastAPI, ...] = (dispatch_app, mastermind_app, forge_app)
+    tracker = health if health is not None else ServiceHealth()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        tracker.set_all(ServiceState.STARTING)
         try:
             async with AsyncExitStack() as stack:
                 with _uvicorn_owns_signals(asyncio.get_running_loop()):
-                    for sub_app in sub_apps:
-                        await stack.enter_async_context(sub_app.router.lifespan_context(sub_app))
+                    for name, sub_app in zip(SERVICE_NAMES, sub_apps, strict=True):
+                        try:
+                            await stack.enter_async_context(sub_app.router.lifespan_context(sub_app))
+                        except Exception as exc:
+                            # Recorded, then re-raised: uvicorn reports a startup failure and
+                            # `henchmen serve` decides whether to serve the needs-attention Console.
+                            tracker.record_startup_failure(name, exc)
+                            raise
                 # A sub-app lifespan may have replaced a shared provider with its
                 # own instance; close the duplicate and restore the shared one.
                 shared: dict[str, object] = {"message_broker": shared_broker, "document_store": shared_store}
@@ -149,15 +171,26 @@ def build_serve_app(
                         if current is not None and current is not instance:
                             await _aclose(current, f"{sub_app.title} {attr}")
                             setattr(sub_app.state, attr, instance)
+                tracker.set_all(ServiceState.RUNNING)
                 logger.info("All services initialized")
                 try:
                     yield
                 finally:
+                    tracker.set_all(ServiceState.STOPPING)
                     await shared_broker.drain()
                     logger.info("Shutting down")
                 # Leaving the AsyncExitStack runs the sub-app shutdowns in reverse order.
         finally:
+            tracker.finish()
             await _aclose(shared_store, "shared document store")
+            # A failed startup (or a normal shutdown) must not leave this run's broker as the
+            # process-wide singleton (ruling: no resource leak into a same-process fallback):
+            # a later build_serve_app call already replaces it, but a needs-attention app built
+            # after a startup failure builds no broker of its own and must never reach this one.
+            # (A startup failure happens before the success path's own drain() above ever runs,
+            # so there is nothing in flight here to wait for -- only the singleton to release.)
+            if get_shared_broker() is shared_broker:
+                set_shared_broker(None)
 
     app = FastAPI(title="Henchmen (Local Dev)", version=__version__, lifespan=lifespan)
     app.mount("/dispatch", dispatch_app)
@@ -165,7 +198,7 @@ def build_serve_app(
     app.mount("/forge", forge_app)
 
     @app.get("/health")
-    async def health() -> dict[str, object]:
+    async def health_status() -> dict[str, object]:
         return {"status": "ok", "mode": "local", "services": ["dispatch", "mastermind", "forge"]}
 
     if console is not None:
@@ -237,6 +270,22 @@ def build_setup_app(console: FastAPI) -> FastAPI:
     return app
 
 
+def build_attention_app(console: FastAPI) -> FastAPI:
+    """Needs-attention mode: a degraded /health plus the Console, whose status lists the problems."""
+    from henchmen import __version__
+
+    app = FastAPI(
+        title="Henchmen (needs attention)", version=__version__, docs_url=None, redoc_url=None, openapi_url=None
+    )
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "degraded", "mode": "attention"}
+
+    app.mount("/", console)
+    return app
+
+
 def serve_app(app: FastAPI, *, host: str, port: int, log_level: str, restart: RestartSignal) -> int:
     """Run ``app`` until it stops; return the process exit code.
 
@@ -245,14 +294,23 @@ def serve_app(app: FastAPI, *, host: str, port: int, log_level: str, restart: Re
     left to print a traceback, and a server whose lifespan never started
     (``server.started`` still ``False``) exits with uvicorn's own
     ``STARTUP_FAILURE`` code so a genuine startup failure is distinguishable
-    from a clean stop. A requested restart takes priority over both.
+    from a clean stop. A requested restart takes priority over both. A
+    ``SystemExit`` raised inside uvicorn -- it exits 1 when it cannot bind and,
+    in newer releases, 3 when startup fails -- is returned as the code instead
+    of ending the process, so the caller can choose needs-attention mode.
     """
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level=log_level))
     restart.attach(server)
-    with suppress(KeyboardInterrupt):
-        server.run()
+    exit_code: int | None = None
+    try:
+        with suppress(KeyboardInterrupt):
+            server.run()
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else STARTUP_FAILURE
     if restart.requested:
         return RESTART_EXIT_CODE
+    if exit_code:
+        return exit_code
     if not server.started:
         return STARTUP_FAILURE
     return 0
