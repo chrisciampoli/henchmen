@@ -117,6 +117,14 @@ def main() -> None:
 
     add_init_arguments(init_parser)
 
+    console_link_parser = subparsers.add_parser(
+        "console-link",
+        help="Print a fresh one-time sign-in link for the Henchmen Console (data-directory installs)",
+    )
+    from henchmen.cli.console_link import add_console_link_arguments
+
+    add_console_link_arguments(console_link_parser)
+
     eval_parser = subparsers.add_parser("eval", help="Run the offline evaluation harness")
     _add_eval_run_arguments(eval_parser, provider_required=False)
     eval_subparsers = eval_parser.add_subparsers(dest="eval_command")
@@ -163,6 +171,10 @@ def main() -> None:
         from henchmen.cli.init import run_init_cli
 
         sys.exit(run_init_cli(args))
+    elif args.command == "console-link":
+        from henchmen.cli.console_link import run_console_link_cli
+
+        sys.exit(run_console_link_cli(args))
     else:
         parser.print_help()
         sys.exit(1)

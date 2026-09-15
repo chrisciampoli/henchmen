@@ -360,7 +360,7 @@ def test_serve_with_incomplete_setup_serves_only_the_console(
 
     monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
     monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("HENCHMEN_CONSOLE_SETUP_TOKEN", "given-token")
+    monkeypatch.setenv("HENCHMEN_CONSOLE_SETUP_TOKEN", "g" * 43)
     with (
         patch("henchmen.cli.serve.build_serve_app") as build_services,
         patch("henchmen.cli.serve.serve_app", return_value=RESTART_EXIT_CODE) as run,
@@ -371,7 +371,7 @@ def test_serve_with_incomplete_setup_serves_only_the_console(
     build_services.assert_not_called()
     served = run.call_args.args[0]
     assert TestClient(served, base_url=_LOCAL).get("/health").json()["mode"] == "setup"
-    assert "console/session?setup_token=given-token" in capsys.readouterr().out
+    assert f"console/session?setup_token={'g' * 43}" in capsys.readouterr().out
 
 
 def test_serve_with_completed_setup_mounts_the_console_in_run_mode(

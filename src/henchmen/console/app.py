@@ -10,7 +10,7 @@ from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -85,10 +85,17 @@ def create_console_app(
         return ConsoleStatus(mode=mode, setup_completed=store.load().completed, version=__version__)
 
     @app.get("/console/session", response_model=None)
-    async def session(setup_token: str = Query(default="")) -> RedirectResponse | JSONResponse:
-        if not auth.check_setup_token(setup_token):
+    async def session(request: Request, setup_token: str = Query(default="")) -> RedirectResponse | JSONResponse:
+        if auth.verify_session(request.cookies.get(SESSION_COOKIE)):
+            # Already signed in: an old or reused link must neither fail nor burn the current token.
+            return RedirectResponse("/", status_code=303)
+        if not auth.consume_setup_token(setup_token):
             return JSONResponse(
-                {"detail": "This sign-in link is not valid. Open Henchmen again from the Henchmen app."},
+                {
+                    "detail": (
+                        "This sign-in link has expired or was already used. Open Henchmen again from the Henchmen app."
+                    )
+                },
                 status_code=403,
             )
         response = RedirectResponse("/", status_code=303)

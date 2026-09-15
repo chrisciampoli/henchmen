@@ -194,7 +194,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run -d --name henchmen-local -p 127.0.0.1:8000:8000 \
-            -e HENCHMEN_CONSOLE_SETUP_TOKEN=ci-token henchmen-local:ci
+            -e HENCHMEN_CONSOLE_SETUP_TOKEN=ci-setup-token-0123456789abcdefghijklmnop henchmen-local:ci
           for i in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:8000/health >/dev/null; then break; fi
             sleep 2
@@ -205,7 +205,7 @@ jobs:
           # Capture first: `docker logs | grep -q` can fail under pipefail when grep
           # exits early and docker logs dies of SIGPIPE.
           logs="$(docker logs henchmen-local 2>&1)"
-          grep -q "console/session?setup_token=ci-token" <<<"$logs"
+          grep -q "console/session?setup_token=ci-setup-token-0123456789abcdefghijklmnop" <<<"$logs"
 
       - name: Container logs on failure
         if: failure()

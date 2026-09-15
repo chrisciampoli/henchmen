@@ -22,17 +22,31 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
+import os
+import re
 import secrets
+import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from henchmen.config.secret_files import read_or_create_secret
+from henchmen.config.secret_files import (
+    create_secret_file,
+    ensure_secrets_dir,
+    read_or_create_secret,
+    write_secret_file,
+)
+
+logger = logging.getLogger(__name__)
 
 SESSION_COOKIE = "henchmen_console"
 _KEY_FILE_NAME = "console-session.key"
+SETUP_TOKEN_FILE_NAME = "setup-token"
+_SETUP_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 _LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _DEFAULT_PORTS: dict[str, int] = {"http": 80, "https": 443, "ws": 80, "wss": 443}
@@ -93,13 +107,100 @@ def is_local_origin(origin: str | None) -> bool:
     return _origin_parts(origin) is not None
 
 
+def _tokens_match(candidate: str, expected: str) -> bool:
+    """Constant-time comparison of two tokens (bytes of different lengths simply do not match)."""
+    return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+
+
+class SetupTokenStore:
+    """The one-time Console sign-in token, kept in ``<secrets>/setup-token``.
+
+    Rotated on every process start and by ``henchmen console-link``; consumed
+    by a successful exchange, which replaces it with a random value nobody
+    holds (the file stays present, so the launcher's seed can never apply
+    again). The file is re-read on every check, so a rotation made by another
+    process takes effect immediately.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+
+    def current(self) -> str | None:
+        """The token a sign-in link must carry, or ``None`` when there is no usable token."""
+        try:
+            raw = self.path.read_bytes()
+        except FileNotFoundError:
+            return None
+        token = raw.decode("ascii", errors="replace").strip()
+        return token if _SETUP_TOKEN_PATTERN.fullmatch(token) else None
+
+    def rotate(self, seed: str | None = None) -> str:
+        """Issue a new token, invalidating any earlier link; ``seed`` is used only for the very first token."""
+        with self._lock:
+            ensure_secrets_dir(self.path.parent)
+            candidate = (seed or "").strip()
+            use_seed = (
+                bool(candidate) and not self.path.exists() and _SETUP_TOKEN_PATTERN.fullmatch(candidate) is not None
+            )
+            if candidate and not use_seed:
+                logger.info(
+                    "Ignoring the setup token seed: it applies only to the first token "
+                    "and needs 32+ URL-safe characters."
+                )
+            token = candidate if use_seed else secrets.token_urlsafe(32)
+            write_secret_file(self.path, token.encode("ascii"))
+            return token
+
+    def consume(self, candidate: str) -> bool:
+        """Accept ``candidate`` at most once; any race or I/O problem fails closed."""
+        if not candidate:
+            return False
+        with self._lock:
+            current = self.current()
+            if current is None or not _tokens_match(candidate, current):
+                return False
+            claim = self.path.with_name(f"{self.path.name}.{secrets.token_hex(8)}.claim")
+            try:
+                os.replace(self.path, claim)
+            except OSError:
+                # Another process claimed or rotated it first; never the token value itself.
+                logger.info("Setup token claim on %s lost a race or failed; failing closed.", self.path.name)
+                return False
+            try:
+                claimed = claim.read_bytes().decode("ascii", errors="replace").strip()
+            except OSError:
+                logger.warning("Could not read the claimed setup token file %s; failing closed.", claim.name)
+                claimed = ""
+            finally:
+                claim.unlink(missing_ok=True)
+            with suppress(FileExistsError):
+                # A rotation that landed in between wins; otherwise leave an unknown token in place.
+                create_secret_file(self.path, secrets.token_urlsafe(32).encode("ascii"))
+            return bool(claimed) and _tokens_match(candidate, claimed)
+
+
 class ConsoleAuth:
     """Setup-token check plus signed, expiring session cookies."""
 
-    def __init__(self, setup_token: str, signing_key: bytes, max_age_seconds: int = 30 * 24 * 3600) -> None:
-        self.setup_token = setup_token
+    def __init__(
+        self,
+        setup_token: str,
+        signing_key: bytes,
+        max_age_seconds: int = 30 * 24 * 3600,
+        token_store: SetupTokenStore | None = None,
+    ) -> None:
+        self._memory_token = setup_token
+        self._token_store = token_store
         self._key = signing_key
         self._max_age = max_age_seconds
+
+    @property
+    def setup_token(self) -> str:
+        """The current one-time sign-in token (``""`` once consumed)."""
+        if self._token_store is not None:
+            return self._token_store.current() or ""
+        return self._memory_token
 
     @property
     def max_age_seconds(self) -> int:
@@ -108,18 +209,30 @@ class ConsoleAuth:
 
     @classmethod
     def load(cls, secrets_dir: Path, setup_token: str | None) -> ConsoleAuth:
-        """Load (or create) the signing key; use ``setup_token`` or generate one.
+        """Load (or create) the signing key and rotate the one-time setup token.
 
-        The key file is managed by :func:`henchmen.config.secret_files.read_or_create_secret`:
-        owner-only from creation, atomic, and regenerated when missing, empty or
-        too short (never trusted as an HMAC key, never logged).
+        ``setup_token`` (the launcher's ``HENCHMEN_CONSOLE_SETUP_TOKEN``) seeds
+        only the very first token of this data directory; every later start
+        issues a fresh random one, so a link from an earlier start stops working.
         """
         key = read_or_create_secret(secrets_dir / _KEY_FILE_NAME)
-        return cls(setup_token=setup_token or secrets.token_urlsafe(32), signing_key=key)
+        token_store = SetupTokenStore(secrets_dir / SETUP_TOKEN_FILE_NAME)
+        token = token_store.rotate(seed=setup_token)
+        return cls(setup_token=token, signing_key=key, token_store=token_store)
 
     def check_setup_token(self, candidate: str) -> bool:
-        """Constant-time comparison against the setup token."""
-        return bool(candidate) and hmac.compare_digest(candidate.encode(), self.setup_token.encode())
+        """Constant-time comparison against the current token, without consuming it."""
+        current = self.setup_token
+        return bool(candidate) and bool(current) and _tokens_match(candidate, current)
+
+    def consume_setup_token(self, candidate: str) -> bool:
+        """Accept ``candidate`` once; a second use of the same token is refused."""
+        if self._token_store is not None:
+            return self._token_store.consume(candidate)
+        if not self.check_setup_token(candidate):
+            return False
+        self._memory_token = ""
+        return True
 
     def _sign(self, issued_at: int) -> str:
         return hmac.new(self._key, f"console-session:{issued_at}".encode(), hashlib.sha256).hexdigest()
