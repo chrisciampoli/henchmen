@@ -18,9 +18,11 @@ from henchmen.cli.checks import CheckResult, CheckStatus
 from henchmen.config.settings import Settings
 from henchmen.console.state import SetupStep
 from henchmen.console.steps.ai_provider import estimate_task_cost, recommended_ceiling_usd, recommended_models
-from henchmen.mastermind.scheme_executor.executor import estimate_feature_task_cost
+from henchmen.mastermind.scheme_executor.executor import estimate_feature_task_cost, estimate_node_dispatch_cost
 from henchmen.models.llm import ModelTier
+from henchmen.models.scheme import NodeType
 from henchmen.providers.tiers import TIER_FIELDS
+from henchmen.schemes.feature_standard import FEATURE_STANDARD
 from tests.unit.console_harness import ConsoleHarness, make_harness
 
 BASE = "/console/api/steps/ai_provider"
@@ -78,12 +80,19 @@ def _expected_cost(provider: str, models: dict[str, str]) -> float:
     return round(estimate_feature_task_cost(settings), 2)
 
 
+# Comfortably above the Anthropic default-tier estimate (never a literal guess at that
+# number, which would drift out of sync with pricing/budget changes exactly as a
+# previous version of this constant did when the estimate started pricing the whole
+# scheme instead of one node -- ruling C2a).
+SAFE_CEILING_USD = round(_expected_cost("anthropic", ANTHROPIC_DEFAULT_MODELS) * 2, 2)
+
+
 def _save_body(**overrides: Any) -> dict[str, Any]:
     body: dict[str, Any] = {
         "provider": "anthropic",
         "api_key": KEY,
         "models": dict(ANTHROPIC_DEFAULT_MODELS),
-        "task_cost_ceiling_usd": 12.0,
+        "task_cost_ceiling_usd": SAFE_CEILING_USD,
     }
     body.update(overrides)
     return body
@@ -173,7 +182,7 @@ def test_save_writes_config_and_completes_the_step(harness: ConsoleHarness, monk
     assert body["details"]["credential"] == "configured"
     assert body["details"]["models"] == ANTHROPIC_DEFAULT_MODELS
     assert body["details"]["estimated_cost_per_task_usd"] == expected_cost
-    assert body["details"]["task_cost_ceiling_usd"] == 12.0
+    assert body["details"]["task_cost_ceiling_usd"] == SAFE_CEILING_USD
     assert body["details"]["ceiling_below_estimate"] is False
     assert "warning" not in body["details"]
     assert KEY not in response.text
@@ -186,7 +195,7 @@ def test_save_writes_config_and_completes_the_step(harness: ConsoleHarness, monk
     assert store.get("HENCHMEN_ANTHROPIC_MODEL_LIGHT") == ANTHROPIC_DEFAULT_MODELS["light"]
     assert store.get("HENCHMEN_ANTHROPIC_MODEL_REASONING") == ANTHROPIC_DEFAULT_MODELS["reasoning"]
     assert store.get("HENCHMEN_LLM_CHAT_MODEL") == ANTHROPIC_DEFAULT_MODELS["light"]
-    assert store.get("HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD") == "12"
+    assert store.get("HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD") == f"{SAFE_CEILING_USD:g}"
     assert SetupStep.AI_PROVIDER in harness.setup_store.load().completed_steps
 
 
@@ -220,6 +229,64 @@ def test_save_keeps_an_existing_provider_setting(harness: ConsoleHarness, monkey
     harness.config_store.update({"HENCHMEN_PROVIDER": "gcp", "HENCHMEN_GCP_PROJECT_ID": "p"}, section="Provider")
     assert harness.post(BASE, _save_body()).json()["ok"] is True
     assert harness.config_store.get("HENCHMEN_PROVIDER") == "gcp"
+
+
+def test_save_switching_provider_unsets_the_previous_api_key(
+    harness: ConsoleHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_anthropic(monkeypatch)
+    assert harness.post(BASE, _save_body()).json()["ok"] is True
+    assert harness.config_store.get("HENCHMEN_ANTHROPIC_API_KEY") == KEY
+
+    monkeypatch.setattr(
+        checks,
+        "check_openai_key",
+        lambda api_key, *, timeout=checks.DEFAULT_TIMEOUT: CheckResult("OpenAI API key", CheckStatus.OK, "valid"),
+    )
+    monkeypatch.setattr(
+        checks,
+        "list_openai_models",
+        lambda api_key, *, timeout=checks.DEFAULT_TIMEOUT: list(OPENAI_DEFAULT_MODELS.values()),
+    )
+    other_key = "sk-openai-secret-0000000000000000"
+    body = harness.post(
+        BASE,
+        {
+            "provider": "openai",
+            "api_key": other_key,
+            "models": dict(OPENAI_DEFAULT_MODELS),
+            "task_cost_ceiling_usd": 12.0,
+        },
+    ).json()
+    assert body["ok"] is True
+    assert harness.config_store.get("HENCHMEN_OPENAI_API_KEY") == other_key
+    assert harness.config_store.get("HENCHMEN_ANTHROPIC_API_KEY") == ""
+
+
+def test_save_reports_a_config_store_rejection_instead_of_500(
+    harness: ConsoleHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        checks,
+        "check_vertex",
+        lambda project_id, region, *, timeout=checks.DEFAULT_TIMEOUT: CheckResult(
+            "Vertex AI credentials", CheckStatus.OK, "ADC present"
+        ),
+    )
+    response = harness.post(
+        BASE,
+        {
+            "provider": "gcp",
+            "gcp_project_id": "acme-prod\nHENCHMEN_EVIL=1",
+            "models": dict(VERTEX_DEFAULT_MODELS),
+            "task_cost_ceiling_usd": 12.0,
+        },
+    )
+    body = response.json()
+    assert response.status_code == 200
+    assert body["ok"] is False
+    assert body["problems"][0]["field"] == "gcp_project_id"
+    assert not harness.config_store.config_file.exists()
 
 
 def test_failed_save_writes_nothing(harness: ConsoleHarness, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -267,8 +334,14 @@ def test_current_masks_the_saved_key(harness: ConsoleHarness, monkeypatch: pytes
     assert details["provider"] == "anthropic"
     assert details["credential"] == "configured"
     assert details["models"] == ANTHROPIC_DEFAULT_MODELS
-    assert details["task_cost_ceiling_usd"] == 12.0
+    assert details["task_cost_ceiling_usd"] == SAFE_CEILING_USD
     assert KEY not in response.text
+
+
+def test_current_normalizes_a_saved_provider_alias(harness: ConsoleHarness) -> None:
+    harness.config_store.update({"HENCHMEN_LLM_PROVIDER": "vertex"}, section="LLM")
+    body = harness.get(BASE).json()
+    assert body["details"]["provider"] == "gcp"
 
 
 def test_current_recommends_a_ceiling_when_a_provider_was_saved_without_one(harness: ConsoleHarness) -> None:
@@ -358,6 +431,80 @@ def test_recommended_ceiling_usd_covers_the_estimate_with_headroom() -> None:
 
 @pytest.mark.parametrize("provider", ["anthropic", "openai", "gcp"])
 def test_default_ceiling_covers_the_feature_task_estimate(provider: str) -> None:
-    """The recommended ceiling covers a typical feature task for every default LLM tier (ruling C2)."""
-    estimate = estimate_task_cost(provider, _default_models(provider))
-    assert recommended_ceiling_usd(estimate) >= estimate
+    """Simulate the executor's pre-dispatch cost gate (ruling C2a).
+
+    Rather than merely re-checking the arithmetic identity that
+    ``recommended_ceiling_usd`` always returns at least its input (true by
+    construction, and already covered by
+    ``test_recommended_ceiling_usd_covers_the_estimate_with_headroom``), this
+    dispatches every agentic node of the feature scheme in turn -- exactly as
+    the executor's own cumulative-cost gate would -- and asserts the running
+    total never exceeds the recommended ceiling, for each provider's default
+    tiers.
+    """
+    models = _default_models(provider)
+    overrides: dict[str, Any] = {"_env_file": None, "provider": "local", "llm_provider": provider}
+    for tier, field in TIER_FIELDS[provider].items():
+        overrides[field] = models[_tier_key(tier)]
+    settings = Settings(**overrides)
+    agentic_nodes = [node for node in FEATURE_STANDARD.nodes if node.node_type == NodeType.AGENTIC]
+    assert len(agentic_nodes) >= 2  # implement_feature and fix_tests, at minimum
+
+    ceiling = recommended_ceiling_usd(estimate_task_cost(provider, models))
+    cumulative = 0.0
+    for node in agentic_nodes:
+        cumulative += estimate_node_dispatch_cost(settings, node)
+        assert cumulative <= ceiling
+
+
+def test_recommended_models_falls_back_to_an_available_model() -> None:
+    """When the account's listing lacks the Settings default, fall back to a model it does offer."""
+    limited = [ANTHROPIC_DEFAULT_MODELS["light"], "an-unrelated-model"]
+    recs = recommended_models("anthropic", limited)
+    assert recs["light"] == ANTHROPIC_DEFAULT_MODELS["light"]
+    assert recs["complex"] == limited[0]
+    assert recs["reasoning"] == limited[0]
+
+
+def test_problem_from_check_redacts_a_key_echoed_back_by_the_provider(
+    harness: ConsoleHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A check that (bug or not) echoes the submitted key back must never leak it to the browser."""
+    monkeypatch.setattr(
+        checks,
+        "check_anthropic_key",
+        lambda api_key, *, timeout=checks.DEFAULT_TIMEOUT: CheckResult(
+            "Anthropic API key", CheckStatus.FAIL, f"rejected: bad key {api_key}", hint=f"Retry with {api_key}"
+        ),
+    )
+    response = harness.post(f"{BASE}/validate", {"provider": "anthropic", "api_key": KEY})
+    assert KEY not in response.text
+
+
+def test_problem_from_check_redacts_url_userinfo(harness: ConsoleHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A leaked basic-auth Ollama URL in a check's error text must never reach the browser."""
+    leaking_url = "http://admin:hunter2@localhost:11434"
+    monkeypatch.setattr(
+        checks,
+        "check_ollama",
+        lambda base_url, *, timeout=checks.DEFAULT_TIMEOUT: CheckResult(
+            "Ollama", CheckStatus.FAIL, f"cannot reach {leaking_url}", hint=f"Start it with: {leaking_url}"
+        ),
+    )
+    response = harness.post(f"{BASE}/validate", {"provider": "local", "ollama_base_url": leaking_url})
+    assert "admin:hunter2" not in response.text
+
+
+def test_estimate_task_cost_applies_saved_token_budgets(harness: ConsoleHarness) -> None:
+    """A previously saved HENCHMEN_OPERATIVE_MAX_* budget changes the estimate to match runtime."""
+    unbounded = estimate_task_cost("anthropic", ANTHROPIC_DEFAULT_MODELS)
+    harness.config_store.update(
+        {
+            "HENCHMEN_OPERATIVE_MAX_SYSTEM_TOKENS": "100",
+            "HENCHMEN_OPERATIVE_MAX_MESSAGE_TOKENS": "100",
+            "HENCHMEN_OPERATIVE_MAX_OUTPUT_TOKENS": "50",
+        },
+        section="Operative",
+    )
+    bounded = estimate_task_cost("anthropic", ANTHROPIC_DEFAULT_MODELS, harness.config_store)
+    assert bounded < unbounded

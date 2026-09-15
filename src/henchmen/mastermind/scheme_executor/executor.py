@@ -14,6 +14,7 @@ from henchmen.models.scheme import NodeType, SchemeNode
 from henchmen.models.task import HenchmenTask
 from henchmen.providers.pricing import estimate_cost_for_settings
 from henchmen.schemes.base import SchemeGraph
+from henchmen.schemes.feature_standard import FEATURE_STANDARD
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -61,25 +62,26 @@ def estimate_node_dispatch_cost(settings: "Settings", node: SchemeNode) -> float
 
 
 def estimate_feature_task_cost(settings: "Settings") -> float:
-    """Estimate the USD cost of the most expensive agentic node a first feature task can hit.
+    """Estimate the USD cost of a full feature task, including one round of test fixes (ruling C2a).
 
     Used by the Console's AI provider step to recommend a per-task spending
-    limit that actually covers a real task (ruling C2), rather than a private
-    token profile that could diverge from what the executor's own cost gate
-    enforces. Looks the node up from the registered ``feature_standard``
-    scheme rather than copying its budget.
+    limit that actually covers a real task, rather than a private token
+    profile that could diverge from what the executor's own cost gate
+    enforces. Sums :func:`estimate_node_dispatch_cost` over every agentic
+    (LLM-dispatched) node of ``FEATURE_STANDARD`` -- ``implement_feature``
+    and, when the test gate fails once, ``fix_tests`` -- since a real first
+    task routinely hits both, not only the single most expensive node.
+
+    Reads the nodes directly off the ``FEATURE_STANDARD`` scheme definition
+    object rather than through ``SchemeRegistry``: the registry is mutable
+    process-wide state that tests clear between runs
+    (``SchemeRegistry.clear()``), which would make this function's behaviour
+    depend on test execution order.
     """
-    from henchmen.schemes.registry import SchemeRegistry
-
-    graph = SchemeRegistry.get("feature_standard")
-    if graph is None:
-        import henchmen.schemes.feature_standard  # noqa: F401  (imports register with SchemeRegistry)
-
-        graph = SchemeRegistry.get("feature_standard")
-    node = graph.get_node("implement_feature") if graph is not None else None
-    if node is None:
-        raise RuntimeError("feature_standard scheme has no 'implement_feature' node")
-    return estimate_node_dispatch_cost(settings, node)
+    agentic_nodes = [node for node in FEATURE_STANDARD.nodes if node.node_type == NodeType.AGENTIC]
+    if not agentic_nodes:
+        raise RuntimeError("feature_standard scheme has no agentic nodes to price")
+    return sum(estimate_node_dispatch_cost(settings, node) for node in agentic_nodes)
 
 
 def validate_deterministic_handlers(scheme_graph: SchemeGraph) -> list[str]:
