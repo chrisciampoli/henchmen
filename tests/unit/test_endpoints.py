@@ -96,3 +96,21 @@ def test_an_invalid_environment_value_fails_closed(tmp_path: Path, monkeypatch: 
     monkeypatch.setenv("HENCHMEN_GITHUB_API_URL", "http://api.github.com")
     with pytest.raises(EndpointError, match="github_api_url"):
         resolve_github_endpoints(_config(tmp_path, "HENCHMEN_GITHUB_API_URL=https://api.github.com\n"))
+
+
+def test_an_unreadable_config_file_fails_closed_without_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from henchmen.utils import endpoints
+
+    config = _config(tmp_path, "HENCHMEN_GITHUB_WEB_URL=https://ghe.example.test\n")
+
+    def denied(*args: object, **kwargs: object) -> dict[str, str]:
+        raise PermissionError(13, "Permission denied", str(config))
+
+    monkeypatch.setattr(endpoints, "dotenv_values", denied)
+    with pytest.raises(EndpointError) as exc_info:
+        resolve_github_endpoints(config)
+    assert exc_info.value.field == "github_api_url"
+    assert "PermissionError" in str(exc_info.value)
+    assert exc_info.value.__cause__ is None

@@ -842,6 +842,13 @@ def _serve_data_dir(
         logger.warning("%s", forward_problem)
         sys.exit(needs_attention([forward_problem], int(settings.local_serve_port)))
 
+    # Run mode only, before any service is built: no process is signing with a key that a
+    # reconnect replaced, so unreferenced GitHub App keys can go. Setup and attention modes
+    # skip it (they start no services, and the next run-mode start cleans up anyway).
+    from henchmen.console.github_app import remove_unused_app_keys_at_startup
+
+    remove_unused_app_keys_at_startup(paths.config_file(), secrets_dir, settings.github_app_private_key_path)
+
     port = int(settings.local_serve_port)
     health = ServiceHealth()
     # Loaded only now: setup and attention modes serve no services and must never fail

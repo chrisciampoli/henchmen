@@ -759,6 +759,134 @@ def test_run_mode_loads_the_internal_push_token(monkeypatch: pytest.MonkeyPatch,
     assert desktop.internal_push_token == load_internal_auth(tmp_path / "secrets").push_token
 
 
+def _run_mode_config(tmp_path: Path, extra: str = "") -> None:
+    (tmp_path / "henchmen.env").write_text(
+        "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123\n"
+        "HENCHMEN_LOCAL_DOCKER_NETWORK=henchmen\nHENCHMEN_DISPATCH_API_TOKEN=test-dispatch-token-0123456789abcdef\n"
+        + extra,
+        encoding="utf-8",
+    )
+
+
+def _github_app_keys(tmp_path: Path) -> tuple[Path, dict[Path, bytes], list[Path]]:
+    from tests.unit.github_fakes import app_key_pair
+
+    secrets = tmp_path / "secrets"
+    secrets.mkdir(exist_ok=True)
+    current = secrets / "github-app-2.pem"
+    current.write_bytes(app_key_pair()[0])
+    stale = [secrets / "github-app-1.pem", secrets / "github-app.pem"]
+    for path in stale:
+        path.write_bytes(b"old key")
+    unrelated = {
+        secrets / "github-app-1.pem.bak": b"keep",
+        secrets / "github-callback-states.json": b"{}",
+        secrets / "notes.txt": b"keep",
+    }
+    for path, content in unrelated.items():
+        path.write_bytes(content)
+    return current, unrelated, stale
+
+
+def test_run_mode_start_removes_only_unreferenced_github_app_keys_before_building_services(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from henchmen.cli import _serve
+    from henchmen.console.state import SetupState, SetupStep
+
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    current, unrelated, stale = _github_app_keys(tmp_path)
+    _run_mode_config(
+        tmp_path,
+        f"HENCHMEN_GITHUB_APP_ID=2\nHENCHMEN_GITHUB_APP_INSTALLATION_ID=7\nHENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH={current}\n",
+    )
+    SetupStateStore(tmp_path / "setup-state.json").save(
+        SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True)
+    )
+    seen_when_building: list[list[str]] = []
+
+    def _build(*args: object, **kwargs: object) -> MagicMock:
+        seen_when_building.append(sorted(path.name for path in (tmp_path / "secrets").glob("github-app*.pem")))
+        return MagicMock()
+
+    with (
+        patch("henchmen.cli.serve.build_serve_app", side_effect=_build),
+        patch("henchmen.cli.serve.serve_app", return_value=0),
+        pytest.raises(SystemExit),
+    ):
+        _serve(_serve_args())
+    assert seen_when_building == [["github-app-2.pem"]]
+    assert current.exists()
+    assert not any(path.exists() for path in stale)
+    assert all(path.read_bytes() == content for path, content in unrelated.items())
+
+
+def test_run_mode_start_keeps_the_key_the_environment_names(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from henchmen.cli import _serve
+    from henchmen.console.state import SetupState, SetupStep
+
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    current, _unrelated, stale = _github_app_keys(tmp_path)
+    # The file names github-app-2.pem; the environment (which wins) names github-app-1.pem.
+    _run_mode_config(
+        tmp_path,
+        f"HENCHMEN_GITHUB_APP_ID=2\nHENCHMEN_GITHUB_APP_INSTALLATION_ID=7\nHENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH={current}\n",
+    )
+    monkeypatch.setenv("HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH", str(stale[0]))
+    stale[0].write_bytes((tmp_path / "secrets" / "github-app-2.pem").read_bytes())
+    SetupStateStore(tmp_path / "setup-state.json").save(
+        SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True)
+    )
+    with (
+        patch("henchmen.cli.serve.build_serve_app", return_value=MagicMock()),
+        patch("henchmen.cli.serve.serve_app", return_value=0),
+        pytest.raises(SystemExit),
+    ):
+        _serve(_serve_args())
+    assert current.exists()
+    assert stale[0].exists()
+    assert not stale[1].exists()
+
+
+def test_setup_and_attention_modes_remove_no_github_app_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from henchmen.cli import _serve
+    from henchmen.console.state import SetupState, SetupStep
+
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("HENCHMEN_CONSOLE_SETUP_TOKEN", "g" * 43)
+    _current, _unrelated, stale = _github_app_keys(tmp_path)
+    # Setup mode (setup not complete).
+    with patch("henchmen.cli.serve.serve_app", return_value=0), pytest.raises(SystemExit):
+        _serve(_serve_args())
+    assert all(path.exists() for path in stale)
+    # Attention mode (complete, but the configuration cannot start).
+    (tmp_path / "henchmen.env").write_text("HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_SERVE_PORT=not-a-port\n")
+    SetupStateStore(tmp_path / "setup-state.json").save(
+        SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True)
+    )
+    with (
+        patch("henchmen.cli.serve.build_serve_app") as build,
+        patch("henchmen.cli.serve.serve_app", return_value=0),
+        pytest.raises(SystemExit),
+    ):
+        _serve(_serve_args())
+    build.assert_not_called()
+    assert all(path.exists() for path in stale)
+
+
+def test_startup_key_cleanup_never_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from henchmen.console import github_app
+
+    def boom(*args: object, **kwargs: object) -> list[Path]:
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(github_app, "remove_unreferenced_app_keys", boom)
+    assert github_app.remove_unused_app_keys_at_startup(tmp_path / "missing.env", tmp_path / "secrets", "") == []
+
+
 # ---------------------------------------------------------------------------
 # Task 11: service health, the attention app and serve_app's own exit codes
 # ---------------------------------------------------------------------------
