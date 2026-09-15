@@ -186,6 +186,14 @@ The Forge handles post-PR CI validation. It does not open PRs -- the Mastermind'
 
 1. **CI Runner** (`CIRunner`): Clones the PR branch, runs `ruff check` on the Python files the PR changed, runs the tests (`pytest`, or `npm test` for a Node target), and runs the silent failure scan on the PR diff. Lint and the scan fail closed when the PR base cannot be resolved. The result is `passed` only when every check ran and passed; a check that could not run (for example, the target's tests need a tool the Forge image lacks) makes the run `incomplete`, which the PR comment flags and Mastermind does not treat as a pass.
 
+   **When the effective container orchestrator is local Docker** (a desktop install, or a checkout running `HENCHMEN_PROVIDER=local`), none of the PR's code runs in the Forge process. Forge clones without a checkout and keeps only the silent-failure scan, which reads the diff text and runs nothing from the repository. Lint and tests run in **one** gate container from the operative image (`ci_gate forge`). It clones once, installs dependencies once as uid 65534, then runs both checks. The run is bounded by the gate timeout (`HENCHMEN_LAIR_DEFAULT_TIMEOUT`), not the Pub/Sub budget (`HENCHMEN_FORGE_CI_TIMEOUT_SECONDS`), which exists only for the cloud ack deadline. On this path lint is **deliberately stricter** than the cloud host path. It uses the Mastermind lint gate's `lint_scope` rules:
+   - `ruff` on changed `.py` files
+   - `eslint` on changed JS/TS files from each file's nearest `package.json`
+   - `go vet` on changed Go packages
+   - the whole-project Rust/Java lint when those languages changed
+
+   A project whose stack cannot be detected fails lint. Python dependencies are not installed before tests. Whether there is a tests check, and whether it is `skipped` for a `package.json` without a `test` script, is decided from the committed tree exactly as on the host path. This path therefore needs Docker and the operative image (`HENCHMEN_OPERATIVE_IMAGE`).
+
 2. **Silent Failure Detector** (`SilentFailureDetector`): Scans the git diff for patterns that indicate silent failures:
    - `critical`: Empty catch blocks, bare `except: pass`, hardcoded secrets
    - `warning`: Catch-return-null, catch without logging, retry without backoff, noop changes

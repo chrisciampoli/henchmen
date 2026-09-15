@@ -346,3 +346,15 @@ class TestSubprocessSafety:
         blob = str(result)
         assert "ghp_leakme" not in blob
         assert result["passed"] is False
+
+
+def test_a_non_utf8_package_json_reports_tests_as_skipped(tmp_path) -> None:
+    """M1: an undecodable manifest is "no test script" (skipped), never an exception out of the run."""
+    import asyncio
+
+    from henchmen.forge.ci_runner import STATUS_SKIPPED, CIRunner
+
+    (tmp_path / "package.json").write_bytes(b'{"scripts": {"test": "\xff\xfe"}}')
+    check = asyncio.run(CIRunner(timeout_seconds=5)._run_node_tests(str(tmp_path)))
+    assert check["status"] == STATUS_SKIPPED
+    assert "no `test` script" in check["error"]

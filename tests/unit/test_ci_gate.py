@@ -1148,3 +1148,213 @@ class TestRunFix:
         )
         assert rc == 0, err
         assert not marker.exists()
+
+
+# ---------------------------------------------------------------------------
+# `ci_gate forge`: Forge CI's lint and tests over one clone and one install
+# ---------------------------------------------------------------------------
+
+
+class _ForgeHarness:
+    """Records every unprivileged script and clone a `run_forge` call makes."""
+
+    def __init__(self, returncodes: dict[str, int] | None = None) -> None:
+        self.scripts: list[str] = []
+        self._returncodes = returncodes or {}
+
+    async def run_script(self, workspace: str, script: str, *, sandbox: Sandbox) -> tuple[int, str]:
+        self.scripts.append(script)
+        for fragment, returncode in self._returncodes.items():
+            if fragment in script:
+                return returncode, f"{fragment} output {TOKEN}"
+        return 0, "ok"
+
+
+def _node_workspace(root: Path) -> None:
+    _write(root, "package.json", '{"devDependencies": {"eslint": "9"}, "scripts": {"test": "vitest"}}')
+    _write(root, "package-lock.json", "{}")
+    _write(root, "src/app.ts", "export const x = 1\n")
+
+
+async def _forge(workspace: Path, **kwargs: Any) -> GateResult:
+    return await ci_gate.run_forge(
+        repo="acme/widgets", branch="feature", base_branch="main", token=TOKEN, workspace=str(workspace), **kwargs
+    )
+
+
+@pytest.mark.usefixtures("sandboxed")
+class TestRunForge:
+    @pytest.mark.asyncio
+    async def test_one_clone_one_install_then_lint_and_tests(self, tmp_path: Path) -> None:
+        _node_workspace(tmp_path)
+        harness = _ForgeHarness()
+        with (
+            patch.object(ci_gate, "clone_repo", AsyncMock()) as clone,
+            patch.object(ci_gate, "changed_files", AsyncMock(return_value=["src/app.ts"])),
+            patch.object(ci_gate, "_strip_remote_token", AsyncMock(return_value=None)),
+            patch.object(ci_gate, "_run_script", AsyncMock(side_effect=harness.run_script)),
+        ):
+            result = await _forge(tmp_path)
+
+        clone.assert_awaited_once()
+        install, lint, tests = harness.scripts
+        assert install == "npm ci || npm install --no-audit"
+        assert "npm ci" not in lint and "npm ci" not in tests, "dependencies are installed exactly once"
+        assert "npx --no-install eslint ./src/app.ts" in lint
+        assert "npm run --if-present test" in tests
+        assert result.condition == "pass"
+        assert [(check.name, check.condition) for check in result.checks] == [("lint", "pass"), ("tests", "pass")]
+
+    @pytest.mark.asyncio
+    async def test_a_node_prs_desktop_forge_lint_goes_through_plan_lint(self, tmp_path: Path) -> None:
+        """Accepted strictness: Forge lint on desktop is the Mastermind lint gate's lint_scope, not ruff-only."""
+        _node_workspace(tmp_path)
+        harness = _ForgeHarness()
+        with (
+            patch.object(ci_gate, "clone_repo", AsyncMock()),
+            patch.object(ci_gate, "changed_files", AsyncMock(return_value=["src/app.ts"])),
+            patch.object(ci_gate, "_strip_remote_token", AsyncMock(return_value=None)),
+            patch.object(ci_gate, "plan_lint", wraps=ci_gate.plan_lint) as plan_lint,
+            patch.object(ci_gate, "_run_script", AsyncMock(side_effect=harness.run_script)),
+        ):
+            result = await _forge(tmp_path, run_tests=False)
+        plan_lint.assert_called_once()
+        stack, _, changed = plan_lint.call_args.args
+        assert stack.name == "node-npm" and changed == ["src/app.ts"]
+        assert any("eslint ./src/app.ts" in script for script in harness.scripts)
+        assert not any("ruff" in script for script in harness.scripts)
+        assert [check.name for check in result.checks] == ["lint"]
+
+    @pytest.mark.asyncio
+    async def test_skip_tests_runs_lint_only(self, tmp_path: Path) -> None:
+        _node_workspace(tmp_path)
+        harness = _ForgeHarness()
+        with (
+            patch.object(ci_gate, "clone_repo", AsyncMock()),
+            patch.object(ci_gate, "changed_files", AsyncMock(return_value=["src/app.ts"])),
+            patch.object(ci_gate, "_strip_remote_token", AsyncMock(return_value=None)),
+            patch.object(ci_gate, "_run_script", AsyncMock(side_effect=harness.run_script)),
+        ):
+            result = await _forge(tmp_path, run_tests=False)
+        assert not any("npm run --if-present test" in script for script in harness.scripts)
+        assert [check.name for check in result.checks] == ["lint"]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_install_fails_every_check_that_needs_it_without_running_it(self, tmp_path: Path) -> None:
+        _node_workspace(tmp_path)
+        harness = _ForgeHarness(returncodes={"npm ci": 1})
+        with (
+            patch.object(ci_gate, "clone_repo", AsyncMock()),
+            patch.object(ci_gate, "changed_files", AsyncMock(return_value=["src/app.ts"])),
+            patch.object(ci_gate, "_strip_remote_token", AsyncMock(return_value=None)),
+            patch.object(ci_gate, "_run_script", AsyncMock(side_effect=harness.run_script)),
+        ):
+            result = await _forge(tmp_path)
+        assert len(harness.scripts) == 1
+        assert result.condition == "fail"
+        assert all(
+            check.condition == "fail" and "dependency install failed" in check.message for check in result.checks
+        )
+        assert all(TOKEN not in check.output for check in result.checks)
+
+    @pytest.mark.asyncio
+    async def test_lint_and_tests_are_reported_separately(self, tmp_path: Path) -> None:
+        _node_workspace(tmp_path)
+        harness = _ForgeHarness(returncodes={"npm run --if-present test": 1})
+        with (
+            patch.object(ci_gate, "clone_repo", AsyncMock()),
+            patch.object(ci_gate, "changed_files", AsyncMock(return_value=["src/app.ts"])),
+            patch.object(ci_gate, "_strip_remote_token", AsyncMock(return_value=None)),
+            patch.object(ci_gate, "_run_script", AsyncMock(side_effect=harness.run_script)),
+        ):
+            result = await _forge(tmp_path)
+        assert result.condition == "fail"
+        lint, tests = result.checks
+        assert (lint.name, lint.condition) == ("lint", "pass")
+        assert (tests.name, tests.condition, tests.message) == ("tests", "fail", "tests failed")
+        assert TOKEN not in tests.output
+
+    @pytest.mark.asyncio
+    async def test_a_clone_failure_fails_every_check(self, tmp_path: Path) -> None:
+        with patch.object(ci_gate, "clone_repo", AsyncMock(side_effect=RuntimeError(f"denied {TOKEN}"))):
+            result = await _forge(tmp_path)
+        assert result.condition == "fail"
+        assert [check.name for check in result.checks] == ["lint", "tests"]
+        assert all("clone failed" in check.message and TOKEN not in check.message for check in result.checks)
+
+    @pytest.mark.asyncio
+    async def test_nothing_to_lint_and_no_sandbox_fails_only_what_had_to_run(self, tmp_path: Path) -> None:
+        _node_workspace(tmp_path)
+        refused = GateResult(condition="fail", message="forge failed (could not hand the workspace over)")
+        with (
+            patch.object(ci_gate, "clone_repo", AsyncMock()),
+            patch.object(ci_gate, "changed_files", AsyncMock(return_value=["README.md"])),
+            patch.object(ci_gate, "_strip_remote_token", AsyncMock(return_value=None)),
+            patch.object(ci_gate, "_prepare_sandbox", return_value=refused),
+            patch.object(
+                ci_gate, "_run_script", AsyncMock(side_effect=AssertionError("no repo code without a sandbox"))
+            ),
+        ):
+            result = await _forge(tmp_path)
+        lint, tests = result.checks
+        assert lint.condition == "pass" and "no changed JavaScript/TypeScript files" in lint.message
+        assert tests.condition == "fail" and tests.message == refused.message
+
+    def test_main_passes_skip_tests(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        monkeypatch.setattr(ci_gate.sys, "stdin", io.StringIO(f"{TOKEN}\n"))
+        done = GateResult(condition="pass", message="forge: lint passed")
+        with patch.object(ci_gate, "run_forge", AsyncMock(return_value=done)) as forge:
+            assert ci_gate.main(["forge", "--repo=a/b", "--branch=f", "--base=main", "--skip-tests"]) == 0
+        assert forge.await_args.kwargs["run_tests"] is False and forge.await_args.kwargs["token"] == TOKEN
+
+    def test_one_parser_reads_the_per_check_results(self) -> None:
+        result = GateResult(
+            condition="fail",
+            message="forge: lint passed; tests failed",
+            checks=[
+                ci_gate.GateCheckResult(name="lint", condition="pass", message="lint passed"),
+                ci_gate.GateCheckResult(name="tests", condition="fail", message="tests failed", output="boom"),
+            ],
+        )
+        assert parse_gate_result(f"noise\n{GATE_RESULT_MARKER}{result.model_dump_json()}\n") == result
+
+
+class TestGateRunnerForForge:
+    @pytest.mark.asyncio
+    async def test_per_check_results_are_passed_through_scrubbed(self) -> None:
+        from henchmen.mastermind.scheme_executor import handlers
+
+        result = GateResult(
+            condition="fail",
+            message="forge: lint passed; tests failed",
+            checks=[
+                ci_gate.GateCheckResult(name="lint", condition="pass", message="lint passed"),
+                ci_gate.GateCheckResult(name="tests", condition="fail", message="tests failed", output=f"x {TOKEN}"),
+            ],
+        )
+        proc = _gate_proc(1, stdout=f"{GATE_RESULT_MARKER}{result.model_dump_json()}\n".encode())
+        with patch.object(handlers.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)) as exec_mock:
+            gate = await handlers.run_gate_in_container(
+                _local_settings(), "forge", repo="acme/widgets", branch="f", base_branch="main"
+            )
+        argv = list(exec_mock.await_args.args)
+        assert argv[argv.index("ghcr.io/acme/henchmen/operative:1.0.0") + 3] == "forge"
+        assert gate["condition"] == "fail"
+        assert [(c["name"], c["condition"]) for c in gate["checks"]] == [("lint", "pass"), ("tests", "fail")]
+        assert TOKEN not in gate["checks"][1]["output"]
+
+    @pytest.mark.asyncio
+    async def test_every_gate_container_runs_under_an_init(self) -> None:
+        _, exec_mock = await _check(_local_settings(), _gate_proc(0, stdout=_marker("pass", "ok")))
+        argv = list(exec_mock.await_args.args)
+        assert "--init" in argv[: argv.index("--entrypoint")]
+
+
+def test_a_failed_handover_names_the_user_namespace_as_the_likely_cause(tmp_path: Path) -> None:
+    with (
+        patch.object(ci_gate, "_running_as_root", return_value=True),
+        patch.object(ci_gate, "_chown_tree", side_effect=OSError(22, "Invalid argument")),
+    ):
+        result = ci_gate._prepare_sandbox(str(tmp_path), "lint")
+    assert isinstance(result, GateResult) and result.condition == "fail"
+    assert "uid 65534 is not mapped in this Docker user namespace" in result.message

@@ -27,7 +27,6 @@ from henchmen.utils.redaction import install_secret_redaction
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
     from henchmen.forge.ci_runner import CIRunner
-    from henchmen.mastermind.scheme_executor.ci_gate import GateCommand
 
 logger = logging.getLogger(__name__)
 
@@ -332,18 +331,18 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
         from henchmen.forge.ci_runner import CIRunner
 
         try:
-            # One budget for the whole run and for any single command: the run
-            # must finish (and ack) inside the 600s Pub/Sub ack deadline.
-            budget = settings.forge_ci_timeout_seconds
+            # One budget for the whole run and for any single command: the cloud
+            # run must finish (and ack) inside the 600s Pub/Sub ack deadline. A
+            # desktop run has no ack deadline (the in-process broker waits), so it
+            # gets the gate timeout every other local gate gets instead.
+            budget = int(settings.lair_default_timeout) if local else settings.forge_ci_timeout_seconds
             runner = CIRunner(
                 timeout_seconds=budget,
                 total_budget_seconds=budget,
                 redact=[github_token] if github_token else [],
             )
             if local:
-                result = await _run_local_ci(
-                    settings, runner, full_repo, head_branch, base_branch, workspace, budget_seconds=budget
-                )
+                result = await _run_local_ci(settings, runner, full_repo, head_branch, base_branch, workspace)
             else:
                 result = await runner.run(workspace, base_ref=base_branch)
         except Exception as exc:
@@ -386,55 +385,60 @@ async def _run_local_ci(
     head_branch: str,
     base_branch: str,
     workspace: str,
-    *,
-    budget_seconds: int,
 ) -> dict[str, Any]:
-    """Desktop Forge CI: lint and tests in the gate container, the silent-failure scan on the no-checkout clone.
+    """Desktop Forge CI: one gate container for lint and tests, the silent-failure scan on the no-checkout clone.
 
-    The results are combined by :meth:`CIRunner.aggregate`, so the forge-result
-    status mapping (``passed``/``failed``/``incomplete``) and the PR comment are
-    those of the host path. Whether there is a tests check at all -- and whether
-    it is ``skipped`` for a ``package.json`` without a ``test`` script -- is
-    decided from the committed tree exactly as the host path decides it
-    (:meth:`CIRunner.committed_tests_decision`). Lint and tests go through the
-    Mastermind's single container runner (``run_gate_in_container``) and share
-    one wall-clock budget with the scan.
+    ``ci_gate forge`` clones once, installs dependencies once (as the
+    unprivileged user) and reports both checks in one result, through the
+    single container runner (``run_gate_in_container``) with the gate timeout.
+    Lint is scoped by :mod:`~henchmen.mastermind.scheme_executor.lint_scope`
+    (the Mastermind lint gate's rules), which is stricter than the cloud host
+    path's ruff-on-changed-``.py``-files.
+
+    Whether there is a tests check at all -- and whether it is ``skipped`` for a
+    ``package.json`` without a ``test`` script -- is decided from the committed
+    tree exactly as the host path decides it
+    (:meth:`CIRunner.committed_tests_decision`). The results are combined by
+    :meth:`CIRunner.aggregate`, so the forge-result status mapping
+    (``passed``/``failed``/``incomplete``) and the PR comment are those of the
+    host path. A gate that times out or reports no usable result fails every
+    check it was asked to run.
     """
     from henchmen.forge.ci_runner import STATUS_FAILED, STATUS_PASSED
     from henchmen.mastermind.scheme_executor.handlers import run_gate_in_container
 
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + budget_seconds
-    checks: list[dict[str, Any]] = []
     run_tests, tests_check = await runner.committed_tests_decision(workspace)
-    gates: list[GateCommand] = ["lint", "tests"] if run_tests else ["lint"]
-    for check in gates:
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            checks.append(
-                runner.check_result(check, STATUS_FAILED, "", f"CI time budget of {budget_seconds}s exhausted")
-            )
+    names = ["lint", "tests"] if run_tests else ["lint"]
+    gate = await run_gate_in_container(
+        settings,
+        "forge",
+        repo=full_repo,
+        branch=head_branch,
+        base_branch=base_branch,
+        extra_args=() if run_tests else ("--skip-tests",),
+    )
+    reported = {str(check.get("name")): check for check in gate.get("checks", []) if isinstance(check, dict)}
+    gate_failed = gate.get("condition") != "pass"
+    any_check_failed = any(check.get("condition") != "pass" for check in reported.values())
+    checks: list[dict[str, Any]] = []
+    for name in names:
+        check = reported.get(name)
+        if check is None or (gate_failed and not any_check_failed):
+            # No per-check result (a timeout, a crash, no marker) or a pass the exit code contradicts.
+            message = str(gate.get("message", "")) or f"the gate reported no {name} result"
+            checks.append(runner.check_result(name, STATUS_FAILED, str(gate.get("output", "")), message))
             continue
-        gate = await run_gate_in_container(
-            settings,
-            check,
-            repo=full_repo,
-            branch=head_branch,
-            base_branch=base_branch,
-            timeout_seconds=remaining,
-        )
-        passed = gate.get("condition") == "pass"
+        passed = check.get("condition") == "pass"
         checks.append(
             runner.check_result(
-                check,
+                name,
                 STATUS_PASSED if passed else STATUS_FAILED,
-                str(gate.get("output", "")),
-                "" if passed else str(gate.get("message", "")),
+                str(check.get("output", "")),
+                "" if passed else str(check.get("message", "")),
             )
         )
     if tests_check is not None:
         checks.append(tests_check)
-    runner.total_budget_seconds = max(1, int(deadline - loop.time()))
     checks.append(await runner.run_silent_failure_scan(workspace, base_branch))
     return runner.aggregate(checks)
 

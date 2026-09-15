@@ -102,7 +102,10 @@ A data-directory install (`HENCHMEN_DATA_DIR`, the local image) is treated as a 
   auto-fixer and Forge's PR lint and tests all run in a separate gate container from the operative image
   (`ci_gate`). Nothing is bind-mounted from the host, so the data volume and the Docker socket are never
   reachable from repository code. Forge keeps only its silent-failure scan in the server process: it
-  clones without a checkout and scans the diff text, which executes nothing from the repository.
+  clones without a checkout and scans the diff text, which executes nothing from the repository. Forge's
+  lint and tests share one gate container (one clone, one dependency install). That lint applies the
+  Mastermind lint gate's rules, deliberately stricter than the cloud path's ruff-only lint. The gate runs
+  under Docker's `--init`, so processes that repository code leaves behind are reaped.
 - **What the gate container guarantees about the GitHub token.** The token reaches the gate only on its
   standard input (`docker run -i`). It is never on a command line or in the container's or the docker
   CLI's environment. The gate process starts as root with every capability dropped except

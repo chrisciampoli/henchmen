@@ -270,27 +270,34 @@ class LairManager:
 
         logger.info("[LAIR] Creating lair %s for task %s node %s", lair_id, task.id, node.id)
 
-        orchestrator = self._get_orchestrator()
-        exec_id = await orchestrator.run_job(
-            job_id=lair_id,
-            image=image,
-            env_vars=env_vars,
-            cpu=cpu,
-            memory=memory,
-            timeout_seconds=timeout_seconds,
-            service_account=service_account,
-            secrets=secrets,
-        )
-
-        logger.info("[LAIR] Execution started: %s", exec_id)
-
+        # Registered provisionally *before* the job starts: an operative that
+        # finishes and reports before run_job returns must not be refused as
+        # "never launched". Removed again if the launch itself fails.
         self._active_lairs[lair_id] = {
-            "execution_id": exec_id,
+            "execution_id": "",
             "task_id": task.id,
             "node_id": node.id,
             "timeout_seconds": timeout_seconds,
             "created_at": datetime.now(UTC).isoformat(),
         }
+        orchestrator = self._get_orchestrator()
+        try:
+            exec_id = await orchestrator.run_job(
+                job_id=lair_id,
+                image=image,
+                env_vars=env_vars,
+                cpu=cpu,
+                memory=memory,
+                timeout_seconds=timeout_seconds,
+                service_account=service_account,
+                secrets=secrets,
+            )
+        except BaseException:
+            self._active_lairs.pop(lair_id, None)
+            raise
+
+        logger.info("[LAIR] Execution started: %s", exec_id)
+        self._active_lairs[lair_id]["execution_id"] = exec_id
 
         return lair_id
 
@@ -304,8 +311,9 @@ class LairManager:
         node timeout plus the start-up and report grace periods from launch.
         Only the most recent lair for the task and node counts: a lair a
         re-execution superseded cannot report over its replacement. A lair
-        launched by a previous process (a restart) is unknown here and refused;
-        the watchdog re-dispatches that work instead.
+        launched by a previous process (a restart) is unknown here and refused:
+        the in-flight scheme died with the process; desktop recovery is the
+        Phase 3 poller's job.
         """
         launched: list[tuple[datetime, str, dict[str, Any]]] = []
         for lair_id, info in self._active_lairs.items():

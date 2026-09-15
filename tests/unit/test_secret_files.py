@@ -561,3 +561,29 @@ def test_secret_bytes_are_fsynced_before_they_are_published(tmp_path: Path, monk
     assert "replace" in events
     assert events.index("fsync") < events.index("replace")
     assert path.read_bytes() == b"z" * 32
+
+
+@symlinks_supported
+def test_a_symlinked_env_file_is_refused_with_what_to_do(tmp_path: Path) -> None:
+    """M4: `EnvFile.write` (henchmen init, the Console) refuses a symlinked env file and says how to fix it."""
+    from henchmen.cli.envfile import EnvFile
+
+    target = tmp_path / "real.env"
+    target.write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+    link = tmp_path / "henchmen.env"
+    link.symlink_to(target)
+    env = EnvFile.load(link)
+    env.set("HENCHMEN_PROVIDER", "gcp")
+    with pytest.raises(secret_files.SecretFileError) as exc_info:
+        env.write(backup=False)
+    assert "replace the symlink with a regular file owned by you" in str(exc_info.value)
+    assert target.read_text(encoding="utf-8") == "HENCHMEN_PROVIDER=local\n", "the target is never written through"
+
+
+@posix_only
+def test_a_foreign_owned_secret_error_says_how_to_fix_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "secrets" / "setup-token"
+    read_or_create_secret(path)
+    monkeypatch.setattr(secret_files.os, "geteuid", lambda: os.stat(path).st_uid + 1)
+    with pytest.raises(secret_files.SecretFileError, match="make it a regular file owned by you"):
+        write_secret_file(path, b"q" * 32)
