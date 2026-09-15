@@ -303,6 +303,33 @@ def test_a_second_process_cannot_reuse_the_seed(tmp_path: Path) -> None:
     assert SetupTokenStore(path).rotate(seed=SEED) != SEED
 
 
+def test_seed_write_failure_falls_back_to_a_random_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Marker created, then the seed write itself fails (fix round 2, item 2)."""
+    from henchmen.console import auth as auth_module
+
+    path = tmp_path / SETUP_TOKEN_FILE_NAME
+    store = SetupTokenStore(path)
+    real_write = auth_module.write_secret_file
+    calls = {"n": 0}
+
+    def flaky_write(target: Path, data: bytes) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("disk full")
+        real_write(target, data)
+
+    monkeypatch.setattr(auth_module, "write_secret_file", flaky_write)
+
+    token = store.rotate(seed=SEED)
+
+    assert token != SEED, "the seed write failed, so a random token must have been written instead"
+    assert calls["n"] == 2, "exactly one fallback write after the seed write failed"
+    assert store.current() == token
+
+    later = store.rotate(seed=SEED)
+    assert later != SEED, "the marker already exists, so a later rotate must still ignore the seed"
+
+
 def test_a_rotation_between_read_and_claim_does_not_destroy_the_new_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -328,6 +355,39 @@ def test_a_rotation_between_read_and_claim_does_not_destroy_the_new_token(
     assert SetupTokenStore(path).consume(new_token) is True, "the rotated-in token must survive the failed claim"
 
 
+def test_hard_link_restore_failure_leaves_neither_token_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Same race as above, but the restore itself also fails (fix round 2, item 7)."""
+    path = tmp_path / SETUP_TOKEN_FILE_NAME
+    store = SetupTokenStore(path)
+    old_token = store.rotate()
+    real_replace = os.replace
+    new_token_holder: dict[str, str] = {}
+
+    def racing_replace(src: object, dst: object) -> None:
+        monkeypatch.setattr("henchmen.console.auth.os.replace", real_replace)
+        new_token_holder["new"] = SetupTokenStore(path).rotate()
+        real_replace(src, dst)
+
+    def failing_link(src: object, dst: object) -> None:
+        raise PermissionError("cannot restore")
+
+    monkeypatch.setattr("henchmen.console.auth.os.replace", racing_replace)
+    monkeypatch.setattr("henchmen.console.auth.os.link", failing_link)
+    caplog.set_level(logging.WARNING)
+
+    assert store.consume(old_token) is False
+
+    new_token = new_token_holder["new"]
+    assert SetupTokenStore(path).consume(old_token) is False
+    assert SetupTokenStore(path).consume(new_token) is False
+    assert caplog.records, "a failed restore must be logged, not silently swallowed"
+    for record in caplog.records:
+        assert old_token not in record.getMessage()
+        assert new_token not in record.getMessage()
+
+
 def test_claim_unlink_failure_still_returns_the_right_result_and_a_valid_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -351,6 +411,42 @@ def test_no_claim_files_remain_after_normal_consume_paths(tmp_path: Path) -> Non
     token = store.rotate()
     assert store.consume(token) is True
     assert store.consume(token) is False  # a second, doomed-to-fail attempt too
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".claim")]
+    assert leftovers == []
+
+
+def test_utime_is_applied_to_the_claim_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fix round 2, item 3: refresh the claim's mtime so a concurrent sweep never treats
+    an in-flight claim as stale (the rename preserves the token file's own, possibly old,
+    mtime)."""
+    store = SetupTokenStore(tmp_path / SETUP_TOKEN_FILE_NAME)
+    token = store.rotate()
+    real_utime = os.utime
+    touched: list[str] = []
+
+    def recording_utime(path: object, *args: object, **kwargs: object) -> None:
+        touched.append(Path(str(path)).name)
+        real_utime(path, *args, **kwargs)
+
+    monkeypatch.setattr("henchmen.console.auth.os.utime", recording_utime)
+    assert store.consume(token) is True
+    assert len(touched) == 1
+    assert touched[0].endswith(".claim")
+
+
+def test_replacement_write_failure_still_removes_the_claim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fix round 2, item 4: the claim must never linger even if the replacement write fails."""
+    store = SetupTokenStore(tmp_path / SETUP_TOKEN_FILE_NAME)
+    token = store.rotate()
+
+    def failing_create(path: object, data: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("henchmen.console.auth.create_secret_file", failing_create)
+
+    with pytest.raises(OSError):
+        store.consume(token)
+
     leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".claim")]
     assert leftovers == []
 

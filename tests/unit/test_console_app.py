@@ -210,7 +210,7 @@ def test_session_exchange_with_a_file_backed_token_store_is_one_time(tmp_path: P
 
     client.cookies.clear()
     second = client.get("/console/session", params={"setup_token": token})
-    assert second.status_code in (303, 403)
+    assert second.status_code == 403, "no session cookie and an already-spent token must be refused outright"
 
     # A signed-in browser that opens the same, now-spent link must be redirected, not errored.
     client.cookies.set(SESSION_COOKIE, auth.issue_session())
