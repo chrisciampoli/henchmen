@@ -274,6 +274,32 @@ def test_apply_validates_the_file_not_the_seeded_default(tmp_path: Path, monkeyp
     assert store.load().completed is False
 
 
+def test_apply_refuses_a_bad_forward_host_and_does_not_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ruling 1: otherwise a saved config that builds and validates fine, but whose forward
+    host the whole-app allowlist would refuse, would apply, restart, and land straight back
+    in needs-attention mode instead of being refused here."""
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    store = SetupStateStore(tmp_path / "setup-state.json")
+    auth = ConsoleAuth(setup_token="tok", signing_key=b"k" * 32)
+    config = tmp_path / "henchmen.env"
+    applied = _ApplyRecorder()
+    app = create_console_app(mode=ConsoleMode.SETUP, store=store, auth=auth, config_file=config, on_apply=applied)
+    client = _signed_in(TestClient(app, base_url=LOCAL, follow_redirects=False), auth)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
+    # The default forward base (host.docker.internal) is exactly the P3 default problem.
+    config.write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+    before = config.read_bytes()
+
+    response = client.post("/console/api/apply", headers=ORIGIN)
+
+    assert response.status_code == 409
+    problems = response.json()["detail"]["problems"]
+    assert any("HENCHMEN_LOCAL_FORWARD_BASE_URL" in p for p in problems)
+    assert store.load().completed is False
+    assert applied.calls == 0
+    assert config.read_bytes() == before
+
+
 def test_apply_refuses_a_configuration_that_cannot_start_leaves_the_file_untouched(
     env, monkeypatch: pytest.MonkeyPatch
 ) -> None:

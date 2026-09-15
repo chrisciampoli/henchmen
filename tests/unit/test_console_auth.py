@@ -810,11 +810,31 @@ class TestForwardHostProblem:
         assert "host.docker.internal" in problem
         assert "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8000" in problem
 
-    def test_desktop_with_the_container_hostname_returns_none(
+    def test_desktop_with_the_container_hostname_and_a_network_returns_none(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
+        settings = _settings(local_forward_base_url="http://henchmen:8000", local_docker_network="henchmen")
+        assert forward_host_problem(settings) is None
+
+    def test_desktop_with_the_container_hostname_but_no_network_reports_a_problem(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The forward base names the container hostname, but without a shared Docker network an
+        operative on the default bridge network cannot resolve that name -- reachable only by luck."""
+        monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
         settings = _settings(local_forward_base_url="http://henchmen:8000")
+        problem = forward_host_problem(settings)
+        assert problem is not None
+        assert "HENCHMEN_LOCAL_DOCKER_NETWORK=henchmen" in problem
+        assert "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8000" in problem
+        assert "--network henchmen --name henchmen" in problem
+
+    def test_the_readme_docker_run_recipe_returns_none(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """README's `docker run --name henchmen --network henchmen ... -e HENCHMEN_LOCAL_DOCKER_NETWORK=henchmen
+        -e HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8000` recipe must never land in attention mode."""
+        monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
+        settings = _settings(local_forward_base_url="http://henchmen:8000", local_docker_network="henchmen")
         assert forward_host_problem(settings) is None
 
     @pytest.mark.parametrize("loopback", ["127.0.0.1", "localhost", "[::1]"])

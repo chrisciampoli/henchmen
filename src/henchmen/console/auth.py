@@ -464,6 +464,12 @@ def forward_host_problem(settings: Settings) -> str | None:
     the default bridge network or a named ``local_docker_network`` -- so that
     hostname always names the operative's own container, never this machine,
     regardless of ``local_docker_network``.
+
+    A forward base naming the container hostname itself is also a problem when
+    ``local_docker_network`` is blank: on Docker's default bridge network,
+    containers cannot resolve each other by the ``--name`` they were started
+    with, only a named user-defined network gives them that (see the README's
+    ``docker run --network henchmen --name henchmen`` recipe).
     """
     from henchmen.config.paths import is_desktop_install
 
@@ -486,19 +492,28 @@ def forward_host_problem(settings: Settings) -> str | None:
     if not hostname:
         return f"HENCHMEN_LOCAL_FORWARD_BASE_URL ({settings.local_forward_base!r}) is not a usable URL."
 
-    suggestion = f"http://{container_hostname}:{settings.local_serve_port}"
+    # Every suggestion below names both settings the README's recipe sets together,
+    # plus the docker run flags that make the container hostname resolvable at all.
+    network_fix = (
+        f"HENCHMEN_LOCAL_DOCKER_NETWORK={container_hostname} and "
+        f"HENCHMEN_LOCAL_FORWARD_BASE_URL=http://{container_hostname}:{settings.local_serve_port}, and start "
+        f"the henchmen container with `--network {container_hostname} --name {container_hostname}`"
+    )
     lowered = hostname.lower()
     if lowered in _LOOPBACK_NAMES:
         return (
             f"Operatives call Henchmen at {hostname}, its own loopback address inside the operative's "
-            f"container, which never reaches this machine. Set HENCHMEN_LOCAL_FORWARD_BASE_URL={suggestion}"
+            f"container, which never reaches this machine. Set {network_fix}"
+        )
+    if lowered == container_hostname and not settings.local_docker_network.strip():
+        return (
+            f"Operatives call Henchmen at {hostname} (the configured container hostname), but no Docker "
+            "network is configured -- on the default bridge network a container cannot resolve another "
+            f"container's name. Set {network_fix}"
         )
     if lowered in desktop_allowed_hostnames(container_hostname):
         return None
-    return (
-        f"Operatives call Henchmen at {hostname}, which a desktop install refuses. "
-        f"Set HENCHMEN_LOCAL_FORWARD_BASE_URL={suggestion}"
-    )
+    return f"Operatives call Henchmen at {hostname}, which a desktop install refuses. Set {network_fix}"
 
 
 def _cookie(header: str, name: str) -> str | None:
