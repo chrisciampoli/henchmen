@@ -66,6 +66,24 @@ def _streaming_request(headers: dict[str, str], chunks: list[bytes]) -> Request:
     return Request(scope, receive)
 
 
+def _disconnecting_request(headers: dict[str, str]) -> Request:
+    """A request whose client hangs up mid-stream, like a real dropped connection."""
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.disconnect"}
+
+    raw = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/pubsub/operative-complete",
+        "headers": raw,
+        "query_string": b"",
+        "client": ("172.18.0.5", 40000),
+    }
+    return Request(scope, receive)
+
+
 def _forbidden_read_request(headers: dict[str, str] | None = None) -> Request:
     """A request whose body must never be read -- receive() fails the test if it is."""
 
@@ -351,6 +369,17 @@ class TestOperativeReportAuth:
             await pubsub_auth_module.verify_operative_report(request, _settings())
         assert exc.value.status_code == 401
 
+    @pytest.mark.asyncio
+    async def test_client_disconnect_while_streaming_is_a_400_not_a_500(self, desktop) -> None:
+        """A dropped connection is routine, not a server error -- and not evidence of an attack."""
+        from henchmen.dispatch.pubsub_auth import verify_operative_report
+
+        headers = {"Authorization": f"Bearer {desktop.task_token('task-1')}"}
+        request = _disconnecting_request(headers)
+        with pytest.raises(HTTPException) as exc:
+            await verify_operative_report(request, _settings())
+        assert exc.value.status_code == 400
+
 
 def test_bearer_tokens_are_redacted_from_logs() -> None:
     line = "POST failed with Authorization: Bearer " + "a" * 43
@@ -388,3 +417,23 @@ def test_any_token_env_assignment_is_redacted(key: str) -> None:
     redacted = redact(f"{key}={value}")
     assert value not in redacted
     assert key in redacted
+
+
+def test_operative_task_token_dict_repr_is_redacted() -> None:
+    """A logged dict/env repr (single quotes, e.g. Python's `%r`) must not leak the token either."""
+    token = "e" * 64
+    line = f"env={{'HENCHMEN_OPERATIVE_TASK_TOKEN': '{token}', 'TASK_ID': 'task-1'}}"
+    redacted = redact(line)
+    assert token not in redacted
+    assert "'HENCHMEN_OPERATIVE_TASK_TOKEN': '***REDACTED***'" in redacted
+    assert "'TASK_ID': 'task-1'" in redacted, "unrelated quoted keys must survive untouched"
+
+
+def test_operative_task_token_json_repr_is_redacted() -> None:
+    """The same shape, JSON-style (double quotes, no space after the colon)."""
+    token = "f" * 64
+    line = '{"HENCHMEN_OPERATIVE_TASK_TOKEN":"' + token + '","task_id":"task-1"}'
+    redacted = redact(line)
+    assert token not in redacted
+    assert '"HENCHMEN_OPERATIVE_TASK_TOKEN":"***REDACTED***"' in redacted
+    assert '"task_id":"task-1"' in redacted

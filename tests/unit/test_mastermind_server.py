@@ -52,6 +52,30 @@ def _agent() -> MagicMock:
     return agent
 
 
+class _DictBackedStore:
+    """A DocumentStore fake whose ``get`` returns whatever ``set`` last stored.
+
+    The plain ``MagicMock`` store used elsewhere in this file always returns
+    ``None`` from ``get`` regardless of prior ``set`` calls, which is fine for
+    tests that only inspect *what* was written. A dedup cross-request test
+    needs the real read-your-writes behaviour instead -- two requests must
+    observe each other's dedup markers -- or it would pass even with the dedup
+    keying completely broken.
+    """
+
+    def __init__(self) -> None:
+        self._data: dict[tuple[str, str], dict[str, Any]] = {}
+
+    async def get(self, collection: str, doc_id: str) -> dict[str, Any] | None:
+        return self._data.get((collection, doc_id))
+
+    async def set(self, collection: str, doc_id: str, data: dict[str, Any]) -> None:
+        self._data[(collection, doc_id)] = data
+
+    async def delete(self, collection: str, doc_id: str) -> None:
+        self._data.pop((collection, doc_id), None)
+
+
 @pytest.fixture
 def agent() -> Iterator[MagicMock]:
     fake = _agent()
@@ -568,6 +592,39 @@ class TestOperativeReportOnDesktop:
         assert "task-abcdef01:op-dedup-1" in keys, (
             "the task-token path must record a dedup marker scoped to the verified task id"
         )
+        assert "op-dedup-1" not in keys, (
+            "the plain message_id must never be claimed on the task-token path -- another task's "
+            "operative could reuse the same Pub/Sub message_id and suppress this one's report"
+        )
+
+    def test_same_message_id_from_two_different_tasks_is_not_a_duplicate(self, monkeypatch, tmp_path):
+        """The scoped dedup key must not let task A's report suppress task B's -- even when both
+        happen to carry the same Pub/Sub message_id, which is not scoped to a task at all."""
+        from henchmen.config.internal_auth import load_internal_auth
+        from henchmen.mastermind.server import app
+
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        internal = load_internal_auth(tmp_path / "secrets")
+        fake = _agent()
+        fake.tracker._store = _DictBackedStore()
+        with patch("henchmen.mastermind.server.get_agent", return_value=fake):
+            client = TestClient(app, raise_server_exceptions=False)
+
+            resp_a = client.post(
+                "/pubsub/operative-complete",
+                json=_envelope(self._report("task-a"), message_id="op-x"),
+                headers={"Authorization": f"Bearer {internal.task_token('task-a')}"},
+            )
+            resp_b = client.post(
+                "/pubsub/operative-complete",
+                json=_envelope(self._report("task-b"), message_id="op-x"),
+                headers={"Authorization": f"Bearer {internal.task_token('task-b')}"},
+            )
+
+        assert resp_a.status_code == 200
+        assert resp_b.status_code == 200
+        assert resp_b.json()["status"] != "duplicate"
+        assert fake.lair_manager.notify_operative_complete.call_count == 2
 
 
 class TestOperativeReportTaskIdCrossCheck:

@@ -142,7 +142,14 @@ class LairManager:
         (``TASK_ID``, ``NODE_ID``, ...), which is deliberately unprefixed
         because it is input, not configuration.
         """
-        is_local = self.settings.provider == "local"
+        # Gated on the *effective* container orchestrator rather than the coarse
+        # `provider` setting: an override (`HENCHMEN_CONTAINER_ORCHESTRATOR_PROVIDER`)
+        # can point container orchestration at Docker, or away from it, independently
+        # of `provider`. Everything below that only makes sense for a Lair actually
+        # launched by Docker -- secrets in plain env vars, the host forward URL, the
+        # Ollama rewrite, and the task token -- shares this one gate so they can never
+        # disagree with each other.
+        is_local = ProviderRegistry(self.settings).resolve_provider_name("container_orchestrator") == "local"
         env = self.settings.operative_env(include_secrets=is_local)
 
         env.update(
@@ -184,15 +191,9 @@ class LairManager:
             if self.settings.github_token:
                 env["GITHUB_TOKEN"] = self.settings.github_token
 
-        # Desktop install whose *effective* container orchestrator resolves to the
-        # local Docker one: a token valid only for this task authenticates the
-        # operative's report and its task-state calls (D-P4). Gated on the
-        # orchestrator resolution rather than the coarse `provider` setting above,
-        # since an override (`HENCHMEN_CONTAINER_ORCHESTRATOR_PROVIDER`) can point
-        # container orchestration at Docker, or away from it, independently of
-        # `provider` — only a Lair actually launched by Docker can be handed this
-        # token. The internal push token never enters an operative (amendment A2).
-        if ProviderRegistry(self.settings).resolve_provider_name("container_orchestrator") == "local":
+            # Desktop install: a token valid only for this task authenticates the
+            # operative's report and its task-state calls (D-P4). The internal push
+            # token never enters an operative (amendment A2).
             internal = desktop_internal_auth()
             if internal is not None:
                 env["HENCHMEN_OPERATIVE_TASK_TOKEN"] = internal.task_token(task.id)

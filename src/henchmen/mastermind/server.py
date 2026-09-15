@@ -619,14 +619,19 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
     try:
         envelope = await request.json()
 
-        # Layer 1: Pub/Sub message-level dedup. On the task-token path the dedup
-        # key is prefixed with the verified task id so an operative -- which
-        # only ever holds a token for its own task -- cannot collide with, or
-        # spoof completion of, another task's message_id.
+        # Layer 1: Pub/Sub message-level dedup. On the task-token path the *only*
+        # dedup key is the verified task id, prefixed onto message_id: the plain
+        # message_id must NOT also be claimed, or an operative for task A could
+        # suppress task B's report by reusing (or guessing) the same message_id
+        # -- Pub/Sub message ids are not secret and are not scoped to a task.
         message_id = envelope.get("message", {}).get("messageId", "")
         verified_task_id = getattr(request.state, "operative_task_id", None)
-        dedup_key = f"{verified_task_id}:{message_id}" if verified_task_id else None
-        if await _check_message_dedup(message_id, dedup_key=dedup_key, handler="operative-complete"):
+        if verified_task_id:
+            dedup_message_id = ""
+            dedup_key = f"{verified_task_id}:{message_id}" if message_id else None
+        else:
+            dedup_message_id, dedup_key = message_id, None
+        if await _check_message_dedup(dedup_message_id, dedup_key=dedup_key, handler="operative-complete"):
             logger.info("Duplicate operative-complete message %s, skipping", message_id)
             return {"status": "duplicate", "message_id": message_id}
 
@@ -684,7 +689,7 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
         )
 
         # Two-phase dedup: only now is the message really processed.
-        await _mark_message_done(message_id, dedup_key=dedup_key, handler="operative-complete")
+        await _mark_message_done(dedup_message_id, dedup_key=dedup_key, handler="operative-complete")
         return {"status": "ok"}
     except HTTPException:
         raise
