@@ -125,6 +125,7 @@ def create_console_app(
     seeded_env: Mapping[str, str] | None = None,
     problems: Sequence[str] = (),
     service_status: Callable[[], dict[str, str]] | None = None,
+    config_store: ConfigStore | None = None,
 ) -> FastAPI:
     """Build the Console app. ``on_apply`` is called after apply's response is sent.
 
@@ -141,10 +142,19 @@ def create_console_app(
     and are returned only to a request carrying a valid Console session
     (decision C17): an unauthenticated status poll still sees ``mode:
     "attention"`` but an empty problem list. ``service_status`` reports each
-    service's live state (run mode only).
+    service's live state (run mode only). ``config_store`` is the Console's
+    single configuration writer (D-P10); when omitted, one is built from
+    ``config_file``/``secrets_dir``. An injected store must point at the same
+    two paths -- a caller (a test) that passes a mismatched store is a bug,
+    not a configuration to silently prefer one or the other for.
     """
+    if config_store is not None and (
+        config_store.config_file != config_file or config_store.secrets_dir != secrets_dir
+    ):
+        raise ValueError("config_store does not point at this app's config_file/secrets_dir")
     app = FastAPI(title="Henchmen Console", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.setup_store = store
+    app.state.config_store = config_store or ConfigStore(config_file, secrets_dir)
 
     @app.exception_handler(RequestValidationError)
     async def _on_validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -225,7 +235,9 @@ def create_console_app(
         # Run mode must start with an authenticated task API (D-P10). The token is only
         # computed here, in memory: it is validated as part of the configuration before
         # anything is written, so a refused apply never touches the file (ruling P6).
-        config_store = ConfigStore(config_file, secrets_dir)
+        # Uses the app's own store, sharing its config-file lock with every step write
+        # (ruling C16) rather than building a second instance over the same file.
+        config_store = app.state.config_store
         env_files = (str(config_file),)
         # Skip generating one when the running environment already supplies a usable
         # token (e.g. a Secret Manager mount): the environment outranks the file anyway.

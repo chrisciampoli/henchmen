@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from henchmen.cli.envfile import EnvFile, quote_value
+from henchmen.cli.envfile import EnvFile, is_secret_key, quote_value
 
 SAMPLE = """# Henchmen local development configuration
 
@@ -252,3 +252,35 @@ class TestWrite:
         assert env_path.read_text(encoding="utf-8") == original
         leftovers = [p.name for p in env_path.parent.iterdir() if p.name != ".env.local"]
         assert leftovers == []
+
+
+# ---------------------------------------------------------------------------
+# is_secret_key
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "HENCHMEN_GITHUB_TOKEN",
+        "HENCHMEN_ANTHROPIC_API_KEY",
+        "HENCHMEN_SLACK_SIGNING_SECRET",
+        "HENCHMEN_GITHUB_WEBHOOK_SECRET",
+        "henchmen_jira_api_token",
+    ],
+)
+def test_credential_keys_are_secret(key: str) -> None:
+    assert is_secret_key(key)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "HENCHMEN_OPERATIVE_MAX_OUTPUT_TOKENS",
+        "HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH",
+        "HENCHMEN_GITHUB_APP_ID",
+        "HENCHMEN_JIRA_PROJECT_KEY",
+    ],
+)
+def test_non_credential_keys_are_not_secret(key: str) -> None:
+    assert not is_secret_key(key)

@@ -28,6 +28,25 @@ from henchmen.config.secret_files import write_secret_file
 _ASSIGNMENT_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
 _NEEDS_QUOTES_RE = re.compile(r"[\s#\"'\\$`]")
 
+_SECRET_KEY_SUFFIXES: tuple[str, ...] = ("_TOKEN", "_API_KEY", "_PRIVATE_KEY", "_SECRET")
+
+
+def is_secret_key(key: str) -> bool:
+    """True when a dotenv key names a credential whose value must never be displayed.
+
+    Only the name's ending counts: ``HENCHMEN_GITHUB_TOKEN`` and
+    ``HENCHMEN_ANTHROPIC_API_KEY`` are secret, while
+    ``HENCHMEN_OPERATIVE_MAX_OUTPUT_TOKENS``, ``HENCHMEN_JIRA_PROJECT_KEY`` and
+    ``HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH`` are not.
+
+    ``henchmen.console.app``'s setup-state choice filter (``_choices_are_not_secrets``)
+    intentionally checks a broader set of name segments and suffixes than this
+    function -- a false positive there only blocks saving a non-secret choice
+    name, while a false negative here would display a credential, so the two
+    are deliberately not unified.
+    """
+    return key.strip().upper().endswith(_SECRET_KEY_SUFFIXES)
+
 
 def _unquote(raw: str) -> str:
     """Strip surrounding quotes and inline comments from a raw assignment value."""

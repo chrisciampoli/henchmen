@@ -21,14 +21,13 @@ from pathlib import Path
 
 from henchmen.cli import checks
 from henchmen.cli.checks import CheckResult, CheckStatus, SlackChannel, SlackScopeError
-from henchmen.cli.envfile import EnvFile
+from henchmen.cli.envfile import EnvFile, is_secret_key
 from henchmen.cli.prompts import Choice, ConsolePrompter, PromptAbortedError, Prompter, mask_secret
 from henchmen.config.paths import config_file
 
 SECTIONS: tuple[str, ...] = ("mode", "llm", "github", "slack", "jira", "limits")
 EXIT_ABORTED = 130
 _MAX_ATTEMPTS = 3
-_SECRET_MARKERS = ("TOKEN", "KEY", "SECRET")
 _TIERS: tuple[tuple[str, str], ...] = (
     ("complex", "core coding (implement_fix / implement_feature)"),
     ("light", "cheap, fast steps (planning, lint fixes)"),
@@ -660,16 +659,12 @@ _SECTION_RUNNERS: dict[str, Callable[[Prompter, WizardState, InitOptions], None]
 # ---------------------------------------------------------------------------
 
 
-def _is_secret(key: str) -> bool:
-    return any(marker in key for marker in _SECRET_MARKERS)
-
-
 def _print_summary(prompter: Prompter, state: WizardState) -> None:
     prompter.info("")
     prompter.info("Summary")
     width = max((len(k) for k in state.pending), default=10)
     for key, value in state.pending.items():
-        shown = mask_secret(value) if _is_secret(key) else value
+        shown = mask_secret(value) if is_secret_key(key) else value
         prompter.info(f"  {key.ljust(width)}  {shown}")
 
 
