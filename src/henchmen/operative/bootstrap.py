@@ -18,7 +18,8 @@ import henchmen.schemes.feature_standard  # noqa: F401
 import henchmen.schemes.goal_decomposition  # noqa: F401
 from henchmen.arsenal._repo import normalize_repo_slug
 from henchmen.arsenal._workspace import DEFAULT_WORKSPACE_ROOT, set_workspace_root
-from henchmen.config.settings import Environment, Settings, get_settings
+from henchmen.config.posture import fail_open_allowed
+from henchmen.config.settings import Settings, get_settings
 from henchmen.models.llm import ModelTier
 from henchmen.models.operative import OperativeConfig, OperativeReport, OperativeStatus
 from henchmen.operative.agent_builder import build_operative_agent
@@ -140,13 +141,13 @@ def _get_document_store(registry: ProviderRegistry, settings: Settings) -> Docum
     The store carries the heartbeat the Mastermind watchdog relies on and the
     task-level cost accumulator. Running without it in staging/prod would let
     a node spend past the task ceiling and look dead to the watchdog, so there
-    the Job fails instead. Dev keeps the warn-and-continue path so a local run
-    without Firestore still works.
+    the Job fails instead. Dev on a repository checkout keeps the
+    warn-and-continue path; an operative launched by a desktop install never does.
     """
     try:
         return registry.get_document_store()
     except Exception as exc:
-        if settings.environment == Environment.DEV:
+        if fail_open_allowed(settings):
             logger.warning("Document store unavailable (heartbeat/accumulator disabled in dev): %s", exc)
             return None
         logger.error(

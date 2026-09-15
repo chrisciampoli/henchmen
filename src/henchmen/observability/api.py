@@ -159,17 +159,22 @@ _MetricsAuthDependency = Callable[..., Coroutine[Any, Any, None]]
 def build_metrics_auth_dependency(settings: "Settings") -> _MetricsAuthDependency:
     """Return the FastAPI dependency guarding the /metrics router.
 
-    Fail-closed: an unset token means "open" only in DEV, never in STAGING or
-    PROD. The token itself is never logged.
+    Fail-closed: an unset token means "open" only in DEV on a repository
+    checkout, never in STAGING, PROD or on a desktop install. The token itself
+    is never logged.
     """
-    return _build_metrics_auth((settings.metrics_auth_token or "").strip(), settings.environment.value)
+    from henchmen.config.paths import is_desktop_install
+
+    return _build_metrics_auth(
+        (settings.metrics_auth_token or "").strip(), settings.environment.value, is_desktop_install()
+    )
 
 
-def _build_metrics_auth(token: str, environment: str) -> _MetricsAuthDependency:
+def _build_metrics_auth(token: str, environment: str, desktop: bool) -> _MetricsAuthDependency:
     from henchmen.config.settings import Environment
 
     if not token:
-        if environment in (Environment.STAGING.value, Environment.PROD.value):
+        if environment in (Environment.STAGING.value, Environment.PROD.value) or desktop:
 
             async def _deny(authorization: str = Header(default="")) -> None:
                 raise HTTPException(
@@ -221,10 +226,13 @@ async def require_metrics_auth(authorization: str = Header(default="")) -> None:
     time (``@app.get(..., dependencies=[Depends(require_metrics_auth)])``) and
     applies exactly the bearer-token rules of the ``/metrics`` router.
     """
+    from henchmen.config.paths import is_desktop_install
     from henchmen.config.settings import get_settings
 
     settings = get_settings()
-    check = _cached_metrics_auth((settings.metrics_auth_token or "").strip(), settings.environment.value)
+    check = _cached_metrics_auth(
+        (settings.metrics_auth_token or "").strip(), settings.environment.value, is_desktop_install()
+    )
     await check(authorization)
 
 

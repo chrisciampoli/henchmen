@@ -14,6 +14,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import Scope
 
+from henchmen.config.paths import is_desktop_install
+from henchmen.config.posture import fail_open_allowed
 from henchmen.config.settings import Environment, get_settings
 from henchmen.dispatch.api_models import CreateTaskRequest
 from henchmen.dispatch.handlers.cli import handle_cli_request
@@ -221,12 +223,13 @@ def _require_signing_secret(
 ) -> None:
     """Raise 401 if a signing secret is required but missing.
 
-    Fail-closed policy: STAGING and PROD must have a signing secret configured.
-    DEV tolerates missing secrets for local iteration but logs a warning.
+    Fail-closed policy: STAGING, PROD and every desktop (data-directory) install
+    must have a signing secret configured. DEV on a repository checkout
+    tolerates missing secrets for local iteration but logs a warning.
     """
     if secret:
         return
-    if env in (Environment.STAGING, Environment.PROD):
+    if env in (Environment.STAGING, Environment.PROD) or is_desktop_install():
         logger.error(
             "[%s] Refusing request: signing secret is not configured in %s environment",
             integration,
@@ -265,9 +268,9 @@ async def require_api_token(request: Request) -> None:
     # Settings already maps Terraform's seeded placeholder secret to empty.
     expected = settings.dispatch_api_token.strip()
     if not expected:
-        if settings.environment in (Environment.STAGING, Environment.PROD):
+        if not fail_open_allowed(settings):
             logger.error(
-                "[api] Refusing task creation: HENCHMEN_DISPATCH_API_TOKEN is not configured in %s",
+                "[api] Refusing task creation: HENCHMEN_DISPATCH_API_TOKEN is not configured (environment=%s)",
                 settings.environment.value,
             )
             raise HTTPException(status_code=401, detail="Dispatch API token is not configured")
@@ -310,7 +313,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     for problem in settings.validate_for_runtime():
         logger.warning("[dispatch] Configuration problem: %s", problem)
-    if settings.environment != Environment.DEV and not settings.dispatch_api_token:
+    if not fail_open_allowed(settings) and not settings.dispatch_api_token:
         logger.warning(
             "[dispatch] Configuration problem: HENCHMEN_DISPATCH_API_TOKEN is empty, so POST /api/v1/tasks "
             "returns 401 in %s",
