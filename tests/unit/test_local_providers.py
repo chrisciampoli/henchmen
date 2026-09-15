@@ -1464,3 +1464,83 @@ class TestInMemoryBrokerForwarding:
             await broker.publish("busy", b"x")
 
         assert len(broker.get_messages("busy")) == memory_module._MESSAGE_HISTORY
+
+
+# ---------------------------------------------------------------------------
+# InMemoryMessageBroker — publish_and_confirm (awaited confirmation path)
+# ---------------------------------------------------------------------------
+
+
+class TestInMemoryBrokerConfirmForwarding:
+    """Ruling P8 follow-up: the confirm path uses its own short timeout and a narrow retry set."""
+
+    async def _confirm(self, script):
+        from henchmen.providers.local.memory import InMemoryMessageBroker
+
+        client = _RecordingHTTPClient(script)
+        broker = InMemoryMessageBroker()
+        broker.set_forward_map({"topic": "http://localhost:8000/hook"})
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            patch("henchmen.providers.local.memory._FORWARD_RETRY_BACKOFF_SECONDS", 0),
+        ):
+            result = await broker.publish_and_confirm("topic", b"{}")
+        return broker, client, result
+
+    @pytest.mark.asyncio
+    async def test_success_returns_true_sends_one_post_and_leaves_no_background_task(self):
+        broker, client, result = await self._confirm([_FakeHTTPResponse(200)])
+        assert result is True
+        assert client.calls == 1
+        assert broker._background_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_uses_the_short_confirm_timeout(self):
+        from henchmen.providers.local import memory as memory_module
+
+        _broker, client, _result = await self._confirm([_FakeHTTPResponse(200)])
+        assert client.timeouts == [memory_module._CONFIRM_TIMEOUT_SECONDS]
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_is_not_retried_and_returns_false(self):
+        import httpx
+
+        broker, client, result = await self._confirm([httpx.ReadTimeout("boom")])
+        assert result is False
+        assert client.calls == 1
+        assert broker._background_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_error_response_is_not_retried_and_returns_false(self):
+        broker, client, result = await self._confirm([_FakeHTTPResponse(500)])
+        assert result is False
+        assert client.calls == 1
+        assert broker._background_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_connect_error_is_retried(self):
+        import httpx
+
+        broker, client, result = await self._confirm([httpx.ConnectError("boom"), _FakeHTTPResponse(200)])
+        assert result is True
+        assert client.calls == 2
+        assert broker._background_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_connect_error_after_exhausting_retries_returns_false(self):
+        import httpx
+
+        from henchmen.providers.local import memory as memory_module
+
+        broker, client, result = await self._confirm([httpx.ConnectError("boom")] * memory_module._FORWARD_RETRIES)
+        assert result is False
+        assert client.calls == memory_module._FORWARD_RETRIES
+        assert broker._background_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_no_forward_target_returns_false_without_a_request(self):
+        from henchmen.providers.local.memory import InMemoryMessageBroker
+
+        broker = InMemoryMessageBroker()
+        assert await broker.publish_and_confirm("nowhere", b"{}") is False
+        assert broker._background_tasks == set()

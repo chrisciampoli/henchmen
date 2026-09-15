@@ -25,7 +25,10 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
+from henchmen.config.posture import is_desktop_posture
+
 if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
     from henchmen.providers.interfaces.document_store import DocumentStore
 
 logger = logging.getLogger(__name__)
@@ -42,16 +45,32 @@ class TaskCostAccumulator:
         document_store: "DocumentStore",
         task_id: str,
         ceiling_usd: float,
+        *,
+        settings: "Settings | None" = None,
     ) -> None:
         self._store = document_store
         self._task_id = task_id
         self._ceiling_usd = ceiling_usd
+        self._settings = settings
         self._total_usd: float = 0.0
         self._loaded: bool = False
         self._lock = asyncio.Lock()
 
     async def _ensure_loaded(self) -> None:
-        """Lazily load the current running total from the document store."""
+        """Lazily load the current running total from the document store.
+
+        A missing document (``get`` returning ``None`` -- every provider's
+        "not found" result, including ``HttpDocumentStore`` mapping its 404
+        to ``None``) is not an error: it just means no prior node has spent
+        anything yet, so the total starts at zero. A genuine seed error (a
+        raised exception) is a different matter: on a desktop install, or for
+        an operative it launched (:func:`~henchmen.config.posture.is_desktop_posture`),
+        silently starting the ceiling at zero would let a node spend past the
+        real running total with no ceiling protection at all, so it is
+        re-raised there to fail the node closed instead. Everywhere else
+        (a repository checkout in dev) the original warn-and-default-to-zero
+        behaviour is unchanged.
+        """
         if self._loaded:
             return
         try:
@@ -59,6 +78,13 @@ class TaskCostAccumulator:
             if doc is not None:
                 self._total_usd = float(doc.get(_COST_FIELD, 0.0) or 0.0)
         except Exception as exc:
+            if self._settings is not None and is_desktop_posture(self._settings):
+                logger.error(
+                    "TaskCostAccumulator: failed to seed cost for task %s -- failing closed: %s",
+                    self._task_id,
+                    exc,
+                )
+                raise
             logger.warning(
                 "TaskCostAccumulator: failed to load cost for task %s: %s",
                 self._task_id,

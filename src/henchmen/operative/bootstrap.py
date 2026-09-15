@@ -75,6 +75,9 @@ def install_log_redaction() -> None:
             )
 
 
+_HEARTBEAT_FAILURE_LOG_EVERY = 5
+
+
 async def _heartbeat_loop(
     document_store: DocumentStore,
     task_id: str,
@@ -84,8 +87,12 @@ async def _heartbeat_loop(
 
     Runs as a background task alongside the agent loop so the Mastermind
     watchdog can distinguish a live-but-slow operative from a dead one.
-    Any Firestore write failures are swallowed — observability must never
-    crash the operative.
+    Write failures are swallowed — observability must never crash the
+    operative — but are not silent: the first failure and every
+    ``_HEARTBEAT_FAILURE_LOG_EVERY``-th consecutive one after it are logged
+    at WARNING (a single flaky write is expected noise; a heartbeat that
+    cannot land at all is worth knowing about without flooding the log every
+    ``interval_seconds``).
 
     The timestamp is an ISO-8601 UTC string, matching every other timestamp
     ``TaskTracker`` stores. ``get_stalled_tasks`` range-filters
@@ -93,6 +100,7 @@ async def _heartbeat_loop(
     by a string range on Firestore (so the task could never be found stalled)
     and raises on the SQLite store.
     """
+    consecutive_failures = 0
     while True:
         try:
             await document_store.update(
@@ -100,8 +108,16 @@ async def _heartbeat_loop(
                 task_id,
                 {"last_heartbeat": datetime.now(UTC).isoformat()},
             )
+            consecutive_failures = 0
         except Exception as exc:
-            logger.debug("Heartbeat write failed (non-fatal): %s", exc)
+            consecutive_failures += 1
+            if consecutive_failures == 1 or consecutive_failures % _HEARTBEAT_FAILURE_LOG_EVERY == 0:
+                logger.warning(
+                    "Heartbeat write failed for task %s (non-fatal, %d consecutive): %s",
+                    task_id,
+                    consecutive_failures,
+                    exc,
+                )
         try:
             await asyncio.sleep(interval_seconds)
         except asyncio.CancelledError:
@@ -268,7 +284,7 @@ async def run_operative() -> None:
                 return
             exc = t.exception()
             if exc is not None:
-                logger.debug("Heartbeat task exited with exception: %s", exc)
+                logger.warning("Heartbeat task exited with exception: %s", exc)
 
         heartbeat_task.add_done_callback(_log_heartbeat_exit)
 

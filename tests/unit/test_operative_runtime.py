@@ -652,7 +652,7 @@ class TestDocumentStoreFailClosed:
 class TestPublishReportAwaitsDelivery:
     """Ruling P8: an operative must confirm its completion report reached Mastermind before exiting."""
 
-    def _report(self) -> Any:
+    def _report(self, status: OperativeStatus = OperativeStatus.COMPLETED) -> Any:
         from datetime import UTC, datetime
 
         from henchmen.models.operative import OperativeReport
@@ -662,7 +662,7 @@ class TestPublishReportAwaitsDelivery:
             scheme_id="bugfix_standard",
             node_id="implement_fix",
             operative_id="op-1",
-            status=OperativeStatus.COMPLETED,
+            status=status,
             summary="done",
             confidence_score=0.9,
             started_at=datetime.now(UTC),
@@ -712,7 +712,10 @@ class TestPublishReportAwaitsDelivery:
         assert client.post.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_connection_failure_after_retries_raises(self):
+    async def test_connect_error_after_retries_raises(self):
+        """Only a genuine connection failure (httpx.ConnectError/ConnectTimeout) is retried."""
+        import httpx
+
         from henchmen.operative.bootstrap import publish_report
         from henchmen.providers.local import memory as memory_module
         from henchmen.providers.local.memory import InMemoryMessageBroker
@@ -722,7 +725,7 @@ class TestPublishReportAwaitsDelivery:
         client = MagicMock()
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
-        client.post = AsyncMock(side_effect=ConnectionError("boom"))
+        client.post = AsyncMock(side_effect=httpx.ConnectError("boom"))
         settings = _settings(pubsub_topic_operative_complete="operative-complete")
 
         with (
@@ -732,6 +735,51 @@ class TestPublishReportAwaitsDelivery:
         ):
             await publish_report(self._report(), settings, broker=broker)
         assert client.post.await_count == memory_module._FORWARD_RETRIES
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_is_not_retried_and_raises_after_one_attempt(self):
+        """A ReadTimeout means the request may already have reached the handler — never retried."""
+        import httpx
+
+        from henchmen.operative.bootstrap import publish_report
+        from henchmen.providers.local.memory import InMemoryMessageBroker
+
+        broker = InMemoryMessageBroker()
+        broker.set_forward_map({"operative-complete": "http://localhost:8000/hook"})
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.post = AsyncMock(side_effect=httpx.ReadTimeout("boom"))
+        settings = _settings(pubsub_topic_operative_complete="operative-complete")
+
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            pytest.raises(RuntimeError, match="Failed to deliver"),
+        ):
+            await publish_report(self._report(), settings, broker=broker)
+        assert client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [OperativeStatus.INTERRUPTED, OperativeStatus.TIMED_OUT])
+    async def test_interrupted_and_timed_out_reports_also_go_through_the_confirm_path(self, status):
+        """The confirm path is chosen by broker/topic, not by report status."""
+        from henchmen.operative.bootstrap import publish_report
+        from henchmen.providers.local.memory import InMemoryMessageBroker
+
+        broker = InMemoryMessageBroker()
+        broker.set_forward_map({"operative-complete": "http://localhost:8000/hook"})
+        response = MagicMock(status_code=204)
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.post = AsyncMock(return_value=response)
+        settings = _settings(pubsub_topic_operative_complete="operative-complete")
+
+        with patch("httpx.AsyncClient", return_value=client):
+            await publish_report(self._report(status=status), settings, broker=broker)
+
+        assert client.post.await_count == 1
+        assert broker._background_tasks == set()
 
     @pytest.mark.asyncio
     async def test_no_forward_target_uses_the_non_blocking_path(self):

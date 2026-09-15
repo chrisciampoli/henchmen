@@ -23,6 +23,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+import httpx
+
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
 
@@ -30,11 +32,20 @@ logger = logging.getLogger(__name__)
 
 # In local mode the "push subscription" handler runs the whole scheme inline,
 # so a forwarded POST legitimately stays open for as long as an operative run.
+# Used only by the background, fire-and-forget path (``publish``).
 _FORWARD_TIMEOUT_SECONDS = 1800.0
+# The awaited confirmation path (``publish_and_confirm``) is on an operative's
+# exit path -- it must not hang for anywhere near that long.
+_CONFIRM_TIMEOUT_SECONDS = 30.0
 # Transient transport failures (the target service still starting up) are
 # retried; an HTTP response — even a 5xx — is not, the handler already saw it.
 _FORWARD_RETRIES = 3
 _FORWARD_RETRY_BACKOFF_SECONDS = 0.5
+# The confirm path retries only a failure to even connect. A ReadTimeout, a
+# RemoteProtocolError, or any HTTP response (even a 5xx) means the request may
+# already have been received and processed -- retrying then risks a duplicate
+# delivery, so those return False on the first attempt instead.
+_CONFIRM_RETRYABLE_EXCEPTIONS: tuple[type[Exception], ...] = (httpx.ConnectError, httpx.ConnectTimeout)
 # Published messages are kept only for test inspection; cap them so a
 # long-running `henchmen serve` does not grow without bound.
 _MESSAGE_HISTORY = 1000
@@ -152,10 +163,13 @@ class InMemoryMessageBroker:
 
         # HTTP forwarding (non-blocking, best-effort). Hold a strong reference
         # to the task and clean up via a done-callback to prevent GC from reaping
-        # the in-flight forward before it completes.
+        # the in-flight forward before it completes. Keeps its long-standing
+        # behaviour: a long timeout and a retry on any exception.
         url = self._forward_map.get(topic)
         if url:
-            task = asyncio.create_task(self._forward_to_http(url, msg_id, data, attributes))
+            task = asyncio.create_task(
+                self._forward_to_http(url, msg_id, data, attributes, timeout_seconds=_FORWARD_TIMEOUT_SECONDS)
+            )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
 
@@ -177,23 +191,48 @@ class InMemoryMessageBroker:
         process reporting its own completion) does not exit before delivery
         is confirmed one way or the other. Returns False when no forward URL
         is configured for ``topic`` — there is nothing to confirm.
+
+        Uses a short timeout (:data:`_CONFIRM_TIMEOUT_SECONDS`) and retries
+        only a genuine connection failure — never a timeout waiting on the
+        response, a dropped connection mid-response, or any HTTP response at
+        all — since in those cases the request may already have reached the
+        handler and a retry risks a duplicate delivery.
         """
         msg_id = self._record_publish(topic, data, attributes)
         url = self._forward_map.get(topic)
         if not url:
             return False
-        return await self._forward_to_http(url, msg_id, data, attributes)
+        return await self._forward_to_http(
+            url,
+            msg_id,
+            data,
+            attributes,
+            timeout_seconds=_CONFIRM_TIMEOUT_SECONDS,
+            retryable_exceptions=_CONFIRM_RETRYABLE_EXCEPTIONS,
+        )
 
-    async def _forward_to_http(self, url: str, msg_id: str, data: bytes, attributes: dict[str, str]) -> bool:
+    async def _forward_to_http(
+        self,
+        url: str,
+        msg_id: str,
+        data: bytes,
+        attributes: dict[str, str],
+        *,
+        timeout_seconds: float,
+        retryable_exceptions: tuple[type[Exception], ...] | None = None,
+    ) -> bool:
         """POST a Pub/Sub-style envelope to a local HTTP endpoint. Returns True only on a 2xx response.
 
-        Real Pub/Sub push retries a delivery that never reached the handler,
-        so a connection failure (the target service is still booting) is
-        retried here too. A non-2xx *response* is reported at WARNING and not
-        retried — the handler already consumed the message.
-        """
-        import httpx
+        Shared by both callers so retry logic exists in exactly one place:
 
+        * ``publish`` (background, fire-and-forget) passes
+          ``retryable_exceptions=None``, meaning "retry on any exception" —
+          its long-standing behaviour, since nothing awaits its outcome.
+        * ``publish_and_confirm`` passes a narrow tuple (connection failures
+          only): a response — even a 5xx — or a timeout/error while a
+          response might already be on its way is never retried there, only
+          reported at WARNING and returned as ``False``.
+        """
         envelope = {
             "message": {
                 "data": base64.b64encode(data).decode("utf-8"),
@@ -208,13 +247,17 @@ class InMemoryMessageBroker:
                 # trust_env=False: never read HTTP(S)_PROXY / NO_PROXY from the environment for this
                 # loopback call. A configured proxy would otherwise receive the internal push token.
                 async with httpx.AsyncClient(trust_env=False) as client:
-                    resp = await client.post(url, json=envelope, headers=headers, timeout=_FORWARD_TIMEOUT_SECONDS)
+                    resp = await client.post(url, json=envelope, headers=headers, timeout=timeout_seconds)
                 if resp.status_code >= 400:
                     logger.warning("HTTP forward of %s to %s returned %d", msg_id, url, resp.status_code)
                     return False
                 logger.debug("Forwarded %s to %s (status=%d)", msg_id, url, resp.status_code)
                 return True
             except Exception as exc:
+                retryable = retryable_exceptions is None or isinstance(exc, retryable_exceptions)
+                if not retryable:
+                    logger.warning("HTTP forward failed for %s -> %s (not retried): %s", msg_id, url, exc)
+                    return False
                 if attempt >= _FORWARD_RETRIES:
                     logger.warning("HTTP forward failed for %s -> %s: %s", msg_id, url, exc)
                     return False

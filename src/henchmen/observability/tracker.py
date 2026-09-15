@@ -121,6 +121,13 @@ SUCCESS_STATUSES: frozenset[str] = frozenset({"completed", "pr_created"})
 EXECUTION_STATE_COMPLETED = "completed"
 EXECUTION_STATE_ESCALATED = "escalated"
 
+# Terminal: Mastermind will never resume, heartbeat, or otherwise touch a task
+# once its execution_state reaches one of these. Anything that would write
+# onto a task document on behalf of an operative (e.g. the desktop-only
+# internal task routes) must treat one of these as final rather than
+# reviving a finished task -- reuse this set instead of hardcoding a new list.
+TERMINAL_EXECUTION_STATES: frozenset[str] = frozenset({EXECUTION_STATE_COMPLETED, EXECUTION_STATE_ESCALATED})
+
 
 class TaskTracker:
     """Persists task execution telemetry to a DocumentStore.

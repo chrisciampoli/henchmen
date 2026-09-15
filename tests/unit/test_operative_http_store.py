@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -147,6 +148,104 @@ class TestRoutes:
         assert client.get("/internal/tasks/bad%20id/cost", headers=_auth(internal)).status_code == 422
         store.get.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("task_id", [".", ".."])
+    async def test_dot_and_dotdot_task_ids_are_refused(self, internal, task_id: str) -> None:
+        """Exercised directly: a literal "." or ".." path segment is normalised away by URL
+        resolution before it would ever reach routing (RFC 3986 dot-segment removal), so this
+        cannot be reproduced through an HTTP call — the dependency itself must reject it."""
+        from fastapi import HTTPException, Request
+
+        from henchmen.mastermind.internal_api import require_task_token
+
+        request = MagicMock(spec=Request)
+        request.headers = {"Authorization": f"Bearer {internal.task_token(task_id)}"}
+        with pytest.raises(HTTPException) as exc_info:
+            await require_task_token(task_id, request)
+        assert exc_info.value.status_code == 422
+
+    def test_secrets_io_failure_is_503_not_500(self, routes) -> None:
+        client, store = routes
+        with patch("henchmen.dispatch.pubsub_auth.desktop_internal_auth", side_effect=OSError("disk full")):
+            resp = client.get(f"/internal/tasks/{TASK}/cost", headers={"Authorization": "Bearer whatever"})
+        assert resp.status_code == 503
+        store.get.assert_not_awaited()
+
+    def test_rejection_is_logged_without_the_bearer_token(self, routes, internal, caplog) -> None:
+        client, store = routes
+        with caplog.at_level(logging.WARNING, logger="henchmen.mastermind.internal_api"):
+            resp = client.get(f"/internal/tasks/{TASK}/cost", headers={"Authorization": "Bearer wrong-token-value"})
+        assert resp.status_code == 401
+        assert TASK in caplog.text
+        assert "wrong-token-value" not in caplog.text
+        store.get.assert_not_awaited()
+
+    def test_heartbeat_missing_task_document_is_404(self, routes, internal) -> None:
+        client, store = routes
+        store.get.return_value = None
+        resp = client.post(f"/internal/tasks/{TASK}/heartbeat", headers=_auth(internal))
+        assert resp.status_code == 404
+        store.update.assert_not_awaited()
+
+    @pytest.mark.parametrize("state", ["completed", "escalated"])
+    def test_heartbeat_on_a_finished_task_is_409(self, routes, internal, state: str) -> None:
+        client, store = routes
+        store.get.return_value = {"execution_state": state}
+        resp = client.post(f"/internal/tasks/{TASK}/heartbeat", headers=_auth(internal))
+        assert resp.status_code == 409
+        store.update.assert_not_awaited()
+
+    def test_interrupted_report_missing_task_document_is_404(self, routes, internal) -> None:
+        client, store = routes
+        store.get.return_value = None
+        resp = client.put(
+            f"/internal/tasks/{TASK}/interrupted-report",
+            headers=_auth(internal),
+            content=_report().model_dump_json(),
+        )
+        assert resp.status_code == 404
+        store.update.assert_not_awaited()
+
+    @pytest.mark.parametrize("state", ["completed", "escalated"])
+    def test_interrupted_report_on_a_finished_task_is_409(self, routes, internal, state: str) -> None:
+        client, store = routes
+        store.get.return_value = {"execution_state": state}
+        resp = client.put(
+            f"/internal/tasks/{TASK}/interrupted-report",
+            headers=_auth(internal),
+            content=_report().model_dump_json(),
+        )
+        assert resp.status_code == 409
+        store.update.assert_not_awaited()
+
+    @pytest.mark.parametrize("field", ["started_at", "completed_at"])
+    def test_interrupted_report_with_a_future_timestamp_is_422(self, routes, internal, field: str) -> None:
+        client, store = routes
+        far_future = datetime.now(UTC) + timedelta(hours=1)
+        report = _report().model_copy(update={field: far_future})
+        resp = client.put(
+            f"/internal/tasks/{TASK}/interrupted-report", headers=_auth(internal), content=report.model_dump_json()
+        )
+        assert resp.status_code == 422
+        store.get.assert_not_awaited()
+        store.update.assert_not_awaited()
+
+    def test_oversized_body_is_rejected_before_being_fully_read(self, routes, internal) -> None:
+        from henchmen.dispatch.pubsub_auth import MAX_OPERATIVE_REPORT_BYTES
+
+        client, store = routes
+        oversized = b"a" * (MAX_OPERATIVE_REPORT_BYTES + 1)
+        resp = client.put(f"/internal/tasks/{TASK}/interrupted-report", headers=_auth(internal), content=oversized)
+        assert resp.status_code == 401
+        store.get.assert_not_awaited()
+        store.update.assert_not_awaited()
+
+    def test_malformed_body_is_422_not_500(self, routes, internal) -> None:
+        client, store = routes
+        resp = client.put(f"/internal/tasks/{TASK}/interrupted-report", headers=_auth(internal), content=b"not json")
+        assert resp.status_code == 422
+        store.update.assert_not_awaited()
+
     def test_routes_do_not_exist_outside_a_desktop_install(self, monkeypatch, tmp_path) -> None:
         from henchmen.mastermind import server
 
@@ -224,6 +323,19 @@ class TestClientStore:
             await store.increment("task_executions", TASK, {"estimated_cost_usd": 1.0})
         with pytest.raises(OperationNotAllowedError):
             await store.update_if("task_executions", TASK, "a", 1, {})
+
+    @pytest.mark.asyncio
+    async def test_client_never_trusts_proxy_env_vars(self) -> None:
+        """A configured HTTP(S)_PROXY must never receive the operative's task token."""
+        store = HttpDocumentStore(_settings("t" * 64))
+        client_instance = MagicMock()
+        client_instance.__aenter__ = AsyncMock(return_value=client_instance)
+        client_instance.__aexit__ = AsyncMock(return_value=False)
+        response = httpx.Response(204, request=httpx.Request("POST", "http://henchmen:8000/hook"))
+        client_instance.request = AsyncMock(return_value=response)
+        with patch("httpx.AsyncClient", return_value=client_instance) as ctor:
+            await store.update("task_executions", TASK, {"last_heartbeat": "now"})
+        assert ctor.call_args.kwargs.get("trust_env") is False
 
     def test_needs_a_base_url_and_a_token(self) -> None:
         with pytest.raises(ValueError, match="LOCAL_FORWARD_BASE_URL"):
