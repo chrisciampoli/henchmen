@@ -40,6 +40,37 @@ _RACE_RETRY_DELAY_SECONDS = 0.02
 # real background thread against a wall-clock timeout.
 _sleep = time.sleep
 
+# A temp file older than this can no longer belong to a write in progress; it is
+# safe for the next call to sweep away as abandoned (e.g. left by a process that
+# crashed between creating it and cleaning it up).
+_STALE_TEMP_FILE_AGE_SECONDS = 5 * 60
+
+
+def _unlink_temp_quietly(tmp_path: Path) -> None:
+    """Best-effort removal of a temp file we no longer need; a leftover is swept up later."""
+    try:
+        tmp_path.unlink(missing_ok=True)
+    except OSError:
+        logger.debug("Could not remove leftover temp file %s; a later sweep will remove it.", tmp_path.name)
+
+
+def _sweep_stale_temp_files(path: Path) -> None:
+    """Best-effort removal of this secret's own abandoned ``<name>.<hex>.tmp`` siblings.
+
+    Only files whose name matches this exact secret's temp-file pattern
+    (``<path.name>.*.tmp``) are considered, and only those old enough that they
+    cannot belong to a write in progress right now. This is opportunistic
+    housekeeping, not a correctness requirement, so every error is swallowed:
+    a permission error or a vanished directory should never block creating or
+    reading the actual secret.
+    """
+    now = time.time()
+    with contextlib.suppress(OSError):
+        for candidate in path.parent.glob(f"{path.name}.*.tmp"):
+            with contextlib.suppress(OSError):
+                if now - candidate.stat().st_mtime >= _STALE_TEMP_FILE_AGE_SECONDS:
+                    candidate.unlink(missing_ok=True)
+
 
 def ensure_secrets_dir(directory: Path) -> None:
     """Create ``directory`` (and parents) owner-only; tighten it if it already exists loosely (POSIX)."""
@@ -54,11 +85,19 @@ def create_secret_file(path: Path, data: bytes) -> None:
 
     If the write fails after the exclusive create (disk full, EIO, an interrupting
     signal), the file is removed before re-raising -- but only if it is still the
-    same file this call created, compared by device and inode taken from the open
-    file descriptor before it is closed. ``O_CREAT | O_EXCL`` guarantees we created
-    it, but a concurrent process can replace the directory entry at ``path`` with
-    its own file (via ``os.replace``) before our write fails; unlinking
-    unconditionally would then delete that other process's file instead of ours.
+    same file this call created, compared by device and inode. Both are read
+    (``os.fstat`` on our own descriptor, ``os.stat`` on the path) *before* closing
+    the descriptor: on Windows an open, unshared handle blocks a concurrent
+    ``os.replace`` of the same name, so stat-ing the path while we still hold the
+    handle open is what actually guarantees we are looking at our own file there;
+    stat-ing after closing would reopen a window for a race that Windows would
+    otherwise have prevented. ``O_CREAT | O_EXCL`` guarantees we created the file,
+    but a concurrent process can still replace the directory entry at ``path``
+    with its own file (via ``os.replace``, always allowed on POSIX) before our
+    write fails; unlinking unconditionally would then delete that other process's
+    file instead of ours. If the filesystem reports an unreliable inode number
+    (``st_ino == 0``, seen on some FAT/exFAT drivers), identity cannot be
+    confirmed at all, so nothing is unlinked.
     """
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
     fd = os.open(str(path), flags, 0o600)
@@ -69,11 +108,15 @@ def create_secret_file(path: Path, data: bytes) -> None:
             view = view[written:]
     except BaseException:
         created = os.fstat(fd)
-        os.close(fd)
         current = None
         with contextlib.suppress(OSError):
             current = os.stat(path)
-        if current is not None and (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+        os.close(fd)
+        if (
+            created.st_ino != 0
+            and current is not None
+            and (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino)
+        ):
             path.unlink(missing_ok=True)
         raise
     os.close(fd)
@@ -81,12 +124,13 @@ def create_secret_file(path: Path, data: bytes) -> None:
 
 def write_secret_file(path: Path, data: bytes) -> None:
     """Atomically replace (or create) ``path`` with ``data``, owner-only from creation."""
+    _sweep_stale_temp_files(path)
     tmp_path = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
     create_secret_file(tmp_path, data)
     try:
         os.replace(tmp_path, path)
     except BaseException:
-        tmp_path.unlink(missing_ok=True)
+        _unlink_temp_quietly(tmp_path)
         raise
 
 
@@ -157,8 +201,7 @@ def _publish_new_secret(path: Path, data: bytes, *, minimum: int) -> bytes:
             on_disk = b""
         return on_disk if len(on_disk) >= minimum else data
     finally:
-        with contextlib.suppress(OSError):
-            tmp_path.unlink(missing_ok=True)
+        _unlink_temp_quietly(tmp_path)
 
 
 def read_or_create_secret(path: Path, *, nbytes: int = MIN_SECRET_BYTES) -> bytes:
@@ -171,6 +214,7 @@ def read_or_create_secret(path: Path, *, nbytes: int = MIN_SECRET_BYTES) -> byte
     """
     minimum = max(nbytes, MIN_SECRET_BYTES)
     ensure_secrets_dir(path.parent)
+    _sweep_stale_temp_files(path)
     try:
         existing: bytes | None = path.read_bytes()
     except FileNotFoundError:
