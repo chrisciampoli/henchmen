@@ -38,6 +38,7 @@ import re
 from typing import TYPE_CHECKING
 
 from fastapi import HTTPException, Request
+from starlette.requests import ClientDisconnect
 
 from henchmen.config.internal_auth import InternalAuth, desktop_internal_auth
 from henchmen.config.posture import fail_open_allowed
@@ -236,21 +237,36 @@ async def _read_capped_body(request: Request, max_bytes: int) -> None:
     setting it here means every later read in this request -- the handler's
     own included -- returns the same bytes from that cache instead of trying
     (and failing) to re-consume the now-exhausted ASGI receive channel.
+
+    A client that disconnects mid-upload is not a server error: Starlette
+    surfaces that as :class:`~starlette.requests.ClientDisconnect` from the
+    stream, which is turned into a 400 here (logged at debug, since a peer
+    hanging up is routine and not evidence of an attack) instead of
+    propagating as an unhandled exception -- this call happens before the
+    handler's own ``try:``, so an uncaught exception here would otherwise
+    surface as a 500.
     """
     if hasattr(request, "_body"):
         return
     chunks: list[bytes] = []
     total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > max_bytes:
-            logger.warning(
-                "[pubsub-auth] Desktop install: refusing an operative report body over %d bytes from %s",
-                max_bytes,
-                request.client.host if request.client else "unknown",
-            )
-            raise HTTPException(status_code=401, detail="Operative report body too large")
-        chunks.append(chunk)
+    try:
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > max_bytes:
+                logger.warning(
+                    "[pubsub-auth] Desktop install: refusing an operative report body over %d bytes from %s",
+                    max_bytes,
+                    request.client.host if request.client else "unknown",
+                )
+                raise HTTPException(status_code=401, detail="Operative report body too large")
+            chunks.append(chunk)
+    except ClientDisconnect as exc:
+        logger.debug(
+            "[pubsub-auth] Client disconnected while streaming an operative report body from %s",
+            request.client.host if request.client else "unknown",
+        )
+        raise HTTPException(status_code=400, detail="Client disconnected") from exc
     request._body = b"".join(chunks)
 
 

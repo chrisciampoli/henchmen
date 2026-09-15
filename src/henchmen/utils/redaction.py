@@ -27,8 +27,23 @@ _BEARER_PATTERN = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{16,}")
 # traceback prints a secret in -- notably ``HENCHMEN_OPERATIVE_TASK_TOKEN``,
 # which is a bare HMAC-SHA256 hex digest with no recognizable prefix pattern
 # of its own, unlike the GitHub/Slack/OpenAI tokens above. The key name is
-# kept in the output (case preserved); only the value is redacted.
+# kept in the output (case preserved); only the value is redacted. This
+# pattern alone does not cover a dict/JSON repr (``'X_TOKEN': 'value'`` or
+# ``"X_TOKEN": "value"``, no ``=``), which is why ``_TOKEN_QUOTED_KV_PATTERN``
+# below exists as a second, independent shape for the same key-ending-in-
+# ``_TOKEN`` idea.
 _TOKEN_ENV_VAR_PATTERN = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*_TOKEN)=(\S+)", re.IGNORECASE)
+
+# The same ``*_TOKEN`` idea, but for a quoted key: value pair as it would
+# appear in a Python dict repr (single quotes) or JSON (double quotes) --
+# e.g. an OperativeConfig/env dict logged via ``%r`` or ``json.dumps``. The
+# quote characters around the key and around the value are each captured and
+# reused verbatim (backreferences \1 and \4) so mixed single/double-quote
+# style is preserved and the two quote pairs need not match each other. Every
+# quantifier here is bounded by a negated character class (`[^'"]*`) rather
+# than nested/overlapping ``.*`` groups, so matching stays linear in input
+# length like the other patterns in this module.
+_TOKEN_QUOTED_KV_PATTERN = re.compile(r"(['\"])([A-Za-z][A-Za-z0-9_]*_TOKEN)\1(\s*:\s*)(['\"])[^'\"]*\4", re.IGNORECASE)
 
 # (pattern, replacement) pairs, applied in order. Every pattern but the bearer
 # one replaces the whole match outright; the bearer pattern captures the word
@@ -54,6 +69,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (_BEARER_PATTERN, r"\1 " + REDACTED),
     (re.compile(r"(?<=setup_token=)[^&#\s\"']+"), REDACTED),  # Console sign-in token (value only)
     (_TOKEN_ENV_VAR_PATTERN, r"\1=" + REDACTED),  # *_TOKEN=value env assignments (key name kept)
+    (_TOKEN_QUOTED_KV_PATTERN, r"\1\2\1\3\4" + REDACTED + r"\4"),  # quoted "*_TOKEN": "value" (dict/JSON reprs)
 )
 
 # Loggers whose formatter reads ``record.args`` itself and so cannot have them
