@@ -618,6 +618,11 @@ class Settings(BaseSettings):
         problems: list[str] = []
         llm = active_llm_provider(self)
 
+        # ``model_post_init`` already refuses this combination at normal construction, but
+        # ``model_copy(update=...)`` (used by several call sites and test fixtures to derive
+        # per-request Settings) bypasses it, so this is checked again defensively here.
+        if self.provider == "gcp" and not self.gcp_project_id:
+            problems.append("HENCHMEN_GCP_PROJECT_ID is empty but the provider is gcp.")
         if llm == "anthropic" and not self.anthropic_api_key:
             problems.append("HENCHMEN_ANTHROPIC_API_KEY is empty but the LLM provider is anthropic.")
         if llm == "openai" and not self.openai_api_key:

@@ -407,10 +407,13 @@ def test_serve_with_completed_setup_mounts_the_console_in_run_mode(
     monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
     monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
     # _serve_args() defaults to port 8123 (below), and the default container hostname is
-    # "henchmen"; a forward base matching both keeps this test in run mode instead of the
-    # needs-attention mode ruling P3 (Task 11) now enters for the unconfigured default.
+    # "henchmen"; a forward base and Docker network matching both keeps this test in run
+    # mode instead of the needs-attention mode ruling P3 (Task 11) now enters for the
+    # unconfigured default (and, without a network, for the container hostname alone).
     (tmp_path / "henchmen.env").write_text(
-        "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123\n", encoding="utf-8"
+        "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123\n"
+        "HENCHMEN_LOCAL_DOCKER_NETWORK=henchmen\n",
+        encoding="utf-8",
     )
     store = SetupStateStore(tmp_path / "setup-state.json")
     store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True))
@@ -445,11 +448,11 @@ def test_run_mode_prints_the_port_settings_actually_resolved(
     # henchmen.env — so R3's pre-registration does not apply to this test.
     monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
     monkeypatch.delenv("HENCHMEN_LOCAL_SERVE_PORT", raising=False)
-    # A forward base matching the resolved port and the default container hostname keeps
-    # this in run mode instead of ruling P3's needs-attention mode for the unconfigured default.
+    # A forward base and Docker network matching the resolved port and the default
+    # container hostname keep this in run mode instead of ruling P3's needs-attention gate.
     (tmp_path / "henchmen.env").write_text(
         "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_SERVE_PORT=9999\n"
-        "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:9999\n",
+        "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:9999\nHENCHMEN_LOCAL_DOCKER_NETWORK=henchmen\n",
         encoding="utf-8",
     )
     store = SetupStateStore(tmp_path / "setup-state.json")
@@ -699,10 +702,12 @@ def test_run_mode_loads_the_internal_push_token(monkeypatch: pytest.MonkeyPatch,
 
     monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
     monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
-    # A forward base matching _serve_args()'s default port (8123) and the default container
-    # hostname keeps this in run mode instead of ruling P3's needs-attention mode.
+    # A forward base and Docker network matching _serve_args()'s default port (8123) and the
+    # default container hostname keep this in run mode instead of ruling P3's attention gate.
     (tmp_path / "henchmen.env").write_text(
-        "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123\n", encoding="utf-8"
+        "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123\n"
+        "HENCHMEN_LOCAL_DOCKER_NETWORK=henchmen\n",
+        encoding="utf-8",
     )
     SetupStateStore(tmp_path / "setup-state.json").save(
         SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True)
@@ -768,6 +773,42 @@ def test_a_service_startup_failure_is_recorded_and_re_raised(serve_env: Path) ->
     assert health.snapshot() == {"dispatch": "failed", "mastermind": "off", "forge": "off"}
 
 
+def test_a_second_sub_apps_failure_still_closes_the_store_and_releases_the_broker(
+    serve_env: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ruling 7: dispatch's lifespan is entered first; when mastermind's then fails,
+    AsyncExitStack unwinds dispatch's already-entered context manager (its own __aexit__
+    runs, so it is not left dangling), and -- regardless of what that unwind itself does --
+    the shared store the combined app owns is closed and the broker singleton is released
+    before any needs-attention fallback."""
+    import sqlite3
+
+    import henchmen.mastermind.server as mastermind_server
+    import henchmen.providers.local.memory as memory
+    from henchmen.config.settings import get_settings
+    from henchmen.console.services import ServiceHealth
+    from henchmen.providers.local.sqlite import SQLiteDocumentStore
+
+    health = ServiceHealth()
+    app = build_serve_app(get_settings(), 8000, health=health)
+    # Set on app.state before any lifespan runs (build_serve_app seeds it synchronously),
+    # so this reference is valid even though mastermind's own lifespan never reaches RUNNING.
+    store = mastermind_server.app.state.document_store
+    assert isinstance(store, SQLiteDocumentStore)
+    with (
+        patch.object(mastermind_server, "get_agent", side_effect=RuntimeError("mastermind boom")),
+        caplog.at_level(logging.INFO),
+        pytest.raises(RuntimeError, match="mastermind boom"),
+        TestClient(app),  # type: ignore[arg-type]
+    ):
+        pass
+    assert "[dispatch] Service started" in caplog.text, "dispatch must have started before mastermind failed"
+    assert health.snapshot() == {"dispatch": "off", "mastermind": "failed", "forge": "off"}
+    assert memory.get_shared_broker() is None
+    with pytest.raises(sqlite3.ProgrammingError):
+        store._conn.execute("SELECT 1")
+
+
 def test_a_failed_lifespan_does_not_leak_the_broker_or_the_store(serve_env: Path) -> None:
     """Ruling: no resource leak into a same-process fallback -- a failed startup must not
     leave its broker as the process-wide singleton, and a fresh build_serve_app afterwards
@@ -817,10 +858,11 @@ def _completed_setup(data_dir: Path, config: str) -> None:
     )
 
 
-# A forward base matching the default container hostname and _serve_args()'s default port
-# (8123), so tests that are not about ruling P3 exercise service/bind failures instead of
-# needs-attention mode for the unconfigured default forward base.
-_FORWARD_OK = "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123\n"
+# A forward base and Docker network matching the default container hostname and
+# _serve_args()'s default port (8123), so tests that are not about ruling P3 exercise
+# service/bind failures instead of needs-attention mode for the unconfigured default
+# forward base or the container-hostname-without-a-network case.
+_FORWARD_OK = "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123\nHENCHMEN_LOCAL_DOCKER_NETWORK=henchmen\n"
 
 
 class TestNeedsAttention:
@@ -892,6 +934,45 @@ class TestNeedsAttention:
         status = self._status(run.call_args_list[1].args[0])
         assert any("A Henchmen service failed to start" in p for p in status["problems"])  # type: ignore[attr-defined]
         assert leaked not in json.dumps(status)
+
+    def test_build_serve_app_raising_falls_back_to_attention_and_releases_the_broker(self, tmp_path: Path) -> None:
+        """Ruling 3: an exception raised while *building* the combined app (a sub-app import, or
+        registry.get_document_store()/get_container_orchestrator()) must also fall back to
+        attention mode, and must not leave the shared-broker singleton pointing at whatever
+        build_serve_app had already set before it failed."""
+        import henchmen.providers.local.memory as memory
+        from henchmen.cli import _serve
+
+        _completed_setup(tmp_path, "HENCHMEN_PROVIDER=local\n" + _FORWARD_OK)
+        with (
+            patch("henchmen.cli.serve.build_serve_app", side_effect=RuntimeError("disk full")),
+            patch("henchmen.cli.serve.serve_app", return_value=0) as run,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            _serve(_serve_args())
+        assert exit_info.value.code == 0
+        status = self._status(run.call_args.args[0])
+        assert any("A Henchmen service failed to start" in p for p in status["problems"])  # type: ignore[attr-defined]
+        assert memory.get_shared_broker() is None
+
+    def test_attention_port_falls_back_to_the_config_file_when_settings_and_the_env_var_fail(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ruling 4: --port, then HENCHMEN_LOCAL_SERVE_PORT, then the port saved in the config
+        file, then 8000 -- this exercises the third, file-based fallback."""
+        from henchmen.cli import _serve
+
+        monkeypatch.delenv("HENCHMEN_LOCAL_SERVE_PORT", raising=False)
+        _completed_setup(
+            tmp_path,
+            "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_SERVE_PORT=9321\nHENCHMEN_OPERATIVE_TASK_COST_CEILING_USD=abc\n",
+        )
+        with (
+            patch("henchmen.cli.serve.serve_app", return_value=0) as run,
+            pytest.raises(SystemExit),
+        ):
+            _serve(_serve_args(port=None))
+        assert run.call_args.kwargs["port"] == 9321
 
     def test_a_bind_failure_is_not_attention_mode(self, tmp_path: Path) -> None:
         from henchmen.cli import _serve

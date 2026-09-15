@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from henchmen import __version__
 from henchmen.config.validation import settings_problems
-from henchmen.console.auth import SESSION_COOKIE, ConsoleAuth, ConsoleGuard
+from henchmen.console.auth import SESSION_COOKIE, ConsoleAuth, ConsoleGuard, forward_host_problem
 from henchmen.console.config_store import DISPATCH_API_TOKEN_KEY, ConfigStore
 from henchmen.console.services import ServiceHealth
 from henchmen.console.state import OPTIONAL_STEPS, SetupState, SetupStateStore, SetupStep
@@ -214,6 +214,13 @@ def create_console_app(
         pending_token = config_store.pending_dispatch_api_token(env_files=env_files, seeded_env=seeded_env)
         overrides = {DISPATCH_API_TOKEN_KEY: pending_token} if pending_token is not None else None
         _settings, problems = settings_problems(env_files, seeded_env=seeded_env, overrides=overrides)
+        if _settings is not None:
+            # Otherwise a saved config that builds and validates fine, but whose forward
+            # host the whole-app allowlist would refuse, would apply, restart, and land
+            # straight back in needs-attention mode instead of being refused here.
+            forward_problem = forward_host_problem(_settings)
+            if forward_problem is not None:
+                problems = [*problems, forward_problem]
         if problems:
             # Marking setup complete would restart into a run mode that cannot start,
             # and setup mode would no longer be offered to fix it.

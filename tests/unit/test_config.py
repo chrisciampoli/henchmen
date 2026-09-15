@@ -240,6 +240,24 @@ class TestSettingsLocalMode:
             Settings()
 
 
+class TestValidateForRuntimeCatchesProviderGcpBypass:
+    """``model_post_init`` already refuses provider=gcp with no project id at construction,
+    but ``model_copy(update=...)`` -- used by several call sites and test fixtures to derive
+    per-request Settings -- bypasses it, so ``validate_for_runtime`` checks it again."""
+
+    def test_provider_gcp_without_a_project_id_is_a_runtime_problem(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        base = Settings(_env_file=None, provider="local", gcp_project_id="test-project")  # type: ignore[call-arg]
+        settings = base.model_copy(update={"provider": "gcp", "gcp_project_id": ""})
+        assert any("HENCHMEN_GCP_PROJECT_ID" in p for p in settings.validate_for_runtime())
+
+    def test_provider_gcp_with_a_project_id_has_no_provider_problem(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        base = Settings(_env_file=None, provider="local", gcp_project_id="test-project")  # type: ignore[call-arg]
+        settings = base.model_copy(update={"provider": "gcp"})
+        assert not any("HENCHMEN_GCP_PROJECT_ID" in p for p in settings.validate_for_runtime())
+
+
 # ---------------------------------------------------------------------------
 # Extra fields are ignored (SettingsConfigDict extra="ignore")
 # ---------------------------------------------------------------------------

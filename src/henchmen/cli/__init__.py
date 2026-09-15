@@ -699,6 +699,43 @@ def _bootstrap_port(args: argparse.Namespace) -> int:
         sys.exit(2)
 
 
+def _attention_port_when_settings_failed(args: argparse.Namespace) -> int:
+    """Best-effort port for needs-attention mode when Settings itself could not be built.
+
+    Unlike :func:`_bootstrap_port` (setup mode, where an unusable port is a real
+    configuration error worth exiting 2 for), this path exists specifically to
+    avoid exiting: Settings already failed to build for some reason, so the port
+    is recovered on a best-effort basis instead -- ``--port``, then
+    ``HENCHMEN_LOCAL_SERVE_PORT``, then the same key read directly out of the
+    saved config file (an invalid value there is logged and ignored, never
+    fatal), then 8000.
+    """
+    from henchmen.cli.envfile import EnvFile
+    from henchmen.config import paths
+
+    if args.port is not None:
+        return int(args.port)
+    env_value = os.environ.get("HENCHMEN_LOCAL_SERVE_PORT")
+    if env_value:
+        try:
+            return int(env_value)
+        except ValueError:
+            pass
+    config_file = paths.config_file()
+    try:
+        raw = EnvFile.load(config_file).get("HENCHMEN_LOCAL_SERVE_PORT")
+    except OSError:
+        raw = ""
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logging.getLogger("henchmen").warning(
+                "HENCHMEN_LOCAL_SERVE_PORT=%r in %s is not an integer; ignoring it.", raw, config_file
+            )
+    return 8000
+
+
 def _console_link_hint() -> str:
     """One-line hint printed instead of a sign-in URL when no usable token exists."""
     return "No sign-in link is available right now. Run `henchmen console-link` for one."
@@ -740,7 +777,6 @@ def _serve_data_dir(
 
     try:
         auth = ConsoleAuth.load(secrets_dir, setup_token=os.environ.get(paths.SETUP_TOKEN_ENV) or None)
-        internal = load_internal_auth(secrets_dir)
     except OSError as exc:
         print(f"ERROR: could not read or write {secrets_dir}: {exc}", file=sys.stderr)
         print("Hint: check permissions on the data volume.", file=sys.stderr)
@@ -790,7 +826,10 @@ def _serve_data_dir(
 
     settings, problems = settings_problems(paths.env_files())
     if settings is None or problems:
-        attention_port = int(settings.local_serve_port) if settings is not None else _bootstrap_port(args)
+        if settings is not None:
+            attention_port = int(settings.local_serve_port)
+        else:
+            attention_port = _attention_port_when_settings_failed(args)
         sys.exit(needs_attention(problems, attention_port))
 
     # Ruling P3: a forward host the whole-app Host allowlist would silently refuse (the
@@ -804,6 +843,15 @@ def _serve_data_dir(
 
     port = int(settings.local_serve_port)
     health = ServiceHealth()
+    # Loaded only now: setup and attention modes serve no services and must never fail
+    # closed on a secrets-directory write error that a completed, healthy config would
+    # never even reach (the run path below is the only one that needs this secret).
+    try:
+        internal = load_internal_auth(secrets_dir)
+    except OSError as exc:
+        print(f"ERROR: could not read or write {secrets_dir}: {exc}", file=sys.stderr)
+        print("Hint: check permissions on the data volume.", file=sys.stderr)
+        sys.exit(2)
     desktop = DesktopRuntime(
         allowed_hostnames=desktop_allowed_hostnames(settings.local_container_hostname),
         internal_push_token=internal.push_token,
@@ -821,9 +869,21 @@ def _serve_data_dir(
         active_llm_provider(settings),
         settings.environment.value,
     )
-    app = build_serve_app(
-        settings, port, console=console(ConsoleMode.RUN, health=health), desktop=desktop, health=health
-    )
+    try:
+        app = build_serve_app(
+            settings, port, console=console(ConsoleMode.RUN, health=health), desktop=desktop, health=health
+        )
+    except Exception as exc:
+        # build_serve_app can fail before ever reaching serve_app (a sub-app import, or
+        # registry.get_document_store()/get_container_orchestrator()) -- it may already have
+        # set the shared-broker singleton by then, so release it explicitly rather than
+        # leaving it pointing at a broker no lifespan will ever close (ruling: no leak).
+        from henchmen.providers.local.memory import set_shared_broker
+
+        logger.exception("Failed to build the combined app")
+        set_shared_broker(None)
+        detail = str(exc) or type(exc).__name__
+        sys.exit(needs_attention([f"A Henchmen service failed to start: {detail}"], port))
     code = serve_app(app, host=args.host, port=port, log_level=args.log_level, restart=restart)
     if code == STARTUP_FAILURE and health.startup_error is not None and not restart.requested:
         # uvicorn runs the lifespan before binding, so the port is still free for the recovery Console.
