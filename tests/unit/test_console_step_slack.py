@@ -493,3 +493,31 @@ def test_cooldown_is_per_channel(harness: ConsoleHarness, slack: FakeSlack) -> N
     assert harness.post(f"{BASE}/channel", {"channel_id": "C0002"}).json()["ok"] is True
     posts_after = sum(1 for name, _ in slack.calls if name == "post")
     assert posts_after == posts_before + 1
+
+
+def test_new_bot_token_reposts_within_the_cooldown_window(harness: ConsoleHarness, slack: FakeSlack) -> None:
+    """F1: the cooldown is keyed on (workspace fingerprint, channel_id), never the channel alone."""
+    _save_and_complete(harness)
+    posts_before = sum(1 for name, _ in slack.calls if name == "post")
+
+    # A different bot token means a different, confirmed workspace fingerprint --
+    # it must not inherit C0001's cooldown from the old token, even within the window.
+    slack.identity = SlackIdentity(team_id="T2", user_id="U2", bot_id="B2")
+    assert harness.post(f"{BASE}/tokens", {"bot_token": OTHER_BOT, "app_token": APP}).json()["ok"] is True
+    assert harness.post(f"{BASE}/channel", {"channel_id": "C0001"}).json()["ok"] is True
+    posts_after = sum(1 for name, _ in slack.calls if name == "post")
+    assert posts_after == posts_before + 1
+
+
+def test_skip_path_reports_already_confirmed_not_posted(harness: ConsoleHarness, slack: FakeSlack) -> None:
+    """F2: the response must reflect the real skip path, not a hardcoded "posted"."""
+    _save_and_complete(harness)
+    body = harness.post(f"{BASE}/channel", {"channel_id": "C0001"}).json()
+    assert body["ok"] is True
+    assert body["details"]["test_message"] == "already confirmed"
+
+
+def test_posted_test_message_reports_posted(harness: ConsoleHarness, slack: FakeSlack) -> None:
+    _save_tokens(harness)
+    body = harness.post(f"{BASE}/channel", {"channel_id": "C0001"}).json()
+    assert body["details"]["test_message"] == "posted"
