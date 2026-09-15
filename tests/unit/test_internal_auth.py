@@ -224,6 +224,54 @@ class TestMaintenanceGuardIgnoresBrokerProvider:
         assert desktop.push_token not in str(exc.value.detail)
 
 
+def _report_body(task_id: str) -> bytes:
+    import base64
+    import json
+
+    data = base64.b64encode(json.dumps({"task_id": task_id}).encode()).decode()
+    return json.dumps({"message": {"data": data, "messageId": "m-1"}}).encode()
+
+
+class TestOperativeReportAuth:
+    @pytest.mark.asyncio
+    async def test_task_token_for_the_reported_task_is_accepted(self, desktop) -> None:
+        from henchmen.dispatch.pubsub_auth import verify_operative_report
+
+        request = _request({"Authorization": f"Bearer {desktop.task_token('task-1')}"}, _report_body("task-1"))
+        await verify_operative_report(request, _settings())
+        assert request.state.operative_task_id == "task-1"
+        assert (await request.json())["message"]["messageId"] == "m-1", "the body stays readable for the handler"
+
+    @pytest.mark.asyncio
+    async def test_task_token_for_another_task_is_rejected(self, desktop) -> None:
+        from henchmen.dispatch.pubsub_auth import verify_operative_report
+
+        request = _request({"Authorization": f"Bearer {desktop.task_token('task-1')}"}, _report_body("task-2"))
+        with pytest.raises(HTTPException) as exc:
+            await verify_operative_report(request, _settings())
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", [b"", b"not json", b'{"message": {"data": "!!!"}}'])
+    async def test_undecodable_report_with_a_task_token_is_rejected(self, desktop, body: bytes) -> None:
+        from henchmen.dispatch.pubsub_auth import verify_operative_report
+
+        request = _request({"Authorization": f"Bearer {desktop.task_token('task-1')}"}, body)
+        with pytest.raises(HTTPException) as exc:
+            await verify_operative_report(request, _settings())
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_push_token_is_accepted_and_no_token_is_rejected(self, desktop) -> None:
+        from henchmen.dispatch.pubsub_auth import verify_operative_report
+
+        await verify_operative_report(
+            _request({"Authorization": f"Bearer {desktop.push_token}"}, _report_body("task-1")), _settings()
+        )
+        with pytest.raises(HTTPException):
+            await verify_operative_report(_request({}, _report_body("task-1")), _settings())
+
+
 def test_bearer_tokens_are_redacted_from_logs() -> None:
     line = "POST failed with Authorization: Bearer " + "a" * 43
     assert "a" * 43 not in redact(line)

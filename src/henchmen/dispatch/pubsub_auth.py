@@ -31,6 +31,8 @@ The verifier:
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 from typing import TYPE_CHECKING
 
@@ -208,3 +210,50 @@ async def verify_pubsub_oidc(request: Request, settings: Settings) -> None:
 
     # Success: attach claims to the request so downstream handlers can log them.
     request.state.pubsub_oidc_claims = claims
+
+
+async def _reported_task_id(request: Request) -> str:
+    """The ``task_id`` inside a Pub/Sub-style envelope, or ``""`` when it cannot be read.
+
+    Envelope parsing is untrusted input: bad base64, bad JSON, a missing or
+    non-string ``task_id``, or any other decoding failure all fall through to
+    ``""`` (never a raw exception) so the caller fails closed with a 401
+    instead of a 500. Starlette caches ``request.body()``, so this read does
+    not prevent the handler from parsing the body again afterwards.
+    """
+    try:
+        envelope = await request.json()
+        data = json.loads(base64.b64decode(envelope["message"]["data"], validate=True).decode("utf-8"))
+    except Exception:
+        return ""
+    task_id = data.get("task_id") if isinstance(data, dict) else None
+    return task_id if isinstance(task_id, str) else ""
+
+
+async def verify_operative_report(request: Request, settings: Settings) -> None:
+    """Authenticate a POST to ``/pubsub/operative-complete``.
+
+    Outside desktop local mode this is exactly :func:`verify_pubsub_oidc`. On a
+    desktop install the report comes straight from an operative container,
+    which holds only the token derived for its own task: it is accepted when it
+    matches the ``task_id`` the report carries. The internal push token is also
+    accepted (Mastermind's own broker still delivers reports that way in some
+    paths). Anything else -- including an undecodable envelope -- is 401.
+    """
+    internal = local_push_auth(settings)
+    if internal is None:
+        await verify_pubsub_oidc(request, settings)
+        return
+    token = _split_bearer(request.headers.get("Authorization"))
+    if internal.verify_push_token(token):
+        request.state.pubsub_internal_caller = True
+        return
+    task_id = await _reported_task_id(request)
+    if task_id and internal.verify_task_token(task_id, token):
+        request.state.operative_task_id = task_id
+        return
+    logger.warning(
+        "[pubsub-auth] Desktop install: refusing an operative report without a valid task token from %s",
+        request.client.host if request.client else "unknown",
+    )
+    raise HTTPException(status_code=401, detail="Missing or invalid operative task token")

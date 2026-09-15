@@ -58,6 +58,7 @@ def agent() -> Iterator[MagicMock]:
     with (
         patch("henchmen.mastermind.server.get_agent", return_value=fake),
         patch("henchmen.mastermind.server.verify_pubsub_oidc", new_callable=AsyncMock),
+        patch("henchmen.mastermind.server.verify_operative_report", new_callable=AsyncMock),
     ):
         yield fake
 
@@ -468,4 +469,61 @@ class TestMaintenanceRoutesOnDesktop:
 
         monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
         resp = TestClient(forge_app, raise_server_exceptions=False).post("/api/v1/process-queue")
+        assert resp.status_code == 401
+
+
+class TestOperativeReportOnDesktop:
+    """Amendment A2: an operative authenticates its report with its own task token, not the push token."""
+
+    @staticmethod
+    def _report(task_id: str) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        return {
+            "task_id": task_id,
+            "scheme_id": "bugfix_standard",
+            "node_id": "implement_fix",
+            "operative_id": "lair-1",
+            "status": "completed",
+            "summary": "done",
+            "confidence_score": 0.9,
+            "started_at": now,
+            "completed_at": now,
+        }
+
+    @pytest.fixture
+    def desktop_client(self, monkeypatch, tmp_path):
+        from henchmen.config.internal_auth import load_internal_auth
+        from henchmen.mastermind.server import app
+
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        fake = _agent()
+        with patch("henchmen.mastermind.server.get_agent", return_value=fake):
+            yield TestClient(app, raise_server_exceptions=False), fake, load_internal_auth(tmp_path / "secrets")
+
+    def test_own_task_token_delivers_the_report(self, desktop_client):
+        client, fake, internal = desktop_client
+        token = internal.task_token("task-abcdef01")
+        resp = client.post(
+            "/pubsub/operative-complete",
+            json=_envelope(self._report("task-abcdef01")),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        fake.lair_manager.notify_operative_complete.assert_called_once()
+
+    @pytest.mark.parametrize("header_for", ["other-task", None])
+    def test_foreign_or_missing_token_is_refused(self, desktop_client, header_for):
+        client, fake, internal = desktop_client
+        headers = {"Authorization": f"Bearer {internal.task_token(header_for)}"} if header_for else {}
+        resp = client.post("/pubsub/operative-complete", json=_envelope(self._report("task-abcdef01")), headers=headers)
+        assert resp.status_code == 401
+        fake.lair_manager.notify_operative_complete.assert_not_called()
+
+    def test_task_token_cannot_publish_a_task(self, desktop_client):
+        client, fake, internal = desktop_client
+        resp = client.post(
+            "/pubsub/task-intake",
+            json=_envelope({"id": "task-abcdef01"}),
+            headers={"Authorization": f"Bearer {internal.task_token('task-abcdef01')}"},
+        )
         assert resp.status_code == 401
