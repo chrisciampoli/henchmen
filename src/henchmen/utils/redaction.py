@@ -66,15 +66,25 @@ _AWS_ACCOUNT_ID_PATTERN = re.compile(r"(?i)(\baccount\b\s*:?\s*)\d{12}\b")
 # reads "https://***REDACTED***@host/..." rather than losing the URL
 # entirely. The two alternatives cover "user:pass" (or an empty user,
 # ":pass") and a single bearer-style token with no colon; both stop at the
-# next "@", "/" or whitespace, so this stays linear in input length like the
-# other patterns here.
+# next "@", "/" or whitespace.
 #
-# ``ssh://`` is excluded (the negative lookahead after \b): SSH has no
-# password-in-URL mechanism, so its userinfo is always a login identity, not
-# a secret -- e.g. ``ssh://git@github.com:org/repo`` must survive untouched.
-# A bare email address (``user@mail.com``) never matches either pattern,
-# since neither contains a "scheme://" prefix.
-_URL_USERINFO_PATTERN = re.compile(r"(?i)\b(?!ssh://)([a-z][a-z0-9+.-]*://)(?:[^\s@/:]*:[^\s@/]*|[^\s@/:]+)@")
+# ``ssh://`` and ``git+ssh://`` are excluded (the negative lookahead): SSH has
+# no password-in-URL mechanism, so its userinfo is always a login identity,
+# not a secret -- e.g. ``ssh://git@github.com:org/repo`` must survive
+# untouched. A bare email address (``user@mail.com``) never matches either
+# alternative, since neither contains a "scheme://" prefix.
+#
+# The scheme is bounded (`{0,31}`, not `*`) and anchored by a lookbehind
+# rather than `\b`: an earlier version used `\b[a-z][a-z0-9+.-]*://`, which is
+# quadratic on a long run of scheme-like characters with no "://" anywhere
+# (e.g. 40k characters of "a." takes ~4.4s) -- `\b` re-attempts the unbounded
+# scheme scan from every word boundary in the run. The lookbehind plus a
+# bounded quantifier makes the worst-case work at each position O(32), so the
+# whole match stays linear in input length -- this matters because `redact`
+# runs on every log record in every service and on CI gate output.
+_URL_USERINFO_PATTERN = re.compile(
+    r"(?i)(?<![a-z0-9+.-])(?!(?:git\+)?ssh://)([a-z][a-z0-9+.-]{0,31}://)(?:[^\s@/:]*:[^\s@/]*|[^\s@/:]+)@"
+)
 
 # (pattern, replacement) pairs, applied in order. Every pattern but the bearer
 # one replaces the whole match outright; the bearer pattern captures the word

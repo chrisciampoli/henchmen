@@ -9,7 +9,14 @@ alongside the Bedrock check.
 
 from __future__ import annotations
 
-from henchmen.utils.redaction import REDACTED, redact
+import time
+
+from henchmen.utils.redaction import _PATTERNS, REDACTED, redact
+
+# Generous bound (not a tight benchmark) so this stays non-flaky on a loaded
+# CI runner while still catching a genuinely quadratic pattern -- every case
+# below runs in single-digit milliseconds on a linear implementation.
+_TIMING_BOUND_SECONDS = 0.5
 
 
 class TestAwsRedaction:
@@ -99,3 +106,54 @@ class TestUrlUserinfoRedaction:
     def test_plain_email_address_is_left_alone(self):
         text = "notify user@mail.com when the run finishes"
         assert redact(text) == text
+
+    def test_git_plus_ssh_remote_identity_is_left_alone(self):
+        """``git+ssh://`` (pip's VCS URL form) has the same no-password-in-URL property as ssh://."""
+        text = "resolved from git+ssh://git@github.com/org/r"
+        assert redact(text) == text
+
+
+class TestRedactionPerformance:
+    """Regression coverage for a quadratic ``_URL_USERINFO_PATTERN``.
+
+    An earlier version anchored the scheme with ``\\b[a-z][a-z0-9+.-]*://``:
+    ``\\b`` re-attempts the unbounded scheme scan from every word boundary in
+    a long run of scheme-like characters that never reaches "://", making a
+    40k-character run of ``"a."`` take about 4.4s and 100k take about 28s.
+    ``redact`` runs on every log record in every service and on CI gate
+    output, so a pathological line (or a long, harmless one) must never make
+    it slow.
+    """
+
+    def _assert_fast(self, text: str) -> None:
+        start = time.perf_counter()
+        redact(text)
+        elapsed = time.perf_counter() - start
+        assert elapsed < _TIMING_BOUND_SECONDS, f"redact() took {elapsed:.3f}s on {len(text)} chars"
+
+    def test_a_dot_run_is_fast(self):
+        self._assert_fast("a." * 20000)
+
+    def test_a_plus_run_is_fast(self):
+        self._assert_fast("a+" * 20000)
+
+    def test_a_dash_run_is_fast(self):
+        self._assert_fast("a-" * 20000)
+
+    def test_repeated_bearer_word_is_fast(self):
+        self._assert_fast("bearer " * 20000)
+
+    def test_a_long_no_match_string_is_fast(self):
+        self._assert_fast("x" * 100_000)
+
+    def test_every_pattern_individually_is_fast_on_every_pathological_input(self):
+        """Guards every entry in _PATTERNS, not just the URL-userinfo one that regressed."""
+        pathological_inputs = ("a." * 20000, "a+" * 20000, "a-" * 20000, "bearer " * 20000, "x" * 100_000)
+        for text in pathological_inputs:
+            for pattern, replacement in _PATTERNS:
+                start = time.perf_counter()
+                pattern.sub(replacement, text)
+                elapsed = time.perf_counter() - start
+                assert elapsed < _TIMING_BOUND_SECONDS, (
+                    f"{pattern.pattern!r} took {elapsed:.3f}s on a {len(text)}-char pathological input"
+                )
