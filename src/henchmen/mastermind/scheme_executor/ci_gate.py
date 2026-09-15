@@ -37,10 +37,14 @@ Fail-closed: a clone failure, an undetectable stack, an uncomputable diff, a
 privilege-drop failure, a non-zero exit code or any unexpected error is a
 ``fail`` result, and the process exits 0 only for a ``pass``.
 
+``forge`` runs Forge CI's lint and tests over one clone and one dependency
+install and reports both checks in one result line.
+
 Usage inside the operative image (the token is read from stdin)::
 
     python -m henchmen.mastermind.scheme_executor.ci_gate lint --repo=owner/name --branch=henchmen/x --base=main
     python -m henchmen.mastermind.scheme_executor.ci_gate fix --repo=owner/name --branch=henchmen/x --base=main
+    python -m henchmen.mastermind.scheme_executor.ci_gate forge --repo=owner/name --branch=feature --base=main
 """
 
 from __future__ import annotations
@@ -89,15 +93,30 @@ _MAX_STDIN_TOKEN_CHARS = 4096
 _TOKEN_ENV_VARS = ("HENCHMEN_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
 
 CheckType = Literal["lint", "tests"]
-GateCommand = Literal["lint", "tests", "fix"]
+GateCommand = Literal["lint", "tests", "fix", "forge"]
+
+
+class GateCheckResult(BaseModel):
+    """One check (lint or tests) of a multi-check gate run (``forge``)."""
+
+    name: CheckType = Field(..., description="Which check this is")
+    condition: Literal["pass", "fail"] = Field(..., description="Whether the check passed")
+    message: str = Field(..., description="Human-readable summary (secrets scrubbed)")
+    output: str = Field(default="", description="Command output, truncated (secrets scrubbed)")
 
 
 class GateResult(BaseModel):
-    """Outcome of one gate run, printed as the last stdout line after :data:`GATE_RESULT_MARKER`."""
+    """Outcome of one gate run, printed as the last stdout line after :data:`GATE_RESULT_MARKER`.
+
+    ``checks`` is filled only by the ``forge`` subcommand, which runs lint and
+    tests in one container; ``condition`` is then ``pass`` only when every
+    check passed. One model, one marker, one parser for every subcommand.
+    """
 
     condition: Literal["pass", "fail"] = Field(..., description="Scheme edge condition")
     message: str = Field(..., description="Human-readable summary (secrets scrubbed)")
     output: str = Field(default="", description="Command output, truncated (secrets scrubbed)")
+    checks: list[GateCheckResult] = Field(default_factory=list, description="Per-check results (forge only)")
 
 
 @dataclass(frozen=True)
@@ -119,7 +138,7 @@ class Sandbox:
     home: str
 
 
-def _label(command: GateCommand) -> str:
+def _label(command: str) -> str:
     return "fix_lint" if command == "fix" else command
 
 
@@ -201,7 +220,14 @@ def _prepare_sandbox(workspace: str, label: str) -> Sandbox | GateResult:
         _chown_tree(home, UNPRIVILEGED_UID, UNPRIVILEGED_GID)
         _chown_tree(workspace, UNPRIVILEGED_UID, UNPRIVILEGED_GID)
     except OSError as exc:
-        return GateResult(condition="fail", message=f"{label} failed (could not hand the workspace over: {exc})")
+        return GateResult(
+            condition="fail",
+            message=(
+                f"{label} failed (could not hand the workspace over to uid {UNPRIVILEGED_UID}: {exc}); "
+                f"the likely cause is that uid {UNPRIVILEGED_UID} is not mapped in this Docker user namespace "
+                "(rootless Docker or userns-remap)"
+            ),
+        )
     return Sandbox(uid=UNPRIVILEGED_UID, gid=UNPRIVILEGED_GID, home=home)
 
 
@@ -292,22 +318,8 @@ async def _strip_remote_token(workspace: str, repo: str, check_type: str, token:
     return None
 
 
-async def plan_gate(
-    check_type: GateCommand, *, repo: str, branch: str, base_branch: str, token: str, workspace: str
-) -> GatePlan | GateResult:
-    """Clone ``branch`` into ``workspace`` and scope the commands for ``check_type``.
-
-    Returns a :class:`GateResult` directly when the gate is already decided —
-    a clone failure, an undetectable stack, an uncomputable diff, or (for
-    lint and fix) nothing relevant to run — otherwise the :class:`GatePlan`.
-
-    This is the single place that clones and scopes a gate: both the cloud
-    path (which then runs the plan natively via ``_run_on_host``) and the
-    gate container's :func:`run_gate` / :func:`run_fix` call this function
-    so the clone/detect/scope logic exists exactly once. ``fix`` is only
-    ever planned inside the gate container.
-    """
-    label = _label(check_type)
+async def clone_and_detect(label: str, *, repo: str, branch: str, token: str, workspace: str) -> Stack | GateResult:
+    """Clone ``branch`` into ``workspace`` and detect its stack; a fail :class:`GateResult` when either fails."""
     try:
         await clone_repo(repo, branch, workspace, token=token or None)
     except RuntimeError as exc:
@@ -322,6 +334,39 @@ async def plan_gate(
                 "(no pyproject.toml/package.json/go.mod/Cargo.toml/pom.xml found)"
             ),
         )
+    return stack
+
+
+async def plan_gate(
+    check_type: Literal["lint", "tests", "fix"],
+    *,
+    repo: str,
+    branch: str,
+    base_branch: str,
+    token: str,
+    workspace: str,
+    stack: Stack | None = None,
+) -> GatePlan | GateResult:
+    """Clone ``branch`` into ``workspace`` and scope the commands for ``check_type``.
+
+    Returns a :class:`GateResult` directly when the gate is already decided —
+    a clone failure, an undetectable stack, an uncomputable diff, or (for
+    lint and fix) nothing relevant to run — otherwise the :class:`GatePlan`.
+
+    This is the single place that clones and scopes a gate: both the cloud
+    path (which then runs the plan natively via ``_run_on_host``) and the
+    gate container's :func:`run_gate` / :func:`run_fix` / :func:`run_forge`
+    call this function so the clone/detect/scope logic exists exactly once.
+    ``stack`` (from :func:`clone_and_detect`) means the workspace is already
+    cloned: ``forge`` scopes lint and tests over one clone. ``fix`` and
+    ``forge`` only ever run inside the gate container.
+    """
+    label = _label(check_type)
+    if stack is None:
+        detected = await clone_and_detect(label, repo=repo, branch=branch, token=token, workspace=workspace)
+        if isinstance(detected, GateResult):
+            return detected
+        stack = detected
 
     if check_type == "tests":
         return GatePlan(stack=stack, commands=(CheckCommand(argv=tuple(stack.test_command)),))
@@ -370,6 +415,88 @@ async def run_gate(
         message=f"{check_type} {'passed' if passed else 'failed'}",
         output=scrub_secret(output, token)[:GATE_OUTPUT_LIMIT],
     )
+
+
+# ---------------------------------------------------------------------------
+# forge: Forge CI's lint and tests over one clone and one install
+# ---------------------------------------------------------------------------
+
+
+async def run_forge(
+    *, repo: str, branch: str, base_branch: str, token: str, workspace: str, run_tests: bool = True
+) -> GateResult:
+    """Forge CI inside one gate container: clone once, install once, then lint and (unless skipped) tests.
+
+    Lint is scoped exactly like the Mastermind gate (``plan_gate("lint")``, so
+    :mod:`~henchmen.mastermind.scheme_executor.lint_scope`), tests run the
+    stack's test command. The dependency install (:func:`install_script`) runs
+    once, as the unprivileged user, before any check that has a command to
+    run; if it fails, every such check fails with its output. The result
+    carries one :class:`GateCheckResult` per check; ``condition`` is ``pass``
+    only when all of them passed.
+    """
+    names: list[CheckType] = ["lint", "tests"] if run_tests else ["lint"]
+    detected = await clone_and_detect("forge", repo=repo, branch=branch, token=token, workspace=workspace)
+    if isinstance(detected, GateResult):
+        return _forge_result([_check_from(name, detected) for name in names])
+
+    plans: dict[CheckType, GatePlan | GateResult] = {}
+    for name in names:
+        plans[name] = await plan_gate(
+            name, repo=repo, branch=branch, base_branch=base_branch, token=token, workspace=workspace, stack=detected
+        )
+    if all(isinstance(plan, GateResult) for plan in plans.values()):
+        return _forge_result([_check_from(name, plans[name]) for name in names])  # type: ignore[arg-type]
+
+    scrub_result = await _strip_remote_token(workspace, repo, "forge", token)
+    sandbox_or_fail = _prepare_sandbox(workspace, "forge") if scrub_result is None else scrub_result
+    if isinstance(sandbox_or_fail, GateResult):
+        refused = sandbox_or_fail
+        return _forge_result(
+            [_check_from(name, plan if isinstance(plan, GateResult) else refused) for name, plan in plans.items()]
+        )
+    sandbox = sandbox_or_fail
+
+    install_failure: GateResult | None = None
+    install = install_script(detected)
+    if install is not None:
+        returncode, output = await _run_script(workspace, install, sandbox=sandbox)
+        if returncode != 0:
+            install_failure = GateResult(
+                condition="fail",
+                message=f"dependency install failed (exit {returncode})",
+                output=scrub_secret(output, token)[-GATE_OUTPUT_LIMIT:],
+            )
+
+    checks: list[GateCheckResult] = []
+    for name, plan in plans.items():
+        if isinstance(plan, GateResult):
+            checks.append(_check_from(name, plan))
+            continue
+        if install_failure is not None:
+            checks.append(_check_from(name, install_failure, prefix=f"{name} failed — "))
+            continue
+        returncode, output = await _run_script(workspace, to_shell_script(plan.commands, None), sandbox=sandbox)
+        passed = returncode == 0
+        checks.append(
+            GateCheckResult(
+                name=name,
+                condition="pass" if passed else "fail",
+                message=f"{name} {'passed' if passed else 'failed'}",
+                output=scrub_secret(output, token)[:GATE_OUTPUT_LIMIT],
+            )
+        )
+    return _forge_result(checks)
+
+
+def _check_from(name: CheckType, result: GateResult, prefix: str = "") -> GateCheckResult:
+    return GateCheckResult(name=name, condition=result.condition, message=prefix + result.message, output=result.output)
+
+
+def _forge_result(checks: list[GateCheckResult]) -> GateResult:
+    passed = all(check.condition == "pass" for check in checks)
+    summary = "; ".join(f"{check.name} {'passed' if check.condition == 'pass' else 'failed'}" for check in checks)
+    return GateResult(condition="pass" if passed else "fail", message=f"forge: {summary}", checks=checks)
 
 
 # ---------------------------------------------------------------------------
@@ -528,16 +655,26 @@ def parse_gate_result(stdout: str) -> GateResult | None:
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="ci_gate", description="Run a Henchmen CI gate inside the operative image")
-    parser.add_argument("check", choices=("lint", "tests", "fix"))
+    parser.add_argument("check", choices=("lint", "tests", "fix", "forge"))
     parser.add_argument("--repo", required=True)
     parser.add_argument("--branch", required=True)
     parser.add_argument("--base", required=True)
     parser.add_argument("--author-name", default="Henchmen")
     parser.add_argument("--author-email", default="henchmen@users.noreply.github.com")
+    parser.add_argument("--skip-tests", action="store_true", help="forge only: run lint without tests")
     return parser.parse_args(argv)
 
 
 async def _run(args: argparse.Namespace, token: str, workspace: str, private_dir: str) -> GateResult:
+    if args.check == "forge":
+        return await run_forge(
+            repo=args.repo,
+            branch=args.branch,
+            base_branch=args.base,
+            token=token,
+            workspace=workspace,
+            run_tests=not args.skip_tests,
+        )
     if args.check == "fix":
         return await run_fix(
             repo=args.repo,
@@ -582,6 +719,7 @@ __all__ = [
     "GATE_RESULT_MARKER",
     "UNPRIVILEGED_GID",
     "UNPRIVILEGED_UID",
+    "GateCheckResult",
     "GatePlan",
     "GateResult",
     "Sandbox",
@@ -590,8 +728,10 @@ __all__ = [
     "main",
     "parse_gate_result",
     "plan_gate",
+    "clone_and_detect",
     "read_token_from_stdin",
     "run_fix",
+    "run_forge",
     "run_gate",
     "scrub_secret",
 ]

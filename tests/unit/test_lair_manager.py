@@ -536,3 +536,60 @@ class TestReportBinding:
         lair_id = await manager.create_lair(task, node)
         assert manager.accepts_report_from("task-9", "implement_fix", lair_id) is True
         assert manager.accepts_report_from("task-9", "implement_fix", "lair-forged") is False
+
+
+class TestProvisionalLairRegistration:
+    """M5: a lair is reportable from the moment it is launched, and forgotten if the launch fails."""
+
+    @staticmethod
+    def _task_and_node():
+        from henchmen.models.scheme import SchemeNode
+
+        task = MagicMock()
+        task.id = "task-7"
+        task.context.repo = "acme/api"
+        task.context.branch = "main"
+        task.title = "t"
+        task.description = "d"
+        task.branch_name = "henchmen/task-7"
+        node = MagicMock(spec=SchemeNode)
+        node.id = "implement_fix"
+        node.timeout_seconds = 120
+        node.model_name = None
+        return task, node
+
+    @pytest.mark.asyncio
+    async def test_a_report_arriving_before_run_job_returns_is_accepted(self):
+        from henchmen.config.settings import Settings
+        from henchmen.mastermind.lair_manager import LairManager
+
+        seen: list[bool] = []
+        manager: LairManager
+
+        async def _run_job(**kwargs):
+            seen.append(manager.accepts_report_from("task-7", "implement_fix", kwargs["job_id"]))
+            return "exec-1"
+
+        orchestrator = MagicMock()
+        orchestrator.run_job = AsyncMock(side_effect=_run_job)
+        store = MagicMock()
+        store.delete = AsyncMock()
+        manager = LairManager(Settings(_env_file=None, provider="gcp", gcp_project_id="p"), orchestrator, store)
+        lair_id = await manager.create_lair(*self._task_and_node())
+        assert seen == [True]
+        assert manager._active_lairs[lair_id]["execution_id"] == "exec-1"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_launch_leaves_nothing_reportable(self):
+        from henchmen.config.settings import Settings
+        from henchmen.mastermind.lair_manager import LairManager
+
+        orchestrator = MagicMock()
+        orchestrator.run_job = AsyncMock(side_effect=RuntimeError("docker not running"))
+        store = MagicMock()
+        store.delete = AsyncMock()
+        manager = LairManager(Settings(_env_file=None, provider="gcp", gcp_project_id="p"), orchestrator, store)
+        with pytest.raises(RuntimeError, match="docker not running"):
+            await manager.create_lair(*self._task_and_node())
+        assert manager._active_lairs == {}
+        assert manager.accepts_report_from("task-7", "implement_fix") is False

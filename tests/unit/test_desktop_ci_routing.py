@@ -211,63 +211,123 @@ def _scan(status: str = "passed") -> dict[str, Any]:
     return {"name": "silent_failure_scan", "status": status, "passed": status == "passed", "output": "", "error": ""}
 
 
+def _gate_checks(**conditions: str) -> dict[str, Any]:
+    """A `run_gate_in_container` result for `ci_gate forge` with one entry per named check."""
+    checks = [
+        {
+            "name": name,
+            "condition": condition,
+            "message": f"{name} {'passed' if condition == 'pass' else 'failed'}",
+            "output": "1 failed, 2 passed" if condition != "pass" else "",
+        }
+        for name, condition in conditions.items()
+    ]
+    overall = "pass" if all(c == "pass" for c in conditions.values()) else "fail"
+    return {"condition": overall, "message": "forge: ...", "output": "", "checks": checks}
+
+
 class TestForgeRouting:
-    @pytest.mark.asyncio
-    async def test_desktop_forge_runs_lint_and_tests_in_the_gate_container(self, forge_state: AsyncMock) -> None:
+    @staticmethod
+    def _patches(settings: Settings, pr: MagicMock, gate: AsyncMock, decision: Any = (True, None)) -> Any:
+        from contextlib import ExitStack
+
         from henchmen.forge import server
         from henchmen.forge.ci_runner import CIRunner
 
-        settings = _settings()
+        stack = ExitStack()
+        stack.enter_context(patch.object(server, "get_settings", return_value=settings))
+        stack.enter_context(patch("github.Github", return_value=_github_client(pr)))
+        stack.enter_context(patch.object(server, "clone_repo", AsyncMock()))
+        stack.enter_context(patch.object(handlers, "run_gate_in_container", gate))
+        stack.enter_context(
+            patch.object(CIRunner, "run", AsyncMock(side_effect=AssertionError("no host CI on desktop")))
+        )
+        stack.enter_context(patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=decision)))
+        stack.enter_context(patch.object(CIRunner, "run_silent_failure_scan", AsyncMock(return_value=_scan())))
+        return stack
+
+    @pytest.mark.asyncio
+    async def test_desktop_forge_runs_lint_and_tests_in_one_gate_container(self, forge_state: AsyncMock) -> None:
+        from henchmen.forge import server
+
+        settings = _settings(lair_default_timeout=1800, forge_ci_timeout_seconds=540)
         pr = MagicMock()
-        gates = {
-            "lint": {"condition": "pass", "message": "lint passed", "output": ""},
-            "tests": {"condition": "fail", "message": "tests failed", "output": "1 failed, 2 passed"},
-        }
-        gate = AsyncMock(side_effect=lambda settings, check, **kwargs: gates[check])
-        with (
-            patch.object(server, "get_settings", return_value=settings),
-            patch("github.Github", return_value=_github_client(pr)),
-            patch.object(server, "clone_repo", AsyncMock()) as clone,
-            patch.object(handlers, "run_gate_in_container", gate),
-            patch.object(CIRunner, "run", AsyncMock(side_effect=AssertionError("no host CI on desktop"))),
-            patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=(True, None))),
-            patch.object(CIRunner, "run_silent_failure_scan", AsyncMock(return_value=_scan())) as scan,
-        ):
+        gate = AsyncMock(return_value=_gate_checks(lint="pass", tests="fail"))
+        with self._patches(settings, pr, gate), patch.object(server, "clone_repo", AsyncMock()) as clone:
             await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
 
+        # Exactly one container run per Forge CI, for both checks.
+        gate.assert_awaited_once()
+        args, kwargs = gate.await_args.args, gate.await_args.kwargs
+        assert args == (settings, "forge")
+        assert (kwargs["repo"], kwargs["branch"], kwargs["base_branch"]) == ("acme/widgets", "feature-branch", "main")
+        assert kwargs.get("extra_args", ()) == ()
+        # The gate timeout applies (run_gate_in_container's default), never the Pub/Sub budget.
+        assert "timeout_seconds" not in kwargs
         # Only a no-checkout clone reaches the host, for the text-only silent-failure scan.
         assert clone.await_args.kwargs["no_checkout"] is True
-        assert scan.await_args.args[1] == "main"
-        assert [call.args[1] for call in gate.await_args_list] == ["lint", "tests"]
-        for call in gate.await_args_list:
-            assert (call.kwargs["repo"], call.kwargs["branch"], call.kwargs["base_branch"]) == (
-                "acme/widgets",
-                "feature-branch",
-                "main",
-            )
-            assert 0 < call.kwargs["timeout_seconds"] <= settings.forge_ci_timeout_seconds
         payload = _published(forge_state)[0]
         assert payload["status"] == "failed"
         assert payload["failed"] == ["tests"]
         comment = pr.create_issue_comment.call_args.args[0]
         assert "tests — failed" in comment and "1 failed, 2 passed" in comment
+        assert "lint — passed" in comment
+
+    @pytest.mark.asyncio
+    async def test_the_desktop_scan_budget_is_the_gate_timeout(self, forge_state: AsyncMock) -> None:
+        from henchmen.forge import server
+        from henchmen.forge.ci_runner import CIRunner
+
+        settings = _settings(lair_default_timeout=1800, forge_ci_timeout_seconds=540)
+        gate = AsyncMock(return_value=_gate_checks(lint="pass", tests="pass"))
+        with self._patches(settings, MagicMock(), gate):
+            real_init = CIRunner.__init__
+            budgets: list[int] = []
+
+            def _recording_init(self: CIRunner, **kwargs: Any) -> None:
+                budgets.append(kwargs["total_budget_seconds"])
+                real_init(self, **kwargs)
+
+            with patch.object(CIRunner, "__init__", _recording_init):
+                await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
+        assert budgets == [1800]
 
     @pytest.mark.asyncio
     async def test_desktop_forge_passes_only_when_every_check_passed(self, forge_state: AsyncMock) -> None:
         from henchmen.forge import server
-        from henchmen.forge.ci_runner import CIRunner
 
-        ok = {"condition": "pass", "message": "ok", "output": ""}
-        with (
-            patch.object(server, "get_settings", return_value=_settings()),
-            patch("github.Github", return_value=_github_client(MagicMock())),
-            patch.object(server, "clone_repo", AsyncMock()),
-            patch.object(handlers, "run_gate_in_container", AsyncMock(return_value=ok)),
-            patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=(True, None))),
-            patch.object(CIRunner, "run_silent_failure_scan", AsyncMock(return_value=_scan())),
-        ):
+        gate = AsyncMock(return_value=_gate_checks(lint="pass", tests="pass"))
+        with self._patches(_settings(), MagicMock(), gate):
             await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
         assert _published(forge_state)[0]["status"] == "passed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "gate_result",
+        [
+            {"condition": "fail", "message": "forge failed (the gate did not finish within 1800s)", "output": ""},
+            {
+                "condition": "fail",
+                "message": "forge failed (the gate container exited 137 without a result)",
+                "output": "",
+            },
+            # A pass the exit code contradicts: every per-check pass is overruled.
+            {**_gate_checks(lint="pass", tests="pass"), "condition": "fail", "message": "forge failed (exited 1)"},
+        ],
+        ids=["timeout", "no-result", "pass-but-nonzero-exit"],
+    )
+    async def test_a_gate_without_usable_results_fails_every_check(
+        self, forge_state: AsyncMock, gate_result: dict[str, Any]
+    ) -> None:
+        from henchmen.forge import server
+
+        pr = MagicMock()
+        with self._patches(_settings(), pr, AsyncMock(return_value=gate_result)):
+            await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
+        payload = _published(forge_state)[0]
+        assert payload["status"] == "failed"
+        assert payload["failed"] == ["lint", "tests"]
+        assert gate_result["message"] in pr.create_issue_comment.call_args.args[0]
 
     @pytest.mark.asyncio
     async def test_a_node_repo_without_a_test_script_stays_incomplete_on_desktop(self, forge_state: AsyncMock) -> None:
@@ -277,17 +337,11 @@ class TestForgeRouting:
 
         skipped = CIRunner.check_result("tests", STATUS_SKIPPED, "", "package.json declares no `test` script.")
         pr = MagicMock()
-        gate = AsyncMock(return_value={"condition": "pass", "message": "lint passed", "output": ""})
-        with (
-            patch.object(server, "get_settings", return_value=_settings()),
-            patch("github.Github", return_value=_github_client(pr)),
-            patch.object(server, "clone_repo", AsyncMock()),
-            patch.object(handlers, "run_gate_in_container", gate),
-            patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=(False, skipped))),
-            patch.object(CIRunner, "run_silent_failure_scan", AsyncMock(return_value=_scan())),
-        ):
+        gate = AsyncMock(return_value=_gate_checks(lint="pass"))
+        with self._patches(_settings(), pr, gate, decision=(False, skipped)):
             await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
-        assert [call.args[1] for call in gate.await_args_list] == ["lint"]
+        gate.assert_awaited_once()
+        assert gate.await_args.kwargs["extra_args"] == ("--skip-tests",)
         payload = _published(forge_state)[0]
         assert payload["status"] == "incomplete" and payload["skipped"] == ["tests"]
         assert "INCOMPLETE" in pr.create_issue_comment.call_args.args[0]
@@ -295,32 +349,19 @@ class TestForgeRouting:
     @pytest.mark.asyncio
     async def test_a_repo_with_no_tests_has_no_tests_check_on_desktop(self, forge_state: AsyncMock) -> None:
         from henchmen.forge import server
-        from henchmen.forge.ci_runner import CIRunner
 
-        gate = AsyncMock(return_value={"condition": "pass", "message": "lint passed", "output": ""})
-        with (
-            patch.object(server, "get_settings", return_value=_settings()),
-            patch("github.Github", return_value=_github_client(MagicMock())),
-            patch.object(server, "clone_repo", AsyncMock()),
-            patch.object(handlers, "run_gate_in_container", gate),
-            patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=(False, None))),
-            patch.object(CIRunner, "run_silent_failure_scan", AsyncMock(return_value=_scan())),
-        ):
+        gate = AsyncMock(return_value=_gate_checks(lint="pass"))
+        with self._patches(_settings(), MagicMock(), gate, decision=(False, None)):
             await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
-        assert [call.args[1] for call in gate.await_args_list] == ["lint"]
+        assert gate.await_args.kwargs["extra_args"] == ("--skip-tests",)
         assert _published(forge_state)[0]["status"] == "passed"
 
     @pytest.mark.asyncio
     async def test_a_desktop_gate_runner_error_is_a_ci_error(self, forge_state: AsyncMock) -> None:
         from henchmen.forge import server
-        from henchmen.forge.ci_runner import CIRunner
 
         with (
-            patch.object(server, "get_settings", return_value=_settings()),
-            patch("github.Github", return_value=_github_client(MagicMock())),
-            patch.object(server, "clone_repo", AsyncMock()),
-            patch.object(handlers, "run_gate_in_container", AsyncMock(side_effect=FileNotFoundError("docker"))),
-            patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=(True, None))),
+            self._patches(_settings(), MagicMock(), AsyncMock(side_effect=FileNotFoundError("docker"))),
             pytest.raises(server.ForgeCIError),
         ):
             await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
@@ -332,12 +373,14 @@ class TestForgeRouting:
         from henchmen.forge.ci_runner import CIRunner
 
         result = {"passed": True, "failed": [], "skipped": [], "checks": [], "summary": ""}
+        settings = _settings(provider="gcp", forge_ci_timeout_seconds=123)
         with (
-            patch.object(server, "get_settings", return_value=_settings(provider="gcp")),
+            patch.object(server, "get_settings", return_value=settings),
             patch("github.Github", return_value=_github_client(MagicMock())),
             patch.object(server, "clone_repo", AsyncMock()) as clone,
             patch.object(handlers, "run_gate_in_container", AsyncMock(side_effect=AssertionError("cloud path"))),
             patch.object(CIRunner, "run", AsyncMock(return_value=result)) as run,
+            patch.object(CIRunner, "committed_tests_decision", AsyncMock(side_effect=AssertionError("cloud path"))),
         ):
             await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
         assert clone.await_args.kwargs["no_checkout"] is False

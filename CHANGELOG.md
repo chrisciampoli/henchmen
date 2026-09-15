@@ -106,6 +106,12 @@ silently ignored, and the Dispatch container never ran its own HTTP app.
 - Settings `local_docker_network` and `operative_image`.
 
 ### Changed
+- **Local-orchestrator CI runs in a gate container.** Whenever the effective container orchestrator is
+  local Docker, which includes a repository checkout running `HENCHMEN_PROVIDER=local`, Forge CI and the
+  `fix_lint` node run in a gate container from the operative image, so both now need Docker and that
+  image. Forge runs lint and tests in a single `ci_gate forge` container (one clone, one dependency
+  install), bounded by the gate timeout. Its lint uses the Mastermind lint gate's `lint_scope` rules,
+  which are stricter than the cloud path's ruff on changed Python files.
 - **Credential settings accept two spellings.** `github_token`,
   `slack_bot_token`, `slack_app_token`, `slack_signing_secret`,
   `jira_base_url`, `jira_email` and `jira_api_token` accept both the
@@ -252,6 +258,17 @@ silently ignored, and the Dispatch container never ran its own HTTP app.
   images, and git from the Dispatch image.
 
 ### Security
+- Desktop gate containers (local CI gates, `fix_lint`, Forge CI) receive the GitHub token only on stdin,
+  never in argv or an environment. They run every repository-controlled command as uid 65534, with a
+  minimal capability set, `no-new-privileges` and `--init`. `fix_lint` pushes from a root-only git
+  directory with hooks disabled.
+- An operative report or interrupted report body over the size cap is answered 413, and the operative
+  treats that as undeliverable. Operatives cap `git_diff` at 512 KiB. Task-token reports are accepted
+  only from the lair Mastermind launched for that task and node.
+- The needs-attention Console returns its problem list only to a signed-in session. An unauthenticated
+  `/console/api/status` still reports the mode.
+- `EnvFile` (and so `henchmen init` and the Console) and every secret file refuse a symlinked,
+  non-regular or foreign-owned file with an actionable error rather than following it.
 - Secret redaction now applies to the whole `henchmen` logger tree and formats
   the record before matching, so `%s` arguments are redacted too. Anthropic
   `sk-ant-` keys were added to the pattern.

@@ -81,15 +81,21 @@ def check_secret_path(path: Path) -> None:
     except FileNotFoundError:
         return
     if stat.S_ISLNK(info.st_mode):
-        raise SecretFileError(f"secret file {path} is a symbolic link; remove it and start Henchmen again")
+        raise SecretFileError(
+            f"{path} is a symbolic link, which Henchmen never follows for a secret or configuration file; "
+            "replace the symlink with a regular file owned by you (copy the target's content in if you need it), "
+            "then try again"
+        )
     if not stat.S_ISREG(info.st_mode):
-        raise SecretFileError(f"secret file {path} is not a regular file; remove it and start Henchmen again")
+        raise SecretFileError(
+            f"{path} is not a regular file; replace it with a regular file owned by you, then try again"
+        )
     if sys.platform != "win32":
         owner = info.st_uid
         if owner != os.geteuid():
             raise SecretFileError(
-                f"secret file {path} is owned by another user (uid {owner}); "
-                "fix its ownership or remove it and start Henchmen again"
+                f"{path} is owned by another user (uid {owner}); make it a regular file owned by you "
+                f"(for example `chown $(id -u) {path}`), then try again"
             )
 
 

@@ -596,7 +596,8 @@ async def run_gate_in_container(
     token = settings.github_token
     image = settings.operative_image or DEFAULT_LOCAL_OPERATIVE_IMAGE
     container = f"henchmen-gate-{uuid4().hex[:12]}"
-    cmd = ["docker", "run", "--rm", "-i", "--name", container]
+    # --init: a tiny init reaps the orphans repo code leaves behind and forwards signals to the gate.
+    cmd = ["docker", "run", "--rm", "--init", "-i", "--name", container]
     if settings.local_docker_network:
         cmd.extend(["--network", settings.local_docker_network])
     cmd.extend(_gate_resource_limit_args(settings))
@@ -664,11 +665,23 @@ async def run_gate_in_container(
         }
     message = scrub_secret(result.message, token)
     output = scrub_secret(result.output, token)
+    extra: dict[str, Any] = {}
+    if result.checks:
+        # Multi-check gates (forge) report each check; scrubbed like the rest of the result.
+        extra["checks"] = [
+            {
+                "name": check.name,
+                "condition": check.condition,
+                "message": scrub_secret(check.message, token),
+                "output": scrub_secret(check.output, token),
+            }
+            for check in result.checks
+        ]
     if result.condition == "pass" and returncode == 0:
-        return {"condition": "pass", "message": message, "output": output}
+        return {"condition": "pass", "message": message, "output": output, **extra}
     if result.condition == "pass":
         message = f"{command} failed (the gate reported a pass but exited {returncode})"
-    return {"condition": "fail", "message": message, "output": output}
+    return {"condition": "fail", "message": message, "output": output, **extra}
 
 
 async def _cleanup_after_abnormal_exit(

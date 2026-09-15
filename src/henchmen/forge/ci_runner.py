@@ -516,7 +516,7 @@ class CIRunner:
         try:
             with open(os.path.join(workspace_dir, "package.json"), encoding="utf-8") as fh:
                 return _test_script(fh.read())
-        except OSError:
+        except (OSError, ValueError):  # ValueError: UnicodeDecodeError on a non-UTF-8 manifest
             return None
 
     # ------------------------------------------------------------------

@@ -443,6 +443,11 @@ Confirm `ollama serve` is running: `curl http://localhost:11434/api/tags`.
 **Linux: `permission denied` on the Docker socket**
 `sudo usermod -aG docker $USER`, then log out and back in.
 
+**Every local lint/test gate fails with "uid 65534 is not mapped in this Docker user namespace"**
+The gate container runs repository code as uid 65534 (`nobody`). Rootless Docker and `userns-remap`
+must map that uid: add a subordinate uid range that covers it in `/etc/subuid` and `/etc/subgid`, or run
+the gates on a Docker engine without user-namespace remapping.
+
 See [docs/troubleshooting.md](docs/troubleshooting.md) for the full guide.
 
 ---
