@@ -6,6 +6,7 @@ import base64
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -347,3 +348,67 @@ def test_publish_new_secret_ignores_cleanup_failure_of_the_temp_file(
 
     assert len(secret) >= MIN_SECRET_BYTES
     assert path.read_bytes() == secret
+
+
+# --- Fix round 3 -------------------------------------------------------------
+
+
+def test_create_secret_file_does_not_delete_when_the_file_id_is_unreliable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A filesystem that always reports st_ino == 0 (some FAT/exFAT drivers) cannot tell "our file"
+    from "someone else's" apart, so identity can never be confirmed and nothing is unlinked.
+    """
+    path = tmp_path / "k"
+
+    class _UnreliableStat:
+        st_dev = 1
+        st_ino = 0
+
+    def failing_write(_fd: int, _data: object) -> int:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "write", failing_write)
+    monkeypatch.setattr(os, "fstat", lambda _fd: _UnreliableStat())
+    monkeypatch.setattr(os, "stat", lambda _path, *args, **kwargs: _UnreliableStat())
+
+    with pytest.raises(OSError):
+        create_secret_file(path, b"a" * 32)
+
+    monkeypatch.undo()  # restore real os.write/os.fstat/os.stat before inspecting the filesystem
+    assert path.exists()
+    assert path.read_bytes() == b""
+
+
+def test_sweep_removes_an_old_matching_temp_file(tmp_path: Path) -> None:
+    path = tmp_path / "k"
+    stale = path.with_name(f"{path.name}.deadbeef.tmp")
+    stale.write_bytes(b"leftover")
+    old = time.time() - 400  # older than the 5-minute floor
+    os.utime(stale, (old, old))
+
+    read_or_create_secret(path)
+
+    assert not stale.exists()
+
+
+def test_sweep_keeps_a_fresh_matching_temp_file(tmp_path: Path) -> None:
+    path = tmp_path / "k"
+    fresh = path.with_name(f"{path.name}.cafebabe.tmp")
+    fresh.write_bytes(b"leftover")  # default mtime is "now", well under the 5-minute floor
+
+    read_or_create_secret(path)
+
+    assert fresh.exists()
+
+
+def test_sweep_keeps_a_non_matching_old_file(tmp_path: Path) -> None:
+    path = tmp_path / "k"
+    unrelated = tmp_path / "other.deadbeef.tmp"
+    unrelated.write_bytes(b"unrelated")
+    old = time.time() - 400
+    os.utime(unrelated, (old, old))
+
+    read_or_create_secret(path)
+
+    assert unrelated.exists()
