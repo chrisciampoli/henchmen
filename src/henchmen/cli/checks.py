@@ -13,15 +13,46 @@ and friends) so tests can substitute fakes without touching the network.
 from __future__ import annotations
 
 import base64
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
 import httpx
 
+from henchmen.config.settings import Settings
+from henchmen.providers.pricing import PRICE_TABLE
+from henchmen.providers.tiers import TIER_FIELDS
+
 DEFAULT_TIMEOUT = 10.0
 
 RECOMMENDED_OLLAMA_MODELS: tuple[str, ...] = ("qwen2.5-coder:7b", "llama3.3", "deepseek-r1:8b")
+
+# Vertex AI has no per-key model listing Henchmen can use; these are the Gemini
+# models the tier defaults and the price table know. No Claude on Vertex AI.
+# Computed, never a literal (CLAUDE.md: never hardcode a model name).
+VERTEX_MODELS: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        [str(Settings.model_fields[field].default) for field in TIER_FIELDS["gcp"].values()]
+        + [model for model in PRICE_TABLE if model.startswith("gemini-")]
+    )
+)
+
+_OPENAI_EXCLUDE: tuple[str, ...] = (
+    "realtime",
+    "audio",
+    "tts",
+    "transcribe",
+    "embedding",
+    "moderation",
+    "image",
+    "dall",
+    "whisper",
+    "search",
+    "instruct",
+    "babbage",
+    "davinci",
+)
 
 
 class CheckStatus(StrEnum):
@@ -114,6 +145,17 @@ def _google_default_credentials() -> tuple[Any, str | None]:
     return credentials, project
 
 
+def _bedrock_client(region: str, timeout: float) -> Any:
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "bedrock",
+        region_name=region,
+        config=Config(connect_timeout=timeout, read_timeout=timeout, retries={"max_attempts": 1}),
+    )
+
+
 def _slack_error_code(exc: BaseException) -> str:
     """Extract Slack's ``error`` string from a SlackApiError-shaped exception."""
     response = getattr(exc, "response", None)
@@ -197,6 +239,19 @@ def list_openai_models(api_key: str, *, timeout: float = DEFAULT_TIMEOUT) -> lis
         return []
 
 
+def filter_openai_models(models: Sequence[str]) -> list[str]:
+    """Keep chat/reasoning models an operative can use; drop audio, image, embedding and legacy ids."""
+    keep: list[str] = []
+    for model in models:
+        lowered = model.lower()
+        if not lowered.startswith(("gpt-", "o1", "o3", "o4")):
+            continue
+        if any(marker in lowered for marker in _OPENAI_EXCLUDE):
+            continue
+        keep.append(model)
+    return keep
+
+
 def _list_paged_ids(page: Any) -> list[str]:
     ids = [str(getattr(item, "id", "")) for item in getattr(page, "data", [])]
     return sorted(i for i in ids if i)
@@ -266,6 +321,65 @@ def check_vertex(project_id: str, region: str, *, timeout: float = DEFAULT_TIMEO
             hint=f"Run: gcloud auth application-default set-quota-project {project_id}",
         )
     return CheckResult(name, CheckStatus.OK, f"ADC present for {project_id} ({region})")
+
+
+def check_bedrock(region: str, *, timeout: float = DEFAULT_TIMEOUT) -> CheckResult:
+    """Verify AWS credentials can list Bedrock text models in ``region``."""
+    name = "AWS Bedrock"
+    if not region:
+        return CheckResult(name, CheckStatus.FAIL, "no AWS region set", hint="Set HENCHMEN_AWS_REGION")
+    try:
+        models = _bedrock_model_ids(_bedrock_client(region, timeout))
+    except ImportError as exc:
+        return _sdk_missing(name, "aws", exc)
+    except Exception as exc:
+        return CheckResult(
+            name,
+            CheckStatus.FAIL,
+            f"cannot list Bedrock models in {region}: {_short(exc)}",
+            hint=(
+                "Give Henchmen AWS credentials allowed to call bedrock:ListFoundationModels and "
+                "bedrock:ListInferenceProfiles in this region"
+            ),
+        )
+    if not models:
+        return CheckResult(
+            name,
+            CheckStatus.FAIL,
+            f"no text models are available in {region}",
+            hint="Request model access in the Bedrock console for this region",
+        )
+    return CheckResult(name, CheckStatus.OK, f"reachable in {region} ({len(models)} models)")
+
+
+def list_bedrock_models(region: str, *, timeout: float = DEFAULT_TIMEOUT) -> list[str]:
+    """Foundation model ids and inference profile ids, sorted; ``[]`` on any failure."""
+    try:
+        return _bedrock_model_ids(_bedrock_client(region, timeout))
+    except Exception:
+        return []
+
+
+def _bedrock_model_ids(client: Any) -> list[str]:
+    ids: set[str] = set()
+    for summary in client.list_foundation_models(byOutputModality="TEXT").get("modelSummaries", []):
+        model_id = str(summary.get("modelId", ""))
+        if model_id:
+            ids.add(model_id)
+    next_token: str | None = None
+    while True:
+        kwargs: dict[str, Any] = {"maxResults": 100}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        page = client.list_inference_profiles(**kwargs)
+        for summary in page.get("inferenceProfileSummaries", []):
+            profile_id = str(summary.get("inferenceProfileId", ""))
+            if profile_id:
+                ids.add(profile_id)
+        next_token = page.get("nextToken") or None
+        if not next_token:
+            break
+    return sorted(ids)
 
 
 # ---------------------------------------------------------------------------
@@ -473,11 +587,13 @@ def check_jira(base_url: str, email: str, api_token: str, *, timeout: float = DE
 __all__ = [
     "DEFAULT_TIMEOUT",
     "RECOMMENDED_OLLAMA_MODELS",
+    "VERTEX_MODELS",
     "CheckResult",
     "CheckStatus",
     "SlackChannel",
     "SlackScopeError",
     "check_anthropic_key",
+    "check_bedrock",
     "check_github_repo",
     "check_github_token",
     "check_jira",
@@ -486,8 +602,10 @@ __all__ = [
     "check_slack_app_token",
     "check_slack_bot_token",
     "check_vertex",
+    "filter_openai_models",
     "join_slack_channel",
     "list_anthropic_models",
+    "list_bedrock_models",
     "list_ollama_models",
     "list_openai_models",
     "list_slack_channels",

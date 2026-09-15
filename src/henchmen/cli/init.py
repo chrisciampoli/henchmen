@@ -72,22 +72,6 @@ _TIER_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
         "reasoning": ("bedrock_model_reasoning", "us.anthropic.claude-sonnet-4-20250514-v1:0"),
     },
 }
-_VERTEX_MODELS: tuple[str, ...] = ("gemini-2.5-pro", "gemini-2.5-flash", "gemini-3.1-pro")
-_OPENAI_EXCLUDE = (
-    "realtime",
-    "audio",
-    "tts",
-    "transcribe",
-    "embedding",
-    "moderation",
-    "image",
-    "dall",
-    "whisper",
-    "search",
-    "instruct",
-    "babbage",
-    "davinci",
-)
 
 
 def _settings_default(field_name: str, fallback: str) -> str:
@@ -258,18 +242,6 @@ def _pick_model(
     return picked
 
 
-def _filter_openai_models(models: Sequence[str]) -> list[str]:
-    keep = []
-    for model in models:
-        lowered = model.lower()
-        if not lowered.startswith(("gpt-", "o1", "o3", "o4")):
-            continue
-        if any(marker in lowered for marker in _OPENAI_EXCLUDE):
-            continue
-        keep.append(model)
-    return keep
-
-
 def _gcloud_project() -> str:
     """Best-effort ``gcloud config get-value project``; empty when unavailable."""
     try:
@@ -384,7 +356,7 @@ def section_llm(prompter: Prompter, state: WizardState, options: InitOptions) ->
         )
         if key:
             state.set("HENCHMEN_OPENAI_API_KEY", key, "LLM")
-            available = _filter_openai_models(checks.list_openai_models(key, timeout=options.timeout))
+            available = checks.filter_openai_models(checks.list_openai_models(key, timeout=options.timeout))
     elif llm == "local":
         url_default = state.get("HENCHMEN_LLM_OLLAMA_BASE_URL", "http://localhost:11434")
         base_url = (
@@ -406,7 +378,7 @@ def section_llm(prompter: Prompter, state: WizardState, options: InitOptions) ->
         region = state.get("HENCHMEN_GCP_REGION", "us-central1")
         state.set("HENCHMEN_GCP_REGION", region, "GCP")
         _report(prompter, state, checks.check_vertex(project, region, timeout=options.timeout))
-        available = list(_VERTEX_MODELS)
+        available = list(checks.VERTEX_MODELS)
     elif llm == "aws":
         region_default = state.get("HENCHMEN_AWS_REGION", "us-east-1")
         region = (
@@ -415,7 +387,8 @@ def section_llm(prompter: Prompter, state: WizardState, options: InitOptions) ->
             else prompter.text("AWS region for Bedrock", default=region_default, validator=_validate_required)
         )
         state.set("HENCHMEN_AWS_REGION", region, "AWS")
-        prompter.warn("Bedrock support is experimental; model IDs are not validated live.")
+        _report(prompter, state, checks.check_bedrock(region, timeout=options.timeout))
+        available = checks.list_bedrock_models(region, timeout=options.timeout)
 
     tier_fields = _TIER_FIELDS[llm]
     picked: dict[str, str] = {}

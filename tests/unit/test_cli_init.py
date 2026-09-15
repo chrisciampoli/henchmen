@@ -510,3 +510,30 @@ class TestCliWiring:
     def test_init_without_data_dir_still_writes_env_local(self, monkeypatch):
         monkeypatch.delenv("HENCHMEN_DATA_DIR", raising=False)
         assert options_from_args(argparse.Namespace(env_file=None)).env_file == Path(".env.local")
+
+
+# ---------------------------------------------------------------------------
+# section_llm — AWS Bedrock branch
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_section_validates_live(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    regions: list[str] = []
+
+    def fake_check(region: str, *, timeout: float) -> CheckResult:
+        regions.append(region)
+        return CheckResult("AWS Bedrock", CheckStatus.OK, "reachable in us-east-1 (1 models)")
+
+    monkeypatch.setattr(checks, "check_bedrock", fake_check)
+    monkeypatch.setattr(
+        checks, "list_bedrock_models", lambda region, *, timeout: ["us.anthropic.claude-sonnet-4-20250514-v1:0"]
+    )
+    state = init.WizardState(env=EnvFile.load(tmp_path / ".env.local"))
+    state.set("HENCHMEN_LLM_PROVIDER", "aws", "LLM")
+    prompter = ScriptedPrompter([])
+
+    init.section_llm(prompter, state, InitOptions(env_file=tmp_path / ".env.local", yes=True))
+
+    assert regions == ["us-east-1"]
+    assert any("AWS Bedrock" in line for line in prompter.output)
+    assert not any("not validated live" in line for line in prompter.output)
