@@ -176,6 +176,14 @@ class FakeGitHub:
             return httpx.Response(self.token_status, json={"message": "Bad credentials"})
         body = json.loads(request.content or b"{}")
         token = f"ghs_fake{len(self.minted) + 1:04d}"
-        self.minted.append({"token": token, "repositories": body.get("repositories")})
+        names = body.get("repositories")
+        self.minted.append({"token": token, "repositories": names})
         expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock() + self.token_lifetime_seconds))
-        return httpx.Response(201, json={"token": token, "expires_at": expires})
+        response: dict[str, Any] = {"token": token, "expires_at": expires}
+        if names:
+            # Like GitHub: the repositories the token is scoped to, owned by the installation's account.
+            login = self.installations[request.url.path.strip("/").split("/")[2]]["account"]["login"]
+            response["repositories"] = [
+                {"name": name, "full_name": f"{login}/{name}", "owner": {"login": login}} for name in names
+            ]
+        return httpx.Response(201, json=response)

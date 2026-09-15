@@ -12,8 +12,10 @@ module instead of reading ``Settings.github_token``:
   token until 5 minutes before it expires. A token can be scoped to one
   repository, and a caller that keeps a token for a long time (an operative)
   asks for a minimum remaining lifetime.
-* **No GitHub App**: return ``github_token`` (the PAT) exactly as before, so
-  engineers and existing deployments keep working.
+* **No GitHub App** (none of the three set): return ``github_token`` (the
+  PAT) exactly as before, so engineers and existing deployments keep working.
+* **Partly configured App** (some but not all set): every token call raises
+  :class:`GitHubAuthError` naming the missing settings; the PAT is never used.
 
 A configured App that cannot produce a token raises :class:`GitHubAuthError`;
 it never silently falls back to the PAT, and callers fail closed. The private
@@ -59,12 +61,24 @@ GITHUB_API_VERSION = "2022-11-28"
 JWT_BACKDATE_SECONDS = 60
 JWT_LIFETIME_SECONDS = 9 * 60
 REFRESH_MARGIN_SECONDS = 5 * 60
-# Installation tokens live one hour; a longer minimum lifetime cannot be met.
-MAX_MIN_TTL_SECONDS = 55 * 60
+# Installation tokens live one hour. The longest minimum lifetime a caller can ask for is
+# 50 minutes, which leaves at least 10 minutes of tolerance for clock skew between this
+# server and GitHub before a freshly minted token fails the lifetime check.
+MAX_MIN_TTL_SECONDS = 50 * 60
 _HTTP_TIMEOUT = 10.0
 _ERROR_MESSAGE_LIMIT = 200
-# A GitHub repository name (the part after ``owner/``).
-_REPOSITORY_NAME = re.compile(r"[A-Za-z0-9._-]{1,100}")
+# ``owner/name`` with a GitHub login (letters, digits, hyphens) and a repository name.
+_OWNER = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}"
+_NAME = r"[A-Za-z0-9._-]{1,100}"
+_REPO_SHORT = re.compile(rf"(?P<owner>{_OWNER})/(?P<name>{_NAME})")
+_REPO_HTTPS = re.compile(rf"https://[A-Za-z0-9.-]+(?::\d{{1,5}})?/(?P<owner>{_OWNER})/(?P<name>{_NAME})")
+_REPO_SSH = re.compile(rf"git@[A-Za-z0-9.-]+:(?P<owner>{_OWNER})/(?P<name>{_NAME})")
+# Environment names of the three App settings, in GitHubAppConfig.from_values argument order.
+_APP_SETTING_NAMES = (
+    "HENCHMEN_GITHUB_APP_ID",
+    "HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH",
+    "HENCHMEN_GITHUB_APP_INSTALLATION_ID",
+)
 
 SyncClientFactory = Callable[[], httpx.Client]
 AsyncClientFactory = Callable[[], httpx.AsyncClient]
@@ -99,6 +113,21 @@ class GitHubAppConfig(BaseModel):
         return cls.from_values(
             settings.github_app_id, settings.github_app_private_key_path, settings.github_app_installation_id
         )
+
+
+def partial_app_message(app_id: object, private_key_path: object, installation_id: object) -> str | None:
+    """The problem when some, but not all, of the three App settings are set; ``None`` otherwise.
+
+    Names only the missing settings, never a value. A partly configured App is
+    an error rather than "no App" (D-P11): someone set out to use a GitHub App,
+    so quietly using the PAT instead would hide the mistake.
+    """
+    values = (app_id, private_key_path, installation_id)
+    present = [isinstance(value, str) and bool(value.strip()) for value in values]
+    if all(present) or not any(present):
+        return None
+    missing = [name for name, is_set in zip(_APP_SETTING_NAMES, present, strict=True) if not is_set]
+    return f"The GitHub App is only partly configured: set {', '.join(missing)}."
 
 
 class InstallationToken(BaseModel):
@@ -166,7 +195,11 @@ def load_app_private_key(path: Path) -> bytes:
 
 
 def app_jwt_for(app_id: str, private_key_path: Path, *, now: float | None = None) -> str:
-    """A fresh app JWT for ``app_id``, signed with the key at ``private_key_path``."""
+    """A fresh app JWT for ``app_id``, signed with the key at ``private_key_path``.
+
+    The key is read for this one signature and not kept: no frame or object
+    holds the bytes after the call returns (and a rotated key file is picked up).
+    """
     return build_app_jwt(app_id, load_app_private_key(private_key_path), now=time.time() if now is None else now)
 
 
@@ -187,16 +220,31 @@ def parse_expiry(raw: object) -> float:
     return parsed.timestamp()
 
 
-def _repository_name(repo: str | None) -> str | None:
-    """``owner/name`` (or a clone URL) → ``name``; ``None`` for no repository. Invalid names raise."""
+def parse_repository(repo: str | None) -> tuple[str, str] | None:
+    """``(owner, name)`` for a repository reference; ``None`` for no repository.
+
+    Accepted shapes, exactly two path parts each: ``owner/name``,
+    ``https://<host>/owner/name[.git]`` and ``git@<host>:owner/name[.git]``.
+    Anything else (a bare name, ``owner/name/tree/main``, ``http://``) raises
+    :class:`GitHubAuthError`: an unparseable reference must never widen into a
+    token for the whole installation or silently pick another repository.
+    """
     if repo is None or not repo.strip():
         return None
-    name = repo.strip().rstrip("/").split("/")[-1]
-    name = name.removesuffix(".git")
-    if not _REPOSITORY_NAME.fullmatch(name) or name in {".", ".."}:
-        # Fail closed: an unparseable name must never widen into an installation-wide token.
-        raise GitHubAuthError("The repository name for a GitHub installation token is not valid")
-    return name
+    text = repo.strip()
+    candidates = (
+        (_REPO_SHORT, text),
+        (_REPO_HTTPS, text.removesuffix(".git")),
+        (_REPO_SSH, text.removesuffix(".git")),
+    )
+    for pattern, candidate in candidates:
+        match = pattern.fullmatch(candidate)
+        if match is not None:
+            name = match["name"]
+            if name in {".", ".."} or name.endswith(".git"):
+                break
+            return match["owner"], name
+    raise GitHubAuthError("The repository for a GitHub installation token must be owner/name or a GitHub clone URL")
 
 
 def _default_client() -> httpx.Client:
@@ -210,6 +258,11 @@ def _default_async_client() -> httpx.AsyncClient:
 
 class GitHubCredentialsProvider:
     """Hands out GitHub tokens: cached installation tokens for an App, else the PAT.
+
+    ``partial_app_problem`` (from :func:`partial_app_message`) marks a
+    configuration that set some of the App settings but not all: every token
+    method then raises :class:`GitHubAuthError` with that message, and the PAT
+    is never returned (D-P11).
 
     Concurrency: a cache miss is minted under a per-cache-key lock — a
     ``threading.Lock`` for :meth:`installation_token` and an ``asyncio.Lock``
@@ -227,16 +280,22 @@ class GitHubCredentialsProvider:
         client_factory: SyncClientFactory | None = None,
         async_client_factory: AsyncClientFactory | None = None,
         clock: Callable[[], float] = time.time,
+        partial_app_problem: str | None = None,
     ) -> None:
+        from henchmen.config.settings import require_secure_github_url
+
+        try:
+            self._api_url = require_secure_github_url(api_url or GITHUB_API_URL).rstrip("/")
+        except ValueError as exc:
+            raise GitHubAuthError(f"The GitHub API URL {exc}") from None
         self._app = app
         self._pat = pat
-        self._api_url = api_url.strip().rstrip("/") or GITHUB_API_URL
+        self._partial_app_problem = partial_app_problem
         self._client_factory = client_factory or _default_client
         self._async_client_factory = async_client_factory or _default_async_client
         self._clock = clock
         self._lock = threading.Lock()
         self._tokens: dict[str, InstallationToken] = {}
-        self._private_key: bytes | None = None
         self._sync_locks: dict[str, threading.Lock] = {}
         self._async_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]] = (
             weakref.WeakKeyDictionary()
@@ -247,8 +306,12 @@ class GitHubCredentialsProvider:
 
     @property
     def uses_app(self) -> bool:
-        """True when tokens come from a GitHub App rather than the PAT."""
-        return self._app is not None
+        """True when tokens come from a GitHub App rather than the PAT.
+
+        False for a partly configured App too, but every token method of such a
+        provider raises, so a caller that falls back to :meth:`token` still fails closed.
+        """
+        return self._app is not None and self._partial_app_problem is None
 
     @property
     def app(self) -> GitHubAppConfig | None:
@@ -256,17 +319,17 @@ class GitHubCredentialsProvider:
         return self._app
 
     def app_jwt(self) -> str:
-        """A fresh app JWT (for ``/app/*`` endpoints)."""
+        """A fresh app JWT (for ``/app/*`` endpoints); the key file is read for this signature only."""
         app = self._require_app()
-        return build_app_jwt(app.app_id, self._load_private_key(app), now=self._clock())
+        return app_jwt_for(app.app_id, app.private_key_path, now=self._clock())
 
     def installation_token(
         self, repo: str | None = None, *, min_ttl_seconds: int = REFRESH_MARGIN_SECONDS
     ) -> InstallationToken:
         """An installation token for ``repo`` (or the whole installation) that stays valid long enough."""
         app = self._require_app()
-        name = _repository_name(repo)
-        cache_key = (name or "*").lower()
+        repository = parse_repository(repo)
+        cache_key = _cache_key(repository)
         margin = self._required_lifetime(min_ttl_seconds)
         cached = self._cached(cache_key, margin)
         if cached is not None:
@@ -275,22 +338,22 @@ class GitHubCredentialsProvider:
             cached = self._cached(cache_key, margin)
             if cached is not None:
                 return cached
-            url, body = self._token_request(app, name)
+            url, body = self._token_request(app, repository)
             headers = api_headers(self.app_jwt())
             try:
                 with self._client_factory() as client:
                     response = client.post(url, json=body, headers=headers)
             except httpx.HTTPError as exc:
                 raise self._unreachable(exc) from None
-            return self._remember(cache_key, name, response, min_ttl_seconds)
+            return self._remember(cache_key, repository, response, min_ttl_seconds)
 
     async def installation_token_async(
         self, repo: str | None = None, *, min_ttl_seconds: int = REFRESH_MARGIN_SECONDS
     ) -> InstallationToken:
         """Async :meth:`installation_token`."""
         app = self._require_app()
-        name = _repository_name(repo)
-        cache_key = (name or "*").lower()
+        repository = parse_repository(repo)
+        cache_key = _cache_key(repository)
         margin = self._required_lifetime(min_ttl_seconds)
         cached = self._cached(cache_key, margin)
         if cached is not None:
@@ -299,45 +362,40 @@ class GitHubCredentialsProvider:
             cached = self._cached(cache_key, margin)
             if cached is not None:
                 return cached
-            url, body = self._token_request(app, name)
+            url, body = self._token_request(app, repository)
             headers = api_headers(self.app_jwt())
             try:
                 async with self._async_client_factory() as client:
                     response = await client.post(url, json=body, headers=headers)
             except httpx.HTTPError as exc:
                 raise self._unreachable(exc) from None
-            return self._remember(cache_key, name, response, min_ttl_seconds)
+            return self._remember(cache_key, repository, response, min_ttl_seconds)
 
     def token(self, repo: str | None = None, *, min_ttl_seconds: int = REFRESH_MARGIN_SECONDS) -> str:
         """A token for ``repo``: an installation token with an App, else the PAT (maybe empty)."""
-        if self._app is None:
+        if self._app is None and self._partial_app_problem is None:
             return self._pat
         return self.installation_token(repo, min_ttl_seconds=min_ttl_seconds).token
 
     async def token_async(self, repo: str | None = None, *, min_ttl_seconds: int = REFRESH_MARGIN_SECONDS) -> str:
         """Async :meth:`token` for code on the event loop."""
-        if self._app is None:
+        if self._app is None and self._partial_app_problem is None:
             return self._pat
         return (await self.installation_token_async(repo, min_ttl_seconds=min_ttl_seconds)).token
 
     def invalidate(self) -> None:
-        """Forget cached tokens and the loaded key (e.g. after reconnecting GitHub)."""
+        """Forget cached tokens (e.g. after reconnecting GitHub)."""
         with self._lock:
             self._tokens.clear()
-            self._private_key = None
 
     # -- internals -------------------------------------------------------------
 
     def _require_app(self) -> GitHubAppConfig:
+        if self._partial_app_problem is not None:
+            raise GitHubAuthError(self._partial_app_problem)
         if self._app is None:
             raise GitHubAuthError("No GitHub App is configured")
         return self._app
-
-    def _load_private_key(self, app: GitHubAppConfig) -> bytes:
-        with self._lock:
-            if self._private_key is None:
-                self._private_key = load_app_private_key(app.private_key_path)
-            return self._private_key
 
     def _sync_lock(self, cache_key: str) -> threading.Lock:
         with self._lock:
@@ -356,7 +414,7 @@ class GitHubCredentialsProvider:
 
     @staticmethod
     def _required_lifetime(min_ttl_seconds: int) -> int:
-        """Seconds a cached token must still be valid for: at least the refresh margin, at most 55 minutes."""
+        """Seconds a cached token must still be valid for: at least the refresh margin, at most the cap."""
         if min_ttl_seconds > MAX_MIN_TTL_SECONDS:
             logger.warning(
                 "A GitHub token valid for %ss was requested; installation tokens last an hour, so %ss is used",
@@ -373,8 +431,10 @@ class GitHubCredentialsProvider:
             return cached
         return None
 
-    def _token_request(self, app: GitHubAppConfig, name: str | None) -> tuple[str, dict[str, Any]]:
-        body: dict[str, Any] = {"repositories": [name]} if name else {}
+    def _token_request(self, app: GitHubAppConfig, repository: tuple[str, str] | None) -> tuple[str, dict[str, Any]]:
+        # GitHub's access_tokens endpoint takes repository *names*; the owner is the installation's
+        # account, and the response is checked against the requested owner in _remember.
+        body: dict[str, Any] = {"repositories": [repository[1]]} if repository else {}
         return f"{self._api_url}/app/installations/{app.installation_id}/access_tokens", body
 
     @staticmethod
@@ -383,9 +443,13 @@ class GitHubCredentialsProvider:
         return GitHubAuthError(f"Could not reach GitHub for an installation token ({type(exc).__name__})")
 
     def _remember(
-        self, cache_key: str, name: str | None, response: httpx.Response, min_ttl_seconds: int
+        self,
+        cache_key: str,
+        repository: tuple[str, str] | None,
+        response: httpx.Response,
+        min_ttl_seconds: int,
     ) -> InstallationToken:
-        scope = name or "the whole installation"
+        scope = "/".join(repository) if repository else "the whole installation"
         if response.status_code != 201:
             detail = github_error_detail(response)
             logger.warning("GitHub refused an installation token for %s (%s)", scope, detail)
@@ -394,9 +458,13 @@ class GitHubCredentialsProvider:
             payload = response.json()
         except ValueError:
             raise GitHubAuthError("GitHub returned an unreadable installation token response") from None
-        token = payload.get("token") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            raise GitHubAuthError("GitHub returned an unreadable installation token response")
+        token = payload.get("token")
         if not isinstance(token, str) or not token:
             raise GitHubAuthError("GitHub returned no installation token")
+        if repository is not None:
+            _check_token_repositories(payload.get("repositories"), repository)
         issued = InstallationToken(token=token, expires_at=parse_expiry(payload.get("expires_at")))
         remaining = issued.expires_at - self._clock()
         wanted = min(max(min_ttl_seconds, 0), MAX_MIN_TTL_SECONDS)
@@ -412,6 +480,44 @@ class GitHubCredentialsProvider:
         return issued
 
 
+def _cache_key(repository: tuple[str, str] | None) -> str:
+    return "/".join(repository).lower() if repository else "*"
+
+
+def _check_token_repositories(listed: object, repository: tuple[str, str]) -> None:
+    """Raise unless every repository GitHub scoped the token to is the one requested.
+
+    GitHub lists the token's repositories (``full_name``, ``owner.login``,
+    ``name``) in the access_tokens response. Whatever identity an entry
+    carries must match the requested ``owner/name`` (case-insensitive); an
+    entry naming another owner or repository — e.g. the installation belongs
+    to a different account that happens to have a repository of the same
+    name — fails closed. A response without the list cannot be checked and is
+    accepted.
+    """
+    if listed is None:
+        return
+    owner, name = (part.lower() for part in repository)
+    if not isinstance(listed, list) or not listed:
+        raise GitHubAuthError(f"GitHub did not scope the installation token to {repository[0]}/{repository[1]}")
+    for entry in listed:
+        if not isinstance(entry, dict):
+            raise GitHubAuthError("GitHub returned an unreadable repository list for the installation token")
+        full_name = entry.get("full_name")
+        login = entry.get("owner", {}).get("login") if isinstance(entry.get("owner"), dict) else None
+        entry_name = entry.get("name")
+        mismatched = (
+            (isinstance(full_name, str) and full_name.lower() != f"{owner}/{name}")
+            or (isinstance(login, str) and login.lower() != owner)
+            or (isinstance(entry_name, str) and entry_name.lower() != name)
+        )
+        if mismatched or not any(isinstance(value, str) for value in (full_name, login, entry_name)):
+            raise GitHubAuthError(
+                f"GitHub scoped the installation token to a different repository than "
+                f"{repository[0]}/{repository[1]}; check that the App is installed on that account"
+            )
+
+
 _providers: dict[tuple[str, ...], GitHubCredentialsProvider] = {}
 _providers_lock = threading.Lock()
 
@@ -423,12 +529,16 @@ def get_credentials_provider(settings: Settings | None = None) -> GitHubCredenti
 
         settings = get_settings()
     app = GitHubAppConfig.from_settings(settings)
+    partial = partial_app_message(
+        settings.github_app_id, settings.github_app_private_key_path, settings.github_app_installation_id
+    )
     pat = settings.github_token if isinstance(settings.github_token, str) else ""
     api_url = settings.github_api_url if isinstance(settings.github_api_url, str) else GITHUB_API_URL
     key = (
         app.app_id if app else "",
         str(app.private_key_path) if app else "",
         app.installation_id if app else "",
+        partial or "",
         api_url,
         # Keyed on a digest so the PAT itself is not held in a dict key.
         hashlib.sha256(pat.encode("utf-8")).hexdigest(),
@@ -436,7 +546,7 @@ def get_credentials_provider(settings: Settings | None = None) -> GitHubCredenti
     with _providers_lock:
         provider = _providers.get(key)
         if provider is None:
-            provider = GitHubCredentialsProvider(app=app, pat=pat, api_url=api_url)
+            provider = GitHubCredentialsProvider(app=app, pat=pat, api_url=api_url, partial_app_problem=partial)
             _providers[key] = provider
         return provider
 
