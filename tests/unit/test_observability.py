@@ -1051,7 +1051,7 @@ class TestPRDedup:
             # The handler reads the token through Settings, and get_settings()
             # is cached, so patching os.environ after the instance was built
             # would not reach it.
-            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value="fake-token"),
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token_async", return_value="fake-token"),
             patch("github.Github") as mock_github_cls,
         ):
             mock_github_cls.return_value.get_repo.return_value = mock_repo
@@ -1090,7 +1090,7 @@ class TestPRDedup:
             # The handler reads the token through Settings, and get_settings()
             # is cached, so patching os.environ after the instance was built
             # would not reach it.
-            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value="fake-token"),
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token_async", return_value="fake-token"),
             patch("github.Github") as mock_github_cls,
         ):
             mock_github_cls.return_value.get_repo.return_value = mock_repo

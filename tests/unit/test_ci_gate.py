@@ -467,7 +467,12 @@ class TestLocalGateInvocation:
         ) as exec_mock:
             task = asyncio.ensure_future(
                 handlers.run_gate_in_container(
-                    _local_settings(), "tests", repo="acme/widgets", branch="henchmen/t", base_branch="main"
+                    _local_settings(),
+                    "tests",
+                    repo="acme/widgets",
+                    branch="henchmen/t",
+                    base_branch="main",
+                    token=TOKEN,
                 )
             )
             await asyncio.sleep(0.01)  # let it reach the gather before cancelling
@@ -525,7 +530,12 @@ class TestLocalGateInvocation:
         ):
             task = asyncio.ensure_future(
                 handlers.run_gate_in_container(
-                    _local_settings(), "tests", repo="acme/widgets", branch="henchmen/t", base_branch="main"
+                    _local_settings(),
+                    "tests",
+                    repo="acme/widgets",
+                    branch="henchmen/t",
+                    base_branch="main",
+                    token=TOKEN,
                 )
             )
             await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
@@ -1335,7 +1345,7 @@ class TestGateRunnerForForge:
         proc = _gate_proc(1, stdout=f"{GATE_RESULT_MARKER}{result.model_dump_json()}\n".encode())
         with patch.object(handlers.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)) as exec_mock:
             gate = await handlers.run_gate_in_container(
-                _local_settings(), "forge", repo="acme/widgets", branch="f", base_branch="main"
+                _local_settings(), "forge", repo="acme/widgets", branch="f", base_branch="main", token=TOKEN
             )
         argv = list(exec_mock.await_args.args)
         assert argv[argv.index("ghcr.io/acme/henchmen/operative:1.0.0") + 3] == "forge"

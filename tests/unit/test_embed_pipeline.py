@@ -55,6 +55,36 @@ class TestEmbeddingPipelineGuards:
         assert kwargs["token"] == "ghp-from-settings"
 
     @pytest.mark.asyncio
+    async def test_clone_uses_the_credentials_provider_token(self, monkeypatch):
+        settings = _settings(monkeypatch, HENCHMEN_GITHUB_TOKEN="ghp-pat")
+        provider = AsyncMock(return_value="ghs_installation")
+        clone = AsyncMock(side_effect=RuntimeError("stop here"))
+        resolve = AsyncMock(return_value="main")
+        monkeypatch.setattr(embed_pipeline, "get_github_token_async", provider)
+        monkeypatch.setattr(embed_pipeline, "clone_repo", clone)
+        monkeypatch.setattr(embed_pipeline, "_resolve_default_branch", resolve)
+
+        await embed_pipeline.run_embedding_pipeline(repo="acme/api", mode="full", settings=settings)
+
+        provider.assert_awaited_once_with("acme/api", settings=settings)
+        assert resolve.await_args.args == ("acme/api", "ghs_installation")
+        assert clone.call_args.kwargs["token"] == "ghs_installation"
+
+    @pytest.mark.asyncio
+    async def test_github_credentials_failure_fails_the_run(self, monkeypatch):
+        from henchmen.utils.github_auth import GitHubAuthError
+
+        settings = _settings(monkeypatch, HENCHMEN_GITHUB_TOKEN="ghp-pat")
+        clone = AsyncMock()
+        monkeypatch.setattr(embed_pipeline, "get_github_token_async", AsyncMock(side_effect=GitHubAuthError("no key")))
+        monkeypatch.setattr(embed_pipeline, "clone_repo", clone)
+
+        result = await embed_pipeline.run_embedding_pipeline(repo="acme/api", mode="full", settings=settings)
+
+        assert result == {"status": "failed", "error": "GitHub credentials unavailable: no key"}
+        clone.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_failed_upsert_does_not_advance_last_indexed_commit(self, monkeypatch, tmp_path):
         """A partial upsert must not mark the commit indexed.
 

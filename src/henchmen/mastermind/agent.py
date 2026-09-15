@@ -32,7 +32,7 @@ from henchmen.providers.interfaces.llm_provider import LLMProvider
 from henchmen.providers.interfaces.message_broker import MessageBroker
 from henchmen.schemes.base import SchemeGraph
 from henchmen.schemes.registry import SchemeRegistry
-from henchmen.utils.git import get_github_token
+from henchmen.utils.github_auth import GitHubAuthError, get_github_token_async
 
 logger = logging.getLogger(__name__)
 
@@ -333,7 +333,12 @@ class MastermindAgent:
             return {"status": "escalated", "task_id": task_id, "reason": reason}
 
         # 4. Extract errors
-        github_token = get_github_token()
+        try:
+            github_token = await get_github_token_async(repo, settings=self.settings)
+        except GitHubAuthError as exc:
+            reason = f"GitHub credentials unavailable: {exc}"
+            await self.tracker.mark_escalated(task_id, reason=reason)
+            return {"status": "escalated", "task_id": task_id, "reason": reason}
         errors = await extract_ci_errors(repo, check_suite_id, github_token)
         if not errors:
             return {"status": "skipped", "reason": "no errors found"}
@@ -455,7 +460,11 @@ class MastermindAgent:
 
         # Pre-fetch file tree from GitHub so the operative knows the codebase structure
         repo = task.context.repo
-        github_token = self.settings.github_token
+        try:
+            github_token = await get_github_token_async(repo, settings=self.settings) if repo else ""
+        except GitHubAuthError as exc:
+            logger.warning("[DOSSIER] GitHub credentials unavailable; skipping the file tree: %s", exc)
+            github_token = ""
         base_branch = task.context.branch or "main"
         if repo and github_token:
             try:

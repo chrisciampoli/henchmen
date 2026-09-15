@@ -23,6 +23,7 @@ from pydantic import Field
 
 from henchmen.models._base import StrictBase
 from henchmen.utils.git import clone_repo
+from henchmen.utils.github_auth import GitHubAuthError, get_github_token_async
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -102,7 +103,10 @@ async def run_embedding_pipeline(
     collection_name = settings.rag_corpus_display_name
     project_id = settings.gcp_project_id
     region = settings.rag_corpus_region
-    github_token = settings.github_token
+    try:
+        github_token = await get_github_token_async(repo, settings=settings)
+    except GitHubAuthError as exc:
+        return {"status": "failed", "error": f"GitHub credentials unavailable: {exc}"}
 
     logger.info("[EMBED] Starting %s embedding for %s", mode, repo)
 

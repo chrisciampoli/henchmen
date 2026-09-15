@@ -22,6 +22,7 @@ from henchmen.dispatch.pubsub_auth import require_internal_caller, verify_pubsub
 from henchmen.providers.local.memory import FORWARD_TIMEOUT_SECONDS
 from henchmen.providers.registry import orchestrator_is_local
 from henchmen.utils.git import clone_repo
+from henchmen.utils.github_auth import MAX_MIN_TTL_SECONDS, GitHubAuthError, get_github_token_async
 from henchmen.utils.lifespan import run_shutdown
 from henchmen.utils.message_dedup import claim_message, mark_message_done, release_message_claim
 from henchmen.utils.redaction import install_secret_redaction
@@ -336,8 +337,33 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
         logger.error("[FORGE] Cannot parse PR URL %s: %s", pr_url, exc)
         raise await _fail(pr_url, task_id, request_id, "parse-error", str(exc), retriable=False) from exc
 
-    # HENCHMEN_GITHUB_TOKEN or the bare GITHUB_TOKEN, via Settings' AliasChoices.
-    github_token = settings.github_token
+    # Desktop (effective container orchestrator is local): the PR's code is
+    # operative-written and must never run in this server process. Only the
+    # silent-failure scan (git plumbing plus text analysis, no checkout)
+    # stays here; lint and tests run in the gate container (decision C18).
+    local = orchestrator_is_local(settings)
+    # One budget for the whole run and for any single command: the cloud
+    # run must finish (and ack) inside the 600s Pub/Sub ack deadline. A
+    # desktop run gets the gate timeout, capped below the in-memory broker's
+    # forward re-send (desktop_ci_budget_seconds), counted from the start of
+    # this request.
+    budget = desktop_ci_budget_seconds(settings) if local else settings.forge_ci_timeout_seconds
+
+    # An installation token scoped to this repository when a GitHub App is configured, else the PAT.
+    # It clones at the start and (on desktop) goes into the gate, so it must outlive the whole run.
+    min_ttl = int(budget) + _DESKTOP_FORWARD_HEADROOM_SECONDS
+    if min_ttl > MAX_MIN_TTL_SECONDS:
+        logger.warning(
+            "[FORGE] The CI budget (%ss) is longer than a GitHub installation token is guaranteed to last (%ss); "
+            "a GitHub App token may expire before CI finishes",
+            int(budget),
+            MAX_MIN_TTL_SECONDS,
+        )
+    try:
+        github_token = await get_github_token_async(full_repo, settings=settings, min_ttl_seconds=min_ttl)
+    except GitHubAuthError as exc:
+        logger.error("[FORGE] GitHub credentials unavailable for %s: %s", pr_url, exc)
+        raise await _fail(pr_url, task_id, request_id, "github-credentials", str(exc), retriable=True) from exc
     if not github_token and not fail_open_allowed(settings):
         raise await _fail(
             pr_url,
@@ -363,12 +389,6 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
             logger.error("[FORGE] GitHub lookup failed for %s: %s", pr_url, exc)
             raise await _fail(pr_url, task_id, request_id, "github-api-error", str(exc), retriable=True) from exc
 
-        # Desktop (effective container orchestrator is local): the PR's code is
-        # operative-written and must never run in this server process. Only the
-        # silent-failure scan (git plumbing plus text analysis, no checkout)
-        # stays here; lint and tests run in the gate container (decision C18).
-        local = orchestrator_is_local(settings)
-
         # --- Clone the repo (shallow, single branch) ----------------------
         try:
             await clone_repo(
@@ -387,12 +407,6 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
         from henchmen.forge.ci_runner import CIRunner
 
         try:
-            # One budget for the whole run and for any single command: the cloud
-            # run must finish (and ack) inside the 600s Pub/Sub ack deadline. A
-            # desktop run gets the gate timeout, capped below the in-memory broker's
-            # forward re-send (desktop_ci_budget_seconds), counted from the start of
-            # this request.
-            budget = desktop_ci_budget_seconds(settings) if local else settings.forge_ci_timeout_seconds
             runner = CIRunner(
                 timeout_seconds=budget,
                 total_budget_seconds=budget,
@@ -400,7 +414,14 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
             )
             if local:
                 result = await _run_local_ci(
-                    settings, runner, full_repo, head_branch, base_branch, workspace, deadline=started + budget
+                    settings,
+                    runner,
+                    full_repo,
+                    head_branch,
+                    base_branch,
+                    workspace,
+                    token=github_token,
+                    deadline=started + budget,
                 )
             else:
                 result = await runner.run(workspace, base_ref=base_branch)
@@ -408,8 +429,12 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
             raise await _fail(pr_url, task_id, request_id, "ci-error", str(exc), retriable=True) from exc
 
         # --- Comment on the PR ---------------------------------------------
+        # A fresh token and client: the run can outlast the token the lookup used (ruling PI-15).
         try:
-            pr.create_issue_comment(_build_comment(result, task_id))
+            comment_token = await get_github_token_async(full_repo, settings=settings)
+            comment_client = Github(auth=Auth.Token(comment_token)) if comment_token else Github()
+            comment_pr = comment_client.get_repo(full_repo).get_pull(pr_number)
+            comment_pr.create_issue_comment(_build_comment(result, task_id))
         except Exception as exc:
             logger.warning("[FORGE] Failed to comment on PR: %s", exc)
 
@@ -445,6 +470,7 @@ async def _run_local_ci(
     base_branch: str,
     workspace: str,
     *,
+    token: str,
     deadline: float,
 ) -> dict[str, Any]:
     """Desktop Forge CI: one gate container for lint and tests, the silent-failure scan on the no-checkout clone.
@@ -469,6 +495,9 @@ async def _run_local_ci(
     run: the gate gets what is left of it, the silent-failure scan whatever the
     gate left over, and a scan with nothing left is ``skipped`` (so the run is
     at best ``incomplete``, never ``passed``).
+
+    ``token`` is the credentials provider's token for ``full_repo``, fetched by
+    the caller to outlive the whole budget; it reaches the gate over stdin only.
     """
     from henchmen.forge.ci_runner import STATUS_FAILED, STATUS_PASSED, STATUS_SKIPPED
     from henchmen.mastermind.scheme_executor.handlers import run_gate_in_container
@@ -486,6 +515,7 @@ async def _run_local_ci(
             repo=full_repo,
             branch=head_branch,
             base_branch=base_branch,
+            token=token,
             extra_args=() if run_tests else ("--skip-tests",),
             timeout_seconds=remaining,
         )

@@ -109,7 +109,7 @@ class TestFixLintRouting:
         settings = _settings(provider="gcp")
         with (
             patch.object(handlers, "run_gate_in_container", AsyncMock(side_effect=AssertionError("cloud path"))),
-            patch.object(handlers, "get_github_token", return_value=""),
+            patch.object(handlers, "get_github_token_async", return_value=""),
             patch.object(handlers, "clone_repo", AsyncMock(side_effect=RuntimeError("git clone failed: x"))) as clone,
         ):
             result = await handlers.handle_fix_lint(_executor(settings), MagicMock(), _task(), Dossier(task_id="t"))
@@ -167,7 +167,9 @@ class TestCleanupCancellation:
             patch.object(handlers, "_cleanup_gate_container", cleanup),
         ):
             task = asyncio.ensure_future(
-                handlers.run_gate_in_container(_settings(), "tests", repo="a/b", branch="b", base_branch="main")
+                handlers.run_gate_in_container(
+                    _settings(), "tests", repo="a/b", branch="b", base_branch="main", token=TOKEN
+                )
             )
             await asyncio.wait_for(reader_cancelled.wait(), timeout=2.0)
             task.cancel()
@@ -504,7 +506,7 @@ class TestDesktopForgeDeadline:
         ):
             # 300s of the budget are already gone: the gate gets what is left, the scan less still.
             result = await server._run_local_ci(
-                _settings(), runner, "acme/widgets", "f", "main", "/ws", deadline=loop.time() + 700
+                _settings(), runner, "acme/widgets", "f", "main", "/ws", token=TOKEN, deadline=loop.time() + 700
             )
         assert gate.await_args.kwargs["timeout_seconds"] <= 700
         assert budgets and budgets[0] <= 700
@@ -528,7 +530,7 @@ class TestDesktopForgeDeadline:
             patch.object(CIRunner, "run_silent_failure_scan", AsyncMock(side_effect=AssertionError("no time left"))),
         ):
             result = await server._run_local_ci(
-                _settings(), runner, "a/b", "f", "main", "/ws", deadline=loop.time() + 0.2
+                _settings(), runner, "a/b", "f", "main", "/ws", token=TOKEN, deadline=loop.time() + 0.2
             )
         assert result["passed"] is False and result["incomplete"] is True
         assert result["skipped"] == ["silent_failure_scan"]
@@ -545,7 +547,7 @@ class TestDesktopForgeDeadline:
             patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=(True, None))),
         ):
             result = await server._run_local_ci(
-                _settings(), runner, "a/b", "f", "main", "/ws", deadline=loop.time() - 1
+                _settings(), runner, "a/b", "f", "main", "/ws", token=TOKEN, deadline=loop.time() - 1
             )
         assert result["failed"] == ["lint", "tests"]
 
@@ -657,3 +659,129 @@ class TestForgeRequestDedup:
             assert self._post().json()["status"] == "accepted"
         assert run.await_count == 2
         assert store.docs == {}
+
+
+# ---------------------------------------------------------------------------
+# GitHub credentials in gate containers (Task 7, ruling PB-2)
+# ---------------------------------------------------------------------------
+
+INSTALLATION_TOKEN = "ghs_" + "i" * 36
+
+
+class _Stream:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def read(self, n: int = -1) -> bytes:
+        data, self._data = self._data, b""
+        return data
+
+
+def _passing_gate_proc(message: str) -> MagicMock:
+    from henchmen.mastermind.scheme_executor.ci_gate import GATE_RESULT_MARKER, GateResult
+
+    result = GateResult(condition="pass", message=message)
+    proc = MagicMock()
+    proc.returncode = 0
+    proc.stdin = MagicMock(drain=AsyncMock())
+    proc.stdout = _Stream(f"{GATE_RESULT_MARKER}{result.model_dump_json()}\n".encode())
+    proc.stderr = _Stream(b"")
+    proc.wait = AsyncMock(return_value=0)
+    return proc
+
+
+class TestGateCredentials:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("node", ["lint", "tests", "fix_lint"])
+    async def test_desktop_gates_receive_the_installation_token_not_the_pat(self, node: str) -> None:
+        settings = _settings(lair_default_timeout=1800)  # github_token is the PAT (ghp_...)
+        proc = _passing_gate_proc(f"{node} done with {INSTALLATION_TOKEN}")
+        provider = AsyncMock(return_value=INSTALLATION_TOKEN)
+        with (
+            patch("henchmen.config.settings.get_settings", return_value=settings),
+            patch.object(handlers, "get_github_token_async", provider),
+            patch.object(handlers.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)) as exec_mock,
+        ):
+            if node == "fix_lint":
+                result = await handlers.handle_fix_lint(_executor(settings), MagicMock(), _task(), Dossier(task_id="t"))
+            else:
+                result = await handlers._run_ci_check(MagicMock(), _task(), node)  # type: ignore[arg-type]
+
+        stdin = b"".join(call.args[0] for call in proc.stdin.write.call_args_list)
+        argv = [str(arg) for arg in exec_mock.await_args.args]
+        env = exec_mock.await_args.kwargs["env"]
+        assert stdin == f"{INSTALLATION_TOKEN}\n".encode()
+        assert b"ghp_" not in stdin
+        assert all("ghp_" not in arg and INSTALLATION_TOKEN not in arg for arg in argv)
+        assert all(TOKEN not in value and INSTALLATION_TOKEN not in value for value in env.values())
+        # Fetched once, repo-scoped, and asked to outlive the gate timeout.
+        provider.assert_awaited_once_with("acme/widgets", settings=settings, min_ttl_seconds=1800 + 300)
+        assert INSTALLATION_TOKEN not in result["message"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("node", ["lint", "fix_lint"])
+    async def test_desktop_gates_fail_closed_when_github_credentials_fail(self, node: str) -> None:
+        from henchmen.utils.github_auth import GitHubAuthError
+
+        settings = _settings()
+        with (
+            patch("henchmen.config.settings.get_settings", return_value=settings),
+            patch.object(handlers, "get_github_token_async", AsyncMock(side_effect=GitHubAuthError("no key"))),
+            patch.object(handlers, "run_gate_in_container", AsyncMock(side_effect=AssertionError("no gate"))),
+        ):
+            if node == "fix_lint":
+                result = await handlers.handle_fix_lint(_executor(settings), MagicMock(), _task(), Dossier(task_id="t"))
+            else:
+                result = await handlers._run_ci_check(MagicMock(), _task(), "lint")
+        assert result["condition"] == "fail"
+        assert "(GitHub credentials): no key" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_a_partly_configured_app_never_falls_back_to_the_pat(self) -> None:
+        settings = _settings(github_app_id="4242")  # installation id and key path missing; github_token is a PAT
+        with (
+            patch("henchmen.config.settings.get_settings", return_value=settings),
+            patch.object(handlers, "run_gate_in_container", AsyncMock(side_effect=AssertionError("no gate"))),
+        ):
+            result = await handlers._run_ci_check(MagicMock(), _task(), "tests")
+        assert result["condition"] == "fail"
+        assert "partly configured" in result["message"]
+        assert TOKEN not in result["message"]
+
+    def test_the_gate_token_lifetime_covers_the_gate_timeout(self) -> None:
+        assert handlers._gate_min_ttl(_settings(lair_default_timeout=1800)) == 2100
+
+    @pytest.mark.asyncio
+    async def test_a_gate_timeout_beyond_the_token_cap_is_warned_about(self, caplog: pytest.LogCaptureFixture) -> None:
+        settings = _settings(lair_default_timeout=3600)
+        provider = AsyncMock(return_value=INSTALLATION_TOKEN)
+        with patch.object(handlers, "get_github_token_async", provider), caplog.at_level("WARNING"):
+            assert await handlers._gate_github_token(settings, "acme/widgets") == INSTALLATION_TOKEN
+        assert "may expire before a long gate finishes" in caplog.text
+        assert INSTALLATION_TOKEN not in caplog.text
+        assert provider.await_args.kwargs["min_ttl_seconds"] == 3900
+
+    @pytest.mark.asyncio
+    async def test_forge_desktop_token_outlives_the_ci_budget(self, forge_state: AsyncMock) -> None:
+        from henchmen.forge import server
+
+        settings = _settings(lair_default_timeout=1800)
+        provider = AsyncMock(return_value=INSTALLATION_TOKEN)
+        gate = AsyncMock(return_value=_gate_checks(lint="pass", tests="pass"))
+        with (
+            TestForgeRouting._patches(settings, MagicMock(), gate),
+            patch.object(server, "clone_repo", AsyncMock()) as clone,
+            patch.object(server, "get_github_token_async", provider),
+        ):
+            await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
+
+        budget = server.desktop_ci_budget_seconds(settings)
+        first = provider.await_args_list[0]
+        assert first.args == ("acme/widgets",)
+        assert first.kwargs["settings"] is settings
+        assert first.kwargs["min_ttl_seconds"] >= budget
+        assert first.kwargs["min_ttl_seconds"] == budget + server._DESKTOP_FORWARD_HEADROOM_SECONDS
+        # The same token clones on the host and reaches the gate (over stdin, by the runner).
+        assert clone.await_args.kwargs["token"] == INSTALLATION_TOKEN
+        assert gate.await_args.kwargs["token"] == INSTALLATION_TOKEN
+        assert _published(forge_state)[0]["status"] == "passed"

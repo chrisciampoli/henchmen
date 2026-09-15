@@ -936,3 +936,79 @@ def test_missing_key_file_is_a_runtime_problem(tmp_path: Path) -> None:
         }
     )
     assert any("HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH" in problem for problem in settings.validate_for_runtime())
+
+
+# -- refusal kinds (Task 6 review carry-over) --------------------------------------------
+
+
+def test_a_repository_outside_the_installation_is_an_access_error(
+    key_file: Path, github: FakeGitHub, clock: _Clock
+) -> None:
+    from henchmen.utils.github_auth import GitHubRepositoryAccessError
+
+    github.restrict_token_repositories = True
+    github.repositories = [FakeGitHub.repository("acme/webapp")]
+    with pytest.raises(GitHubRepositoryAccessError) as exc_info:
+        _provider(key_file, github, clock).token("acme/elsewhere")
+    assert exc_info.value.status_code == 422
+
+
+def test_a_token_scoped_to_another_owner_is_an_access_error(key_file: Path, github: FakeGitHub, clock: _Clock) -> None:
+    from henchmen.utils.github_auth import GitHubRepositoryAccessError
+
+    with pytest.raises(GitHubRepositoryAccessError):
+        _provider(key_file, github, clock).token("globex/webapp")
+
+
+@pytest.mark.parametrize("status", [401, 403, 500, 503])
+def test_other_refusals_are_not_access_errors(key_file: Path, github: FakeGitHub, clock: _Clock, status: int) -> None:
+    from henchmen.utils.github_auth import GitHubRepositoryAccessError
+
+    github.token_status = status
+    with pytest.raises(GitHubAuthError) as exc_info:
+        _provider(key_file, github, clock).token("acme/webapp")
+    assert not isinstance(exc_info.value, GitHubRepositoryAccessError)
+    assert exc_info.value.status_code == status
+
+
+def test_an_unreachable_github_has_no_status(key_file: Path, clock: _Clock) -> None:
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("offline")
+
+    provider = GitHubCredentialsProvider(
+        app=GitHubAppConfig(app_id="4242", private_key_path=key_file, installation_id="99"),
+        client_factory=lambda: httpx.Client(transport=httpx.MockTransport(unreachable)),
+        clock=clock,
+    )
+    with pytest.raises(GitHubAuthError) as exc_info:
+        provider.token("acme/webapp")
+    assert exc_info.value.status_code is None
+
+
+# -- server-side consumers (Task 7) ------------------------------------------------------
+
+
+def test_server_components_do_not_read_the_pat_directly() -> None:
+    """Every server-side GitHub consumer goes through the credentials provider (spec §5.1)."""
+    import re
+
+    import henchmen
+    import henchmen.utils.git
+
+    allowed = {
+        "config/settings.py",  # defines the field
+        "utils/github_auth.py",  # the provider's PAT fallback
+        "cli/doctor.py",  # reports whether a PAT is configured
+        "operative/bootstrap.py",  # operative side: reads the token LairManager injected
+        "arsenal/tools/github.py",  # operative side: same
+        "mastermind/lair_manager.py",  # removed from this list by Task 8
+    }
+    root = Path(henchmen.__file__).parent
+    offenders = sorted(
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*.py")
+        if re.search(r"\.github_token\b", path.read_text(encoding="utf-8"))
+        and path.relative_to(root).as_posix() not in allowed
+    )
+    assert offenders == []
+    assert not hasattr(henchmen.utils.git, "get_github_token")

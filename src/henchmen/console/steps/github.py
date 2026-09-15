@@ -109,7 +109,13 @@ from henchmen.console.steps import (
     step_failed,
     step_succeeded,
 )
-from henchmen.utils.github_auth import GitHubAppConfig, GitHubAuthError, GitHubCredentialsProvider, app_jwt_for
+from henchmen.utils.github_auth import (
+    GitHubAppConfig,
+    GitHubAuthError,
+    GitHubCredentialsProvider,
+    GitHubRepositoryAccessError,
+    app_jwt_for,
+)
 from henchmen.utils.redaction import redact
 
 logger = logging.getLogger(__name__)
@@ -537,10 +543,15 @@ async def _confirm_unlisted_repository(
     checks the repositories GitHub scoped the token to. ``GET /repos`` alone
     proves nothing -- it answers 200 for any public repository -- so it is used
     only, with the scoped token, for the canonical name and default branch.
+
+    Only GitHub's refusal to scope the token (:class:`GitHubRepositoryAccessError`)
+    means "cannot access". Any other credentials failure -- GitHub unreachable,
+    a 5xx, an unusable key -- propagates as :class:`GitHubAuthError`, so the
+    caller reports a credentials problem rather than blaming the repository.
     """
     try:
         scoped_token = await provider.token_async(repo)
-    except GitHubAuthError as exc:
+    except GitHubRepositoryAccessError as exc:
         logger.info("GitHub would not scope an installation token to the chosen repository: %s", redact(str(exc)))
         return None
     return await github_app.get_installation_repository(client, api_url, scoped_token, repo, account_login)

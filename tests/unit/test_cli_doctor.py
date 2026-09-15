@@ -440,3 +440,48 @@ def test_check_operative_image_inspects_the_given_image():
     assert run.call_args.args[0] == ["docker", "image", "inspect", "ghcr.io/acme/henchmen/operative:0.3.0"]
     assert result.status == CheckStatus.OK
     assert "ghcr.io/acme/henchmen/operative:0.3.0" in result.message
+
+
+def _app_settings(key_path: str) -> Settings:
+    return _settings(
+        github_token="",
+        github_app_id="4242",
+        github_app_installation_id="77",
+        github_app_private_key_path=key_path,
+    )
+
+
+def test_check_github_reports_an_unusable_app_key(tmp_path) -> None:
+    result = check_github(_app_settings(str(tmp_path / "missing.pem")))
+    assert result.status == CheckStatus.FAIL
+    assert "installation token" in result.message
+
+
+def test_check_github_with_an_app_offline(tmp_path) -> None:
+    result = check_github(_app_settings(str(tmp_path / "missing.pem")), offline=True)
+    assert result.status == CheckStatus.OK
+    assert "not verified" in result.message
+
+
+def test_check_github_with_a_working_app(monkeypatch, tmp_path) -> None:
+    from henchmen.utils.github_auth import GitHubCredentialsProvider
+
+    monkeypatch.setattr(GitHubCredentialsProvider, "token", lambda self, repo=None, *, min_ttl_seconds=300: "ghs_x")
+    result = check_github(_app_settings(str(tmp_path / "key.pem")))
+    assert result.status == CheckStatus.OK
+    assert "GitHub App 4242" in result.message
+    assert "ghs_x" not in result.message
+
+
+@pytest.mark.parametrize("offline", [False, True])
+def test_check_github_reports_a_partly_configured_app_even_with_a_pat(offline: bool) -> None:
+    """A partial App has uses_app False, but it must never read as "GitHub OK" through the PAT."""
+    settings = _settings(github_token="ghp_personal", github_app_id="4242")
+    with (
+        patch("henchmen.cli.checks.check_github_token", side_effect=AssertionError("PAT path")),
+        patch("henchmen.cli.checks.check_github_repo", side_effect=AssertionError("PAT path")),
+    ):
+        result = check_github(settings, offline=offline)
+    assert result.status == CheckStatus.FAIL
+    assert "only partly configured" in result.message
+    assert "ghp_personal" not in result.message
