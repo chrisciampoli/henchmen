@@ -235,6 +235,30 @@ class TestSecretKeyNameRedaction:
         assert redact(text) == text
 
 
+class TestGitHubCallbackValues:
+    def test_manifest_code_in_a_conversion_url_is_redacted(self):
+        line = 'HTTP Request: POST https://api.github.com/app-manifests/a1B2c3_d-4/conversions "HTTP/1.1 201 Created"'
+        result = redact(line)
+        assert "a1B2c3_d-4" not in result
+        assert f"https://api.github.com/app-manifests/{REDACTED}/conversions" in result
+
+    def test_callback_code_and_state_query_values_are_redacted(self):
+        line = '127.0.0.1:5 - "GET /console/api/steps/github/manifest-callback?code=c0de-1&state=St4te_x HTTP/1.1" 303'
+        result = redact(line)
+        assert "c0de-1" not in result
+        assert "St4te_x" not in result
+        assert f"?code={REDACTED}&state={REDACTED} HTTP/1.1" in result
+
+    def test_state_in_a_github_url_is_redacted_but_other_parameters_are_kept(self):
+        result = redact("https://github.com/apps/henchmen-x/installations/new?state=s3cr3t&page=2")
+        assert "s3cr3t" not in result
+        assert result.endswith(f"?state={REDACTED}&page=2")
+
+    def test_names_that_merely_end_in_code_or_state_are_left_alone(self):
+        text = "?zipcode=12345&estate=big and code=plain state=plain"
+        assert redact(text) == text
+
+
 # Worst cases for the patterns added with the GitHub App provider: a header
 # with no footer repeated (each match must stop at the next "-----"), "eyJ"
 # inside one long base64url run (a start must not rescan the run), and long
@@ -250,6 +274,13 @@ _NEW_PATTERN_PATHOLOGICAL_INPUTS = (
     "-ATATT" * 20000,
     "A_SECRET" * 20000,
     "'x_api_key':" * 20000,
+    # Manifest-code and callback query rules: repeated prefixes with and without values.
+    "/app-manifests/" * 20000,
+    "/app-manifests/" + "a" * 100_000,
+    "?code=" * 20000,
+    "&state=" * 20000,
+    "?state=" + "x" * 100_000,
+    "?code=a?code=a" * 10000,
 )
 
 

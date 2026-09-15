@@ -133,6 +133,19 @@ _URL_USERINFO_PATTERN = re.compile(
     r"(?i)(?<![a-z0-9+.-])(?!(?:git\+)?ssh://)([a-z][a-z0-9+.-]{0,31}://)(?:[^\s@/:]*:[^\s@/]*|[^\s@/:]+)@"
 )
 
+# The one-time GitHub App manifest ``code`` in the conversion URL
+# (``POST /app-manifests/<code>/conversions``, as httpx logs a request line).
+# The prefix is kept; the segment stops at the next ``/`` or whitespace. Every
+# match starts at the fixed literal and the single negated-class quantifier
+# cannot overlap it, so matching is linear.
+_MANIFEST_CODE_PATH_PATTERN = re.compile(r"(/app-manifests/)[^/\s]+")
+
+# OAuth-style ``code`` and ``state`` query parameters (the GitHub manifest and
+# installation callbacks, as uvicorn's access log records the request line).
+# A match can only start at ``?`` or ``&`` and the value class excludes ``&``,
+# so each run is scanned once: linear.
+_CALLBACK_QUERY_PATTERN = re.compile(r"([?&](?:code|state)=)[^&\s\"']+")
+
 # (pattern, replacement) pairs, applied in order. Every pattern but the bearer
 # one replaces the whole match outright; the bearer pattern captures the word
 # itself (case preserved, whatever whitespace separated it from the token) so
@@ -166,6 +179,8 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # match and the captured word is kept in the output.
     (_BEARER_PATTERN, r"\1 " + REDACTED),
     (re.compile(r"(?<=setup_token=)[^&#\s\"']+"), REDACTED),  # Console sign-in token (value only)
+    (_MANIFEST_CODE_PATH_PATTERN, r"\1" + REDACTED),  # GitHub App manifest code in a conversion URL
+    (_CALLBACK_QUERY_PATTERN, r"\1" + REDACTED),  # ?code= / &state= callback query values
     (_SECRET_ENV_VAR_PATTERN, r"\1=" + REDACTED),  # *_TOKEN=/*_API_KEY=/*_SECRET=... (key name kept)
     (_SECRET_QUOTED_KV_PATTERN, r"\1\2\1\3\4" + REDACTED + r"\4"),  # quoted "*_SECRET": "value" (dict/JSON reprs)
     (_URL_USERINFO_PATTERN, r"\1" + REDACTED + "@"),  # scheme://user:pass@ basic-auth URLs

@@ -11,7 +11,10 @@ session-authenticated route issued moments before. A state is:
   disk before the state is honoured. The read-remove-write happens under a
   lock shared by every store over the same file, so two concurrent callbacks
   carrying the same state can never both succeed. If the removal cannot be
-  written, the state is refused (fail closed: it could otherwise be replayed);
+  written, the state is refused (fail closed: it could otherwise be replayed).
+  This guarantee holds within one process (a ``threading.Lock``, no file
+  lock): ``henchmen serve`` runs the Console in a single process, and two
+  processes must never serve the same data directory;
 * **expiring** -- one hour by default, the lifetime of a manifest ``code``;
 * **purpose-bound** -- a manifest state cannot complete an installation;
 * **persisted** in ``secrets/github-callback-states.json`` (mode 0600, written

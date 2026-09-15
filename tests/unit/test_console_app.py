@@ -703,3 +703,54 @@ def test_session_route_refuses_when_consuming_the_token_hits_a_full_disk(
     monkeypatch.undo()
     # The token stays spent: the same link never grants a session afterwards.
     assert client.get("/console/session", params={"setup_token": token}).status_code == 403
+
+
+def _app_config(config: Path, key_file: Path) -> None:
+    config.write_text(
+        "HENCHMEN_PROVIDER=local\n"
+        "HENCHMEN_GITHUB_APP_ID=2\n"
+        "HENCHMEN_GITHUB_APP_INSTALLATION_ID=7\n"
+        f"HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH={key_file}\n",
+        encoding="utf-8",
+    )
+
+
+def test_apply_removes_only_github_app_keys_the_configuration_no_longer_references(env, tmp_path: Path) -> None:
+    from tests.unit.github_fakes import app_key_pair
+
+    client, store, auth, applied, config = env
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    current = secrets / "github-app-2.pem"
+    current.write_bytes(app_key_pair()[0])
+    stale = [secrets / "github-app-1.pem", secrets / "github-app.pem"]
+    for path in stale:
+        path.write_bytes(b"old key")
+    unrelated = [secrets / "session-key", secrets / "github-app-1.pem.bak", secrets / "github-callback-states.json"]
+    for path in unrelated:
+        path.write_bytes(b"keep")
+    _app_config(config, current)
+    _signed_in(client, auth)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
+
+    response = client.post("/console/api/apply", headers=ORIGIN)
+
+    assert response.status_code == 202, response.text
+    assert current.read_bytes() == app_key_pair()[0]
+    assert not any(path.exists() for path in stale)
+    assert all(path.read_bytes() == b"keep" for path in unrelated)
+    assert applied.calls == 1
+
+
+def test_a_refused_apply_removes_no_github_app_key(env, tmp_path: Path) -> None:
+    client, store, auth, applied, config = env
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    stale = secrets / "github-app-1.pem"
+    stale.write_bytes(b"old key")
+    config.write_text("HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_SERVE_PORT=not-a-port\n", encoding="utf-8")
+    _signed_in(client, auth)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
+    assert client.post("/console/api/apply", headers=ORIGIN).status_code == 409
+    assert stale.read_bytes() == b"old key"
+    assert applied.calls == 0
