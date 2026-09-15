@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from henchmen.config.settings import Settings, get_settings
+from henchmen.dispatch.api_models import dispatch_auth_headers
 from henchmen.models.llm import Message, MessageRole, ModelTier
 from henchmen.models.task import TaskType
 
@@ -349,8 +350,9 @@ async def _dispatch_task(task_data: dict[str, str], settings: Settings) -> dict[
         payload["task_type"] = task_type.value
 
     url = _local_dispatch_url(settings)
-    # Dispatch requires this bearer token on /api/v1/tasks whenever it is configured.
-    headers = {"Authorization": f"Bearer {settings.dispatch_api_token}"} if settings.dispatch_api_token else {}
+    # Dispatch requires this bearer token on /api/v1/tasks whenever it is configured
+    # (always on a desktop install, where apply generates it).
+    headers = dispatch_auth_headers(settings.dispatch_api_token)
     try:
         async with httpx.AsyncClient(timeout=_LOCAL_DISPATCH_TIMEOUT) as client:
             resp = await client.post(url, json=payload, headers=headers)

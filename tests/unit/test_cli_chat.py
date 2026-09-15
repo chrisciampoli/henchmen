@@ -464,3 +464,24 @@ async def test_chat_loop_quit(mock_settings: Settings) -> None:
         exit_code = await _chat_loop()
 
     assert exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_chat_in_the_container_uses_the_token_apply_generated(monkeypatch, tmp_path) -> None:
+    from henchmen.config import paths
+    from henchmen.console.config_store import ConfigStore
+
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    config = tmp_path / "henchmen.env"
+    config.write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+    ConfigStore(config, tmp_path / "secrets").ensure_dispatch_api_token()
+    settings = Settings(_env_file=paths.env_files())  # type: ignore[call-arg]
+    assert settings.dispatch_api_token
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"task_id": "abc-123"}
+    mock_resp.raise_for_status = MagicMock()
+    post = AsyncMock(return_value=mock_resp)
+    with patch("henchmen.cli.chat.httpx.AsyncClient", return_value=_http_client(post=post)):
+        await _dispatch_task({"title": "Fix bug", "description": "d", "repo": "acme/backend"}, settings)
+    assert post.call_args.kwargs["headers"] == {"Authorization": f"Bearer {settings.dispatch_api_token}"}

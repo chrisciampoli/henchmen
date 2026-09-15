@@ -238,6 +238,61 @@ def test_root_serves_the_console_page(env) -> None:
     assert response.headers["content-type"].startswith("text/html")
 
 
+def test_apply_generates_the_dispatch_api_token_once(env) -> None:
+    from henchmen.cli.envfile import EnvFile
+
+    client, store, auth, applied, config = env
+    _signed_in(client, auth)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
+    config.write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+    assert client.post("/console/api/apply", headers=ORIGIN).status_code == 202
+    token = EnvFile.load(config).get("HENCHMEN_DISPATCH_API_TOKEN")
+    assert len(token) >= 40
+    assert client.post("/console/api/apply", headers=ORIGIN).status_code == 202
+    assert EnvFile.load(config).get("HENCHMEN_DISPATCH_API_TOKEN") == token
+
+
+def test_apply_validates_the_file_not_the_seeded_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HENCHMEN_PROVIDER", "local")  # seeded by _serve at startup
+    store = SetupStateStore(tmp_path / "setup-state.json")
+    auth = ConsoleAuth(setup_token="tok", signing_key=b"k" * 32)
+    config = tmp_path / "henchmen.env"
+    app = create_console_app(
+        mode=ConsoleMode.SETUP,
+        store=store,
+        auth=auth,
+        config_file=config,
+        on_apply=lambda: None,
+        seeded_env={"HENCHMEN_PROVIDER": "local"},
+    )
+    client = _signed_in(TestClient(app, base_url=LOCAL), auth)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
+    config.write_text("HENCHMEN_PROVIDER=gcp\n", encoding="utf-8")
+    response = client.post("/console/api/apply", headers=ORIGIN)
+    assert response.status_code == 409
+    assert any("HENCHMEN_GCP_PROJECT_ID" in p for p in response.json()["detail"]["problems"])
+    assert store.load().completed is False
+
+
+def test_apply_refuses_a_configuration_that_cannot_start_leaves_the_file_untouched(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ruling P6: a refused apply must not write the config file or generate a .bak."""
+    client, store, auth, applied, config = env
+    monkeypatch.delenv("HENCHMEN_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("HENCHMEN_ANTHROPIC_API_KEY", raising=False)
+    _signed_in(client, auth)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
+    text = "HENCHMEN_PROVIDER=local\nHENCHMEN_LLM_PROVIDER=anthropic\n"
+    config.write_text(text, encoding="utf-8")
+    before = config.read_bytes()
+    response = client.post("/console/api/apply", headers=ORIGIN)
+    assert response.status_code == 409
+    assert config.read_bytes() == before
+    assert not config.with_name(config.name + ".bak").exists()
+    assert applied.calls == 0
+
+
 def test_non_local_host_is_refused_everywhere(env) -> None:
     client, *_ = env
     assert client.get("/", headers={"host": "evil.example"}).status_code == 403

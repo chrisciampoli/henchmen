@@ -124,6 +124,15 @@ class TestDefaultEnv:
         _default_env("HENCHMEN_PROVIDER", "local", file_keys=set())
         assert __import__("os").environ["HENCHMEN_PROVIDER"] == "local"
 
+    def test_seeded_defaults_are_recorded_for_apply_validation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import henchmen.cli as cli
+
+        monkeypatch.setattr(cli, "_SEEDED_ENV_DEFAULTS", {})
+        monkeypatch.delenv("HENCHMEN_PROVIDER", raising=False)
+        _default_env("HENCHMEN_PROVIDER", "local", file_keys=set())
+        _default_env("HENCHMEN_LLM_PROVIDER", "local", file_keys={"HENCHMEN_LLM_PROVIDER"})
+        assert cli._seeded_env_defaults() == {"HENCHMEN_PROVIDER": "local"}
+
 
 # ---------------------------------------------------------------------------
 # henchmen eval — argument parsing

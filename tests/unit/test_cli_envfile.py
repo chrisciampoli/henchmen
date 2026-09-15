@@ -213,3 +213,42 @@ class TestWrite:
         env.set("SECRET", "x")
         env.write()
         assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+    def test_backup_is_owner_only(self, env_path: Path):
+        env = EnvFile.load(env_path)
+        env.set("HENCHMEN_ENVIRONMENT", "staging")
+        backup = env.write()
+        assert backup is not None
+        assert oct(os.stat(backup).st_mode & 0o777) == "0o600"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+    def test_a_world_readable_backup_is_replaced_by_an_owner_only_one(self, env_path: Path):
+        backup_path = env_path.with_name(env_path.name + ".bak")
+        backup_path.write_bytes(b"stale, world-readable")
+        os.chmod(backup_path, 0o644)
+
+        env = EnvFile.load(env_path)
+        env.set("HENCHMEN_ENVIRONMENT", "staging")
+        env.write()
+
+        assert oct(os.stat(backup_path).st_mode & 0o777) == "0o600"
+        assert backup_path.read_text(encoding="utf-8") == SAMPLE
+
+    def test_an_interrupted_main_write_leaves_the_original_intact(
+        self, env_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        original = env_path.read_text(encoding="utf-8")
+        env = EnvFile.load(env_path)
+        env.set("HENCHMEN_ENVIRONMENT", "staging")
+
+        def _boom(_fd: int, _data: bytes) -> int:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(os, "write", _boom)
+        with pytest.raises(OSError):
+            env.write(backup=False)
+
+        assert env_path.read_text(encoding="utf-8") == original
+        leftovers = [p.name for p in env_path.parent.iterdir() if p.name != ".env.local"]
+        assert leftovers == []
