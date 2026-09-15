@@ -332,7 +332,10 @@ class MastermindAgent:
             await self.tracker.mark_escalated(task_id, reason=reason)
             return {"status": "escalated", "task_id": task_id, "reason": reason}
 
-        # 4. Extract errors
+        # 4. Extract errors. Without a repository the provider would mint an
+        # installation-wide token, so an event naming no repo is skipped first.
+        if not repo:
+            return {"status": "skipped", "reason": "missing repo"}
         try:
             github_token = await get_github_token_async(repo, settings=self.settings)
         except GitHubAuthError as exc:

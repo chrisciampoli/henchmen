@@ -353,6 +353,25 @@ class TestHandleCIFailure:
         agent.tracker.clear_ci_fix_in_progress.assert_awaited_once_with("full-task-id")
 
     @pytest.mark.asyncio
+    async def test_missing_repo_is_skipped_without_minting_a_token(self, mock_settings):
+        from unittest.mock import patch as _patch
+
+        with (
+            _patch("henchmen.mastermind.agent.extract_ci_errors", new_callable=AsyncMock) as mock_extract,
+            _patch("henchmen.mastermind.agent.get_github_token_async", new_callable=AsyncMock) as token,
+        ):
+            agent = self._make_agent(mock_settings)
+            agent.tracker.get_task_by_id_prefix = AsyncMock(
+                return_value={"task_id": "full-task-id", "ci_fix_attempts": 0, "ci_fix_in_progress": False}
+            )
+
+            result = await agent.handle_ci_failure("task-prefix", "", "henchmen/task-prefix", 999)
+
+        assert result == {"status": "skipped", "reason": "missing repo"}
+        token.assert_not_awaited()
+        mock_extract.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_github_credentials_failure_escalates(self, mock_settings):
         from unittest.mock import patch as _patch
 

@@ -97,6 +97,10 @@ class GitHubAuthError(RuntimeError):
         self.status_code = status_code
 
 
+class GitHubAppConfigurationError(GitHubAuthError):
+    """The GitHub App settings are only partly configured; retrying cannot help until they are fixed."""
+
+
 class GitHubRepositoryAccessError(GitHubAuthError):
     """GitHub will not scope a token to the requested repository: the installation cannot access it.
 
@@ -410,7 +414,7 @@ class GitHubCredentialsProvider:
 
     def _require_app(self) -> GitHubAppConfig:
         if self._partial_app_problem is not None:
-            raise GitHubAuthError(self._partial_app_problem)
+            raise GitHubAppConfigurationError(self._partial_app_problem)
         if self._app is None:
             raise GitHubAuthError("No GitHub App is configured")
         return self._app
@@ -532,7 +536,10 @@ def _check_token_repositories(listed: object, repository: tuple[str, str]) -> No
             or (isinstance(login, str) and login.lower() != owner)
             or (isinstance(entry_name, str) and entry_name.lower() != name)
         )
-        if mismatched or not any(isinstance(value, str) for value in (full_name, login, entry_name)):
+        if not any(isinstance(value, str) for value in (full_name, login, entry_name)):
+            # No identity to compare: an unreadable answer, not a statement about access.
+            raise GitHubAuthError("GitHub returned an unreadable repository list for the installation token")
+        if mismatched:
             raise GitHubRepositoryAccessError(
                 f"GitHub scoped the installation token to a different repository than "
                 f"{repository[0]}/{repository[1]}; check that the App is installed on that account"

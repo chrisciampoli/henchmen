@@ -44,7 +44,12 @@ from henchmen.providers.local.docker import cpu_limit as docker_cpu_limit
 from henchmen.providers.local.docker import memory_limit as docker_memory_limit
 from henchmen.providers.registry import orchestrator_is_local
 from henchmen.utils.git import clone_repo
-from henchmen.utils.github_auth import MAX_MIN_TTL_SECONDS, GitHubAuthError, get_github_token_async
+from henchmen.utils.github_auth import (
+    MAX_MIN_TTL_SECONDS,
+    GitHubAuthError,
+    get_credentials_provider,
+    get_github_token_async,
+)
 from henchmen.utils.stack_detector import Stack, detect_stack
 
 if TYPE_CHECKING:
@@ -483,10 +488,11 @@ async def _gate_github_token(settings: Settings, repo: str) -> str:
     Raises :class:`~henchmen.utils.github_auth.GitHubAuthError` (callers fail
     closed). Installation tokens last an hour, so the provider caps the request
     at ``MAX_MIN_TTL_SECONDS``; a gate timeout configured beyond that can
-    outlive its token, which then fails a late clone or push.
+    outlive its token, which then fails a late clone or push. A PAT does not
+    expire that way, so the warning is only for a GitHub App.
     """
     min_ttl = _gate_min_ttl(settings)
-    if min_ttl > MAX_MIN_TTL_SECONDS:
+    if min_ttl > MAX_MIN_TTL_SECONDS and get_credentials_provider(settings).uses_app:
         logger.warning(
             "The gate timeout (%ss) is longer than a GitHub installation token is guaranteed to last (%ss); "
             "a GitHub App token may expire before a long gate finishes pushing",

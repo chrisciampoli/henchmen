@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from henchmen.cli import checks
 from henchmen.cli.checks import CheckResult, CheckStatus
 from henchmen.config.settings import DEFAULT_LOCAL_OPERATIVE_IMAGE
+from henchmen.utils.repositories import DEFAULT_REPO_PROBLEM, default_repository, is_owner_name
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -361,20 +362,37 @@ def check_github(settings: Settings, *, offline: bool = False) -> CheckResult:
     The credentials provider decides first: a partly configured App makes every
     token call fail, and ``uses_app`` is False for it, so the problem is reported
     from the provider's own error rather than falling through to "GitHub OK via PAT".
+    With an App and a default repository, the token is scoped to that repository,
+    so an App that cannot see it fails the check.
     """
-    from henchmen.utils.github_auth import GitHubAuthError, get_credentials_provider
+    from henchmen.utils.github_auth import GitHubAuthError, GitHubRepositoryAccessError, get_credentials_provider
 
     name = "GitHub"
     app_hint = "Reconnect GitHub in the Henchmen Console, or check the HENCHMEN_GITHUB_APP_* settings."
+    repo = default_repository(settings)
     try:
         provider = get_credentials_provider(settings)
         if provider.uses_app and offline:
             return CheckResult(name, CheckStatus.OK, f"GitHub App {settings.github_app_id} configured (not verified)")
-        # No network for a PAT (it is returned as configured) or a partly configured App (it raises at once).
-        provider.token()
+        if provider.uses_app and repo:
+            if not is_owner_name(repo):
+                return CheckResult(name, CheckStatus.FAIL, f"{DEFAULT_REPO_PROBLEM} (got {repo!r})")
+            provider.token(repo)
+        else:
+            # No network for a PAT (it is returned as configured) or a partly configured App (it raises at once).
+            provider.token()
+    except GitHubRepositoryAccessError:
+        return CheckResult(
+            name,
+            CheckStatus.FAIL,
+            f"the GitHub App can't see {repo}",
+            hint="Add the repository to the Henchmen app's repository access on GitHub, or choose another default.",
+        )
     except GitHubAuthError as exc:
         return CheckResult(name, CheckStatus.FAIL, f"GitHub App cannot get an installation token: {exc}", hint=app_hint)
     if provider.uses_app:
+        if repo:
+            return CheckResult(name, CheckStatus.OK, f"GitHub App {settings.github_app_id} can access {repo}")
         return CheckResult(name, CheckStatus.OK, f"GitHub App {settings.github_app_id} can get installation tokens")
     if not settings.github_token:
         return CheckResult(
@@ -385,10 +403,7 @@ def check_github(settings: Settings, *, offline: bool = False) -> CheckResult:
         )
     if offline:
         return CheckResult(name, CheckStatus.OK, "HENCHMEN_GITHUB_TOKEN is set (not verified)")
-    if settings.github_default_repo:
-        repo = settings.github_default_repo
-        if "/" not in repo and settings.github_default_org:
-            repo = f"{settings.github_default_org}/{repo}"
+    if repo:
         return checks.check_github_repo(settings.github_token, repo)
     return checks.check_github_token(settings.github_token)
 

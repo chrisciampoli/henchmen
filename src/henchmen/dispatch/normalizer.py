@@ -5,6 +5,7 @@ shared :class:`~henchmen.models.task.HenchmenTask` contract and publishes it.
 No business logic lives here.
 """
 
+import logging
 import re
 from typing import Any
 from uuid import uuid4
@@ -12,6 +13,9 @@ from uuid import uuid4
 from henchmen.config.settings import Settings
 from henchmen.models.task import HenchmenTask, TaskContext, TaskPriority, TaskSource, TaskType
 from henchmen.providers.interfaces.message_broker import MessageBroker
+from henchmen.utils.repositories import DEFAULT_REPO_PROBLEM, default_repository, is_owner_name
+
+logger = logging.getLogger(__name__)
 
 # Slack renders a user/bot mention as ``<@U0123ABC>`` (optionally ``<@U0123ABC|name>``).
 # The literal string ``<@henchmen>`` is never sent by Slack; it only appears in
@@ -41,10 +45,22 @@ def strip_slack_mentions(text: str) -> str:
 
 
 def _resolve_repo(repo: str, settings: Settings | None) -> str:
-    """Return *repo* or, when empty, the configured default target repo."""
+    """Return *repo* or, when empty, the configured default target repo as ``owner/name``.
+
+    A bare default name is qualified with ``github_default_org``
+    (:func:`~henchmen.utils.repositories.default_repository`). A default that is
+    still not ``owner/name`` is not used: it is logged and the task gets no repo,
+    which every downstream consumer fails closed on.
+    """
     if repo:
         return repo
-    return settings.github_default_repo if settings is not None else ""
+    if settings is None:
+        return ""
+    default = default_repository(settings)
+    if default and not is_owner_name(default):
+        logger.warning("Ignoring default repository %r: %s", default, DEFAULT_REPO_PROBLEM)
+        return ""
+    return default
 
 
 def _first_str(source: dict[str, Any], keys: tuple[str, ...]) -> str:

@@ -28,6 +28,7 @@ from henchmen.dispatch.normalizer import TaskNormalizer
 from henchmen.dispatch.pubsub_auth import split_bearer
 from henchmen.utils.lifespan import run_shutdown
 from henchmen.utils.redaction import install_secret_redaction
+from henchmen.utils.repositories import DEFAULT_REPO_PROBLEM, default_repository, is_owner_name
 
 logger = logging.getLogger(__name__)
 
@@ -416,12 +417,14 @@ async def health() -> dict[str, Any]:
 async def create_task(payload: CreateTaskRequest, request: Request) -> dict[str, Any]:
     """CLI handler - accepts JSON task creation requests (bearer-token authenticated)."""
     settings = get_settings()
-    repo = payload.repo or settings.github_default_repo
+    repo = payload.repo or default_repository(settings)
     if not repo:
         raise HTTPException(
             status_code=422,
             detail="'repo' is required (or set HENCHMEN_GITHUB_DEFAULT_REPO)",
         )
+    if not payload.repo and not is_owner_name(repo):
+        raise HTTPException(status_code=422, detail=DEFAULT_REPO_PROBLEM)
     payload = payload.model_copy(update={"repo": repo})
 
     return await handle_cli_request(payload, _normalizer, settings, broker=request.app.state.message_broker)
