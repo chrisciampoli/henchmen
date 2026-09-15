@@ -55,10 +55,10 @@ class DockerOrchestrator:
             cmd.extend(["--network", self._settings.local_docker_network])
         for k, v in env_vars.items():
             cmd.extend(["-e", f"{k}={v}"])
-        cmd.extend(["--memory", _memory_limit(memory)])
-        cpu_limit = _cpu_limit(cpu)
-        if cpu_limit:
-            cmd.extend(["--cpus", cpu_limit])
+        cmd.extend(["--memory", memory_limit(memory)])
+        cpus = cpu_limit(cpu)
+        if cpus:
+            cmd.extend(["--cpus", cpus])
         cmd.append(image)
         logger.info("Starting Docker container %s with image %s", exec_id, image)
         process = await asyncio.create_subprocess_exec(
@@ -195,12 +195,12 @@ class DockerOrchestrator:
             yield line
 
 
-def _memory_limit(memory: str) -> str:
+def memory_limit(memory: str) -> str:
     """Return a ``--memory`` value docker accepts, converting Gi/Mi suffixes to its g/m."""
     return memory.lower().replace("gi", "g").replace("mi", "m")
 
 
-def _cpu_limit(cpu: str) -> str:
+def cpu_limit(cpu: str) -> str:
     """Return a `--cpus` value for a numeric vCPU string, else ''."""
     try:
         value = float(cpu)
