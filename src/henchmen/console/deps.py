@@ -43,6 +43,12 @@ def get_http_client_factory(request: Request) -> HttpClientFactory:
     return cast(HttpClientFactory, factory) if factory is not None else default_http_client
 
 
+def get_seeded_env(request: Request) -> dict[str, str]:
+    """Defaults ``henchmen serve`` seeded into this process's environment (masked where the file sets a key)."""
+    seeded = getattr(request.app.state, "seeded_env", None)
+    return dict(seeded) if isinstance(seeded, dict) else {}
+
+
 def get_callback_states(request: Request) -> CallbackStateStore:
     """Single-use state values for the public GitHub callbacks."""
     return cast(CallbackStateStore, request.app.state.callback_states)

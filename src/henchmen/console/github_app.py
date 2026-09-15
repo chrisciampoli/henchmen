@@ -21,31 +21,40 @@ router is mounted (ruling M-13).
 
 from __future__ import annotations
 
+import logging
+import os
 import re
 import secrets
 import socket
+import stat
+from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
 
 import httpx
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from pydantic import BaseModel, ConfigDict, Field
 
 from henchmen.console.state import SetupStep
 from henchmen.console.steps import STEP_ROUTE_PREFIX
-from henchmen.utils.github_auth import (
-    GITHUB_API_URL,
-    GITHUB_WEB_URL,
-    api_headers,
-    github_error_detail,
-    github_json_headers,
-)
+from henchmen.utils.endpoints import EndpointError, GitHubEndpoints, resolve_github_endpoints
+from henchmen.utils.github_auth import api_headers, github_error_detail, github_json_headers
+
+__all__ = ["EndpointError", "GitHubEndpoints"]
+
+logger = logging.getLogger(__name__)
 
 MANIFEST_PURPOSE = "github-manifest"
 INSTALL_PURPOSE = "github-install"
 _STEP_PATH = f"{STEP_ROUTE_PREFIX}/{SetupStep.GITHUB.value}"
 MANIFEST_CALLBACK_PATH = f"{_STEP_PATH}/manifest-callback"
 INSTALLED_CALLBACK_PATH = f"{_STEP_PATH}/installed"
-PRIVATE_KEY_FILE_NAME = "github-app.pem"
+# Each App's key has its own file, ``github-app-<app id>.pem``: a reconnect writes the new
+# App's key beside the one the running process still signs with, never over it.
+PRIVATE_KEY_FILE_PREFIX = "github-app"
+_KEY_FILE_RE = re.compile(r"github-app(?:-\d{1,20})?\.pem")
 HOMEPAGE_URL = "https://github.com/chrisciampoli/henchmen"
 # Checks and Actions are read by CI feedback (forge/error_extractor.py, MastermindAgent._build_dossier).
 # Never "workflows": operatives must not change CI workflows, so GitHub refuses such pushes (A4).
@@ -64,6 +73,8 @@ _APP_NAME_PREFIX = "Henchmen ("
 _CODE_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,99}")
 _INSTALLATION_ID_RE = re.compile(r"\d{1,20}")
+_APP_ID_RE = re.compile(r"\d{1,20}")
+_LOGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
 _REPO_PAGE_SIZE = 100
 _MAX_REPO_PAGES = 10
 
@@ -74,15 +85,6 @@ class GitHubAppApiError(RuntimeError):
     def __init__(self, message: str, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
-
-
-class GitHubEndpoints(BaseModel):
-    """Where the GitHub API and web UI live (github.com unless a test fake overrides it)."""
-
-    model_config = ConfigDict(frozen=True)
-
-    api_url: str = Field(..., description="REST API base URL, no trailing slash")
-    web_url: str = Field(..., description="Web base URL, no trailing slash")
 
 
 class AppConversion(BaseModel):
@@ -123,24 +125,68 @@ class InstalledRepository(BaseModel):
     private: bool = Field(default=False, description="Whether the repository is private")
 
 
-def github_endpoints() -> GitHubEndpoints:
-    """GitHub endpoints from ``Settings.github_api_url``/``github_web_url``.
+def github_endpoints(config_file: Path, *, seeded_env: Mapping[str, str] | None = None) -> GitHubEndpoints:
+    """The GitHub endpoints the configuration names right now.
 
-    Falls back to github.com when Settings cannot be built (setup mode, before
-    the configuration is complete). Settings already refuses an insecure or
-    credential-carrying URL, so the fallback can only ever point at github.com,
-    never at an unvalidated host.
+    Uncached and independent of whether the full ``Settings`` validates
+    (:func:`henchmen.utils.endpoints.resolve_github_endpoints`). An invalid URL
+    raises :class:`EndpointError`; there is no fallback to github.com.
     """
-    from henchmen.config.settings import get_settings
+    return resolve_github_endpoints(config_file, seeded_env=seeded_env)
 
+
+def private_key_file_name(app_id: str) -> str:
+    """``github-app-<app id>.pem``; ``app_id`` must be the digits GitHub assigned."""
+    if not isinstance(app_id, str) or not _APP_ID_RE.fullmatch(app_id):
+        raise ValueError("a GitHub App id is digits only")
+    return f"{PRIVATE_KEY_FILE_PREFIX}-{app_id}.pem"
+
+
+def remove_unreferenced_app_keys(secrets_dir: Path, referenced: Iterable[str | Path]) -> list[Path]:
+    """Delete GitHub App key files in ``secrets_dir`` that no configuration references; best effort.
+
+    Only regular files named ``github-app.pem`` or ``github-app-<digits>.pem``
+    are considered, never a symbolic link or anything else in the directory.
+    A file whose resolved path matches any ``referenced`` path is always kept.
+    Failures are logged (file name and error type) and skipped. Returns the
+    removed paths.
+    """
+    keep: set[Path] = set()
+    for item in referenced:
+        text = str(item).strip()
+        if text:
+            try:
+                keep.add(Path(text).resolve())
+            except OSError:
+                continue
+    removed: list[Path] = []
     try:
-        settings = get_settings()
-    except ValueError:
-        return GitHubEndpoints(api_url=GITHUB_API_URL, web_url=GITHUB_WEB_URL)
-    return GitHubEndpoints(
-        api_url=settings.github_api_url.strip().rstrip("/") or GITHUB_API_URL,
-        web_url=settings.github_web_url.strip().rstrip("/") or GITHUB_WEB_URL,
-    )
+        candidates = sorted(secrets_dir.iterdir())
+    except OSError:
+        return removed
+    for candidate in candidates:
+        if not _KEY_FILE_RE.fullmatch(candidate.name):
+            continue
+        try:
+            info = os.lstat(candidate)
+            if not stat.S_ISREG(info.st_mode) or candidate.resolve() in keep:
+                continue
+            candidate.unlink()
+        except OSError as exc:
+            logger.warning("Could not remove unused GitHub App key %s (%s)", candidate.name, type(exc).__name__)
+            continue
+        logger.info("Removed unused GitHub App key %s", candidate.name)
+        removed.append(candidate)
+    return removed
+
+
+def _is_rsa_private_key(pem: str) -> bool:
+    """True when ``pem`` parses as an unencrypted RSA private key (GitHub App keys are RSA)."""
+    try:
+        key = load_pem_private_key(pem.encode("utf-8"), password=None)
+    except Exception:  # ValueError, TypeError, UnsupportedAlgorithm, ...: all mean "unusable"
+        return False
+    return isinstance(key, RSAPrivateKey)
 
 
 def is_valid_code(code: str) -> bool:
@@ -268,12 +314,13 @@ async def convert_manifest(client: httpx.AsyncClient, api_url: str, code: str) -
     slug = _string_field(body, "slug")
     pem = _string_field(body, "pem")
     webhook_secret = _string_field(body, "webhook_secret")
-    if not (app_id.isascii() and app_id.isdigit() and is_valid_slug(slug) and "PRIVATE KEY" in pem):
+    if not (_APP_ID_RE.fullmatch(app_id) and is_valid_slug(slug) and _is_rsa_private_key(pem)):
         raise GitHubAppApiError("GitHub's app details were incomplete")
     if any(character in webhook_secret for character in ("\n", "\r", "\x00")):
         raise GitHubAppApiError("GitHub's app details were unreadable")
     owner = body.get("owner")
-    owner_login = _string_field(owner, "login") if isinstance(owner, dict) else ""
+    raw_login = _string_field(owner, "login") if isinstance(owner, dict) else ""
+    owner_login = raw_login if _LOGIN_RE.fullmatch(raw_login) else ""
     return AppConversion(
         app_id=app_id,
         slug=slug,

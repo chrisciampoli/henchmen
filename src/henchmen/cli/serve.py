@@ -286,12 +286,16 @@ def configure_serve_logging(log_level: str) -> None:
 
     Installed before any service module is imported and in setup mode too, so
     uvicorn's access log never records the Console sign-in token (or any other
-    known secret) in a request line.
+    known secret) in a request line. The ``httpx`` logger is kept at WARNING.
     """
     from henchmen.utils.redaction import install_secret_redaction
 
     install_secret_redaction()
     logging.basicConfig(level=getattr(logging, log_level.upper()))
+    # httpx logs every request line at INFO, including one-time values in URLs (a GitHub
+    # manifest code, callback state); redaction covers those shapes too, but they have no
+    # operational value in the serve log.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def console_url(port: int, setup_token: str) -> str:

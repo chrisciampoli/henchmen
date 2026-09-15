@@ -42,6 +42,7 @@ PUBLIC_PATHS: frozenset[str] = frozenset({"/console/api/status"})
 _CHOICE_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SECRET_KEY_SEGMENTS = frozenset({"token", "secret", "password", "passwd", "credential", "credentials", "pem"})
 _SECRET_KEY_SUFFIXES = ("api_key", "private_key", "signing_key", "access_key")
+_GITHUB_APP_PRIVATE_KEY_PATH_KEY = "HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH"
 _MAX_CHOICES = 32
 _MAX_CHOICE_VALUE_CHARS = 256
 
@@ -114,6 +115,17 @@ class SetupStateUpdate(BaseModel):
         return choices
 
 
+def _remove_unused_github_app_keys(config_store: ConfigStore, effective_key_path: str) -> None:
+    """Best effort: delete GitHub App key files neither the config file nor the effective Settings reference."""
+    from henchmen.console.github_app import remove_unreferenced_app_keys
+
+    try:
+        referenced = [config_store.get(_GITHUB_APP_PRIVATE_KEY_PATH_KEY), effective_key_path]
+        remove_unreferenced_app_keys(config_store.secrets_dir, referenced)
+    except Exception as exc:  # never let housekeeping block apply
+        logger.warning("Could not clean up unused GitHub App keys (%s)", type(exc).__name__)
+
+
 def create_console_app(
     *,
     mode: ConsoleMode,
@@ -157,6 +169,7 @@ def create_console_app(
     app.state.setup_store = store
     app.state.config_store = config_store or ConfigStore(config_file, secrets_dir)
     app.state.callback_states = CallbackStateStore(secrets_dir / STATE_FILE_NAME)
+    app.state.seeded_env = dict(seeded_env or {})
 
     @app.exception_handler(RequestValidationError)
     async def _on_validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -278,6 +291,11 @@ def create_console_app(
                             "Check permissions and free space on the data volume."
                         ),
                     ) from None
+            # The configuration validated and the restart follows: GitHub App key files a
+            # reconnect left behind (github-app-<old id>.pem) are no longer needed. Both the
+            # file's reference and the effective Settings value are kept, whichever wins.
+            if _settings is not None:
+                _remove_unused_github_app_keys(config_store, _settings.github_app_private_key_path)
         store.mark_completed()
         background.add_task(on_apply)
         return {"restarting": True}

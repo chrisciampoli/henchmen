@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -240,3 +241,112 @@ async def test_bot_identity() -> None:
         )
         with pytest.raises(github_app.GitHubAppApiError):
             await github_app.bot_identity(client, API, "unknown-app")
+
+
+def _conversion_handler(body: object) -> httpx.MockTransport:
+    return httpx.MockTransport(lambda request: httpx.Response(201, json=body))
+
+
+def _ec_private_key_pem() -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    return key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    ).decode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pem",
+    [
+        "-----BEGIN PRIVATE KEY-----\nbm90IGEga2V5\n-----END PRIVATE KEY-----\n",
+        "-----BEGIN RSA PRIVATE KEY-----\n" + "A" * 64 + "\n-----END RSA PRIVATE KEY-----\n",
+        "garbage PRIVATE KEY garbage",
+    ],
+)
+async def test_a_pem_that_does_not_parse_is_an_incomplete_conversion(pem: str) -> None:
+    body = {"id": 1, "slug": "henchmen-x", "pem": pem, "owner": {"login": "chris"}}
+    async with httpx.AsyncClient(transport=_conversion_handler(body)) as client:
+        with pytest.raises(github_app.GitHubAppApiError, match="incomplete") as exc_info:
+            await github_app.convert_manifest(client, API, "code-1")
+    assert "PRIVATE KEY" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_a_non_rsa_private_key_is_an_incomplete_conversion() -> None:
+    body = {"id": 1, "slug": "henchmen-x", "pem": _ec_private_key_pem()}
+    async with httpx.AsyncClient(transport=_conversion_handler(body)) as client:
+        with pytest.raises(github_app.GitHubAppApiError, match="incomplete"):
+            await github_app.convert_manifest(client, API, "code-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner", "expected"),
+    [
+        ({"login": "chris"}, "chris"),
+        ({"login": "Acme-Corp-2"}, "Acme-Corp-2"),
+        ({"login": "-bad"}, ""),
+        ({"login": "a" * 40}, ""),
+        ({"login": "evil/../x"}, ""),
+        ({"login": "chris\nHENCHMEN_X=1"}, ""),
+        ({"login": 42}, ""),
+        ("chris", ""),
+        (None, ""),
+    ],
+)
+async def test_owner_login_is_accepted_only_as_a_github_login(owner: object, expected: str) -> None:
+    body = {"id": 1, "slug": "henchmen-x", "pem": app_key_pair()[0].decode(), "owner": owner}
+    async with httpx.AsyncClient(transport=_conversion_handler(body)) as client:
+        conversion = await github_app.convert_manifest(client, API, "code-1")
+    assert conversion.owner_login == expected
+
+
+def test_private_key_file_names_are_per_app() -> None:
+    assert github_app.private_key_file_name("4242") == "github-app-4242.pem"
+    for bad in ("", "12a", "../1", "1" * 21):
+        with pytest.raises(ValueError):
+            github_app.private_key_file_name(bad)
+
+
+def test_unreferenced_key_cleanup_removes_only_unreferenced_app_keys(tmp_path: Path) -> None:
+    import os
+
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    referenced = secrets / "github-app-2.pem"
+    env_referenced = secrets / "github-app-3.pem"
+    stale = [secrets / "github-app-1.pem", secrets / "github-app.pem"]
+    others = [
+        secrets / "github-app-1.pem.0a1b.tmp",
+        secrets / "github-app-x.pem",
+        secrets / "github-callback-states.json",
+        secrets / "session-key",
+    ]
+    for path in [referenced, env_referenced, *stale, *others]:
+        path.write_bytes(b"x")
+    outside = tmp_path / "github-app-9.pem"
+    outside.write_bytes(b"x")
+
+    removed = github_app.remove_unreferenced_app_keys(secrets, [str(referenced), "", env_referenced])
+
+    assert sorted(removed) == sorted(stale)
+    assert referenced.exists()
+    assert env_referenced.exists()
+    assert not any(path.exists() for path in stale)
+    assert all(path.exists() for path in others)
+    assert outside.exists()
+
+    link = secrets / "github-app-5.pem"
+    try:
+        os.symlink(outside, link)
+    except (OSError, NotImplementedError):
+        return
+    assert github_app.remove_unreferenced_app_keys(secrets, [referenced, env_referenced]) == []
+    assert link.is_symlink()
+
+
+def test_unreferenced_key_cleanup_tolerates_a_missing_directory(tmp_path: Path) -> None:
+    assert github_app.remove_unreferenced_app_keys(tmp_path / "missing", []) == []

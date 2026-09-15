@@ -520,6 +520,39 @@ def test_console_auth_load_permission_error_exits_with_a_readable_error(
     assert "secrets" in capsys.readouterr().err.lower()
 
 
+def test_serve_logging_keeps_httpx_request_lines_out_and_redacts_callback_values(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import uvicorn
+    from fastapi import FastAPI
+
+    from henchmen.cli.serve import configure_serve_logging
+
+    original_factory = logging.getLogRecordFactory()
+    httpx_logger = logging.getLogger("httpx")
+    original_level = httpx_logger.level
+    try:
+        configure_serve_logging("info")
+        uvicorn.Config(FastAPI(), host="127.0.0.1", port=8000, log_level="info")
+        assert httpx_logger.getEffectiveLevel() == logging.WARNING
+        assert not httpx_logger.isEnabledFor(logging.INFO)
+        logging.getLogger("uvicorn.access").info(
+            '%s - "%s %s HTTP/%s" %d',
+            "127.0.0.1:50000",
+            "GET",
+            "/console/api/steps/github/manifest-callback?code=c0de-x&state=St4te-y",
+            "1.1",
+            303,
+        )
+    finally:
+        logging.setLogRecordFactory(original_factory)
+        httpx_logger.setLevel(original_level)
+    output = "".join(capsys.readouterr())
+    assert "c0de-x" not in output
+    assert "St4te-y" not in output
+    assert "manifest-callback?code=***REDACTED***&state=***REDACTED*** HTTP/1.1" in output
+
+
 def test_serve_logging_redacts_the_setup_token_from_uvicorn_access_lines(capsys: pytest.CaptureFixture[str]) -> None:
     """The sign-in URL is printed on purpose, but uvicorn must not write the token into its access log."""
     import uvicorn
