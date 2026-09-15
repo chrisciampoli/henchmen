@@ -10,15 +10,32 @@ secret mounts inject (``GITHUB_TOKEN``, ``SLACK_BOT_TOKEN``, ...). When both
 are present the ``HENCHMEN_`` name wins.
 """
 
+import ipaddress
+import re
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_LOOPBACK_NAMES = frozenset({"localhost"})
+# A Docker Compose service name: a letter first, then lowercase letters, digits and hyphens.
+# Never an IP literal in any spelling (dotted, decimal ``2130706433``, hex ``0x7f000001``).
+_COMPOSE_SERVICE_HOST = re.compile(r"[a-z][a-z0-9-]*")
+
+
+def _is_loopback_host(host: str) -> bool:
+    """``localhost``, any address in ``127.0.0.0/8``, or ``::1`` (written as a canonical IP literal)."""
+    if host in _LOOPBACK_NAMES:
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback
 
 
 def require_secure_github_url(value: str) -> str:
@@ -28,24 +45,29 @@ def require_secure_github_url(value: str) -> str:
     the Console sends browsers (with a single-use ``state``) to
     ``github_web_url``, so both must be ``https``. Plain ``http`` is accepted
     only for a host that cannot be reached across a network boundary by name:
-    a loopback address, or a dotless hostname -- a Docker Compose service name
-    such as ``http://fakes:9000``, which is how the Phase 2C end-to-end suite
-    addresses its fake GitHub inside the compose network. Any dotted host
-    (``github.example.com``, ``10.0.0.5``) must use ``https``.
-    """
-    from urllib.parse import urlsplit
+    a loopback address (``localhost``, ``127.0.0.0/8``, ``::1``), or a host
+    matching ``^[a-z][a-z0-9-]*$`` -- a Docker Compose service name such as
+    ``http://fakes:9000``, which is how the Phase 2C end-to-end suite
+    addresses its fake GitHub inside the compose network. Every other host,
+    including any other IP literal in any spelling, must use ``https``.
 
+    A URL carrying a user name or password is refused with a message that
+    never repeats the URL (the credentials would otherwise land in a log).
+    """
     text = value.strip()
     try:
         parts = urlsplit(text)
         host = (parts.hostname or "").lower()
         parts.port  # noqa: B018 - raises ValueError on an invalid port
+        has_credentials = bool(parts.username or parts.password)
     except ValueError:
         raise ValueError("must be an http(s) URL with a host") from None
-    if not host or parts.scheme not in ("https", "http") or parts.username or parts.password:
-        raise ValueError("must be an https URL with a host and no credentials")
-    if parts.scheme == "http" and host not in _LOOPBACK_HOSTS and "." in host:
-        raise ValueError("must use https (plain http is allowed only for loopback or a dotless compose service host)")
+    if has_credentials or "@" in parts.netloc:
+        raise ValueError("must not contain a user name or password")
+    if not host or parts.scheme not in ("https", "http"):
+        raise ValueError("must be an https URL with a host")
+    if parts.scheme == "http" and not (_is_loopback_host(host) or _COMPOSE_SERVICE_HOST.fullmatch(host)):
+        raise ValueError("must use https (plain http is allowed only for loopback or a compose service name)")
     return text
 
 
@@ -148,6 +170,9 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
         populate_by_name=True,
+        # A rejected value is never repeated in a ValidationError's text: Settings holds
+        # credentials, and a refused URL can carry a user name and password.
+        hide_input_in_errors=True,
     )
 
     # GCP core
@@ -639,8 +664,15 @@ class Settings(BaseSettings):
 
     @field_validator("github_api_url", "github_web_url", mode="after")
     @classmethod
-    def _github_urls_are_secure(cls, value: str) -> str:
-        """GitHub base URLs must be https (http only for loopback or a dotless compose host)."""
+    def _github_urls_are_secure(cls, value: str, info: ValidationInfo) -> str:
+        """GitHub base URLs must be https (http only for loopback or a compose service name).
+
+        A blank value (``HENCHMEN_GITHUB_API_URL=`` left in a dotenv file) means
+        the default rather than an error.
+        """
+        if not value.strip():
+            field_name = info.field_name or ""
+            return str(cls.model_fields[field_name].default)
         return require_secure_github_url(value)
 
     @field_validator(*_SEEDED_SECRET_FIELDS, mode="after")
