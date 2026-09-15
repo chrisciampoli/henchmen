@@ -356,6 +356,10 @@ class Settings(BaseSettings):
             "instance, not its display name: webhooks only send custom fields as customfield_<number>."
         ),
     )
+    jira_intake_label: str = Field(
+        default="henchmen",
+        description="Issue label that marks Jira issues for Henchmen to pick up (read by the laptop-mode Jira poller)",
+    )
     jira_webhook_secret: str = Field(
         default="", description="Shared secret for Jira webhook HMAC verification (X-Hub-Signature)"
     )

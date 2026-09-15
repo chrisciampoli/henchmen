@@ -470,18 +470,29 @@ class TestRemovedSettings:
 # Fields forwarded to operatives whose consumer has not been wired yet. Each
 # entry is a known gap, not a place to park new dead config: remove it as soon
 # as a component reads the field (or the field is deleted).
-_FIELDS_AWAITING_A_READER: frozenset[str] = frozenset()
+#
+# jira_intake_label: written by the Console's Jira step; the Phase 3 Jira poller reads it (A10).
+_FIELDS_AWAITING_A_READER: frozenset[str] = frozenset({"jira_intake_label"})
 
 
 def _unread_settings_fields() -> set[str]:
-    """Settings fields that no module under src/henchmen (other than settings.py) mentions."""
+    """Settings fields that no module under src/henchmen (other than settings.py) mentions.
+
+    Console step routers (``console/steps``) only write settings, so they do not
+    count as readers.
+    """
     from pathlib import Path
 
     import henchmen
 
     package_root = Path(henchmen.__file__).parent
     settings_file = package_root / "config" / "settings.py"
-    corpus = "\n".join(path.read_text(encoding="utf-8") for path in package_root.rglob("*.py") if path != settings_file)
+    steps_dir = package_root / "console" / "steps"
+    corpus = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in package_root.rglob("*.py")
+        if path != settings_file and steps_dir not in path.parents
+    )
     return {name for name in Settings.model_fields if name not in corpus and f"HENCHMEN_{name.upper()}" not in corpus}
 
 
@@ -495,6 +506,32 @@ class TestEverySettingIsRead:
         """An allowlisted field that gained a reader (or was deleted) must leave the allowlist."""
         assert set(Settings.model_fields) >= _FIELDS_AWAITING_A_READER
         assert _unread_settings_fields() >= _FIELDS_AWAITING_A_READER
+
+    def test_step_routers_only_write_settings(self):
+        """Guard for the ``console/steps`` corpus exclusion above (ruling M-9).
+
+        Excluding every step router from the settings-reader corpus would
+        silently hide a step that genuinely reads a setting (through
+        ``get_settings()`` or by building ``Settings(...)`` directly) instead
+        of going through ``ConfigStore``. Only ``ai_provider.py``'s cost
+        estimate does that today, to build a throwaway ``Settings`` for the
+        chosen provider/models -- never the process-wide cached settings.
+        """
+        from pathlib import Path
+
+        import henchmen
+
+        package_root = Path(henchmen.__file__).parent
+        steps_dir = package_root / "console" / "steps"
+        allowed = {steps_dir / "ai_provider.py"}
+        offenders = sorted(
+            str(path.relative_to(package_root))
+            for path in steps_dir.glob("*.py")
+            if path not in allowed
+            for pattern in ("get_settings(", "Settings(")
+            if pattern in path.read_text(encoding="utf-8")
+        )
+        assert offenders == [], f"Step routers must read config through ConfigStore, not Settings: {offenders}"
 
 
 class TestSeededSecretPlaceholder:
