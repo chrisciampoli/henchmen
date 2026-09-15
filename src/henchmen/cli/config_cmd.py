@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from typing import TYPE_CHECKING
 
+from henchmen.cli.envfile import is_secret_key
 from henchmen.cli.prompts import mask_secret
 
 if TYPE_CHECKING:
@@ -21,14 +21,18 @@ if TYPE_CHECKING:
 
 __all__ = ["add_config_arguments", "is_secret_field", "render_settings", "run_config_cli"]
 
-# Credential-bearing field names. Anchored at the end so e.g. ``jira_project_key``
-# and ``operative_max_output_tokens`` (plain config) are not masked.
-_SECRET_FIELD_RE = re.compile(r"(_token|_secret|api_key|password|private_key)$")
-
 
 def is_secret_field(name: str) -> bool:
-    """True when the Settings field ``name`` holds a credential that must never be printed."""
-    return bool(_SECRET_FIELD_RE.search(name))
+    """True when the Settings field ``name`` holds a credential that must never be printed.
+
+    Delegates to :func:`henchmen.cli.envfile.is_secret_key`, the single
+    secret-name classifier, so ``henchmen config``'s masking agrees with the
+    Console's ``ConfigStore.masked()`` on every field -- suffix-only match on
+    ``_TOKEN``/``_API_KEY``/``_PRIVATE_KEY``/``_SECRET``/``_PASSWORD``, case
+    insensitive, prefix-independent (so a bare field name like ``github_token``
+    and its dotenv form ``HENCHMEN_GITHUB_TOKEN`` are both recognised).
+    """
+    return is_secret_key(name)
 
 
 def _render_value(value: object) -> str:

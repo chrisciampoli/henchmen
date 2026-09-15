@@ -28,7 +28,7 @@ from henchmen.config.secret_files import write_secret_file
 _ASSIGNMENT_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
 _NEEDS_QUOTES_RE = re.compile(r"[\s#\"'\\$`]")
 
-_SECRET_KEY_SUFFIXES: tuple[str, ...] = ("_TOKEN", "_API_KEY", "_PRIVATE_KEY", "_SECRET")
+_SECRET_KEY_SUFFIXES: tuple[str, ...] = ("_TOKEN", "_API_KEY", "_PRIVATE_KEY", "_SECRET", "_PASSWORD")
 
 
 def is_secret_key(key: str) -> bool:
@@ -38,6 +38,11 @@ def is_secret_key(key: str) -> bool:
     ``HENCHMEN_ANTHROPIC_API_KEY`` are secret, while
     ``HENCHMEN_OPERATIVE_MAX_OUTPUT_TOKENS``, ``HENCHMEN_JIRA_PROJECT_KEY`` and
     ``HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH`` are not.
+
+    The single secret-name classifier: ``henchmen.cli.config_cmd.is_secret_field``
+    (``henchmen config``'s masking) delegates to this function, as does
+    :meth:`henchmen.console.config_store.ConfigStore.masked`, so every surface
+    that decides whether to show a Settings field's value agrees.
 
     ``henchmen.console.app``'s setup-state choice filter (``_choices_are_not_secrets``)
     intentionally checks a broader set of name segments and suffixes than this

@@ -120,6 +120,23 @@ def test_concurrent_updates_do_not_lose_keys(store: ConfigStore) -> None:
     assert all(store.get(key) == f"value-{index}" for index, key in enumerate(keys))
 
 
+def test_never_writable_keys_are_refused(store: ConfigStore) -> None:
+    """The operative task token and the operative-only GitHub token expiry are server-owned."""
+    with pytest.raises(ConfigStoreError):
+        store.update({"HENCHMEN_OPERATIVE_TASK_TOKEN": "x"}, section="S")
+    with pytest.raises(ConfigStoreError):
+        store.get("HENCHMEN_OPERATIVE_TASK_TOKEN")
+    assert not store.config_file.exists()
+
+
+def test_a_path_with_a_dot_dot_segment_shares_the_lock_with_the_plain_path(tmp_path: Path) -> None:
+    plain = tmp_path / "henchmen.env"
+    detoured = tmp_path / "x" / ".." / "henchmen.env"
+    store_plain = ConfigStore(config_file=plain, secrets_dir=tmp_path / "secrets")
+    store_detoured = ConfigStore(config_file=detoured, secrets_dir=tmp_path / "secrets")
+    assert store_plain._lock is store_detoured._lock  # noqa: SLF001 -- exactly what C16 requires
+
+
 def test_two_instances_over_the_same_file_share_the_lock(tmp_path: Path) -> None:
     """Ruling C16: the lock is keyed by the resolved config path, not the instance.
 

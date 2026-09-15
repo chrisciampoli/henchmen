@@ -1,9 +1,16 @@
 """Shared scaffolding for Console step-router tests.
 
-This module is the only test code that calls ``create_console_app``, which
-discovers and mounts every step router (A2). Outbound HTTP made by routers goes
-to ``handler`` (an ``httpx.MockTransport`` handler); with no handler, any
-outbound call gets a 599 so an unexpected network call fails the test loudly.
+Step-router tests build their app through ``make_harness``/``build_console_app``
+here rather than calling ``create_console_app`` (which discovers and mounts
+every step router, A2) directly, so they get a signed-in client, a real
+``ConfigStore`` and faked outbound HTTP for free. A handful of tests that
+exercise ``create_console_app`` itself -- its signature, its wiring of
+``app.state``, discovery/mounting behaviour -- call it directly instead (see
+``tests/unit/test_console_app.py``, ``test_console_steps.py`` and
+``test_cli_serve.py``); this module intentionally does not wrap those cases.
+Outbound HTTP made by routers goes to ``handler`` (an ``httpx.MockTransport``
+handler); with no handler, any outbound call gets a 599 so an unexpected
+network call fails the test loudly.
 """
 
 from __future__ import annotations

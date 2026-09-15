@@ -1,12 +1,15 @@
 """Tests for the Console HTTP routes."""
 
+import threading
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from henchmen.console.app import ConsoleMode, create_console_app
 from henchmen.console.auth import SESSION_COOKIE, ConsoleAuth
+from henchmen.console.config_store import ConfigStore
 from henchmen.console.state import SetupState, SetupStateStore, SetupStep
 
 LOCAL = "http://127.0.0.1:8000"
@@ -257,6 +260,99 @@ def test_apply_generates_the_dispatch_api_token_once(env) -> None:
     assert len(token) >= 40
     assert client.post("/console/api/apply", headers=ORIGIN).status_code == 202
     assert EnvFile.load(config).get("HENCHMEN_DISPATCH_API_TOKEN") == token
+
+
+def test_apply_writes_the_dispatch_api_token_through_the_injected_config_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ruling I-1: apply must use ``app.state.config_store`` (the injected store), not build a new one."""
+    store = SetupStateStore(tmp_path / "setup-state.json")
+    auth = ConsoleAuth(setup_token="tok", signing_key=b"k" * 32)
+    config = tmp_path / "henchmen.env"
+    injected = ConfigStore(config_file=config, secrets_dir=tmp_path / "secrets")
+    spy = MagicMock(wraps=injected.write_dispatch_api_token)
+    monkeypatch.setattr(injected, "write_dispatch_api_token", spy)
+    applied = _ApplyRecorder()
+    app = create_console_app(
+        mode=ConsoleMode.SETUP,
+        store=store,
+        auth=auth,
+        config_file=config,
+        secrets_dir=tmp_path / "secrets",
+        on_apply=applied,
+        config_store=injected,
+    )
+    client = _signed_in(TestClient(app, base_url=LOCAL), auth)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
+    config.write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+
+    response = client.post("/console/api/apply", headers=ORIGIN)
+
+    assert response.status_code == 202
+    spy.assert_called_once()
+    token = spy.call_args.args[0]
+    assert len(token) >= 40
+
+
+def test_apply_blocks_a_concurrent_step_write_until_it_finishes(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ruling C16/I-2: apply holds the config-file lock across compute-token -> validate -> write.
+
+    A step write attempted while apply is mid-flight must block until apply
+    releases the lock, not interleave with it. Synchronised with
+    ``threading.Event``s (never a sleep-and-hope) so the assertion that the
+    writer has not finished is a guarantee, not a race: apply cannot release
+    the lock until the test itself sets ``proceed``.
+    """
+    import henchmen.console.app as app_module
+
+    client, store, auth, _applied, config = env
+    _signed_in(client, auth)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
+    config.write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+    config_store = client.app.state.config_store
+
+    entered_validation = threading.Event()
+    proceed = threading.Event()
+    original_settings_problems = app_module.settings_problems
+
+    def _slow_settings_problems(*args: object, **kwargs: object) -> object:
+        result = original_settings_problems(*args, **kwargs)  # type: ignore[operator]
+        entered_validation.set()
+        assert proceed.wait(timeout=5), "test did not release apply in time"
+        return result
+
+    monkeypatch.setattr(app_module, "settings_problems", _slow_settings_problems)
+
+    apply_status: list[int] = []
+
+    def _apply() -> None:
+        apply_status.append(client.post("/console/api/apply", headers=ORIGIN).status_code)
+
+    apply_thread = threading.Thread(target=_apply)
+    apply_thread.start()
+    assert entered_validation.wait(timeout=5), "apply never reached validation"
+
+    write_done = threading.Event()
+
+    def _write() -> None:
+        config_store.update({"HENCHMEN_GITHUB_DEFAULT_ORG": "acme"}, section="GitHub")
+        write_done.set()
+
+    writer_thread = threading.Thread(target=_write)
+    writer_thread.start()
+    # apply is provably still holding the lock here: it is blocked inside
+    # `_slow_settings_problems` waiting on `proceed`, which nothing has set
+    # yet, so the concurrent writer cannot have acquired the lock and finished
+    # -- this is a guarantee, not a 200ms race.
+    assert not write_done.wait(timeout=0.2)
+
+    proceed.set()
+    apply_thread.join(timeout=5)
+    writer_thread.join(timeout=5)
+
+    assert apply_status == [202]
+    assert write_done.is_set()
+    assert config_store.get("HENCHMEN_GITHUB_DEFAULT_ORG") == "acme"
 
 
 def test_apply_validates_the_file_not_the_seeded_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

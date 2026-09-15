@@ -26,7 +26,8 @@ from __future__ import annotations
 
 import secrets
 import threading
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 from henchmen.cli.envfile import EnvFile, is_secret_key
@@ -42,18 +43,29 @@ _TOKEN_BYTES = 32
 CONFIGURED = "configured"
 _FORBIDDEN_CHARACTERS: tuple[str, ...] = ("\n", "\r", "\x00")
 
+# Settings fields real enough to be in `_allowed`, but that a Console request must
+# never be able to write: they are set only by the server itself, never by a user
+# choice (the operative task token is generated internally; the GitHub token expiry
+# is stamped by the Lair for the operative runtime contract, never by a step).
+_NEVER_WRITABLE: frozenset[str] = frozenset({"HENCHMEN_OPERATIVE_TASK_TOKEN", "HENCHMEN_GITHUB_TOKEN_EXPIRES_AT"})
+
 # Keyed by the resolved config-file path rather than per instance (ruling C16):
 # apply builds its own ConfigStore for each request, and a step router's store
 # is a different instance again, so only a lock shared by path -- not by
 # instance -- keeps every load-modify-write against the same file serialised.
-_FILE_LOCKS: dict[Path, threading.Lock] = {}
+# An RLock (not a plain Lock) so a caller that holds the lock across a whole
+# read-validate-write sequence via `locked()` (apply: compute the pending
+# Dispatch token, validate Settings, then write it) can still call a method
+# such as `write_dispatch_api_token` that re-acquires the same lock from the
+# same thread without deadlocking.
+_FILE_LOCKS: dict[Path, threading.RLock] = {}
 _FILE_LOCKS_GUARD = threading.Lock()
 
 
-def _lock_for(config_file: Path) -> threading.Lock:
+def _lock_for(config_file: Path) -> threading.RLock:
     key = config_file.resolve()
     with _FILE_LOCKS_GUARD:
-        return _FILE_LOCKS.setdefault(key, threading.Lock())
+        return _FILE_LOCKS.setdefault(key, threading.RLock())
 
 
 class ConfigStoreError(ValueError):
@@ -143,8 +155,23 @@ class ConfigStore:
             env.write()
             return True
 
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        """Hold this file's shared lock across a multi-step sequence.
+
+        For a caller (apply) that must compute something from the current
+        file, validate it, and only then write -- with no step write able to
+        land in between -- rather than three separate lock acquisitions that
+        a concurrent writer could interleave with. The lock is an ``RLock``,
+        so calling another ``ConfigStore`` method (e.g.
+        :meth:`write_dispatch_api_token`) while already holding it, from the
+        same thread, re-enters cleanly instead of deadlocking.
+        """
+        with self._lock:
+            yield
+
     def _check_key(self, key: str) -> None:
-        if key not in self._allowed:
+        if key not in self._allowed or key in _NEVER_WRITABLE:
             raise ConfigStoreError(f"{key!r} is not a Henchmen setting")
 
     def get(self, key: str, default: str = "") -> str:
