@@ -613,3 +613,546 @@ def test_an_unreadable_config_file_fails_the_manifest_instead_of_a_500(
     assert body["ok"] is False
     assert body["problems"][0]["field"] == "github_api_url"
     assert not harness.app.state.callback_states.path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Installation and repository choice (Task 6)
+# ---------------------------------------------------------------------------
+
+REPO = "acme/webapp"
+INSTALLED = f"{BASE}/installed"
+
+
+def _created_app(harness: ConsoleHarness, github: FakeGitHub, *, installation_id: str = "") -> Path:
+    key_path = harness.config_store.write_secret_file(f"github-app-{github.app_id}.pem", app_key_pair()[0])
+    values = {"HENCHMEN_GITHUB_APP_ID": github.app_id, "HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH": str(key_path)}
+    if installation_id:
+        values["HENCHMEN_GITHUB_APP_INSTALLATION_ID"] = installation_id
+    harness.config_store.update(values, section="GitHub")
+    harness.setup_store.set_server_choices({"github_app_slug": github.app_slug})
+    return key_path
+
+
+def _install_state(
+    harness: ConsoleHarness, github: FakeGitHub, *, api_url: str = API_URL, web_url: str = WEB_URL
+) -> str:
+    return harness.app.state.callback_states.issue(
+        INSTALL_PURPOSE, {"slug": github.app_slug, "api_url": api_url, "web_url": web_url}
+    )
+
+
+def _installable(harness: ConsoleHarness, github: FakeGitHub, installation_id: str = "77") -> None:
+    _created_app(harness, github)
+    github.installations[installation_id] = FakeGitHub.installation(installation_id, "acme")
+
+
+def _append_config(harness: ConsoleHarness, tmp_path: Path, text: str) -> None:
+    _write_config(tmp_path, harness.config_store.config_file.read_text(encoding="utf-8") + text)
+
+
+def _ready_to_choose(harness: ConsoleHarness, github: FakeGitHub, *, bot_id: int = 1, **installation: object) -> None:
+    _created_app(harness, github, installation_id="77")
+    github.installations["77"] = FakeGitHub.installation("77", "acme", **installation)
+    github.repositories = [FakeGitHub.repository(REPO)]
+    github.users[f"{github.app_slug}[bot]"] = {"id": bot_id, "login": f"{github.app_slug}[bot]"}
+
+
+# -- the public installed callback ------------------------------------------------
+
+
+def test_installed_callback_stores_the_installation(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _installable(harness, github)
+
+    response = harness.get(
+        INSTALLED, installation_id="77", setup_action="install", state=_install_state(harness, github)
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/?step=github&github=installed"
+    assert response.headers["cache-control"] == "no-store"
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == "77"
+    assert harness.setup_store.load().server_choices["github_account"] == "acme"
+    assert SetupStep.GITHUB not in harness.setup_store.load().completed_steps
+    # Verified with this App's JWT against the installation endpoint.
+    assert [str(request.url) for request in github.requests] == [f"{API_URL}/app/installations/77"]
+    assert github.requests[0].headers["authorization"].startswith("Bearer ")
+
+
+def test_installed_callback_waits_for_admin_approval(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _created_app(harness, github)
+    response = harness.get(INSTALLED, setup_action="request", state=_install_state(harness, github))
+    assert response.headers["location"] == "/?step=github&github=requested"
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == ""
+    assert github.requests == []
+
+
+def test_an_approval_request_never_saves_a_query_installation_id(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _installable(harness, github)
+    response = harness.get(
+        INSTALLED, installation_id="77", setup_action="request", state=_install_state(harness, github)
+    )
+    assert response.headers["location"] == "/?step=github&github=requested"
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == ""
+    assert github.requests == []
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"installation_id": "77", "setup_action": "install", "state": "forged"},
+        {"installation_id": "77", "setup_action": "install"},
+        {"installation_id": "77", "setup_action": "request"},
+        {},
+        {"installation_id": "77", "state": "x" * 5000},
+        {"installation_id": "77", "state": "forged", "redirect": "https://evil.example", "next": "//evil.example"},
+    ],
+)
+def test_installed_callback_refuses_a_bad_state(tmp_path: Path, github: FakeGitHub, params: dict[str, str]) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _installable(harness, github)
+    config_before = harness.config_store.config_file.read_bytes()
+    response = harness.get(INSTALLED, **params)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/?step=github&github_error=expired"
+    assert response.text == ""
+    assert github.requests == []
+    assert harness.config_store.config_file.read_bytes() == config_before
+
+
+def test_redirect_parameters_never_choose_the_target(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _installable(harness, github)
+    response = harness.get(
+        INSTALLED,
+        installation_id="77",
+        state=_install_state(harness, github),
+        redirect="https://evil.example",
+        next="//evil.example",
+        return_to="https://evil.example",
+    )
+    assert response.headers["location"] == "/?step=github&github=installed"
+
+
+def test_installed_callback_state_is_single_use(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _installable(harness, github)
+    state = _install_state(harness, github)
+    first = harness.get(INSTALLED, installation_id="77", state=state)
+    assert first.headers["location"] == "/?step=github&github=installed"
+    harness.config_store.unset(["HENCHMEN_GITHUB_APP_INSTALLATION_ID"])
+    requests_before = len(github.requests)
+
+    replay = harness.get(INSTALLED, installation_id="77", state=state)
+
+    assert replay.headers["location"] == "/?step=github&github_error=expired"
+    assert len(github.requests) == requests_before
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == ""
+
+
+def test_an_expired_install_state_never_calls_github(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _installable(harness, github)
+    clock = [1_000_000.0]
+    harness.app.state.callback_states = CallbackStateStore(
+        harness.app.state.callback_states.path, ttl_seconds=60, clock=lambda: clock[0]
+    )
+    state = _install_state(harness, github)
+    clock[0] += 61
+    response = harness.get(INSTALLED, installation_id="77", state=state)
+    assert response.headers["location"] == "/?step=github&github_error=expired"
+    assert github.requests == []
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == ""
+
+
+def test_a_manifest_state_cannot_complete_the_installation(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _installable(harness, github)
+    response = harness.get(INSTALLED, installation_id="77", state=_issue_manifest_state(harness))
+    assert response.headers["location"] == "/?step=github&github_error=expired"
+    assert github.requests == []
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == ""
+
+
+def test_installed_callback_refuses_an_installation_github_does_not_know(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _created_app(harness, github)
+    response = harness.get(
+        INSTALLED, installation_id="12345", setup_action="install", state=_install_state(harness, github)
+    )
+    assert response.headers["location"] == "/?step=github&github_error=installation"
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == ""
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"app_slug": "someone-elses-app", "app_id": "999"},
+        {"app_slug": "henchmen-test", "app_id": "999"},
+        {"app_slug": "someone-elses-app", "app_id": "4242"},
+    ],
+)
+def test_installed_callback_refuses_an_installation_of_another_app(
+    tmp_path: Path, github: FakeGitHub, identity: dict[str, str]
+) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _created_app(harness, github)
+    github.installations["77"] = FakeGitHub.installation("77", "mallory", **identity)
+    response = harness.get(
+        INSTALLED, installation_id="77", setup_action="install", state=_install_state(harness, github)
+    )
+    assert response.headers["location"] == "/?step=github&github_error=installation"
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == ""
+    assert "github_account" not in harness.setup_store.load().server_choices
+
+
+@pytest.mark.parametrize("installation_id", ["", "abc", "../app", "1" * 21, "７７"])
+def test_a_malformed_installation_id_is_never_sent_to_github(
+    tmp_path: Path, github: FakeGitHub, installation_id: str
+) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _installable(harness, github)
+    response = harness.get(INSTALLED, installation_id=installation_id, state=_install_state(harness, github))
+    assert response.headers["location"] == "/?step=github&github_error=installation"
+    assert github.requests == []
+
+
+def test_installed_callback_uses_the_state_bound_api_url(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _installable(harness, github)
+    state = _install_state(
+        harness, github, api_url="https://api.bound.example.test", web_url="https://bound.example.test"
+    )
+    _append_config(harness, tmp_path, "HENCHMEN_GITHUB_API_URL=https://api.changed.example.test\n")
+    response = harness.get(INSTALLED, installation_id="77", state=state)
+    assert response.headers["location"] == "/?step=github&github=installed"
+    assert [str(request.url) for request in github.requests] == ["https://api.bound.example.test/app/installations/77"]
+
+
+def test_an_install_state_without_usable_urls_never_calls_github(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _installable(harness, github)
+    state = harness.app.state.callback_states.issue(INSTALL_PURPOSE, {"slug": github.app_slug})
+    response = harness.get(INSTALLED, installation_id="77", state=state)
+    assert response.headers["location"] == "/?step=github&github_error=configuration"
+    assert github.requests == []
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == ""
+
+
+def test_installed_callback_without_a_usable_app_saves_nothing(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    github.installations["77"] = FakeGitHub.installation("77", "acme")
+    response = harness.get(INSTALLED, installation_id="77", state=_install_state(harness, github))
+    assert response.headers["location"] == "/?step=github&github_error=installation"
+    assert github.requests == []
+    assert not harness.config_store.config_file.exists()
+
+
+def test_installed_callback_reports_a_failed_write(
+    tmp_path: Path, github: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _installable(harness, github)
+    state = _install_state(harness, github)
+    config_before = harness.config_store.config_file.read_bytes()
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(harness.config_store, "update", fail)
+    response = harness.get(INSTALLED, installation_id="77", state=state)
+    assert response.headers["location"] == "/?step=github&github_error=storage"
+    assert harness.config_store.config_file.read_bytes() == config_before
+    assert "github_account" not in harness.setup_store.load().server_choices
+
+
+def test_installed_callback_logs_no_state_or_app_jwt(
+    tmp_path: Path, github: FakeGitHub, caplog: pytest.LogCaptureFixture
+) -> None:
+    from henchmen.utils.redaction import install_secret_redaction
+
+    harness = _harness(tmp_path, github, signed_in=False)
+    _installable(harness, github)
+    state = _install_state(harness, github)
+    original_factory = logging.getLogRecordFactory()
+    # As in production: the test client's own request line carries the state, like any access log.
+    install_secret_redaction()
+    try:
+        with caplog.at_level(logging.DEBUG):
+            response = harness.get(INSTALLED, installation_id="77", state=state)
+    finally:
+        logging.setLogRecordFactory(original_factory)
+    assert response.headers["location"] == "/?step=github&github=installed"
+    assert not any(state in record.getMessage() for record in caplog.records if record.name.startswith("henchmen"))
+    assert caplog.records
+    app_jwt = github.requests[0].headers["authorization"].removeprefix("Bearer ")
+    for secret in [state, app_jwt, *_secret_texts()]:
+        assert secret not in caplog.text
+        assert secret not in response.headers["location"]
+
+
+# -- the install link (C9) --------------------------------------------------------
+
+
+def test_installation_link_issues_a_fresh_single_use_state(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _created_app(harness, github)
+
+    first = harness.post(f"{BASE}/installation/link").json()
+    second = harness.post(f"{BASE}/installation/link").json()
+
+    assert first["ok"] is True
+    url = first["details"]["install_url"]
+    assert url.startswith(f"https://github.com/apps/{github.app_slug}/installations/new?state=")
+    state = parse_qs(urlsplit(url).query)["state"][0]
+    other = parse_qs(urlsplit(second["details"]["install_url"]).query)["state"][0]
+    assert state != other
+    states: CallbackStateStore = harness.app.state.callback_states
+    assert states.consume(INSTALL_PURPOSE, state) == {"slug": github.app_slug, "api_url": API_URL, "web_url": WEB_URL}
+    assert states.consume(INSTALL_PURPOSE, state) is None
+    assert github.requests == []
+
+
+def test_installation_link_state_completes_the_installation(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _installable(harness, github)
+    url = harness.post(f"{BASE}/installation/link").json()["details"]["install_url"]
+    state = parse_qs(urlsplit(url).query)["state"][0]
+    harness.client.cookies.clear()
+    response = harness.get(INSTALLED, installation_id="77", setup_action="install", state=state)
+    assert response.headers["location"] == "/?step=github&github=installed"
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == "77"
+
+
+def test_installation_link_uses_the_configured_github_urls(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _created_app(harness, github)
+    _append_config(
+        harness,
+        tmp_path,
+        "HENCHMEN_GITHUB_API_URL=https://api.ghe.example.test\nHENCHMEN_GITHUB_WEB_URL=https://ghe.example.test\n",
+    )
+    url = harness.post(f"{BASE}/installation/link").json()["details"]["install_url"]
+    assert url.startswith(f"https://ghe.example.test/apps/{github.app_slug}/installations/new?state=")
+    state = parse_qs(urlsplit(url).query)["state"][0]
+    assert harness.app.state.callback_states.consume(INSTALL_PURPOSE, state) == {
+        "slug": github.app_slug,
+        "api_url": "https://api.ghe.example.test",
+        "web_url": "https://ghe.example.test",
+    }
+
+
+def test_installation_link_without_an_app(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    body = harness.post(f"{BASE}/installation/link").json()
+    assert body["ok"] is False
+    assert "not been created" in body["problems"][0]["message"]
+    assert not harness.app.state.callback_states.path.exists()
+
+
+def test_installation_link_with_an_invalid_github_url_names_the_field(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _created_app(harness, github)
+    _append_config(harness, tmp_path, "HENCHMEN_GITHUB_WEB_URL=http://github.example.com\n")
+    response = harness.post(f"{BASE}/installation/link")
+    body = response.json()
+    assert body["ok"] is False
+    assert body["problems"][0]["field"] == "github_web_url"
+    assert "github.example.com" not in response.text
+    assert not harness.app.state.callback_states.path.exists()
+
+
+def test_installation_link_requires_a_session(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github, signed_in=False)
+    _installable(harness, github)
+    assert harness.post(f"{BASE}/installation/link").status_code == 401
+    assert harness.post(f"{BASE}/installation/check").status_code == 401
+    assert harness.get(f"{BASE}/repositories").status_code == 401
+    assert harness.post(f"{BASE}/repository", {"repo": REPO}).status_code == 401
+    assert not harness.app.state.callback_states.path.exists()
+    assert github.requests == []
+
+
+# -- Check again --------------------------------------------------------------------
+
+
+def test_check_again_finds_the_single_installation(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _installable(harness, github)
+    body = harness.post(f"{BASE}/installation/check").json()
+    assert body == {"ok": True, "step": "github", "details": {"installation_id": "77", "account": "acme"}}
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == "77"
+    assert SetupStep.GITHUB not in harness.setup_store.load().completed_steps
+
+
+def test_check_again_before_approval_offers_an_admin_request(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _created_app(harness, github)
+    body = harness.post(f"{BASE}/installation/check").json()
+    assert body["ok"] is False
+    action = body["problems"][0]["action"]
+    assert f"https://github.com/apps/{github.app_slug}/installations/new" in action
+    assert "Check again" in action
+
+
+def test_check_again_ignores_installations_of_another_app(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _created_app(harness, github)
+    github.installations["88"] = FakeGitHub.installation("88", "mallory", app_slug="other-app", app_id="999")
+    body = harness.post(f"{BASE}/installation/check").json()
+    assert body["ok"] is False
+    assert "not installed" in body["problems"][0]["message"]
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == ""
+
+
+def test_check_again_with_two_accounts_asks_for_one(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _created_app(harness, github)
+    github.installations["77"] = FakeGitHub.installation("77", "acme")
+    github.installations["78"] = FakeGitHub.installation("78", "globex")
+    body = harness.post(f"{BASE}/installation/check").json()
+    assert body["ok"] is False
+    assert "more than one account" in body["problems"][0]["message"]
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == ""
+
+
+def test_check_again_without_an_app(tmp_path: Path, github: FakeGitHub) -> None:
+    body = _harness(tmp_path, github).post(f"{BASE}/installation/check").json()
+    assert body["ok"] is False
+    assert "not been created" in body["problems"][0]["message"]
+    assert github.requests == []
+
+
+def test_check_again_with_an_invalid_github_url_calls_nothing(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _installable(harness, github)
+    _append_config(harness, tmp_path, "HENCHMEN_GITHUB_API_URL=https://user:hunter2-pw@api.github.com\n")
+    response = harness.post(f"{BASE}/installation/check")
+    assert response.json()["problems"][0]["field"] == "github_api_url"
+    assert "hunter2" not in response.text
+    assert github.requests == []
+
+
+# -- repositories and the default repository ------------------------------------------
+
+
+def test_repositories_lists_what_the_installation_can_see(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _created_app(harness, github, installation_id="77")
+    github.installations["77"] = FakeGitHub.installation("77", "acme")
+    github.repositories = [FakeGitHub.repository(REPO), FakeGitHub.repository("acme/api", default_branch="develop")]
+
+    response = harness.get(f"{BASE}/repositories")
+
+    assert response.json()["details"]["repositories"] == [
+        {"full_name": "acme/api", "default_branch": "develop", "private": True},
+        {"full_name": REPO, "default_branch": "main", "private": True},
+    ]
+    assert "ghs_" not in response.text
+    # Listed with an installation token minted for the listing, never the app JWT.
+    listing = [request for request in github.requests if request.url.path == "/installation/repositories"]
+    assert listing
+    assert listing[0].headers["authorization"] == f"Bearer {github.minted[0]['token']}"
+
+
+def test_repositories_before_installation(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _created_app(harness, github)
+    body = harness.get(f"{BASE}/repositories").json()
+    assert body["ok"] is False
+    assert "Install the GitHub App" in body["problems"][0]["message"]
+    assert github.requests == []
+
+
+def test_repositories_when_github_refuses_a_token(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _created_app(harness, github, installation_id="77")
+    github.installations["77"] = FakeGitHub.installation("77", "acme")
+    github.token_status = 401
+    body = harness.get(f"{BASE}/repositories").json()
+    assert body["ok"] is False
+    assert "refused" in body["problems"][0]["message"]
+
+
+def test_choosing_a_repository_completes_the_step(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _ready_to_choose(harness, github, bot_id=987654)
+
+    response = harness.post(f"{BASE}/repository", {"repo": "Acme/WebApp"})
+
+    body = response.json()
+    assert body["ok"] is True
+    assert body["details"] == {"default_repo": REPO, "default_branch": "main", "git_author": "henchmen-test[bot]"}
+    config = harness.config_store
+    assert config.get("HENCHMEN_GITHUB_DEFAULT_REPO") == REPO
+    assert config.get("HENCHMEN_GITHUB_DEFAULT_ORG") == "acme"
+    assert config.get("HENCHMEN_GIT_AUTHOR_NAME") == "henchmen-test[bot]"
+    assert config.get("HENCHMEN_GIT_AUTHOR_EMAIL") == "987654+henchmen-test[bot]@users.noreply.github.com"
+    assert SetupStep.GITHUB in harness.setup_store.load().completed_steps
+    assert "ghs_" not in response.text
+    details = harness.get(BASE).json()["details"]
+    assert (details["installed"], details["default_repo"], details["completed"]) == (True, REPO, True)
+
+
+def test_repository_outside_the_installation_is_refused(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _ready_to_choose(harness, github)
+    github.repositories = [FakeGitHub.repository("acme/api")]
+
+    body = harness.post(f"{BASE}/repository", {"repo": REPO}).json()
+
+    assert body["ok"] is False
+    problem = body["problems"][0]
+    assert problem["field"] == "repo"
+    assert "https://github.com/organizations/acme/settings/installations/77" in problem["action"]
+    assert harness.config_store.get("HENCHMEN_GITHUB_DEFAULT_REPO") == ""
+    assert SetupStep.GITHUB not in harness.setup_store.load().completed_steps
+
+
+def test_missing_write_permissions_are_explained(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _ready_to_choose(harness, github, permissions={"contents": "write", "pull_requests": "read", "metadata": "read"})
+
+    body = harness.post(f"{BASE}/repository", {"repo": REPO}).json()
+
+    assert body["ok"] is False
+    assert "open pull requests" in body["problems"][0]["message"]
+    assert harness.config_store.get("HENCHMEN_GITHUB_DEFAULT_REPO") == ""
+    assert SetupStep.GITHUB not in harness.setup_store.load().completed_steps
+
+
+def test_a_saved_installation_of_another_app_cannot_complete_the_step(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _ready_to_choose(harness, github, app_slug="other-app", app_id="999")
+
+    body = harness.post(f"{BASE}/repository", {"repo": REPO}).json()
+
+    assert body["ok"] is False
+    assert "no longer installed" in body["problems"][0]["message"]
+    assert harness.config_store.get("HENCHMEN_GITHUB_DEFAULT_REPO") == ""
+    assert SetupStep.GITHUB not in harness.setup_store.load().completed_steps
+
+
+def test_a_failed_repository_write_does_not_complete_the_step(
+    tmp_path: Path, github: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _harness(tmp_path, github)
+    _ready_to_choose(harness, github)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(harness.config_store, "update", fail)
+    body = harness.post(f"{BASE}/repository", {"repo": REPO}).json()
+    assert body["ok"] is False
+    assert "writable" in body["problems"][0]["action"]
+    assert SetupStep.GITHUB not in harness.setup_store.load().completed_steps
+
+
+def test_repository_must_be_owner_slash_name(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    assert harness.post(f"{BASE}/repository", {"repo": "webapp"}).status_code == 422
+    assert harness.post(f"{BASE}/repository", {"repo": REPO, "extra": "x"}).status_code == 422
+    assert github.requests == []
