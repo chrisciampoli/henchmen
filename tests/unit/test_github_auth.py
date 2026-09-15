@@ -840,7 +840,10 @@ def test_symlinked_key_file_is_a_runtime_problem(key_file: Path, tmp_path: Path)
         "http://127.0.0.1:9000",
         "http://localhost:9000/github",
         "http://[::1]:9000",
+        "http://127.0.0.2:9000",
+        "http://127.255.255.254",
         "http://fakes:9000/github/api",
+        "http://fake-github",
     ],
 )
 def test_github_urls_accept_https_loopback_and_compose_hosts(field: str, url: str) -> None:
@@ -858,8 +861,18 @@ def test_github_urls_accept_https_loopback_and_compose_hosts(field: str, url: st
         "https://user:secret@api.github.com",
         "https://",
         "api.github.com",
-        "",
         "https://api.github.com:99999",
+        # Plain http to an IP literal that is not loopback, in any spelling, or a non-service name.
+        "http://2130706433",
+        "http://0x7f000001",
+        "http://0177.0.0.1",
+        "http://127.1",
+        "http://0.0.0.0:9000",
+        "http://[::2]:9000",
+        "http://[fe80::1]",
+        "http://1fakes:9000",
+        "http://fakes_internal:9000",
+        "http://-fakes",
     ],
 )
 def test_github_urls_refuse_insecure_or_malformed_values(field: str, url: str) -> None:
@@ -868,6 +881,35 @@ def test_github_urls_refuse_insecure_or_malformed_values(field: str, url: str) -
     with pytest.raises(ValidationError) as exc_info:
         Settings(**{"_env_file": None, field: url})
     assert field in str(exc_info.value)
+
+
+@pytest.mark.parametrize("field", ["github_api_url", "github_web_url"])
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_github_urls_fall_back_to_the_default(field: str, blank: str) -> None:
+    settings = Settings(**{"_env_file": None, "provider": "local", field: blank})
+    assert getattr(settings, field) == Settings.model_fields[field].default
+    assert getattr(settings, field).startswith("https://")
+
+
+@pytest.mark.parametrize("field", ["github_api_url", "github_web_url"])
+@pytest.mark.parametrize(
+    "url",
+    ["https://chris:hunter2-pw@api.github.com", "http://ghp_leakedtoken123@127.0.0.1:9000", "https://:hunter2-pw@x.io"],
+)
+def test_github_urls_with_credentials_are_refused_without_echoing_them(field: str, url: str) -> None:
+    from pydantic import ValidationError
+
+    from henchmen.config.settings import require_secure_github_url
+
+    with pytest.raises(ValueError, match="must not contain a user name or password") as plain:
+        require_secure_github_url(url)
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(**{"_env_file": None, field: url})
+    for text in (str(plain.value), str(exc_info.value)):
+        assert "hunter2" not in text
+        assert "ghp_leakedtoken123" not in text
+        assert url not in text
+    assert "user name or password" in str(exc_info.value)
 
 
 def test_fully_configured_app_is_not_a_runtime_problem(key_file: Path) -> None:
