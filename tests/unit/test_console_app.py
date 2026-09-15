@@ -187,3 +187,33 @@ def test_signed_in_browser_opening_an_old_link_is_redirected_without_error(env) 
     assert response.status_code == 303
     assert response.headers["location"] == "/"
     assert auth.setup_token == "tok", "a signed-in visit must not burn the current token"
+
+
+def test_session_exchange_with_a_file_backed_token_store_is_one_time(tmp_path: Path) -> None:
+    """Same behavior as the in-memory `env` fixture, but through the real file-backed
+    ``SetupTokenStore`` that ``ConsoleAuth.load`` builds (Ruling B4 fix round)."""
+    auth = ConsoleAuth.load(tmp_path / "secrets", setup_token=None)
+    token = auth.setup_token
+    store = SetupStateStore(tmp_path / "setup-state.json")
+    app = create_console_app(
+        mode=ConsoleMode.SETUP,
+        store=store,
+        auth=auth,
+        config_file=tmp_path / "henchmen.env",
+        on_apply=lambda: None,
+    )
+    client = TestClient(app, base_url=LOCAL, follow_redirects=False)
+
+    first = client.get("/console/session", params={"setup_token": token})
+    assert first.status_code == 303
+    assert first.headers["location"] == "/"
+
+    client.cookies.clear()
+    second = client.get("/console/session", params={"setup_token": token})
+    assert second.status_code in (303, 403)
+
+    # A signed-in browser that opens the same, now-spent link must be redirected, not errored.
+    client.cookies.set(SESSION_COOKIE, auth.issue_session())
+    third = client.get("/console/session", params={"setup_token": token})
+    assert third.status_code == 303
+    assert third.headers["location"] == "/"

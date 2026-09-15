@@ -53,6 +53,20 @@ def test_port_flag_wins_and_unloadable_settings_fall_back_to_8000(
     assert capsys.readouterr().out.startswith("http://127.0.0.1:8000/")
 
 
+def test_configured_port_fallback_warns_on_stderr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("HENCHMEN_PROVIDER", "gcp")  # no project id: Settings cannot be built
+
+    assert run_console_link_cli(_args()) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out.startswith("http://127.0.0.1:8000/")
+    assert "8000" in captured.err
+    assert "--port" in captured.err
+
+
 def test_unwritable_secrets_exit_two(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

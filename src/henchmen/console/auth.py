@@ -38,6 +38,8 @@ from henchmen.config.secret_files import (
     create_secret_file,
     ensure_secrets_dir,
     read_or_create_secret,
+    replace_with_retry,
+    sweep_stale_sibling_files,
     write_secret_file,
 )
 
@@ -46,6 +48,7 @@ logger = logging.getLogger(__name__)
 SESSION_COOKIE = "henchmen_console"
 _KEY_FILE_NAME = "console-session.key"
 SETUP_TOKEN_FILE_NAME = "setup-token"
+_SEEDED_MARKER_SUFFIX = ".seeded"
 _SETUP_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 _LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -126,27 +129,54 @@ class SetupTokenStore:
         self.path = path
         self._lock = threading.Lock()
 
+    def _seeded_marker(self) -> Path:
+        """The permanent, never-deleted marker recording that a token was issued at least once.
+
+        Its presence (not the token file's) is the source of truth for "has a seed already
+        been used here", because the token file itself can legitimately disappear (a crash
+        between the claim rename and the recreate in :meth:`consume`, a failed
+        :func:`create_secret_file`, or an ``unlink`` race) without that meaning setup never
+        ran. Trusting the token file's absence would let a lost file re-arm the launcher's
+        seed and grant a session again, or let a second process racing the very first
+        ``rotate`` call reuse the same seed.
+        """
+        return self.path.with_name(self.path.name + _SEEDED_MARKER_SUFFIX)
+
     def current(self) -> str | None:
         """The token a sign-in link must carry, or ``None`` when there is no usable token."""
         try:
             raw = self.path.read_bytes()
         except FileNotFoundError:
             return None
+        except OSError:
+            logger.warning("Could not read the setup token file %s; treating it as absent.", self.path.name)
+            return None
         token = raw.decode("ascii", errors="replace").strip()
-        return token if _SETUP_TOKEN_PATTERN.fullmatch(token) else None
+        if not _SETUP_TOKEN_PATTERN.fullmatch(token):
+            logger.warning("Setup token file %s has unusable content; treating it as absent.", self.path.name)
+            return None
+        return token
 
     def rotate(self, seed: str | None = None) -> str:
         """Issue a new token, invalidating any earlier link; ``seed`` is used only for the very first token."""
         with self._lock:
             ensure_secrets_dir(self.path.parent)
+            sweep_stale_sibling_files(self.path, "claim")
             candidate = (seed or "").strip()
-            use_seed = (
-                bool(candidate) and not self.path.exists() and _SETUP_TOKEN_PATTERN.fullmatch(candidate) is not None
-            )
+            valid_seed = bool(candidate) and _SETUP_TOKEN_PATTERN.fullmatch(candidate) is not None
+            # The exclusive create below succeeds at most once, ever, for this path: that is
+            # what makes "is this truly the first token" safe against a lost token file and
+            # against a second process racing this same first call.
+            try:
+                create_secret_file(self._seeded_marker(), b"1")
+                is_first_ever = True
+            except FileExistsError:
+                is_first_ever = False
+            use_seed = valid_seed and is_first_ever
             if candidate and not use_seed:
                 logger.info(
-                    "Ignoring the setup token seed: it applies only to the first token "
-                    "and needs 32+ URL-safe characters."
+                    "Ignoring the setup token seed: it applies only to the first token ever "
+                    "issued for this data directory and needs 32+ URL-safe characters."
                 )
             token = candidate if use_seed else secrets.token_urlsafe(32)
             write_secret_file(self.path, token.encode("ascii"))
@@ -157,12 +187,13 @@ class SetupTokenStore:
         if not candidate:
             return False
         with self._lock:
+            sweep_stale_sibling_files(self.path, "claim")
             current = self.current()
             if current is None or not _tokens_match(candidate, current):
                 return False
             claim = self.path.with_name(f"{self.path.name}.{secrets.token_hex(8)}.claim")
             try:
-                os.replace(self.path, claim)
+                replace_with_retry(self.path, claim)
             except OSError:
                 # Another process claimed or rotated it first; never the token value itself.
                 logger.info("Setup token claim on %s lost a race or failed; failing closed.", self.path.name)
@@ -172,12 +203,29 @@ class SetupTokenStore:
             except OSError:
                 logger.warning("Could not read the claimed setup token file %s; failing closed.", claim.name)
                 claimed = ""
-            finally:
+            matched = bool(claimed) and _tokens_match(candidate, claimed)
+            if matched:
+                # Consumed: replace with a fresh random token nobody holds yet.
+                with suppress(FileExistsError):
+                    create_secret_file(self.path, secrets.token_urlsafe(32).encode("ascii"))
+            else:
+                # candidate did not match what we actually claimed: most likely another
+                # process rotated the token between our current() read and the claim rename
+                # above, so what we hold in `claim` is that newer token, not a spent one.
+                # Restore it instead of discarding it under a fresh random value.
+                try:
+                    os.link(str(claim), str(self.path))
+                except FileExistsError:
+                    pass  # a newer token is already back in place; nothing to restore
+                except OSError:
+                    logger.warning(
+                        "Could not restore setup token %s after a failed claim; failing closed.", self.path.name
+                    )
+            try:
                 claim.unlink(missing_ok=True)
-            with suppress(FileExistsError):
-                # A rotation that landed in between wins; otherwise leave an unknown token in place.
-                create_secret_file(self.path, secrets.token_urlsafe(32).encode("ascii"))
-            return bool(claimed) and _tokens_match(candidate, claimed)
+            except OSError:
+                logger.debug("Could not remove claim file %s; a later sweep will remove it.", claim.name)
+            return matched
 
 
 class ConsoleAuth:

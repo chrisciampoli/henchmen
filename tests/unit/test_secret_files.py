@@ -17,6 +17,7 @@ from henchmen.config.secret_files import (
     create_secret_file,
     ensure_secrets_dir,
     read_or_create_secret,
+    replace_with_retry,
     write_secret_file,
 )
 
@@ -439,3 +440,60 @@ def test_write_secret_file_also_sweeps_stale_temp_siblings(tmp_path: Path) -> No
 
     assert not stale.exists()
     assert path.read_bytes() == b"n" * 32
+
+
+def test_write_secret_file_retries_a_transient_windows_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "k"
+    path.write_bytes(b"old")
+    real_replace = os.replace
+    attempts = {"n": 0}
+
+    def flaky_replace(src: object, dst: object) -> None:
+        attempts["n"] += 1
+        if attempts["n"] <= 2:
+            raise PermissionError("in use")
+        real_replace(src, dst)
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(os, "replace", flaky_replace)
+    monkeypatch.setattr(secret_files, "_sleep", sleeps.append)
+
+    write_secret_file(path, b"n" * 32)
+
+    assert path.read_bytes() == b"n" * 32
+    assert attempts["n"] == 3
+    assert sleeps == [0.02, 0.02]
+
+
+def test_write_secret_file_reraises_after_replace_stays_permission_denied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "k"
+    path.write_bytes(b"old")
+
+    def always_denied(src: object, dst: object) -> None:
+        raise PermissionError("in use")
+
+    monkeypatch.setattr(os, "replace", always_denied)
+    monkeypatch.setattr(secret_files, "_sleep", lambda _seconds: None)
+
+    with pytest.raises(PermissionError):
+        write_secret_file(path, b"n" * 32)
+    assert path.read_bytes() == b"old"
+
+
+def test_replace_with_retry_succeeds_immediately_without_sleeping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.write_bytes(b"data")
+    sleeps: list[float] = []
+    monkeypatch.setattr(secret_files, "_sleep", sleeps.append)
+
+    replace_with_retry(src, dst)
+
+    assert dst.read_bytes() == b"data"
+    assert sleeps == []

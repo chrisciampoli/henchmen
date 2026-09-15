@@ -31,7 +31,12 @@ def _configured_port() -> int:
 
     try:
         return int(Settings(_env_file=paths.env_files()).local_serve_port)  # type: ignore[call-arg]
-    except ValueError:  # pydantic ValidationError subclasses ValueError
+    except (ValueError, OSError) as exc:  # pydantic ValidationError subclasses ValueError
+        print(
+            f"WARNING: could not read the configured port ({exc}); falling back to {_DEFAULT_PORT}. "
+            "Pass --port to use a different one.",
+            file=sys.stderr,
+        )
         return _DEFAULT_PORT
 
 
