@@ -36,6 +36,12 @@ updates:
       - chrisciampoli
     labels:
       - dependencies
+    # Node base images stay on the current LTS major. Dependabot proposes each
+    # new major (odd releases never become LTS; even ones only in October), so
+    # major bumps are taken by hand when a release enters LTS.
+    ignore:
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: docker
     directory: /containers/forge
@@ -47,6 +53,12 @@ updates:
       - chrisciampoli
     labels:
       - dependencies
+    # Node base images stay on the current LTS major. Dependabot proposes each
+    # new major (odd releases never become LTS; even ones only in October), so
+    # major bumps are taken by hand when a release enters LTS.
+    ignore:
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: docker
     directory: /containers/operative
@@ -58,6 +70,12 @@ updates:
       - chrisciampoli
     labels:
       - dependencies
+    # Node base images stay on the current LTS major. Dependabot proposes each
+    # new major (odd releases never become LTS; even ones only in October), so
+    # major bumps are taken by hand when a release enters LTS.
+    ignore:
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /

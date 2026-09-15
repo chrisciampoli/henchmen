@@ -124,7 +124,7 @@ dev = [
     "pytest-asyncio",
     "pytest-cov",
     "pytest-randomly",
-    "ruff>=0.15.4,<0.16",
+    "ruff>=0.15.4,<0.17",
     "mypy",
     # tests/unit/test_eval_storage.py imports evals.storage, which imports
     # aiosqlite at module scope — without it the unit suite fails to collect.
