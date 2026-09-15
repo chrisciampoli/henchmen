@@ -120,3 +120,29 @@ class SetupStateStore:
                     }
                 )
             )
+
+    def update_client_fields(
+        self, *, current_step: SetupStep, skipped_steps: list[SetupStep], choices: dict[str, str]
+    ) -> SetupState:
+        """Apply the client-writable fields of a setup-state PUT atomically.
+
+        Guarded by the same lock as :meth:`record_step_complete` and
+        :meth:`set_server_choices`, so a step completed by one of those calls
+        while this one is in flight is never lost to a save built from a
+        stale, pre-completion snapshot -- this method's own load and save
+        happen back to back with nothing else able to interleave. A step
+        already in ``completed_steps`` is dropped from ``skipped_steps``:
+        completion always wins over an (now stale) earlier skip.
+        """
+        with self._lock:
+            state = self.load()
+            completed = set(state.completed_steps)
+            return self.save(
+                state.model_copy(
+                    update={
+                        "current_step": current_step,
+                        "skipped_steps": [step for step in skipped_steps if step not in completed],
+                        "choices": choices,
+                    }
+                )
+            )

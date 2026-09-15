@@ -23,6 +23,7 @@ from henchmen.console.steps import (
     get_setup_store,
     step_failed,
     step_succeeded,
+    validate_step_routes,
 )
 
 LOCAL = "http://127.0.0.1:8000"
@@ -38,7 +39,7 @@ def _github_router() -> APIRouter:
         if body.get("good"):
             return step_succeeded(store, SetupStep.GITHUB, {"repos": 1})
         problem = StepProblem(field="token", message="GitHub rejected the token.", action="Create a new token.")
-        return step_failed(SetupStep.GITHUB, [problem])
+        return step_failed(SetupStep.GITHUB, problem)
 
     @router.get("/callback")
     async def callback() -> dict[str, bool]:
@@ -130,6 +131,14 @@ def test_step_failure_needs_at_least_one_problem() -> None:
         StepFailure(step=SetupStep.JIRA, problems=[])
 
 
+def test_step_failed_is_variadic_and_needs_at_least_one_problem() -> None:
+    problem = StepProblem(message="bad")
+    built = step_failed(SetupStep.JIRA, problem)
+    assert built.problems == [problem]
+    with pytest.raises(ValueError):
+        step_failed(SetupStep.JIRA)
+
+
 def test_public_paths_are_declared_once() -> None:
     assert frozenset({"/console/api/status"}) == PUBLIC_PATHS
 
@@ -147,6 +156,34 @@ def test_public_path_matching_is_exact_and_cannot_be_widened_by_a_prefix(console
     assert client.get("/console/api/steps/github/installed").json() == {"public": True}
     assert client.get("/console/api/steps/github/installed-evil").status_code == 401
     assert client.get("/console/api/steps/github/installed/x").status_code == 401
+
+
+def test_create_console_app_validates_injected_step_routes_too(tmp_path: Path) -> None:
+    """Not just discovery: a `step_routes` mapping passed straight into create_console_app
+    (bypassing henchmen.console.steps.<step> modules entirely) is held to the same
+    fail-closed rules -- an injected public path outside the step's own prefix raises."""
+    store = SetupStateStore(tmp_path / "setup-state.json")
+    auth = ConsoleAuth(setup_token="tok", signing_key=b"k" * 32)
+    bad_routes = {SetupStep.GITHUB: StepRoutes(router=APIRouter(), public_paths=frozenset({"/console/api/apply"}))}
+    with pytest.raises(ValueError, match="PUBLIC_ROUTE_PATHS"):
+        create_console_app(
+            mode=ConsoleMode.SETUP,
+            store=store,
+            auth=auth,
+            config_file=tmp_path / "henchmen.env",
+            on_apply=lambda: None,
+            step_routes=bad_routes,
+        )
+
+
+def test_validate_step_routes_is_the_single_check_used_by_both_paths() -> None:
+    validate_step_routes(SetupStep.GITHUB, StepRoutes(router=APIRouter()))
+    with pytest.raises(TypeError, match="without a prefix"):
+        validate_step_routes(SetupStep.GITHUB, StepRoutes(router=APIRouter(prefix="/github")))
+    with pytest.raises(ValueError, match="PUBLIC_ROUTE_PATHS"):
+        validate_step_routes(
+            SetupStep.GITHUB, StepRoutes(router=APIRouter(), public_paths=frozenset({"/console/api/apply"}))
+        )
 
 
 def test_the_setup_state_put_cannot_write_server_choices(console) -> None:
