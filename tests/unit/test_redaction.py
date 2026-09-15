@@ -76,3 +76,26 @@ class TestUrlUserinfoRedaction:
     def test_url_without_credentials_is_left_alone(self):
         text = "reachable at http://localhost:11434 (3 models pulled)"
         assert redact(text) == text
+
+    def test_bearer_style_token_with_no_password_is_stripped(self):
+        result = redact("fetch https://token@host/api failed")
+        assert "token@" not in result
+        assert REDACTED in result
+        assert "https://" in result
+        assert "host/api" in result
+
+    def test_empty_username_with_a_password_is_stripped(self):
+        result = redact("connect to redis://:secret@host:6379 timed out")
+        assert "secret" not in result
+        assert REDACTED in result
+        assert "redis://" in result
+        assert "host:6379" in result
+
+    def test_ssh_git_remote_identity_is_left_alone(self):
+        """SSH has no password-in-URL mechanism; its userinfo is a login identity, not a secret."""
+        text = "clone failed: ssh://git@github.com:org/r"
+        assert redact(text) == text
+
+    def test_plain_email_address_is_left_alone(self):
+        text = "notify user@mail.com when the run finishes"
+        assert redact(text) == text

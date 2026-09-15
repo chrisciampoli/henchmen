@@ -45,6 +45,7 @@ from henchmen.console.steps import (
 )
 from henchmen.mastermind.scheme_executor.executor import estimate_feature_task_cost
 from henchmen.models.llm import ModelTier
+from henchmen.providers.pricing import lookup_price
 from henchmen.providers.tiers import TIER_FIELDS, normalize_llm_provider
 
 logger = logging.getLogger(__name__)
@@ -204,8 +205,10 @@ def recommended_models(provider: str, available: list[str]) -> dict[str, str]:
     """The ``Settings`` default model per tier when the account can reach it.
 
     When ``available`` is non-empty and the default is not in it, falls back
-    to the first model the account's own listing offers for that tier --
-    never a model the key or server cannot actually use.
+    to a listed model ``providers.pricing.lookup_price`` recognizes (so the
+    cost estimate is meaningful) and only when none is known falls back to
+    the first model the account's own listing offers -- never a model the
+    key or server cannot actually use.
     """
     picks: dict[str, str] = {}
     for tier, field_name in TIER_FIELDS[provider].items():
@@ -213,7 +216,7 @@ def recommended_models(provider: str, available: list[str]) -> dict[str, str]:
         if not default and provider == "local":
             default = str(Settings.model_fields["llm_ollama_model"].default or "")
         if available and default not in available:
-            default = available[0]
+            default = next((model for model in available if lookup_price(model) is not None), available[0])
         picks[_tier_key(tier)] = default
     return picks
 
@@ -467,15 +470,20 @@ async def save(body: AiProviderSave, config: ConfigDep, setup: SetupDep) -> Step
     previous_provider = normalize_llm_provider(config.get("HENCHMEN_LLM_PROVIDER"))
     values = _config_values(body, api_key, config, ceiling)
     try:
-        # Both writes happen under one lock acquisition (never `await` inside
-        # it) so a concurrent writer can never observe the stale key sitting
-        # alongside the new provider's configuration.
+        # `update` first: it validates every key and value (ConfigStore's own
+        # check) before writing anything, so a refused save -- an invalid
+        # character in a free-text field, say -- raises here and `unset`
+        # never runs. Only once the new provider's configuration is
+        # committed do we drop the old provider's now-unused key, and both
+        # writes happen under one lock acquisition (never `await` inside it)
+        # so a concurrent writer can never observe one without the other. A
+        # refused save must leave the config file byte-identical.
         with config.locked():
+            config.update(values, section=CONFIG_SECTION)
             if previous_provider and previous_provider != body.provider:
                 stale_key = _API_KEY_SETTINGS.get(previous_provider)
                 if stale_key is not None:
                     config.unset([stale_key])
-            config.update(values, section=CONFIG_SECTION)
     except ConfigStoreError as exc:
         text = str(exc)
         offending_key = next((key for key in values if key in text), None)

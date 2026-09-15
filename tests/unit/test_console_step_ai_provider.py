@@ -289,6 +289,43 @@ def test_save_reports_a_config_store_rejection_instead_of_500(
     assert not harness.config_store.config_file.exists()
 
 
+def test_failed_provider_switch_leaves_the_file_byte_identical(
+    harness: ConsoleHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused switch must not have already deleted the previous provider's key (round-2 regression).
+
+    Regression: ``config.unset`` used to run before ``config.update``
+    validated the new provider's values, so a rejected switch left the old
+    provider's API key gone while ``HENCHMEN_LLM_PROVIDER`` still named it.
+    """
+    _fake_anthropic(monkeypatch)
+    assert harness.post(BASE, _save_body()).json()["ok"] is True
+    before = harness.config_store.config_file.read_bytes()
+
+    monkeypatch.setattr(
+        checks,
+        "check_vertex",
+        lambda project_id, region, *, timeout=checks.DEFAULT_TIMEOUT: CheckResult(
+            "Vertex AI credentials", CheckStatus.OK, "ADC present"
+        ),
+    )
+    response = harness.post(
+        BASE,
+        {
+            "provider": "gcp",
+            "gcp_project_id": "acme\nprod",
+            "models": dict(VERTEX_DEFAULT_MODELS),
+            "task_cost_ceiling_usd": 12.0,
+        },
+    )
+    assert response.json()["ok"] is False
+
+    after = harness.config_store.config_file.read_bytes()
+    assert after == before
+    assert harness.config_store.get("HENCHMEN_ANTHROPIC_API_KEY") == KEY
+    assert harness.config_store.get("HENCHMEN_LLM_PROVIDER") == "anthropic"
+
+
 def test_failed_save_writes_nothing(harness: ConsoleHarness, monkeypatch: pytest.MonkeyPatch) -> None:
     _fake_anthropic(monkeypatch, ok=False)
     assert harness.post(BASE, _save_body()).json()["ok"] is False
@@ -464,6 +501,22 @@ def test_recommended_models_falls_back_to_an_available_model() -> None:
     assert recs["light"] == ANTHROPIC_DEFAULT_MODELS["light"]
     assert recs["complex"] == limited[0]
     assert recs["reasoning"] == limited[0]
+
+
+def test_recommended_models_prefers_a_known_priced_fallback() -> None:
+    """The fallback prefers a model providers.pricing knows, even when it is not first in the list."""
+    priced_model = ANTHROPIC_DEFAULT_MODELS["reasoning"]  # a real model id, known to PRICE_TABLE
+    limited = ["totally-unrecognized-model-a", priced_model, "totally-unrecognized-model-b"]
+    recs = recommended_models("anthropic", limited)
+    assert recs["complex"] == priced_model
+    assert recs["light"] == priced_model
+
+
+def test_recommended_models_falls_back_to_the_first_listed_when_none_are_priced() -> None:
+    """When nothing in the listing has a known price (e.g. local Ollama tags), use the first one."""
+    limited = ["totally-unrecognized-model-a", "totally-unrecognized-model-b"]
+    recs = recommended_models("anthropic", limited)
+    assert recs["complex"] == limited[0]
 
 
 def test_problem_from_check_redacts_a_key_echoed_back_by_the_provider(
