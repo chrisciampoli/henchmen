@@ -31,6 +31,7 @@ _PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"sk-[A-Za-z0-9]{32,}"),  # OpenAI / generic secret keys
     re.compile(r"AIza[A-Za-z0-9_-]{30,}"),  # Google API keys
     re.compile(r"x-access-token:[^@\s]+"),  # Authenticated git clone URLs
+    re.compile(r"(?<=Bearer )[A-Za-z0-9._~+/=-]{16,}"),  # Internal push / task / API bearer tokens (value only)
     re.compile(r"(?<=setup_token=)[^&#\s\"']+"),  # Console sign-in token in a request line (value only)
 )
 

@@ -1359,6 +1359,7 @@ class _RecordingHTTPClient:
         self.script = list(script)
         self.calls = 0
         self.timeouts: list[float] = []
+        self.headers: list[dict[str, str]] = []
 
     async def __aenter__(self):
         return self
@@ -1366,9 +1367,10 @@ class _RecordingHTTPClient:
     async def __aexit__(self, *exc_info):
         return False
 
-    async def post(self, url, json=None, timeout=None):  # noqa: ASYNC109 - mirrors httpx.AsyncClient.post
+    async def post(self, url, json=None, headers=None, timeout=None):  # noqa: ASYNC109 - mirrors httpx.AsyncClient.post
         self.calls += 1
         self.timeouts.append(timeout)
+        self.headers.append(headers or {})
         item = self.script.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -1376,12 +1378,13 @@ class _RecordingHTTPClient:
 
 
 class TestInMemoryBrokerForwarding:
-    async def _forward(self, script):
+    async def _forward(self, script, token=None):
         from henchmen.providers.local.memory import InMemoryMessageBroker
 
         client = _RecordingHTTPClient(script)
         broker = InMemoryMessageBroker()
         broker.set_forward_map({"topic": "http://localhost:8000/hook"})
+        broker.set_forward_token(token)
         with (
             patch("httpx.AsyncClient", return_value=client),
             patch("henchmen.providers.local.memory._FORWARD_RETRY_BACKOFF_SECONDS", 0),
@@ -1403,6 +1406,16 @@ class TestInMemoryBrokerForwarding:
             client = await self._forward([_FakeHTTPResponse(500)])
         assert client.calls == 1
         assert "returned 500" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_forward_token_is_sent_as_a_bearer_header(self):
+        client = await self._forward([_FakeHTTPResponse(200)], token="p" * 43)
+        assert client.headers == [{"Authorization": "Bearer " + "p" * 43}]
+
+    @pytest.mark.asyncio
+    async def test_no_authorization_header_without_a_token(self):
+        client = await self._forward([_FakeHTTPResponse(200)])
+        assert client.headers == [{}]
 
     @pytest.mark.asyncio
     async def test_retained_message_history_is_bounded(self):

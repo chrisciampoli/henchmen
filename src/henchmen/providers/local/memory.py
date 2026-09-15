@@ -93,6 +93,7 @@ class InMemoryMessageBroker:
         self._messages: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=_MESSAGE_HISTORY))
         self._subscribers: dict[str, list[Callable[..., Any]]] = defaultdict(list)
         self._forward_map: dict[str, str] = {}
+        self._forward_token: str | None = None
         # Strong references to in-flight forward tasks. Without this, the asyncio
         # event loop only holds weak references and background tasks can be
         # garbage collected mid-run (silent message loss in local dev).
@@ -120,6 +121,10 @@ class InMemoryMessageBroker:
         Pub/Sub push subscriptions for local development.
         """
         self._forward_map = mapping
+
+    def set_forward_token(self, token: str | None) -> None:
+        """Bearer token sent with every forwarded POST (desktop installs authenticate internal pushes)."""
+        self._forward_token = token or None
 
     async def publish(self, topic: str, data: bytes, ordering_key: str | None = None, **attributes: str) -> str:
         """Publish a message to the given topic. Returns a local message ID."""
@@ -157,10 +162,11 @@ class InMemoryMessageBroker:
             },
             "subscription": "local-dev",
         }
+        headers = {"Authorization": f"Bearer {self._forward_token}"} if self._forward_token else {}
         for attempt in range(1, _FORWARD_RETRIES + 1):
             try:
                 async with httpx.AsyncClient() as client:
-                    resp = await client.post(url, json=envelope, timeout=_FORWARD_TIMEOUT_SECONDS)
+                    resp = await client.post(url, json=envelope, headers=headers, timeout=_FORWARD_TIMEOUT_SECONDS)
                 if resp.status_code >= 400:
                     logger.warning("HTTP forward of %s to %s returned %d", msg_id, url, resp.status_code)
                 else:

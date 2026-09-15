@@ -658,3 +658,38 @@ def test_desktop_run_mode_warns_when_the_forward_host_is_not_allowed(
     # _serve_args() defaults to port 8123, which _serve writes to HENCHMEN_LOCAL_SERVE_PORT
     # (overriding the pre-registered "8000") before Settings resolves local_serve_port.
     assert "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123" in caplog.text
+
+
+def test_desktop_runtime_authenticates_the_shared_broker(serve_env: Path) -> None:
+    import henchmen.providers.local.memory as memory
+    from henchmen.cli.serve import DesktopRuntime
+    from henchmen.config.settings import get_settings
+
+    desktop = DesktopRuntime(allowed_hostnames=frozenset({"localhost"}), internal_push_token="p" * 43)
+    build_serve_app(get_settings(), 8000, desktop=desktop)
+    broker = memory.get_shared_broker()
+    assert broker is not None and broker._forward_token == "p" * 43
+
+    build_serve_app(get_settings(), 8000)
+    assert memory.get_shared_broker()._forward_token is None  # type: ignore[union-attr]
+
+
+def test_run_mode_loads_the_internal_push_token(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from henchmen.cli import _serve
+    from henchmen.config.internal_auth import load_internal_auth
+    from henchmen.console.state import SetupState, SetupStep
+
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    (tmp_path / "henchmen.env").write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+    SetupStateStore(tmp_path / "setup-state.json").save(
+        SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True)
+    )
+    with (
+        patch("henchmen.cli.serve.build_serve_app", return_value=MagicMock()) as build,
+        patch("henchmen.cli.serve.serve_app", return_value=0),
+        pytest.raises(SystemExit),
+    ):
+        _serve(_serve_args())
+    desktop = build.call_args.kwargs["desktop"]
+    assert desktop.internal_push_token == load_internal_auth(tmp_path / "secrets").push_token

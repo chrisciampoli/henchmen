@@ -14,11 +14,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 
 from henchmen.config.posture import fail_open_allowed
 from henchmen.config.settings import get_settings
-from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
+from henchmen.dispatch.pubsub_auth import require_internal_caller, verify_pubsub_oidc
 from henchmen.utils.git import clone_repo
 from henchmen.utils.redaction import install_secret_redaction
 
@@ -95,7 +95,7 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/v1/process-queue")
+@app.post("/api/v1/process-queue", dependencies=[Depends(require_internal_caller)])
 async def process_queue() -> dict[str, str | int]:
     """Merge-queue maintenance tick (called by Cloud Scheduler every 5 minutes).
 

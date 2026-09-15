@@ -425,3 +425,47 @@ class TestWatchdog:
 
         assert resp.status_code == 200
         assert resp.json() == {"stalled_found": 0, "recovered": 0, "escalated": 0}
+
+
+# ---------------------------------------------------------------------------
+# maintenance routes on a desktop install (amendment A8, ruling P4)
+# ---------------------------------------------------------------------------
+
+
+class TestMaintenanceRoutesOnDesktop:
+    """Amendment A8: routes Cloud Scheduler calls in the cloud need the internal token on a desktop install."""
+
+    def test_watchdog_without_the_internal_token_is_refused(self, client, agent, monkeypatch, tmp_path):
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        agent.tracker.get_stalled_tasks = AsyncMock(return_value=[])
+        for path in ("/api/v1/watchdog", "/api/v1/check-dlq", "/api/v1/cleanup"):
+            assert client.post(path).status_code == 401
+        agent.tracker.get_stalled_tasks.assert_not_awaited()
+
+    def test_watchdog_with_the_internal_token_runs(self, client, agent, monkeypatch, tmp_path):
+        from henchmen.config.internal_auth import load_internal_auth
+
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        token = load_internal_auth(tmp_path / "secrets").push_token
+        agent.tracker.get_stalled_tasks = AsyncMock(return_value=[])
+        resp = client.post("/api/v1/watchdog", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+
+    def test_watchdog_without_the_token_is_refused_even_off_the_local_broker(
+        self, client, agent, monkeypatch, tmp_path
+    ):
+        """Ruling P4: the guard is based on ``desktop_internal_auth()`` directly, so it applies to
+        every desktop install regardless of what the message broker provider resolves to."""
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HENCHMEN_MESSAGE_BROKER_PROVIDER", "gcp")
+        agent.tracker.get_stalled_tasks = AsyncMock(return_value=[])
+        resp = client.post("/api/v1/watchdog")
+        assert resp.status_code == 401
+        agent.tracker.get_stalled_tasks.assert_not_awaited()
+
+    def test_forge_process_queue_without_the_internal_token_is_refused(self, monkeypatch, tmp_path):
+        from henchmen.forge.server import app as forge_app
+
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        resp = TestClient(forge_app, raise_server_exceptions=False).post("/api/v1/process-queue")
+        assert resp.status_code == 401

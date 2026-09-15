@@ -737,11 +737,21 @@ def _serve(args: argparse.Namespace) -> None:
         settings.environment.value,
     )
     desktop = None
-    if console is not None:
+    if console is not None and secrets_dir is not None:
         from henchmen.cli.serve import DesktopRuntime
+        from henchmen.config.internal_auth import load_internal_auth
         from henchmen.console.auth import desktop_allowed_hostnames, forward_host_problem
 
-        desktop = DesktopRuntime(allowed_hostnames=desktop_allowed_hostnames(settings.local_container_hostname))
+        try:
+            internal = load_internal_auth(secrets_dir)
+        except OSError as exc:
+            print(f"ERROR: could not read or write {secrets_dir}: {exc}", file=sys.stderr)
+            print("Hint: check permissions on the data volume.", file=sys.stderr)
+            sys.exit(2)
+        desktop = DesktopRuntime(
+            allowed_hostnames=desktop_allowed_hostnames(settings.local_container_hostname),
+            internal_push_token=internal.push_token,
+        )
         problem = forward_host_problem(settings)
         if problem is not None:
             logger.warning("%s", problem)

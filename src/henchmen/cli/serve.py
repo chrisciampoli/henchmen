@@ -17,7 +17,7 @@ import signal
 import threading
 from collections.abc import AsyncIterator, Iterator
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import uvicorn
@@ -89,6 +89,7 @@ class DesktopRuntime:
     """What ``build_serve_app`` needs to harden a desktop (data-directory) install."""
 
     allowed_hostnames: frozenset[str]
+    internal_push_token: str = field(default="", repr=False)
 
 
 def build_serve_app(
@@ -111,6 +112,9 @@ def build_serve_app(
     shared_broker = InMemoryMessageBroker()
     forward_map = default_forward_map(settings, f"http://localhost:{port}")
     shared_broker.set_forward_map(forward_map)
+    # Desktop installs authenticate the simulated Pub/Sub pushes (D-P3); a
+    # repository checkout sends none, as before.
+    shared_broker.set_forward_token(desktop.internal_push_token if desktop is not None else None)
     set_shared_broker(shared_broker)
     logger.info("Shared broker configured with forward map for %d topics", len(forward_map))
 

@@ -18,6 +18,7 @@ Secret values are never logged.
 from __future__ import annotations
 
 import contextlib
+import hmac
 import logging
 import os
 import re
@@ -245,6 +246,19 @@ def _publish_new_secret(path: Path, data: bytes, *, minimum: int) -> bytes:
         return on_disk if len(on_disk) >= minimum else data
     finally:
         _unlink_temp_quietly(tmp_path)
+
+
+def tokens_match(candidate: str | None, expected: str) -> bool:
+    """Constant-time comparison of a caller-supplied token against the expected value.
+
+    A missing or empty ``candidate``, or an empty ``expected`` (nothing to compare
+    against), is always refused rather than compared -- an empty string is never a
+    valid secret. The single helper every secret comparison in Henchmen goes
+    through, so no module maintains its own bespoke equality check.
+    """
+    if not candidate or not expected:
+        return False
+    return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
 
 
 def read_or_create_secret(path: Path, *, nbytes: int = MIN_SECRET_BYTES) -> bytes:

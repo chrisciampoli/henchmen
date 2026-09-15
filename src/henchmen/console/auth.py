@@ -41,6 +41,7 @@ from henchmen.config.secret_files import (
     read_or_create_secret,
     replace_with_retry,
     sweep_stale_sibling_files,
+    tokens_match,
     write_secret_file,
 )
 
@@ -142,11 +143,6 @@ def is_local_origin(origin: str | None) -> bool:
     return _origin_parts(origin) is not None
 
 
-def _tokens_match(candidate: str, expected: str) -> bool:
-    """Constant-time comparison of two tokens (bytes of different lengths simply do not match)."""
-    return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
-
-
 class SetupTokenStore:
     """The one-time Console sign-in token, kept in ``<secrets>/setup-token``.
 
@@ -235,7 +231,7 @@ class SetupTokenStore:
         with self._lock:
             sweep_stale_sibling_files(self.path, "claim")
             current = self.current()
-            if current is None or not _tokens_match(candidate, current):
+            if current is None or not tokens_match(candidate, current):
                 return False
             claim = self.path.with_name(f"{self.path.name}.{secrets.token_hex(8)}.claim")
             try:
@@ -255,7 +251,7 @@ class SetupTokenStore:
             except OSError:
                 logger.warning("Could not read the claimed setup token file %s; failing closed.", claim.name)
                 claimed = ""
-            matched = bool(claimed) and _tokens_match(candidate, claimed)
+            matched = tokens_match(candidate, claimed)
             try:
                 if matched:
                     # Consumed: replace with a fresh random token nobody holds yet.
@@ -332,8 +328,7 @@ class ConsoleAuth:
 
     def check_setup_token(self, candidate: str) -> bool:
         """Constant-time comparison against the current token, without consuming it."""
-        current = self.setup_token
-        return bool(candidate) and bool(current) and _tokens_match(candidate, current)
+        return tokens_match(candidate, self.setup_token)
 
     def consume_setup_token(self, candidate: str) -> bool:
         """Accept ``candidate`` once; a second use of the same token is refused."""

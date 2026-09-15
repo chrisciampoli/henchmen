@@ -26,7 +26,7 @@ import henchmen.schemes.bugfix_standard  # noqa: F401
 import henchmen.schemes.feature_standard  # noqa: F401
 import henchmen.schemes.goal_decomposition  # noqa: F401
 from henchmen.config.settings import get_settings
-from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
+from henchmen.dispatch.pubsub_auth import require_internal_caller, verify_pubsub_oidc
 from henchmen.mastermind.agent import MastermindAgent
 from henchmen.mastermind.scheme_executor import validate_deterministic_handlers
 from henchmen.models.task import HenchmenTask
@@ -825,7 +825,7 @@ async def metrics_summary(days: int = 7) -> dict[str, Any]:
     return await agent.tracker.get_metrics_summary(days)
 
 
-@app.post("/api/v1/watchdog")
+@app.post("/api/v1/watchdog", dependencies=[Depends(require_internal_caller)])
 async def watchdog_handler() -> dict[str, Any]:
     """Detect stalled tasks and trigger recovery.
 
@@ -928,7 +928,7 @@ def _dlq_task_id(message: dict[str, Any]) -> str:
     return str(payload.get("task_id") or payload.get("resume_task_id") or payload.get("id") or "")
 
 
-@app.post("/api/v1/check-dlq")
+@app.post("/api/v1/check-dlq", dependencies=[Depends(require_internal_caller)])
 async def check_dlq_handler() -> dict[str, Any]:
     """Check dead letter queue for lost messages.
 
@@ -975,7 +975,7 @@ async def check_dlq_handler() -> dict[str, Any]:
     return {"dead_letter_count": count, "escalated": escalated}
 
 
-@app.post("/api/v1/cleanup")
+@app.post("/api/v1/cleanup", dependencies=[Depends(require_internal_caller)])
 async def cleanup_handler() -> dict[str, Any]:
     """Cleanup expired task docs and stale dedup records (called by Cloud Scheduler)."""
     agent = get_agent()
