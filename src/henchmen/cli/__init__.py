@@ -673,8 +673,20 @@ def _serve(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(2)
+            try:
+                setup_token_value = auth.setup_token
+            except OSError as exc:
+                # Mirrors the ConsoleAuth.load guard above: a readable error and exit 2,
+                # never a traceback, if the token file becomes unreadable after load().
+                print(f"ERROR: could not read the sign-in token in {secrets_dir}: {exc}", file=sys.stderr)
+                print("Hint: check permissions on the data volume.", file=sys.stderr)
+                sys.exit(2)
+            if not setup_token_value:
+                print(f"ERROR: no usable sign-in token in {secrets_dir}.", file=sys.stderr)
+                print("Hint: check permissions on the data volume.", file=sys.stderr)
+                sys.exit(2)
             logger.info("Setup is not complete; serving only the setup Console")
-            print(f"Open Henchmen setup: {console_url(console_port, auth.setup_token)}", flush=True)
+            print(f"Open Henchmen setup: {console_url(console_port, setup_token_value)}", flush=True)
             setup_console = create_console_app(
                 mode=ConsoleMode.SETUP,
                 store=store,

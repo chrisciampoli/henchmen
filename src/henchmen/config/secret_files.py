@@ -46,6 +46,14 @@ _sleep = time.sleep
 # crashed between creating it and cleaning it up).
 _STALE_TEMP_FILE_AGE_SECONDS = 5 * 60
 
+# How many times, and how long, to retry an `os.replace` that fails with
+# PermissionError -- the error Windows raises when another process (an
+# antivirus scanner, a reader that has not yet closed its handle) has the
+# source or destination briefly open. 5 x 20ms mirrors the same-instant-race
+# tolerance already used above for a losing reader.
+_REPLACE_RETRY_ATTEMPTS = 5
+_REPLACE_RETRY_DELAY_SECONDS = 0.02
+
 
 def _unlink_temp_quietly(tmp_path: Path) -> None:
     """Best-effort removal of a temp file we no longer need; a leftover is swept up later."""
@@ -55,21 +63,20 @@ def _unlink_temp_quietly(tmp_path: Path) -> None:
         logger.debug("Could not remove leftover temp file %s; a later sweep will remove it.", tmp_path.name)
 
 
-def _sweep_stale_temp_files(path: Path) -> None:
-    """Best-effort removal of this secret's own abandoned ``<name>.<hex>.tmp`` siblings.
+def sweep_stale_sibling_files(path: Path, suffix: str) -> None:
+    """Best-effort removal of this secret's own abandoned ``<name>.<hex>.<suffix>`` siblings.
 
-    Only files whose name exactly matches this secret's temp-file naming
-    scheme (``<path.name>.<hex>.tmp``, the pattern ``create_secret_file`` and
-    ``write_secret_file`` build with ``secrets.token_hex``) are considered, and
-    only those old enough that they cannot belong to a write in progress right
-    now. A full-string regex match (rather than a glob, which would also match
-    a sibling like ``<name>.other.tmp`` that never came from this module) is
-    used so a name that merely looks similar is never swept. This is
-    opportunistic housekeeping, not a correctness requirement, so every error
-    is swallowed: a permission error or a vanished directory should never
-    block creating or reading the actual secret.
+    Only files whose name exactly matches this naming scheme (``<path.name>.<hex>.<suffix>``,
+    the pattern this module's own temp files use, and the pattern the Console's setup-token
+    ``.claim`` files use too) are considered, and only those old enough that they cannot
+    belong to an operation in progress right now. A full-string regex match (rather than a
+    glob, which would also match a sibling like ``<name>.other.<suffix>`` that never came
+    from this naming scheme) is used so a name that merely looks similar is never swept.
+    This is opportunistic housekeeping, not a correctness requirement, so every error is
+    swallowed: a permission error or a vanished directory should never block creating or
+    reading the actual secret.
     """
-    pattern = re.compile(re.escape(path.name) + r"\.[0-9a-f]+\.tmp")
+    pattern = re.compile(re.escape(path.name) + r"\.[0-9a-f]+\." + re.escape(suffix))
     now = time.time()
     with contextlib.suppress(OSError):
         for candidate in path.parent.iterdir():
@@ -78,6 +85,30 @@ def _sweep_stale_temp_files(path: Path) -> None:
             with contextlib.suppress(OSError):
                 if now - candidate.stat().st_mtime >= _STALE_TEMP_FILE_AGE_SECONDS:
                     candidate.unlink(missing_ok=True)
+
+
+def _sweep_stale_temp_files(path: Path) -> None:
+    """Best-effort removal of this secret's own abandoned ``<name>.<hex>.tmp`` siblings."""
+    sweep_stale_sibling_files(path, "tmp")
+
+
+def replace_with_retry(src: Path, dst: Path) -> None:
+    """``os.replace``, retrying a transient Windows ``PermissionError`` before re-raising.
+
+    On Windows, ``os.replace`` can raise ``PermissionError`` when another
+    process (an antivirus scanner, a reader that has not yet closed its
+    handle) briefly has the source or destination open. Any other exception
+    (including a genuine race like a vanished source) is raised immediately,
+    unretried.
+    """
+    for attempt in range(_REPLACE_RETRY_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_RETRY_ATTEMPTS - 1:
+                raise
+            _sleep(_REPLACE_RETRY_DELAY_SECONDS)
 
 
 def ensure_secrets_dir(directory: Path) -> None:
@@ -131,12 +162,16 @@ def create_secret_file(path: Path, data: bytes) -> None:
 
 
 def write_secret_file(path: Path, data: bytes) -> None:
-    """Atomically replace (or create) ``path`` with ``data``, owner-only from creation."""
+    """Atomically replace (or create) ``path`` with ``data``, owner-only from creation.
+
+    The final rename retries a transient Windows ``PermissionError`` (see
+    :func:`replace_with_retry`) before giving up and re-raising.
+    """
     _sweep_stale_temp_files(path)
     tmp_path = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
     create_secret_file(tmp_path, data)
     try:
-        os.replace(tmp_path, path)
+        replace_with_retry(tmp_path, path)
     except BaseException:
         _unlink_temp_quietly(tmp_path)
         raise

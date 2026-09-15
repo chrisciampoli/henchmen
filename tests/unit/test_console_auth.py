@@ -2,8 +2,10 @@
 
 import hashlib
 import hmac
+import logging
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -276,6 +278,158 @@ def test_load_rotates_the_token_on_every_start(tmp_path: Path) -> None:
     assert first_token == SEED
     assert second.setup_token != first_token
     assert first.consume_setup_token(first_token) is False, "a restart invalidates the previous link"
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 (B4 + quality): permanent seeded marker, races, retries, logging
+# ---------------------------------------------------------------------------
+
+
+def test_seed_is_not_reused_after_the_token_file_is_lost(tmp_path: Path) -> None:
+    """A crash (or any path that leaves the token file missing) must not re-arm the seed."""
+    path = tmp_path / SETUP_TOKEN_FILE_NAME
+    store = SetupTokenStore(path)
+    assert store.rotate(seed=SEED) == SEED
+    assert store.consume(SEED) is True
+    path.unlink(missing_ok=True)  # simulate the token file being lost after consumption
+    assert store.rotate(seed=SEED) != SEED
+
+
+def test_a_second_process_cannot_reuse_the_seed(tmp_path: Path) -> None:
+    path = tmp_path / SETUP_TOKEN_FILE_NAME
+    assert SetupTokenStore(path).rotate(seed=SEED) == SEED
+    # A second store instance, simulating a second process racing (or following) the
+    # first rotate call, must never treat this as "the very first token" again.
+    assert SetupTokenStore(path).rotate(seed=SEED) != SEED
+
+
+def test_a_rotation_between_read_and_claim_does_not_destroy_the_new_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / SETUP_TOKEN_FILE_NAME
+    store = SetupTokenStore(path)
+    old_token = store.rotate()
+    real_replace = os.replace
+    new_token_holder: dict[str, str] = {}
+
+    def racing_replace(src: object, dst: object) -> None:
+        # Simulate another process rotating the token between our current() read and
+        # our claim rename: by the time our own replace runs, `path` already holds a
+        # brand new token that must not be thrown away. Restore the real os.replace
+        # first so the nested rotate()'s own write does not recurse back into this stub.
+        monkeypatch.setattr("henchmen.console.auth.os.replace", real_replace)
+        new_token_holder["new"] = SetupTokenStore(path).rotate()
+        real_replace(src, dst)
+
+    monkeypatch.setattr("henchmen.console.auth.os.replace", racing_replace)
+    assert store.consume(old_token) is False
+
+    new_token = new_token_holder["new"]
+    assert SetupTokenStore(path).consume(new_token) is True, "the rotated-in token must survive the failed claim"
+
+
+def test_claim_unlink_failure_still_returns_the_right_result_and_a_valid_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SetupTokenStore(tmp_path / SETUP_TOKEN_FILE_NAME)
+    token = store.rotate()
+
+    def failing_unlink(self: Path, *, missing_ok: bool = False) -> None:
+        raise OSError("boom")
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    assert store.consume(token) is True
+    # unlink() is patched everywhere for this test, so read the replacement directly.
+    monkeypatch.undo()
+    replacement = store.current()
+    assert replacement is not None and replacement != token
+
+
+def test_no_claim_files_remain_after_normal_consume_paths(tmp_path: Path) -> None:
+    path = tmp_path / SETUP_TOKEN_FILE_NAME
+    store = SetupTokenStore(path)
+    token = store.rotate()
+    assert store.consume(token) is True
+    assert store.consume(token) is False  # a second, doomed-to-fail attempt too
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".claim")]
+    assert leftovers == []
+
+
+def test_consume_retries_the_claim_rename_on_windows_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SetupTokenStore(tmp_path / SETUP_TOKEN_FILE_NAME)
+    token = store.rotate()
+    real_replace = os.replace
+    attempts = {"n": 0}
+
+    def flaky_replace(src: object, dst: object) -> None:
+        attempts["n"] += 1
+        if attempts["n"] <= 2:
+            raise PermissionError("in use")
+        real_replace(src, dst)
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("henchmen.console.auth.os.replace", flaky_replace)
+    monkeypatch.setattr("henchmen.config.secret_files._sleep", sleeps.append)
+
+    assert store.consume(token) is True
+    assert attempts["n"] == 3
+    assert sleeps == [0.02, 0.02]
+
+
+def test_rotate_logs_but_never_leaks_the_token_or_an_ignored_seed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    store = SetupTokenStore(tmp_path / SETUP_TOKEN_FILE_NAME)
+    first_token = store.rotate()  # a real, valid-looking token: also exercises the "no log yet" path
+    caplog.clear()
+    # A second rotate, seeded with a real (but now stale) token: valid-looking, but
+    # already seeded once, so it is ignored and logged -- and must never appear in it.
+    second_token = store.rotate(seed=first_token)
+    assert second_token != first_token
+    assert caplog.records, "ignoring a stale seed must be logged, not silently swallowed"
+    for record in caplog.records:
+        assert first_token not in record.getMessage()
+        assert second_token not in record.getMessage()
+
+
+def test_consume_never_logs_the_token(tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch) -> None:
+    caplog.set_level(logging.DEBUG)
+    store = SetupTokenStore(tmp_path / SETUP_TOKEN_FILE_NAME)
+    token = store.rotate()
+
+    def lost_race(src: object, dst: object) -> None:
+        raise FileNotFoundError("claimed by another process")
+
+    monkeypatch.setattr("henchmen.console.auth.os.replace", lost_race)
+    caplog.clear()
+    assert store.consume(token) is False
+    assert caplog.records, "a failed claim must be logged, not silently swallowed"
+    for record in caplog.records:
+        assert token not in record.getMessage()
+
+
+def test_concurrent_consume_from_multiple_threads_exactly_one_succeeds(tmp_path: Path) -> None:
+    path = tmp_path / SETUP_TOKEN_FILE_NAME
+    token = SetupTokenStore(path).rotate()
+    results: list[bool] = []
+    results_lock = threading.Lock()
+
+    def attempt() -> None:
+        result = SetupTokenStore(path).consume(token)
+        with results_lock:
+            results.append(result)
+
+    threads = [threading.Thread(target=attempt) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results.count(True) == 1
+    assert results.count(False) == 19
 
 
 def _guarded_app(auth: ConsoleAuth) -> TestClient:

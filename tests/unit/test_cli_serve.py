@@ -374,6 +374,26 @@ def test_serve_with_incomplete_setup_serves_only_the_console(
     assert f"console/session?setup_token={'g' * 43}" in capsys.readouterr().out
 
 
+def test_serve_with_an_unreadable_setup_token_exits_two_instead_of_crashing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ruling B4 fix round, item 4: a broken token read must not surface as a traceback."""
+    from unittest.mock import patch
+
+    from henchmen.cli import _serve
+
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("HENCHMEN_CONSOLE_SETUP_TOKEN", "g" * 43)
+    with (
+        patch.object(ConsoleAuth, "setup_token", new_callable=lambda: property(lambda self: "")),
+        pytest.raises(SystemExit) as exit_info,
+    ):
+        _serve(_serve_args())
+    assert exit_info.value.code == 2
+    assert "sign-in token" in capsys.readouterr().err
+
+
 def test_serve_with_completed_setup_mounts_the_console_in_run_mode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
