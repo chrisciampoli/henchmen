@@ -22,7 +22,7 @@ from henchmen import __version__
 from henchmen.config.settings import Settings
 from henchmen.console.auth import SESSION_COOKIE, ConsoleAuth, ConsoleGuard
 from henchmen.console.state import OPTIONAL_STEPS, SetupState, SetupStateStore, SetupStep
-from henchmen.console.steps import STEP_ROUTE_PREFIX, StepRoutes, discover_step_routes
+from henchmen.console.steps import STEP_ROUTE_PREFIX, StepRoutes, discover_step_routes, validate_step_routes
 from henchmen.utils.redaction import redact
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -89,6 +89,11 @@ class SetupStateUpdate(BaseModel):
         for key, value in choices.items():
             if not _CHOICE_KEY.fullmatch(key):
                 raise ValueError(f"choice name {key!r} is not allowed")
+            if redact(key) != key:
+                # The key itself is never echoed here: a key that trips the same secret
+                # patterns as a value (e.g. a token pasted into the name by mistake) must
+                # not be quoted back in the error text.
+                raise ValueError("choice key looks like a secret; secrets are never kept in setup state")
             looks_secret = bool(set(key.split("_")) & _SECRET_KEY_SEGMENTS) or key.endswith(_SECRET_KEY_SUFFIXES)
             if looks_secret or redact(value) != value:
                 raise ValueError(f"choice {key!r} looks like a credential; credentials are never kept in setup state")
@@ -178,8 +183,9 @@ def create_console_app(
 
     @app.put("/console/api/setup/state")
     async def put_state(update: SetupStateUpdate) -> SetupState:
-        current = store.load()
-        return store.save(current.model_copy(update=update.model_dump()))
+        return store.update_client_fields(
+            current_step=update.current_step, skipped_steps=update.skipped_steps, choices=update.choices
+        )
 
     @app.post("/console/api/apply", status_code=202)
     async def apply(background: BackgroundTasks) -> dict[str, bool]:
@@ -207,6 +213,9 @@ def create_console_app(
     steps = discover_step_routes() if step_routes is None else step_routes
     public_paths = set(PUBLIC_PATHS)
     for step, routes in steps.items():
+        # Discovery already validates its own findings; an explicitly injected
+        # `step_routes` (a future direct caller, or a test) is held to the same rules.
+        validate_step_routes(step, routes)
         app.include_router(routes.router, prefix=f"{STEP_ROUTE_PREFIX}/{step.value}")
         public_paths |= routes.public_paths
 

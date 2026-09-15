@@ -146,6 +146,21 @@ def test_choice_rejection_names_the_key_and_never_the_value(env) -> None:
     assert store.load().choices == {}
 
 
+def test_choice_key_that_looks_like_a_secret_is_rejected_generically(env) -> None:
+    """A key that is otherwise a well-formed choice name but is itself token-shaped (Ruling
+    4: reject when redact(key) != key) must be refused generically -- the error text must
+    not quote the key back, unlike the plain-format-violation case."""
+    client, store, auth, *_ = env
+    _signed_in(client, auth)
+    token_shaped_key = "ghp_" + "a1b2c3d4e5f6g7h8i9j0"  # well-formed choice name, but redact() rewrites it
+    update = {"current_step": "welcome", "choices": {token_shaped_key: "whatever"}}
+    resp = client.put("/console/api/setup/state", json=update, headers=ORIGIN)
+    assert resp.status_code == 422
+    assert token_shaped_key not in resp.text
+    assert "looks like a secret" in resp.text
+    assert store.load().choices == {}
+
+
 def test_non_secret_choices_such_as_a_jira_project_key_are_accepted(env) -> None:
     client, store, auth, *_ = env
     _signed_in(client, auth)

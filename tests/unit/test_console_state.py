@@ -125,3 +125,57 @@ def test_concurrent_record_step_complete_and_set_server_choices_both_persist(tmp
     loaded = store.load()
     assert set(loaded.completed_steps) == {SetupStep.AI_PROVIDER, SetupStep.GITHUB, SetupStep.SLACK, SetupStep.JIRA}
     assert loaded.server_choices == {f"key_{i}": f"value_{i}" for i in range(20)}
+
+
+def test_update_client_fields_sets_current_step_skips_and_choices(tmp_path: Path) -> None:
+    store = SetupStateStore(tmp_path / "setup-state.json")
+    result = store.update_client_fields(
+        current_step=SetupStep.GITHUB, skipped_steps=[SetupStep.SLACK], choices={"llm_provider": "anthropic"}
+    )
+    loaded = store.load()
+    assert loaded.current_step == SetupStep.GITHUB
+    assert loaded.skipped_steps == [SetupStep.SLACK]
+    assert loaded.choices == {"llm_provider": "anthropic"}
+    assert result.current_step == loaded.current_step
+
+
+def test_update_client_fields_drops_a_skip_for_a_step_already_completed(tmp_path: Path) -> None:
+    """Completion always wins over a (now stale) earlier skip (Ruling 3)."""
+    store = SetupStateStore(tmp_path / "setup-state.json")
+    store.save(SetupState(completed_steps=[SetupStep.SLACK]))
+    result = store.update_client_fields(
+        current_step=SetupStep.WELCOME, skipped_steps=[SetupStep.SLACK, SetupStep.JIRA], choices={}
+    )
+    assert result.skipped_steps == [SetupStep.JIRA]
+    assert store.load().skipped_steps == [SetupStep.JIRA]
+
+
+def test_update_client_fields_does_not_lose_a_completion_recorded_between_load_and_save(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completion that lands between this method's own load and save must survive --
+    never overwritten by a save built from a stale, pre-completion snapshot (Ruling 2:
+    put_state must be lock-guarded the same way as record_step_complete). Simulated
+    deterministically: `load` is patched so its first call -- the one `update_client_fields`
+    itself makes -- also persists a "concurrent" completion via the store's own (lock-free)
+    `save`, since going through the locked `record_step_complete` here would try to
+    re-enter the lock this call already holds."""
+    store = SetupStateStore(tmp_path / "setup-state.json")
+    real_load = store.load
+    calls = {"n": 0}
+
+    def racing_load() -> SetupState:
+        state = real_load()
+        calls["n"] += 1
+        if calls["n"] == 1:
+            state = store.save(state.model_copy(update={"completed_steps": [SetupStep.GITHUB]}))
+        return state
+
+    monkeypatch.setattr(store, "load", racing_load)
+
+    result = store.update_client_fields(current_step=SetupStep.WELCOME, skipped_steps=[], choices={"a": "b"})
+
+    assert calls["n"] == 1
+    assert result.completed_steps == [SetupStep.GITHUB]
+    assert result.current_step == SetupStep.WELCOME
+    assert result.choices == {"a": "b"}
