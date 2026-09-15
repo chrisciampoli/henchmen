@@ -71,10 +71,12 @@ class FakeGitHub:
         account_type: str = "Organization",
         permissions: dict[str, str] | None = None,
         app_slug: str = "henchmen-test",
+        app_id: str = "4242",
     ) -> dict[str, Any]:
-        """An ``/app/installations/{id}`` response body."""
+        """An ``/app/installations/{id}`` response body (``app_id``/``app_slug`` default to the test App)."""
         return {
             "id": int(installation_id),
+            "app_id": int(app_id),
             "account": {"login": login, "type": account_type},
             "permissions": dict(DEFAULT_PERMISSIONS if permissions is None else permissions),
             "repository_selection": "selected",

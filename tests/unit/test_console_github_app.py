@@ -350,3 +350,75 @@ def test_unreferenced_key_cleanup_removes_only_unreferenced_app_keys(tmp_path: P
 
 def test_unreferenced_key_cleanup_tolerates_a_missing_directory(tmp_path: Path) -> None:
     assert github_app.remove_unreferenced_app_keys(tmp_path / "missing", []) == []
+
+
+def test_startup_cleanup_keeps_a_relative_key_reference_resolved_against_the_config_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    secrets = data_dir / "secrets"
+    secrets.mkdir(parents=True)
+    referenced = secrets / "github-app-2.pem"
+    stale = secrets / "github-app-1.pem"
+    for path in (referenced, stale):
+        path.write_bytes(b"x")
+    config_file = data_dir / "henchmen.env"
+    config_file.write_text("HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH=secrets/github-app-2.pem\n", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)  # the working directory is not the data directory
+
+    removed = github_app.remove_unused_app_keys_at_startup(config_file, secrets, "")
+
+    assert removed == [stale]
+    assert referenced.exists()
+
+
+def test_startup_cleanup_keeps_a_relative_effective_key_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    referenced = secrets / "github-app-3.pem"
+    referenced.write_bytes(b"x")
+    monkeypatch.chdir(tmp_path.parent)
+    assert (
+        github_app.remove_unused_app_keys_at_startup(tmp_path / "henchmen.env", secrets, "secrets/github-app-3.pem")
+        == []
+    )
+    assert referenced.exists()
+
+
+@pytest.mark.parametrize(
+    ("installation", "app_id", "slug", "expected"),
+    [
+        ({"app_id": "4242", "app_slug": "henchmen-test"}, "4242", "henchmen-test", True),
+        ({"app_id": "4242", "app_slug": ""}, "4242", "henchmen-test", True),
+        ({"app_id": "", "app_slug": "Henchmen-Test"}, "4242", "henchmen-test", True),
+        ({"app_id": "4242", "app_slug": "henchmen-test"}, "4242", "", True),
+        ({"app_id": "999", "app_slug": "henchmen-test"}, "4242", "henchmen-test", False),
+        ({"app_id": "4242", "app_slug": "other-app"}, "4242", "henchmen-test", False),
+        ({"app_id": "", "app_slug": ""}, "4242", "henchmen-test", False),
+        ({"app_id": "4242", "app_slug": "henchmen-test"}, "", "", False),
+    ],
+)
+def test_an_installation_belongs_to_an_app_only_when_github_says_so(
+    installation: dict[str, str], app_id: str, slug: str, expected: bool
+) -> None:
+    item = github_app.Installation(installation_id="77", account_login="acme", **installation)
+    assert item.belongs_to(app_id=app_id, slug=slug) is expected
+
+
+@pytest.mark.asyncio
+async def test_installation_carries_the_app_identity_github_returns() -> None:
+    github = FakeGitHub()
+    github.installations["77"] = FakeGitHub.installation("77", "acme")
+    github.installations["78"] = {**FakeGitHub.installation("78", "acme"), "app_id": True}
+    app_jwt = build_app_jwt(github.app_id, app_key_pair()[0], now=time.time())
+    async with github.async_client() as client:
+        installation = await github_app.get_installation(client, API, app_jwt, "77")
+        odd = await github_app.get_installation(client, API, app_jwt, "78")
+    assert installation is not None
+    assert (installation.app_id, installation.app_slug) == ("4242", "henchmen-test")
+    assert odd is not None
+    assert odd.app_id == ""

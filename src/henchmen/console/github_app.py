@@ -76,7 +76,7 @@ _INSTALLATION_ID_RE = re.compile(r"\d{1,20}")
 _APP_ID_RE = re.compile(r"\d{1,20}")
 _LOGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
 _REPO_PAGE_SIZE = 100
-_MAX_REPO_PAGES = 10
+MAX_REPO_PAGES = 10
 
 
 class GitHubAppApiError(RuntimeError):
@@ -109,10 +109,23 @@ class Installation(BaseModel):
     account_type: str = Field(default="", description="User or Organization")
     permissions: dict[str, str] = Field(default_factory=dict, description="Granted permissions")
     app_slug: str = Field(default="", description="Slug of the installed App")
+    app_id: str = Field(default="", description="ID of the installed App")
 
     def missing_write_permissions(self) -> list[str]:
         """Required permissions not granted at ``write``."""
         return [name for name in REQUIRED_WRITE_PERMISSIONS if self.permissions.get(name) != "write"]
+
+    def belongs_to(self, *, app_id: str, slug: str) -> bool:
+        """True when GitHub says this installation is of the App ``app_id`` / ``slug``.
+
+        An identity is comparable when both GitHub's answer and the expected
+        value carry it. At least one must be comparable, and every comparable
+        one must match: an installation id from a query string is never
+        trusted on its own, and an answer naming a different App is refused.
+        """
+        checks = [(self.app_id, app_id.strip()), (self.app_slug.lower(), slug.strip().lower())]
+        comparable = [(have, want) for have, want in checks if have and want]
+        return bool(comparable) and all(have == want for have, want in comparable)
 
 
 class InstalledRepository(BaseModel):
@@ -188,14 +201,25 @@ def remove_unused_app_keys_at_startup(config_file: Path, secrets_dir: Path, effe
     leaves the previous App's ``github-app-<id>.pem`` behind until then). Keeps
     the key named by the config file's ``HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH``
     and by the effective ``Settings.github_app_private_key_path`` (the
-    environment can outrank the file). Never raises: a problem is logged and
-    nothing is removed.
+    environment can outrank the file). A relative reference is kept both as
+    resolved from the working directory and as resolved against the config
+    file's folder, so a hand-written ``secrets/github-app-<id>.pem`` never
+    loses its key whichever way it is read. Never raises: a problem is logged
+    and nothing is removed.
     """
     from henchmen.cli.envfile import EnvFile
 
     try:
         file_reference = EnvFile.load(config_file).get("HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH")
-        return remove_unreferenced_app_keys(secrets_dir, [file_reference, effective_key_path])
+        references: list[str | Path] = []
+        for reference in (file_reference, effective_key_path):
+            text = str(reference).strip()
+            if not text:
+                continue
+            references.append(text)
+            if not Path(text).is_absolute():
+                references.append(config_file.parent / text)
+        return remove_unreferenced_app_keys(secrets_dir, references)
     except Exception as exc:  # housekeeping must never stop the server from starting
         logger.warning("Could not clean up unused GitHub App keys (%s)", type(exc).__name__)
         return []
@@ -311,7 +335,16 @@ def _installation(body: Any) -> Installation:
         account_type=str(account.get("type", "")),
         permissions={str(key): str(value) for key, value in permissions.items()},
         app_slug=str(body.get("app_slug", "")),
+        app_id=_id_text(body.get("app_id")),
     )
+
+
+def _id_text(raw: object) -> str:
+    """A numeric GitHub id as text; ``""`` for anything else (a bool, a float, a missing value)."""
+    if isinstance(raw, bool) or not isinstance(raw, int | str):
+        return ""
+    text = str(raw)
+    return text if _APP_ID_RE.fullmatch(text) else ""
 
 
 async def convert_manifest(client: httpx.AsyncClient, api_url: str, code: str) -> AppConversion:
@@ -404,7 +437,7 @@ async def list_installation_repositories(
 ) -> list[InstalledRepository]:
     """``GET /installation/repositories`` with an installation token, following pages."""
     repositories: list[InstalledRepository] = []
-    for page in range(1, _MAX_REPO_PAGES + 1):
+    for page in range(1, MAX_REPO_PAGES + 1):
         response = await _send(
             client,
             "GET",
