@@ -296,6 +296,14 @@ class Settings(BaseSettings):
         default="https://github.com",
         description="GitHub web base URL the Console sends browsers to while creating and installing the GitHub App",
     )
+    github_token_expires_at: str = Field(
+        default="",
+        description=(
+            "Operative containers only: expiry (ISO 8601 UTC) of github_token when it is a GitHub App installation "
+            "token. LairManager sets it in operative containers so the operative refreshes the token before it "
+            "expires; empty for a PAT. Never set it on a server (the Console refuses to write it)."
+        ),
+    )
 
     # Slack integration
     slack_bot_token: str = Field(

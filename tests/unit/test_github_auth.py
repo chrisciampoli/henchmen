@@ -24,8 +24,10 @@ from henchmen.utils.github_auth import (
     JWT_LIFETIME_SECONDS,
     MAX_MIN_TTL_SECONDS,
     GitHubAppConfig,
+    GitHubAppKeyError,
     GitHubAuthError,
     GitHubCredentialsProvider,
+    GitHubRepositoryReferenceError,
     InstallationToken,
     app_jwt_for,
     build_app_jwt,
@@ -102,7 +104,7 @@ def test_app_jwt_claims() -> None:
 
 
 def test_unusable_private_key_raises() -> None:
-    with pytest.raises(GitHubAuthError, match="could not sign") as exc_info:
+    with pytest.raises(GitHubAppKeyError, match="could not sign") as exc_info:
         build_app_jwt("4242", b"not a pem", now=time.time())
     assert exc_info.value.__cause__ is None
 
@@ -122,12 +124,12 @@ def test_load_app_private_key_reads_a_regular_file(key_file: Path) -> None:
 
 
 def test_load_app_private_key_missing_file(tmp_path: Path) -> None:
-    with pytest.raises(GitHubAuthError, match="missing or unreadable"):
+    with pytest.raises(GitHubAppKeyError, match="missing or unreadable"):
         load_app_private_key(tmp_path / "absent.pem")
 
 
 def test_load_app_private_key_refuses_a_directory(tmp_path: Path) -> None:
-    with pytest.raises(GitHubAuthError, match="missing or unreadable") as exc_info:
+    with pytest.raises(GitHubAppKeyError, match="missing or unreadable") as exc_info:
         load_app_private_key(tmp_path)
     assert exc_info.value.__cause__ is None
 
@@ -266,7 +268,7 @@ def test_parse_repository_accepted_shapes(repo: str | None, expected: tuple[str,
     ],
 )
 def test_invalid_repository_never_reaches_github(key_file: Path, github: FakeGitHub, clock: _Clock, repo: str) -> None:
-    with pytest.raises(GitHubAuthError, match="owner/name or a GitHub clone URL"):
+    with pytest.raises(GitHubRepositoryReferenceError, match="owner/name or a GitHub clone URL"):
         _provider(key_file, github, clock).token(repo)
     assert github.requests == []
 
@@ -1026,14 +1028,14 @@ def test_server_components_do_not_read_the_pat_directly() -> None:
         "cli/doctor.py",  # reports whether a PAT is configured
         "operative/bootstrap.py",  # operative side: reads the token LairManager injected
         "arsenal/tools/github.py",  # operative side: same
-        "mastermind/lair_manager.py",  # removed from this list by Task 8
     }
     # Attribute reads, string-keyed reads (getattr / model_dump()["github_token"]) and raw environment reads.
-    # ``\benviron\b`` so prose such as "environment sets ... GITHUB_TOKEN" is not a read.
+    # ``\benviron\b`` / ``\bgetenv\b`` so prose such as "environment sets ... GITHUB_TOKEN" is not a read.
     patterns = (
         re.compile(r"\.github_token\b"),
         re.compile(r"[\"']github_token[\"']"),
         re.compile(r"\benviron\b.*GITHUB_TOKEN"),
+        re.compile(r"\bgetenv\b.*GITHUB_TOKEN"),
     )
     root = Path(henchmen.__file__).parent
     offenders = sorted(
@@ -1045,7 +1047,13 @@ def test_server_components_do_not_read_the_pat_directly() -> None:
     )
     assert offenders == []
     # The patterns themselves still catch what they are meant to.
-    samples = ("settings.github_token", 'getattr(settings, "github_token")', 'os.environ.get("GITHUB_TOKEN")')
+    samples = (
+        "settings.github_token",
+        'getattr(settings, "github_token")',
+        'os.environ.get("GITHUB_TOKEN")',
+        'os.getenv("GITHUB_TOKEN")',
+        "getenv('HENCHMEN_GITHUB_TOKEN')",
+    )
     assert all(any(pattern.search(sample) for pattern in patterns) for sample in samples)
     assert not any(pattern.search("environment sets ``GITHUB_TOKEN``") for pattern in patterns)
     assert not hasattr(henchmen.utils.git, "get_github_token")

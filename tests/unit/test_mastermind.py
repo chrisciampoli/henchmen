@@ -820,6 +820,28 @@ class TestSchemeExecutorLairFailure:
         assert node_result["condition"] == "fail"
         assert "dev_mode" not in node_result
 
+    @pytest.mark.asyncio
+    async def test_github_token_failure_never_simulates_pass_on_a_desktop_install(self, monkeypatch, tmp_path):
+        """M-19: a GitHub App that cannot mint an operative token fails the node on desktop, never a simulated pass."""
+        from henchmen.utils.github_auth import GitHubAuthError
+
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        graph = _linear_scheme(["agent_node"], node_types={"agent_node": NodeType.AGENTIC})
+        mock_lair = AsyncMock(spec=LairManager)
+        mock_lair.create_lair.side_effect = GitHubAuthError("GitHub refused to issue an installation token (HTTP 401)")
+        settings = _mock_settings()
+        settings.environment = MagicMock()
+        settings.environment.value = "dev"
+
+        executor = SchemeExecutor(graph, mock_lair, settings)
+        task = _make_task()
+        result = await executor.execute(task, Dossier(task_id=task.id))
+
+        node_result = result["node_results"]["agent_node"]
+        assert node_result["condition"] == "fail"
+        assert "dev_mode" not in node_result
+        mock_lair.wait_for_completion.assert_not_awaited()
+
 
 class TestSchemeExecutorMaxRetries:
     """Test that max-retry exhaustion forces a fail condition (not pass)."""

@@ -392,6 +392,8 @@ class TestRunCIForPRFailurePaths:
             ("forbidden", False),
             ("repository-access", False),
             ("partial-app", False),
+            ("app-key", False),
+            ("repository-reference", False),
         ],
     )
     async def test_github_credentials_failure_publishes_a_failure(self, forge_app, error, retriable):
@@ -399,8 +401,10 @@ class TestRunCIForPRFailurePaths:
         from henchmen.forge.server import _run_ci_for_pr
         from henchmen.utils.github_auth import (
             GitHubAppConfigurationError,
+            GitHubAppKeyError,
             GitHubAuthError,
             GitHubRepositoryAccessError,
+            GitHubRepositoryReferenceError,
         )
 
         errors = {
@@ -410,6 +414,8 @@ class TestRunCIForPRFailurePaths:
             "forbidden": GitHubAuthError("GitHub refused (HTTP 403)", status_code=403),
             "repository-access": GitHubRepositoryAccessError("GitHub refused (HTTP 422)", status_code=422),
             "partial-app": GitHubAppConfigurationError("The GitHub App is only partly configured"),
+            "app-key": GitHubAppKeyError("The GitHub App private key at /x.pem is missing or unreadable"),
+            "repository-reference": GitHubRepositoryReferenceError("must be owner/name or a GitHub clone URL"),
         }
         broker, _store = forge_app
         staging = Settings(**{"_env_file": None, "environment": Environment.STAGING, "gcp_project_id": "test-project"})
@@ -428,6 +434,80 @@ class TestRunCIForPRFailurePaths:
 
         assert exc_info.value.retriable is retriable
         assert exc_info.value.published is True
+        assert _published(broker)[0]["reason"] == "github-credentials"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("pr_url", "key_name"),
+        [
+            # The App key file does not exist: status-less, and the same on every redelivery.
+            ("https://github.com/acme/repo/pull/7", "absent.pem"),
+            # The PR URL parses, but its repository is not owner/name: refused before the key is read.
+            ("https://github.com/acme/re$po/pull/7", "absent.pem"),
+        ],
+    )
+    async def test_status_less_deterministic_credential_failures_are_not_retried(
+        self, forge_app, tmp_path, pr_url, key_name
+    ):
+        """Real provider, no patch: these GitHubAuthErrors carry no HTTP status but can never succeed on retry."""
+        from henchmen.config.settings import Environment, Settings
+        from henchmen.forge.server import _run_ci_for_pr
+
+        broker, _store = forge_app
+        staging = Settings(
+            **{
+                "_env_file": None,
+                "environment": Environment.STAGING,
+                "gcp_project_id": "test-project",
+                "github_app_id": "4242",
+                "github_app_installation_id": "77",
+                "github_app_private_key_path": str(tmp_path / key_name),
+            }
+        )
+
+        with (
+            patch("henchmen.forge.server.get_settings", return_value=staging),
+            patch("httpx.AsyncClient.send", side_effect=AssertionError("no GitHub call for a deterministic failure")),
+            patch("github.Github", side_effect=AssertionError("no GitHub client without credentials")),
+            pytest.raises(ForgeCIError) as exc_info,
+        ):
+            await _run_ci_for_pr(pr_url, "task-1", "req-1")
+
+        assert exc_info.value.retriable is False
+        assert exc_info.value.published is True
+        assert _published(broker)[0]["reason"] == "github-credentials"
+
+    @pytest.mark.asyncio
+    async def test_github_unreachable_through_the_real_provider_stays_retriable(self, forge_app, tmp_path):
+        import httpx
+
+        from henchmen.config.settings import Environment, Settings
+        from henchmen.forge.server import _run_ci_for_pr
+        from tests.unit.github_fakes import app_key_pair
+
+        broker, _store = forge_app
+        key = tmp_path / "github-app.pem"
+        key.write_bytes(app_key_pair()[0])
+        staging = Settings(
+            **{
+                "_env_file": None,
+                "environment": Environment.STAGING,
+                "gcp_project_id": "test-project",
+                "github_app_id": "4242",
+                "github_app_installation_id": "77",
+                "github_app_private_key_path": str(key),
+            }
+        )
+
+        with (
+            patch("henchmen.forge.server.get_settings", return_value=staging),
+            patch("httpx.AsyncClient.send", side_effect=httpx.ConnectError("unreachable")),
+            patch("github.Github", side_effect=AssertionError("no GitHub client without credentials")),
+            pytest.raises(ForgeCIError) as exc_info,
+        ):
+            await _run_ci_for_pr("https://github.com/acme/repo/pull/7", "task-1", "req-1")
+
+        assert exc_info.value.retriable is True
         assert _published(broker)[0]["reason"] == "github-credentials"
 
     @pytest.mark.asyncio
