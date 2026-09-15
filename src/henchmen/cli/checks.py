@@ -136,7 +136,9 @@ def _is_unreachable(exc: BaseException) -> bool:
 
 
 def _http_client(timeout: float) -> httpx.Client:
-    return httpx.Client(timeout=timeout)
+    # trust_env=False: an ambient proxy or netrc configuration must not see the
+    # credentials these calls carry (a Jira API token, an Ollama address).
+    return httpx.Client(timeout=timeout, trust_env=False)
 
 
 def _anthropic_client(api_key: str, timeout: float) -> Any:
