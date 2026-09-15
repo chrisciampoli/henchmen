@@ -393,6 +393,9 @@ class TestOptionalProviderSettings:
         ],
     )
     def test_defaults(self, monkeypatch: pytest.MonkeyPatch, field: str, default: object):
+        # tests/conftest.py points these at per-test files; the defaults are what is under test here.
+        for name in ("HENCHMEN_LOCAL_SQLITE_PATH", "HENCHMEN_LOCAL_STORAGE_DIR", "HENCHMEN_EVAL_DB_PATH"):
+            monkeypatch.delenv(name, raising=False)
         assert getattr(_local_settings(monkeypatch), field) == default
 
     @pytest.mark.parametrize(
