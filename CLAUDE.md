@@ -235,7 +235,9 @@ gcloud run jobs update henchmen-${ENV}-lair-template \
 - Don't use Claude as the git author — all commits must be authored by the human developer
 - Don't add Co-Authored-By lines attributing Claude to commits
 - Don't mount the data volume (or any host path) into an operative or CI-gate container — operatives use
-  the task-scoped `/mastermind/internal/tasks/{task_id}/...` routes, gates clone inside their container
+  the task-scoped `/mastermind/internal/tasks/{task_id}/...` routes, gates clone inside their container.
+  On desktop (`orchestrator_is_local(settings)`) Forge CI's lint/tests and `fix_lint` also run in the gate
+  container, never natively in the server process; the token reaches a gate only over stdin
 - Don't give an operative the internal push token — it gets only `HENCHMEN_OPERATIVE_TASK_TOKEN` for its own task
 - Don't write a secret file by hand — use `henchmen.config.secret_files` (0600, O_BINARY, atomic)
 - Don't let a client write setup completion — steps record it through `SetupStateStore.record_step_complete`

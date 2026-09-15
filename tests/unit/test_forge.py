@@ -19,12 +19,17 @@ from henchmen.forge.server import ForgeCIError, app
 
 
 @pytest.fixture
-def forge_settings(mock_settings):
-    """Project-wide ``mock_settings`` re-exported as ``forge_settings``.
+def forge_settings(mock_settings, monkeypatch):
+    """Project-wide ``mock_settings`` re-exported as ``forge_settings``, on a cloud orchestrator.
 
-    Kept as a distinct fixture so that test code reads as ``settings = forge_settings``
-    without confusion when someone later adds forge-specific overrides here.
+    These tests cover the host CI path Forge takes in the cloud. The suite pins
+    ``HENCHMEN_PROVIDER=local``, whose Docker orchestrator routes Forge CI into the
+    gate container instead (covered by tests/unit/test_desktop_ci_routing.py).
     """
+    from henchmen.config.settings import get_settings
+
+    monkeypatch.setenv("HENCHMEN_CONTAINER_ORCHESTRATOR_PROVIDER", "gcp")
+    get_settings.cache_clear()
     return mock_settings
 
 

@@ -134,7 +134,10 @@ operative container calls back to this one by name. Leave any of them out (or po
 needs-attention mode with a named fix, since the whole-app Host allowlist would otherwise silently
 refuse the callback.
 
-Look for the line starting `Open Henchmen setup:` and open it.
+Look for the line starting `Open Henchmen setup:` and open it. A link can be used once; for a fresh
+one, run `docker exec henchmen henchmen console-link`. A launcher should always get its link from
+`henchmen console-link` rather than rely on `HENCHMEN_CONSOLE_SETUP_TOKEN`: that value only seeds the
+first token a data directory ever issues, so a `console-link` run before the first start uses it up.
 
 ### Prebuilt images
 

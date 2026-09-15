@@ -29,6 +29,18 @@ _SERVICE_OVERRIDE_FIELDS = {
 }
 
 
+def orchestrator_is_local(settings: Settings) -> bool:
+    """True when the *effective* container orchestrator is local Docker.
+
+    The single predicate for every "does this run on a desktop Docker host"
+    decision (lair environment and image, local CI gates, Forge CI and
+    ``fix_lint`` routing): it honours ``HENCHMEN_CONTAINER_ORCHESTRATOR_PROVIDER``
+    rather than the coarse ``provider`` setting, so no two call sites can ever
+    disagree about where operative-written code runs.
+    """
+    return ProviderRegistry(settings).resolve_provider_name("container_orchestrator") == "local"
+
+
 class ProviderRegistry:
     """Resolves provider settings to concrete implementations.
 

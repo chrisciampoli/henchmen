@@ -307,7 +307,7 @@ def test_serve_app_mounts_the_console_after_the_services(serve_env: Path) -> Non
     from henchmen.config.settings import get_settings
 
     app = build_serve_app(get_settings(), 8000, console=_console_app(serve_env, ConsoleMode.RUN))
-    route_paths = [getattr(route, "path", "") for route in app.routes]
+    route_paths = [getattr(route, "path", None) for route in app.routes]
     # Starlette reports a Mount("/") as path "".
     assert route_paths.index("") > route_paths.index("/health"), "the Console mount must come last"
     # No `with`: lifespans are not entered, so this checks routing only.
@@ -320,7 +320,7 @@ def test_serve_app_without_console_is_unchanged(serve_env: Path) -> None:
     from henchmen.config.settings import get_settings
 
     app = build_serve_app(get_settings(), 8000)
-    assert "" not in [getattr(route, "path", "") for route in app.routes]
+    assert "" not in [getattr(route, "path", None) for route in app.routes]
 
 
 def _serve_args(port: int | None = 8123):
