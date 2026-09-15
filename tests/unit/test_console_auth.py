@@ -49,6 +49,11 @@ def test_local_hosts_are_accepted(host: str) -> None:
         "10.0.0.5",
         "[",
         "evil@127.0.0.1:8000",
+        "127.0.0.1/x",
+        "127.0.0.1?x",
+        "127.0.0.1#x",
+        "127.0.0.1\\x",
+        "127.0.0.1 x",
     ],
 )
 def test_other_hosts_are_rejected(host: str | None) -> None:
@@ -724,6 +729,11 @@ def test_desktop_hosts_are_allowed(host: str) -> None:
         "user@henchmen:8000",
         "[",
         "10.0.0.5",
+        "henchmen:8000/x",
+        "henchmen?x",
+        "henchmen#x",
+        "henchmen\\x",
+        "henchmen 8000",
     ],
 )
 def test_other_hosts_are_not_allowed(host: str | None) -> None:
@@ -744,8 +754,38 @@ def test_host_allowlist_guard_refuses_websockets_from_other_hosts() -> None:
 
     inner.add_middleware(HostAllowlistGuard, allowed_hostnames=DESKTOP_HOSTS)
     client = TestClient(inner, base_url="http://evil.example:8000")
-    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/ws"):
+    with pytest.raises(WebSocketDisconnect) as exc, client.websocket_connect("/ws"):
         pass
+    assert exc.value.code == 1008
+
+
+def _duplicate_host_scope(
+    *, path: str = "/x", first: str = "evil.example", second: str = "localhost"
+) -> dict[str, Any]:
+    """An ASGI scope with two ``Host`` headers — a dict can't represent this, so build it by hand."""
+    return {
+        "type": "http",
+        "method": "GET",
+        "path": path,
+        "scheme": "http",
+        "headers": [(b"host", first.encode("latin-1")), (b"host", second.encode("latin-1"))],
+    }
+
+
+@pytest.mark.asyncio
+async def test_host_allowlist_guard_refuses_duplicate_host_headers() -> None:
+    """A duplicate Host header must be refused outright, not resolved to whichever the last one names."""
+    guard = HostAllowlistGuard(_ok_app, allowed_hostnames=DESKTOP_HOSTS)
+    events = await _run_asgi(guard, _duplicate_host_scope())
+    assert events[0]["status"] == 403
+
+
+@pytest.mark.asyncio
+async def test_console_guard_refuses_duplicate_host_headers() -> None:
+    auth = ConsoleAuth(setup_token="t", signing_key=b"k" * 32)
+    guard = ConsoleGuard(_ok_app, auth=auth, public_paths=frozenset())
+    events = await _run_asgi(guard, _duplicate_host_scope(path="/console/api/public"))
+    assert events[0]["status"] == 403
 
 
 def _settings(**overrides: Any) -> Settings:
@@ -785,4 +825,27 @@ class TestForwardHostProblem:
     def test_malformed_url_reports_a_problem(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
         settings = _settings(local_forward_base_url="http://[")
+        assert forward_host_problem(settings) is not None
+
+    def test_blank_container_hostname_reports_a_problem(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
+        settings = _settings(local_container_hostname="   ")
+        problem = forward_host_problem(settings)
+        assert problem is not None
+        assert "HENCHMEN_LOCAL_CONTAINER_HOSTNAME" in problem
+
+    def test_container_hostname_with_a_port_reports_a_problem(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
+        settings = _settings(local_container_hostname="henchmen:8000")
+        problem = forward_host_problem(settings)
+        assert problem is not None
+        assert "HENCHMEN_LOCAL_CONTAINER_HOSTNAME" in problem
+
+    def test_bad_port_in_the_forward_url_reports_a_problem(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
+        settings = _settings(local_forward_base_url="http://henchmen:abc")
         assert forward_host_problem(settings) is not None

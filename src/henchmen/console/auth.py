@@ -57,16 +57,20 @@ _SETUP_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 _LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _DEFAULT_PORTS: dict[str, int] = {"http": 80, "https": 443, "ws": 80, "wss": 443}
+_FORBIDDEN_NETLOC_CHARS = frozenset("/?#\\")
 
 
 def _parse_netloc(netloc: str, default_scheme: str) -> tuple[str, int] | None:
     """Return ``(lowercase hostname, port)`` for a Host header or an Origin's netloc.
 
-    Returns ``None`` for anything malformed (including an unparsable IPv6 host)
-    or carrying userinfo (``user@host``), which a Host or Origin header must
-    never legitimately contain.
+    Returns ``None`` for anything malformed (including an unparsable IPv6 host),
+    carrying userinfo (``user@host``), or containing ``/ ? # \\`` or whitespace
+    — a bare Host or Origin netloc must never legitimately contain any of
+    these, and ``urlsplit`` silently strips a path/query/fragment suffix
+    (``127.0.0.1/x`` would otherwise parse as the bare, allowed hostname
+    ``127.0.0.1``) rather than rejecting it.
     """
-    if "@" in netloc:
+    if "@" in netloc or any(char in _FORBIDDEN_NETLOC_CHARS or char.isspace() for char in netloc):
         return None
     try:
         parts = urlsplit(f"//{netloc}")
@@ -99,6 +103,19 @@ def _host_port(host_header: str, default_scheme: str) -> int | None:
     """Return the port named by a Host header, defaulting by ``default_scheme``."""
     parsed = _parse_netloc(host_header, default_scheme=default_scheme)
     return parsed[1] if parsed is not None else None
+
+
+def _host_header(scope: Scope) -> str | None:
+    """The sole ``Host`` header value from an ASGI scope, or ``None`` when absent or duplicated.
+
+    HTTP server implementations disagree about which of several ``Host``
+    headers on one request they honor (some the first, some the last), so a
+    request carrying more than one is never trusted as naming either value:
+    it is treated the same as carrying no Host header at all, which every
+    caller here already fails closed on.
+    """
+    values = [value.decode("latin-1") for key, value in scope["headers"] if key.lower() == b"host"]
+    return values[0] if len(values) == 1 else None
 
 
 def is_allowed_host(host_header: str | None, allowed_hostnames: frozenset[str]) -> bool:
@@ -377,8 +394,9 @@ class ConsoleGuard:
         is_websocket = scope_type == "websocket"
         headers = {key.decode("latin-1").lower(): value.decode("latin-1") for key, value in scope["headers"]}
         path: str = scope["path"]
+        host_header = _host_header(scope)
 
-        if not is_local_host(headers.get("host")):
+        if not is_local_host(host_header):
             message = "The Henchmen Console only accepts requests addressed to this machine."
             await _deny(send, is_websocket, 403, message)
             return
@@ -387,7 +405,7 @@ class ConsoleGuard:
         needs_origin_check = is_websocket or method not in _SAFE_METHODS
         if needs_origin_check:
             origin_parts = _origin_parts(headers.get("origin"))
-            host_port = _host_port(headers.get("host") or "", scope.get("scheme") or "http")
+            host_port = _host_port(host_header or "", scope.get("scheme") or "http")
             if origin_parts is None or host_port is None or origin_parts[1] != host_port:
                 await _deny(send, is_websocket, 403, "Cross-site request refused.")
                 return
@@ -426,8 +444,7 @@ class HostAllowlistGuard:
         if scope_type not in {"http", "websocket"} or scope["path"] in self.exempt_paths:
             await self.app(scope, receive, send)
             return
-        headers = {key.decode("latin-1").lower(): value.decode("latin-1") for key, value in scope["headers"]}
-        host_header = headers.get("host")
+        host_header = _host_header(scope)
         if not is_allowed_host(host_header, self.allowed_hostnames):
             logger.debug("Refusing request with disallowed Host %r (desktop allowlist).", host_header)
             message = "Henchmen only accepts requests addressed to this machine."
@@ -450,15 +467,25 @@ def forward_host_problem(settings: Settings) -> str | None:
 
     if not is_desktop_install():
         return None
+
+    container_hostname = settings.local_container_hostname.strip().lower()
+    if not container_hostname or any(char in ":/" or char.isspace() for char in container_hostname):
+        return (
+            f"HENCHMEN_LOCAL_CONTAINER_HOSTNAME ({settings.local_container_hostname!r}) must be a bare "
+            "hostname such as 'henchmen', with no port, path or whitespace."
+        )
+
     try:
-        hostname = urlsplit(settings.local_forward_base).hostname
+        split = urlsplit(settings.local_forward_base)
+        hostname = split.hostname
+        _ = split.port  # accessed for its side effect: raises ValueError on an unparsable port
     except ValueError:
         hostname = None
     if not hostname:
         return f"HENCHMEN_LOCAL_FORWARD_BASE_URL ({settings.local_forward_base!r}) is not a usable URL."
-    if hostname.lower() in desktop_allowed_hostnames(settings.local_container_hostname):
+    if hostname.lower() in desktop_allowed_hostnames(container_hostname):
         return None
-    suggestion = f"http://{settings.local_container_hostname}:{settings.local_serve_port}"
+    suggestion = f"http://{container_hostname}:{settings.local_serve_port}"
     return (
         f"Operatives call Henchmen at {hostname}, which a desktop install refuses. "
         f"Set HENCHMEN_LOCAL_FORWARD_BASE_URL={suggestion}"
