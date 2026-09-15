@@ -19,9 +19,11 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from henchmen.config.posture import fail_open_allowed
 from henchmen.config.settings import get_settings
 from henchmen.dispatch.pubsub_auth import require_internal_caller, verify_pubsub_oidc
+from henchmen.providers.local.memory import FORWARD_TIMEOUT_SECONDS
 from henchmen.providers.registry import orchestrator_is_local
 from henchmen.utils.git import clone_repo
 from henchmen.utils.lifespan import run_shutdown
+from henchmen.utils.message_dedup import claim_message, mark_message_done, release_message_claim
 from henchmen.utils.redaction import install_secret_redaction
 
 if TYPE_CHECKING:
@@ -37,6 +39,23 @@ install_secret_redaction()
 # Enough history for `git merge-base` against the PR base to resolve; the
 # silent-failure scan and the changed-file lint both depend on it.
 _CLONE_DEPTH = 200
+
+# On a desktop install this handler runs inline inside the shared in-memory
+# broker's forwarded POST, which re-sends the request after
+# FORWARD_TIMEOUT_SECONDS. The whole CI run must end strictly before that, with
+# this much headroom left for the GitHub calls, the clone, the PR comment and
+# publishing the result.
+_DESKTOP_FORWARD_HEADROOM_SECONDS = 120
+
+# Dedup keys for forge-request deliveries share the processed_messages
+# collection with Mastermind's markers on a desktop install; the prefix keeps
+# them apart.
+_FORGE_REQUEST_DEDUP_PREFIX = "forge-request:"
+
+
+def desktop_ci_budget_seconds(settings: Settings) -> int:
+    """The single wall-clock budget of one desktop Forge CI run: the gate timeout, capped below the broker re-send."""
+    return int(min(float(settings.lair_default_timeout), FORWARD_TIMEOUT_SECONDS - _DESKTOP_FORWARD_HEADROOM_SECONDS))
 
 
 class ForgeCIError(RuntimeError):
@@ -163,6 +182,25 @@ async def forge_request_handler(request: Request) -> dict[str, str]:
     if not pr_url or "pull/" not in pr_url:
         raise HTTPException(status_code=422, detail="Valid 'pr_url' is required in message data")
 
+    # Desktop (local orchestrator): the shared in-memory broker re-sends a forwarded
+    # POST after FORWARD_TIMEOUT_SECONDS. Claim the request id first (the same
+    # two-phase markers Mastermind uses) so a re-send of a still-running or
+    # finished request never runs CI -- and posts a PR comment -- a second time.
+    # The cloud path is unchanged.
+    dedup_key = ""
+    if orchestrator_is_local(get_settings()) and request_id != "unknown":
+        dedup_key = f"{_FORGE_REQUEST_DEDUP_PREFIX}{request_id}"
+        try:
+            duplicate = await claim_message(
+                _get_document_store(), dedup_key, handler="forge-request", ttl_seconds=FORWARD_TIMEOUT_SECONDS
+            )
+        except Exception as exc:
+            logger.error("[FORGE] Could not claim forge-request %s: %s", request_id, exc)
+            raise HTTPException(status_code=500, detail="Could not record the CI request") from None
+        if duplicate:
+            logger.info("[FORGE] Duplicate forge-request %s for %s; not running CI again", request_id, pr_url)
+            return {"status": "duplicate", "request_id": request_id}
+
     # Run CI synchronously within the handler so the Pub/Sub ack is gated on completion.
     # This mirrors the Mastermind pattern: returning before completion would ack the Pub/Sub
     # message, causing lost CI results if the instance recycles mid-run. Cloud Run Pub/Sub
@@ -180,8 +218,14 @@ async def forge_request_handler(request: Request) -> dict[str, str]:
         if isinstance(exc, ForgeCIError) and not exc.retriable:
             # Deterministic failure: a redelivery would fail identically, and the
             # failed forge-result has already been published.
+            if dedup_key:
+                await mark_message_done(_get_document_store(), dedup_key, handler="forge-request")
             return {"status": "failed", "reason": str(exc)}
+        if dedup_key:
+            await release_message_claim(_get_document_store(), dedup_key)
         raise HTTPException(status_code=500, detail="CI run failed; Pub/Sub will retry") from None
+    if dedup_key:
+        await mark_message_done(_get_document_store(), dedup_key, handler="forge-request")
     return {"status": "accepted"}
 
 
@@ -199,6 +243,17 @@ def _get_broker() -> Any:
         broker = ProviderRegistry(get_settings()).get_message_broker()
         app.state.message_broker = broker
     return broker
+
+
+def _get_document_store() -> Any:
+    """Return the process-wide document store on ``app.state``, creating it once like :func:`_get_broker`."""
+    store = getattr(app.state, "document_store", None)
+    if store is None:
+        from henchmen.providers.registry import ProviderRegistry
+
+        store = ProviderRegistry(get_settings()).get_document_store()
+        app.state.document_store = store
+    return store
 
 
 async def _close_broker() -> None:
@@ -273,6 +328,7 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
     can never sit in ``ci_pending`` because Forge gave up quietly.
     """
     settings = get_settings()
+    started = asyncio.get_running_loop().time()
 
     try:
         full_repo, pr_number = _parse_pr_url(pr_url)
@@ -333,16 +389,19 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
         try:
             # One budget for the whole run and for any single command: the cloud
             # run must finish (and ack) inside the 600s Pub/Sub ack deadline. A
-            # desktop run has no ack deadline (the in-process broker waits), so it
-            # gets the gate timeout every other local gate gets instead.
-            budget = int(settings.lair_default_timeout) if local else settings.forge_ci_timeout_seconds
+            # desktop run gets the gate timeout, capped below the in-memory broker's
+            # forward re-send (desktop_ci_budget_seconds), counted from the start of
+            # this request.
+            budget = desktop_ci_budget_seconds(settings) if local else settings.forge_ci_timeout_seconds
             runner = CIRunner(
                 timeout_seconds=budget,
                 total_budget_seconds=budget,
                 redact=[github_token] if github_token else [],
             )
             if local:
-                result = await _run_local_ci(settings, runner, full_repo, head_branch, base_branch, workspace)
+                result = await _run_local_ci(
+                    settings, runner, full_repo, head_branch, base_branch, workspace, deadline=started + budget
+                )
             else:
                 result = await runner.run(workspace, base_ref=base_branch)
         except Exception as exc:
@@ -385,6 +444,8 @@ async def _run_local_ci(
     head_branch: str,
     base_branch: str,
     workspace: str,
+    *,
+    deadline: float,
 ) -> dict[str, Any]:
     """Desktop Forge CI: one gate container for lint and tests, the silent-failure scan on the no-checkout clone.
 
@@ -403,20 +464,31 @@ async def _run_local_ci(
     (``passed``/``failed``/``incomplete``) and the PR comment are those of the
     host path. A gate that times out or reports no usable result fails every
     check it was asked to run.
+
+    ``deadline`` (event-loop time) is the one wall-clock limit of the whole
+    run: the gate gets what is left of it, the silent-failure scan whatever the
+    gate left over, and a scan with nothing left is ``skipped`` (so the run is
+    at best ``incomplete``, never ``passed``).
     """
-    from henchmen.forge.ci_runner import STATUS_FAILED, STATUS_PASSED
+    from henchmen.forge.ci_runner import STATUS_FAILED, STATUS_PASSED, STATUS_SKIPPED
     from henchmen.mastermind.scheme_executor.handlers import run_gate_in_container
 
+    loop = asyncio.get_running_loop()
     run_tests, tests_check = await runner.committed_tests_decision(workspace)
     names = ["lint", "tests"] if run_tests else ["lint"]
-    gate = await run_gate_in_container(
-        settings,
-        "forge",
-        repo=full_repo,
-        branch=head_branch,
-        base_branch=base_branch,
-        extra_args=() if run_tests else ("--skip-tests",),
-    )
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        gate: dict[str, Any] = {"condition": "fail", "message": "forge failed (no CI time budget left)", "output": ""}
+    else:
+        gate = await run_gate_in_container(
+            settings,
+            "forge",
+            repo=full_repo,
+            branch=head_branch,
+            base_branch=base_branch,
+            extra_args=() if run_tests else ("--skip-tests",),
+            timeout_seconds=remaining,
+        )
     reported = {str(check.get("name")): check for check in gate.get("checks", []) if isinstance(check, dict)}
     gate_failed = gate.get("condition") != "pass"
     any_check_failed = any(check.get("condition") != "pass" for check in reported.values())
@@ -425,7 +497,7 @@ async def _run_local_ci(
         check = reported.get(name)
         if check is None or (gate_failed and not any_check_failed):
             # No per-check result (a timeout, a crash, no marker) or a pass the exit code contradicts.
-            message = str(gate.get("message", "")) or f"the gate reported no {name} result"
+            message = f"{name}: {gate.get('message') or 'the gate reported no result'}"
             checks.append(runner.check_result(name, STATUS_FAILED, str(gate.get("output", "")), message))
             continue
         passed = check.get("condition") == "pass"
@@ -439,7 +511,17 @@ async def _run_local_ci(
         )
     if tests_check is not None:
         checks.append(tests_check)
-    checks.append(await runner.run_silent_failure_scan(workspace, base_branch))
+    scan_budget = int(deadline - loop.time())
+    if scan_budget <= 0:
+        checks.append(
+            runner.check_result(
+                "silent_failure_scan", STATUS_SKIPPED, "", "The CI time budget was used up before the scan could run."
+            )
+        )
+    else:
+        runner.timeout_seconds = min(runner.timeout_seconds, scan_budget)
+        runner.total_budget_seconds = scan_budget
+        checks.append(await runner.run_silent_failure_scan(workspace, base_branch))
     return runner.aggregate(checks)
 
 

@@ -35,6 +35,12 @@ from henchmen.models.task import HenchmenTask
 from henchmen.observability.api import create_metrics_router, require_metrics_auth
 from henchmen.schemes.registry import SchemeRegistry
 from henchmen.utils.lifespan import run_shutdown
+from henchmen.utils.message_dedup import (
+    DEFAULT_INFLIGHT_TTL_SECONDS,
+    claim_message,
+    mark_message_done,
+    release_message_claim,
+)
 from henchmen.utils.redaction import install_secret_redaction
 
 logger = logging.getLogger(__name__)
@@ -227,13 +233,13 @@ async def _acquire_watchdog_lease(
 # (or before marking as done), a Pub/Sub redelivery should be allowed to retry.
 # This is the E2 fix for the check-then-set race that could silently drop
 # tasks on transient processing failures.
-_DEDUP_INFLIGHT_TTL_SECONDS = 900
+_DEDUP_INFLIGHT_TTL_SECONDS = DEFAULT_INFLIGHT_TTL_SECONDS
 
 
 async def _check_message_dedup(message_id: str, dedup_key: str | None = None, handler: str = "task-intake") -> bool:
     """Check if a Pub/Sub message (or an explicit dedup key) was already processed.
 
-    Two-phase dedup (E2 fix):
+    Two-phase dedup (E2 fix), implemented once in :mod:`henchmen.utils.message_dedup`:
 
     1. On first observation, the message is marked ``in_flight`` with an
        acquisition timestamp. The handler runs, and only on successful
@@ -248,12 +254,6 @@ async def _check_message_dedup(message_id: str, dedup_key: str | None = None, ha
        retry returns True (treat as duplicate — the concurrent handler will
        ack the original delivery).
 
-    This closes the original failure mode: dedup doc written before
-    processing, processing crashes, Pub/Sub retries, retry sees the dedup doc
-    and silently ack's — the task is lost. With the TTL reclaim path the
-    retry either completes normally (if the prior was short) or reclaims
-    (if the prior crashed).
-
     When a caller supplies an application-level ``dedup_key`` (e.g. the
     watchdog's ``resume-<task_id>-<attempts>``), it is checked in addition
     to the Pub/Sub ``message_id``.
@@ -265,65 +265,13 @@ async def _check_message_dedup(message_id: str, dedup_key: str | None = None, ha
     if not message_id and not dedup_key:
         return False
 
-    agent = get_agent()
-    store = agent.tracker._store
-    now = datetime.now(UTC)
-
-    async def _check_or_claim(key: str) -> bool:
-        try:
-            existing = await store.get("processed_messages", key)
-        except Exception:
-            raise
-        if existing is not None:
-            status = existing.get("status", "done")
-            if status == "done":
-                return True
-            # in_flight — check TTL
-            acquired_raw = existing.get("acquired_at") or existing.get("processed_at")
-            if acquired_raw:
-                try:
-                    acquired = datetime.fromisoformat(acquired_raw)
-                except ValueError:
-                    acquired = now  # Treat as freshly acquired on parse failure
-                age_seconds = (now - acquired).total_seconds()
-                if age_seconds < _DEDUP_INFLIGHT_TTL_SECONDS:
-                    logger.info(
-                        "[dedup] %s is in_flight (age=%.0fs), treating retry as duplicate",
-                        key,
-                        age_seconds,
-                    )
-                    return True
-                logger.warning(
-                    "[dedup] %s in_flight marker is stale (age=%.0fs); reclaiming for retry",
-                    key,
-                    age_seconds,
-                )
-        # Mark as in_flight — the caller is responsible for upgrading to done
-        # after successful processing, or leaving the marker to expire on
-        # failure (so Pub/Sub's redelivery can reclaim).
-        try:
-            await store.set(
-                "processed_messages",
-                key,
-                {
-                    "status": "in_flight",
-                    "acquired_at": now.isoformat(),
-                    # ``cleanup_processed_messages`` filters on processed_at, so
-                    # in_flight markers need it too or they are never reaped.
-                    "processed_at": now.isoformat(),
-                    "handler": handler,
-                    "key": key,
-                },
-            )
-        except Exception:
-            raise
-        return False
-
+    store = get_agent().tracker._store
     # Application-level dedup key takes precedence because it is deterministic.
-    if dedup_key and await _check_or_claim(dedup_key):
+    if dedup_key and await claim_message(store, dedup_key, handler=handler, ttl_seconds=_DEDUP_INFLIGHT_TTL_SECONDS):
         return True
-
-    return bool(message_id and await _check_or_claim(message_id))
+    return bool(
+        message_id and await claim_message(store, message_id, handler=handler, ttl_seconds=_DEDUP_INFLIGHT_TTL_SECONDS)
+    )
 
 
 async def _mark_message_done(message_id: str, dedup_key: str | None = None, handler: str = "task-intake") -> None:
@@ -335,25 +283,10 @@ async def _mark_message_done(message_id: str, dedup_key: str | None = None, hand
     propagate, since a missing upgrade will be harmlessly reclaimed after
     ``_DEDUP_INFLIGHT_TTL_SECONDS`` by a future retry or the watchdog.
     """
-    agent = get_agent()
-    store = agent.tracker._store
-    now = datetime.now(UTC).isoformat()
+    store = get_agent().tracker._store
     for key in (dedup_key, message_id):
-        if not key:
-            continue
-        try:
-            await store.set(
-                "processed_messages",
-                key,
-                {
-                    "status": "done",
-                    "processed_at": now,
-                    "handler": handler,
-                    "key": key,
-                },
-            )
-        except Exception as exc:
-            logger.warning("[dedup] Failed to mark %s as done: %s", key, exc)
+        if key:
+            await mark_message_done(store, key, handler=handler)
 
 
 async def _release_message_claim(message_id: str, dedup_key: str | None = None) -> None:
@@ -364,12 +297,8 @@ async def _release_message_claim(message_id: str, dedup_key: str | None = None) 
     """
     store = get_agent().tracker._store
     for key in (dedup_key, message_id):
-        if not key:
-            continue
-        try:
-            await store.delete("processed_messages", key)
-        except Exception as exc:
-            logger.warning("[dedup] Failed to release the in-flight marker %s: %s", key, exc)
+        if key:
+            await release_message_claim(store, key)
 
 
 @app.get("/health")

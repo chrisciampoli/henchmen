@@ -110,7 +110,8 @@ silently ignored, and the Dispatch container never ran its own HTTP app.
   local Docker, which includes a repository checkout running `HENCHMEN_PROVIDER=local`, Forge CI and the
   `fix_lint` node run in a gate container from the operative image, so both now need Docker and that
   image. Forge runs lint and tests in a single `ci_gate forge` container (one clone, one dependency
-  install), bounded by the gate timeout. Its lint uses the Mastermind lint gate's `lint_scope` rules,
+  install) under one deadline capped below the in-memory broker's forward timeout, and a re-sent
+  forge-request is deduplicated by request id. Its lint uses the Mastermind lint gate's `lint_scope` rules,
   which are stricter than the cloud path's ruff on changed Python files.
 - **Credential settings accept two spellings.** `github_token`,
   `slack_bot_token`, `slack_app_token`, `slack_signing_secret`,
