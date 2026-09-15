@@ -12,7 +12,15 @@ from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from henchmen.console.auth import SESSION_COOKIE, ConsoleAuth, ConsoleGuard, is_local_host, is_local_origin
+from henchmen.console.auth import (
+    SESSION_COOKIE,
+    SETUP_TOKEN_FILE_NAME,
+    ConsoleAuth,
+    ConsoleGuard,
+    SetupTokenStore,
+    is_local_host,
+    is_local_origin,
+)
 
 LOCAL = "http://127.0.0.1:8000"
 
@@ -117,11 +125,12 @@ def test_load_creates_the_secrets_directory_owner_only(tmp_path: Path) -> None:
 
 def test_load_creates_and_reuses_the_signing_key(tmp_path: Path) -> None:
     first = ConsoleAuth.load(tmp_path / "secrets", setup_token=None)
+    first_token = first.setup_token
     second = ConsoleAuth.load(tmp_path / "secrets", setup_token="given")
     cookie = first.issue_session()
     assert second.verify_session(cookie), "sessions must survive a restart"
-    assert second.setup_token == "given"
-    assert len(first.setup_token) >= 32
+    assert len(first_token) >= 32
+    assert second.setup_token not in {"given", first_token}, "the seed applies only to the very first token"
     if sys.platform != "win32":
         assert oct(os.stat(tmp_path / "secrets" / "console-session.key").st_mode & 0o777) == "0o600"
 
@@ -173,6 +182,100 @@ def test_load_regenerates_an_empty_or_short_signing_key(tmp_path: Path, bad_key:
 
     if sys.platform != "win32":
         assert oct(os.stat(key_path).st_mode & 0o777) == "0o600"
+
+
+SEED = "s" * 43
+
+
+def test_rotate_uses_a_valid_seed_only_for_the_very_first_token(tmp_path: Path) -> None:
+    store = SetupTokenStore(tmp_path / "secrets" / SETUP_TOKEN_FILE_NAME)
+    assert store.rotate(seed=SEED) == SEED
+    second = store.rotate(seed=SEED)
+    assert second != SEED
+    assert len(second) >= 43
+    assert store.current() == second
+
+
+@pytest.mark.parametrize("seed", ["short", "has spaces " * 4, "é" * 40])
+def test_rotate_ignores_an_unsafe_seed(tmp_path: Path, seed: str) -> None:
+    token = SetupTokenStore(tmp_path / SETUP_TOKEN_FILE_NAME).rotate(seed=seed)
+    assert token != seed
+    assert len(token) >= 43
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits do not apply on Windows")
+def test_token_file_is_owner_only(tmp_path: Path) -> None:
+    path = tmp_path / "secrets" / SETUP_TOKEN_FILE_NAME
+    SetupTokenStore(path).rotate()
+    assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+
+
+def test_consume_accepts_the_token_exactly_once(tmp_path: Path) -> None:
+    store = SetupTokenStore(tmp_path / SETUP_TOKEN_FILE_NAME)
+    token = store.rotate()
+    assert store.consume(token) is True
+    assert store.consume(token) is False
+    replacement = store.current()
+    assert replacement is not None and replacement != token
+
+
+def test_consume_rejects_wrong_or_empty_tokens_without_burning_the_real_one(tmp_path: Path) -> None:
+    store = SetupTokenStore(tmp_path / SETUP_TOKEN_FILE_NAME)
+    token = store.rotate()
+    assert store.consume("") is False
+    assert store.consume(token[:-1]) is False
+    assert store.consume(token + "x") is False
+    assert store.current() == token
+
+
+def test_a_second_process_cannot_consume_the_same_token(tmp_path: Path) -> None:
+    path = tmp_path / SETUP_TOKEN_FILE_NAME
+    token = SetupTokenStore(path).rotate()
+    assert SetupTokenStore(path).consume(token) is True
+    assert SetupTokenStore(path).consume(token) is False
+
+
+def test_a_failed_claim_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = SetupTokenStore(tmp_path / SETUP_TOKEN_FILE_NAME)
+    token = store.rotate()
+
+    def lost_race(src: object, dst: object) -> None:
+        raise FileNotFoundError("claimed by another process")
+
+    monkeypatch.setattr("henchmen.console.auth.os.replace", lost_race)
+    assert store.consume(token) is False
+
+
+def test_rotation_by_another_process_invalidates_the_old_link(tmp_path: Path) -> None:
+    path = tmp_path / SETUP_TOKEN_FILE_NAME
+    server_view = SetupTokenStore(path)
+    old = server_view.rotate()
+    new = SetupTokenStore(path).rotate()
+    assert server_view.consume(old) is False
+    assert server_view.consume(new) is True
+
+
+def test_current_is_none_for_a_missing_or_corrupt_file(tmp_path: Path) -> None:
+    path = tmp_path / SETUP_TOKEN_FILE_NAME
+    assert SetupTokenStore(path).current() is None
+    path.write_bytes(b"short")
+    assert SetupTokenStore(path).current() is None
+
+
+def test_in_memory_auth_consumes_once() -> None:
+    auth = ConsoleAuth(setup_token="t" * 43, signing_key=b"k" * 32)
+    assert auth.consume_setup_token("t" * 43) is True
+    assert auth.consume_setup_token("t" * 43) is False
+    assert auth.setup_token == ""
+
+
+def test_load_rotates_the_token_on_every_start(tmp_path: Path) -> None:
+    first = ConsoleAuth.load(tmp_path / "secrets", setup_token=SEED)
+    first_token = first.setup_token
+    second = ConsoleAuth.load(tmp_path / "secrets", setup_token=SEED)
+    assert first_token == SEED
+    assert second.setup_token != first_token
+    assert first.consume_setup_token(first_token) is False, "a restart invalidates the previous link"
 
 
 def _guarded_app(auth: ConsoleAuth) -> TestClient:

@@ -171,3 +171,19 @@ def test_root_serves_the_console_page(env) -> None:
 def test_non_local_host_is_refused_everywhere(env) -> None:
     client, *_ = env
     assert client.get("/", headers={"host": "evil.example"}).status_code == 403
+
+
+def test_session_exchange_is_one_time(env) -> None:
+    client, *_ = env
+    assert client.get("/console/session", params={"setup_token": "tok"}).status_code == 303
+    client.cookies.clear()
+    assert client.get("/console/session", params={"setup_token": "tok"}).status_code == 403
+
+
+def test_signed_in_browser_opening_an_old_link_is_redirected_without_error(env) -> None:
+    client, _, auth, *_ = env
+    _signed_in(client, auth)
+    response = client.get("/console/session", params={"setup_token": "already-used"})
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert auth.setup_token == "tok", "a signed-in visit must not burn the current token"
