@@ -362,7 +362,10 @@ class TestLifespanStartsSocketMode:
         broker = MagicMock()
         broker.aclose = AsyncMock()
         with (
-            patch("henchmen.dispatch.server.ProviderRegistry") as registry_cls,
+            # dispatch/server.py imports ProviderRegistry locally inside its lifespan (like
+            # mastermind's and forge's own lifespans), not at module level, so it is patched
+            # at its defining module instead of on henchmen.dispatch.server.
+            patch("henchmen.providers.registry.ProviderRegistry") as registry_cls,
             patch.object(slack_bot, "start_socket_mode", return_value=None),
         ):
             registry_cls.return_value.get_message_broker.return_value = broker

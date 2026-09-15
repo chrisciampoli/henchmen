@@ -242,8 +242,9 @@ class TestSettingsLocalMode:
 
 class TestValidateForRuntimeCatchesProviderGcpBypass:
     """``model_post_init`` already refuses provider=gcp with no project id at construction,
-    but ``model_copy(update=...)`` -- used by several call sites and test fixtures to derive
-    per-request Settings -- bypasses it, so ``validate_for_runtime`` checks it again."""
+    but ``model_copy(update=...)`` -- used by test fixtures (e.g. ``_mock_settings`` in
+    test_provider_registry.py) to derive per-test Settings variants -- bypasses it, so
+    ``validate_for_runtime`` checks it again."""
 
     def test_provider_gcp_without_a_project_id_is_a_runtime_problem(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
@@ -256,6 +257,17 @@ class TestValidateForRuntimeCatchesProviderGcpBypass:
         base = Settings(_env_file=None, provider="local", gcp_project_id="test-project")  # type: ignore[call-arg]
         settings = base.model_copy(update={"provider": "gcp"})
         assert not any("HENCHMEN_GCP_PROJECT_ID" in p for p in settings.validate_for_runtime())
+
+    def test_provider_and_llm_both_gcp_reports_the_missing_project_id_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nit fix: provider=gcp and llm_provider=gcp (the common case) must report the
+        empty project id once, not twice."""
+        monkeypatch.setenv("HENCHMEN_PROVIDER", "local")
+        base = Settings(_env_file=None, provider="local", gcp_project_id="test-project")  # type: ignore[call-arg]
+        settings = base.model_copy(update={"provider": "gcp", "llm_provider": "gcp", "gcp_project_id": ""})
+        problems = [p for p in settings.validate_for_runtime() if "HENCHMEN_GCP_PROJECT_ID" in p]
+        assert len(problems) == 1
 
 
 # ---------------------------------------------------------------------------

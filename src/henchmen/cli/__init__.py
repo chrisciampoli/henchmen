@@ -869,15 +869,29 @@ def _serve_data_dir(
         active_llm_provider(settings),
         settings.environment.value,
     )
+    # Built once, outside build_serve_app's own try below: a failure here must exit rather
+    # than be retried through needs_attention, which would call create_console_app again (in
+    # ATTENTION mode) and could raise a second time, now uncaught inside an exception handler
+    # (decision: surface once, as a clear exit -- see the fix report for the alternative
+    # considered and why this one was chosen).
     try:
-        app = build_serve_app(
-            settings, port, console=console(ConsoleMode.RUN, health=health), desktop=desktop, health=health
-        )
+        run_console = console(ConsoleMode.RUN, health=health)
     except Exception as exc:
-        # build_serve_app can fail before ever reaching serve_app (a sub-app import, or
-        # registry.get_document_store()/get_container_orchestrator()) -- it may already have
-        # set the shared-broker singleton by then, so release it explicitly rather than
-        # leaving it pointing at a broker no lifespan will ever close (ruling: no leak).
+        logger.exception("Failed to build the Henchmen Console")
+        print(f"ERROR: could not build the Henchmen Console: {exc}", file=sys.stderr)
+        sys.exit(STARTUP_FAILURE)
+
+    try:
+        app = build_serve_app(settings, port, console=run_console, desktop=desktop, health=health)
+    except Exception as exc:
+        # build_serve_app can fail after get_document_store() ran (get_container_orchestrator(),
+        # get_ci_provider(), a sub-app import, mounting) -- it closes the store it built itself
+        # before re-raising (see build_serve_app's own try/except). It may also already have
+        # set the shared-broker singleton, so release that here too rather than leaving it
+        # pointing at a broker no lifespan will ever close (ruling: no leak). The Console built
+        # above already proved create_console_app works in this process, so the attention
+        # fallback's own (differently parameterized) call to it is not an untested retry of
+        # the same failure.
         from henchmen.providers.local.memory import set_shared_broker
 
         logger.exception("Failed to build the combined app")

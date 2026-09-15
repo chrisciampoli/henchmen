@@ -773,16 +773,20 @@ def test_a_service_startup_failure_is_recorded_and_re_raised(serve_env: Path) ->
     assert health.snapshot() == {"dispatch": "failed", "mastermind": "off", "forge": "off"}
 
 
-def test_a_second_sub_apps_failure_still_closes_the_store_and_releases_the_broker(
+def test_a_second_sub_apps_failure_still_closes_dispatch_and_the_store_and_the_broker(
     serve_env: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Ruling 7: dispatch's lifespan is entered first; when mastermind's then fails,
-    AsyncExitStack unwinds dispatch's already-entered context manager (its own __aexit__
-    runs, so it is not left dangling), and -- regardless of what that unwind itself does --
-    the shared store the combined app owns is closed and the broker singleton is released
-    before any needs-attention fallback."""
+    """Fix round 2, item 1: dispatch's lifespan is entered first; when mastermind's then
+    fails, AsyncExitStack unwinds dispatch's already-entered context manager by throwing the
+    exception in at its `yield`. Before dispatch's `yield` was wrapped in try/finally, that
+    throw skipped every statement after `yield` -- including closing the Slack Socket Mode
+    handler -- so its background threads stayed connected, accepting Slack messages and
+    publishing them to a broker nothing drains, for as long as the process (through
+    needs-attention mode included). This proves the handler is now actually closed, on top
+    of the store being closed and the broker singleton released."""
     import sqlite3
 
+    import henchmen.dispatch.slack_bot as slack_bot
     import henchmen.mastermind.server as mastermind_server
     import henchmen.providers.local.memory as memory
     from henchmen.config.settings import get_settings
@@ -795,14 +799,17 @@ def test_a_second_sub_apps_failure_still_closes_the_store_and_releases_the_broke
     # so this reference is valid even though mastermind's own lifespan never reaches RUNNING.
     store = mastermind_server.app.state.document_store
     assert isinstance(store, SQLiteDocumentStore)
+    handler = MagicMock()
     with (
+        patch.object(slack_bot, "start_socket_mode", return_value=handler),
         patch.object(mastermind_server, "get_agent", side_effect=RuntimeError("mastermind boom")),
         caplog.at_level(logging.INFO),
         pytest.raises(RuntimeError, match="mastermind boom"),
         TestClient(app),  # type: ignore[arg-type]
     ):
         pass
-    assert "[dispatch] Service started" in caplog.text, "dispatch must have started before mastermind failed"
+    handler.close.assert_called_once()
+    assert "[dispatch] Shutting down" in caplog.text, "dispatch's try/finally must still run its shutdown"
     assert health.snapshot() == {"dispatch": "off", "mastermind": "failed", "forge": "off"}
     assert memory.get_shared_broker() is None
     with pytest.raises(sqlite3.ProgrammingError):
@@ -833,6 +840,43 @@ def test_a_failed_lifespan_does_not_leak_the_broker_or_the_store(serve_env: Path
     with TestClient(app2):  # type: ignore[arg-type]
         assert health2.snapshot() == {"dispatch": "running", "mastermind": "running", "forge": "running"}
     assert memory.get_shared_broker() is None
+
+
+def test_get_container_orchestrator_failure_falls_back_to_attention_with_the_store_closed(
+    serve_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fix round 2, item 2: build_serve_app can fail after registry.get_document_store() ran
+    (get_container_orchestrator() here) -- no lifespan will ever exist to close that store, so
+    build_serve_app itself closes it before re-raising; the caller (_serve_data_dir) then
+    releases the broker singleton and falls back to needs-attention mode. End-to-end through
+    _serve() (unlike the sibling tests above, which drive build_serve_app directly), so this
+    exercises the real cli/__init__.py exception handling around the real build_serve_app."""
+    import sqlite3
+
+    import henchmen.mastermind.server as mastermind_server
+    import henchmen.providers.local.memory as memory
+    from henchmen.cli import _serve
+    from henchmen.providers.registry import ProviderRegistry
+
+    # serve_env already cleared every HENCHMEN_* variable and chdir'd into this directory;
+    # these two additional variables make it a completed data-directory install too.
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(serve_env))
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8123")
+    _completed_setup(serve_env, "HENCHMEN_PROVIDER=local\n" + _FORWARD_OK)
+
+    with (
+        patch.object(ProviderRegistry, "get_container_orchestrator", side_effect=RuntimeError("boom")),
+        patch("henchmen.cli.serve.serve_app", return_value=0) as run,
+        pytest.raises(SystemExit) as exit_info,
+    ):
+        _serve(_serve_args())
+
+    assert exit_info.value.code == 0
+    status = TestClient(run.call_args.args[0], base_url=_LOCAL).get("/console/api/status").json()
+    assert any("A Henchmen service failed to start" in p for p in status["problems"])
+    assert memory.get_shared_broker() is None
+    with pytest.raises(sqlite3.ProgrammingError):
+        mastermind_server.app.state.document_store._conn.execute("SELECT 1")
 
 
 class TestServeAppSystemExit:

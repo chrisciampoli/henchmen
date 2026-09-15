@@ -141,11 +141,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)
 
     logger.info("[mastermind] Service started")
-    yield
-    # Shutdown
-    shutdown_tracing()
-    logger.info("[mastermind] Shutting down — active tasks: %d", len(agent._active_tasks))
-    await _close_providers()
+    try:
+        yield
+    finally:
+        # A sub-app entered after this one (forge) can fail to start; the combined app's
+        # AsyncExitStack then unwinds this lifespan by throwing that exception in at
+        # `yield`, so shutdown must run from `finally`, not after a bare `yield`.
+        try:
+            shutdown_tracing()
+            logger.info("[mastermind] Shutting down — active tasks: %d", len(agent._active_tasks))
+            await _close_providers()
+        except Exception:
+            # Never let a shutdown-path error mask the exception (if any) already
+            # propagating through `yield`.
+            logger.warning("[mastermind] Shutdown raised", exc_info=True)
 
 
 app = FastAPI(title="Henchmen Mastermind", description="Task orchestration engine", lifespan=lifespan)
