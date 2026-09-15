@@ -59,13 +59,22 @@ _AWS_ARN_PATTERN = re.compile(r"arn:aws[a-z-]*:[a-z0-9-]*:[a-z0-9-]*:\d{12}:\S+"
 # \1) so the redacted text still reads "Account: ***REDACTED***".
 _AWS_ACCOUNT_ID_PATTERN = re.compile(r"(?i)(\baccount\b\s*:?\s*)\d{12}\b")
 
-# Basic-auth credentials embedded in a URL ("scheme://user:pass@host/..."), as
-# a misconfigured Jira base URL or a git remote can carry. The scheme is kept
-# (captured and replayed via \1) so the redacted text still reads
-# "https://***REDACTED***@host/..." rather than losing the URL entirely. Both
-# quantifiers are bounded (stop at the next "@", "/" or whitespace), so this
-# stays linear in input length like the other patterns here.
-_URL_USERINFO_PATTERN = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s@/]+:[^\s@/]+@")
+# Credentials embedded in a URL's userinfo ("scheme://user:pass@host/...",
+# "scheme://token@host/...", "scheme://:pass@host/..."), as a misconfigured
+# Jira base URL, an Ollama address, or a bearer-style API URL can carry. The
+# scheme is kept (captured and replayed via \1) so the redacted text still
+# reads "https://***REDACTED***@host/..." rather than losing the URL
+# entirely. The two alternatives cover "user:pass" (or an empty user,
+# ":pass") and a single bearer-style token with no colon; both stop at the
+# next "@", "/" or whitespace, so this stays linear in input length like the
+# other patterns here.
+#
+# ``ssh://`` is excluded (the negative lookahead after \b): SSH has no
+# password-in-URL mechanism, so its userinfo is always a login identity, not
+# a secret -- e.g. ``ssh://git@github.com:org/repo`` must survive untouched.
+# A bare email address (``user@mail.com``) never matches either pattern,
+# since neither contains a "scheme://" prefix.
+_URL_USERINFO_PATTERN = re.compile(r"(?i)\b(?!ssh://)([a-z][a-z0-9+.-]*://)(?:[^\s@/:]*:[^\s@/]*|[^\s@/:]+)@")
 
 # (pattern, replacement) pairs, applied in order. Every pattern but the bearer
 # one replaces the whole match outright; the bearer pattern captures the word
