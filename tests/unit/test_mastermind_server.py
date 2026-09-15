@@ -527,3 +527,64 @@ class TestOperativeReportOnDesktop:
             headers={"Authorization": f"Bearer {internal.task_token('task-abcdef01')}"},
         )
         assert resp.status_code == 401
+
+    def test_malformed_envelope_with_a_valid_looking_task_token_is_refused(self, desktop_client):
+        """A body that doesn't decode to the expected envelope shape is 401, whatever the bearer looks like."""
+        client, fake, internal = desktop_client
+        token = internal.task_token("task-abcdef01")
+        resp = client.post(
+            "/pubsub/operative-complete",
+            content=b"not an envelope",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/octet-stream"},
+        )
+        assert resp.status_code == 401
+        fake.lair_manager.notify_operative_complete.assert_not_called()
+
+    def test_push_token_delivers_the_report(self, desktop_client):
+        """The internal push token remains a valid credential for this endpoint (e.g. a resend path)."""
+        client, fake, internal = desktop_client
+        resp = client.post(
+            "/pubsub/operative-complete",
+            json=_envelope(self._report("task-abcdef01")),
+            headers={"Authorization": f"Bearer {internal.push_token}"},
+        )
+        assert resp.status_code == 200
+        fake.lair_manager.notify_operative_complete.assert_called_once()
+
+    def test_dedup_key_is_scoped_to_the_verified_task(self, desktop_client):
+        """Ruling: the operative-complete dedup key is prefixed with the verified task id on the
+        task-token path, so a colliding message_id cannot be replayed across tasks."""
+        client, fake, internal = desktop_client
+        token = internal.task_token("task-abcdef01")
+        resp = client.post(
+            "/pubsub/operative-complete",
+            json=_envelope(self._report("task-abcdef01"), message_id="op-dedup-1"),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        keys = [
+            call.args[1] for call in fake.tracker._store.set.await_args_list if call.args[0] == "processed_messages"
+        ]
+        assert "task-abcdef01:op-dedup-1" in keys, (
+            "the task-token path must record a dedup marker scoped to the verified task id"
+        )
+
+
+class TestOperativeReportTaskIdCrossCheck:
+    """Ruling: request.state.operative_task_id is authoritative even if a future change to
+    verify_operative_report ever disagreed with the report body -- exercises the
+    ``except HTTPException: raise`` path added alongside it."""
+
+    def test_mismatch_between_verified_token_and_report_task_id_is_refused(self, client, agent):
+        import henchmen.mastermind.server as server_module
+
+        async def _claims_a_different_task(request, settings):
+            request.state.operative_task_id = "some-other-task"
+
+        server_module.verify_operative_report.side_effect = _claims_a_different_task
+
+        report = TestOperativeReportOnDesktop._report("task-abcdef01")
+        resp = client.post("/pubsub/operative-complete", json=_envelope(report, message_id="op-mismatch"))
+
+        assert resp.status_code == 401
+        agent.lair_manager.notify_operative_complete.assert_not_called()

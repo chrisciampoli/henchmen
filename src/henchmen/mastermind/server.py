@@ -619,9 +619,14 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
     try:
         envelope = await request.json()
 
-        # Layer 1: Pub/Sub message-level dedup
+        # Layer 1: Pub/Sub message-level dedup. On the task-token path the dedup
+        # key is prefixed with the verified task id so an operative -- which
+        # only ever holds a token for its own task -- cannot collide with, or
+        # spoof completion of, another task's message_id.
         message_id = envelope.get("message", {}).get("messageId", "")
-        if await _check_message_dedup(message_id, handler="operative-complete"):
+        verified_task_id = getattr(request.state, "operative_task_id", None)
+        dedup_key = f"{verified_task_id}:{message_id}" if verified_task_id else None
+        if await _check_message_dedup(message_id, dedup_key=dedup_key, handler="operative-complete"):
             logger.info("Duplicate operative-complete message %s, skipping", message_id)
             return {"status": "duplicate", "message_id": message_id}
 
@@ -634,12 +639,11 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
 
         report = OperativeReport.model_validate(data)
 
-        # On a desktop install with a task token, request.state.operative_task_id is the
-        # only identifier verify_operative_report trusts. The report's own task_id came
-        # from this same envelope's data, so it must match -- a mismatch means whatever
-        # parsed the token and whatever parsed the report disagree, and that is refused
-        # rather than trusted.
-        verified_task_id = getattr(request.state, "operative_task_id", None)
+        # On a desktop install with a task token, request.state.operative_task_id (already
+        # read above, for the dedup key) is the only identifier verify_operative_report
+        # trusts. The report's own task_id came from this same envelope's data, so it must
+        # match -- a mismatch means whatever parsed the token and whatever parsed the
+        # report disagree, and that is refused rather than trusted.
         if verified_task_id is not None and report.task_id != verified_task_id:
             logger.warning(
                 "[MASTERMIND] Operative report task_id %s does not match its verified task token (%s) — refusing",
@@ -680,7 +684,7 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
         )
 
         # Two-phase dedup: only now is the message really processed.
-        await _mark_message_done(message_id, handler="operative-complete")
+        await _mark_message_done(message_id, dedup_key=dedup_key, handler="operative-complete")
         return {"status": "ok"}
     except HTTPException:
         raise

@@ -34,6 +34,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from fastapi import HTTPException, Request
@@ -45,6 +46,17 @@ if TYPE_CHECKING:
     from henchmen.config.settings import Settings
 
 logger = logging.getLogger(__name__)
+
+# A real OperativeReport, base64-encoded inside a Pub/Sub-style envelope, is
+# normally a few KB; ``git_diff`` can be sizable for a large change. 4 MiB is
+# generous headroom for that while still bounding memory use per request.
+MAX_OPERATIVE_REPORT_BYTES = 4 * 1024 * 1024
+
+# HMAC-SHA256 hex digest: exactly 64 lowercase hex characters. Anything else
+# is rejected before the body is ever touched, so a caller without this shape
+# of bearer (and not the push token) cannot make the server read or parse an
+# arbitrarily large body.
+_TASK_TOKEN_FORMAT = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _split_bearer(header_value: str | None) -> str | None:
@@ -212,14 +224,44 @@ async def verify_pubsub_oidc(request: Request, settings: Settings) -> None:
     request.state.pubsub_oidc_claims = claims
 
 
+async def _read_capped_body(request: Request, max_bytes: int) -> None:
+    """Read *request*'s body from the raw ASGI stream, rejecting past ``max_bytes``.
+
+    Reading via :meth:`Request.stream` rather than :meth:`Request.body` means an
+    oversized body is rejected as soon as more than ``max_bytes`` has arrived,
+    without ever buffering the rest -- a lying or absent ``Content-Length``
+    cannot force unbounded memory use. The bytes read so far are then stashed
+    on ``request._body``, which is exactly the attribute Starlette's own
+    ``Request.body()``/``Request.json()`` check first and populate themselves;
+    setting it here means every later read in this request -- the handler's
+    own included -- returns the same bytes from that cache instead of trying
+    (and failing) to re-consume the now-exhausted ASGI receive channel.
+    """
+    if hasattr(request, "_body"):
+        return
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            logger.warning(
+                "[pubsub-auth] Desktop install: refusing an operative report body over %d bytes from %s",
+                max_bytes,
+                request.client.host if request.client else "unknown",
+            )
+            raise HTTPException(status_code=401, detail="Operative report body too large")
+        chunks.append(chunk)
+    request._body = b"".join(chunks)
+
+
 async def _reported_task_id(request: Request) -> str:
     """The ``task_id`` inside a Pub/Sub-style envelope, or ``""`` when it cannot be read.
 
     Envelope parsing is untrusted input: bad base64, bad JSON, a missing or
     non-string ``task_id``, or any other decoding failure all fall through to
     ``""`` (never a raw exception) so the caller fails closed with a 401
-    instead of a 500. Starlette caches ``request.body()``, so this read does
-    not prevent the handler from parsing the body again afterwards.
+    instead of a 500. Starlette caches the body, so this read does not
+    prevent the handler from parsing it again afterwards.
     """
     try:
         envelope = await request.json()
@@ -239,7 +281,17 @@ async def verify_operative_report(request: Request, settings: Settings) -> None:
     matches the ``task_id`` the report carries. The internal push token is also
     accepted (Mastermind's own broker still delivers reports that way in some
     paths). Anything else -- including an undecodable envelope -- is 401.
+
+    The body is never read for a caller that cannot possibly be a legitimate
+    operative: a missing bearer, or one that is neither the push token nor
+    shaped like a task token (64 lowercase hex characters -- an HMAC-SHA256
+    hex digest), is rejected before any body access at all. Once the shape
+    checks out, an oversized body is rejected by ``Content-Length`` when
+    present, and unconditionally by :func:`_read_capped_body` while streaming
+    -- so a request with no credentials, or with a malformed one, can never
+    make the server buffer or JSON-parse an unbounded body.
     """
+    client_host = request.client.host if request.client else "unknown"
     internal = local_push_auth(settings)
     if internal is None:
         await verify_pubsub_oidc(request, settings)
@@ -248,12 +300,35 @@ async def verify_operative_report(request: Request, settings: Settings) -> None:
     if internal.verify_push_token(token):
         request.state.pubsub_internal_caller = True
         return
+    if not token or not _TASK_TOKEN_FORMAT.fullmatch(token):
+        logger.warning(
+            "[pubsub-auth] Desktop install: refusing an operative report without a valid task token from %s",
+            client_host,
+        )
+        raise HTTPException(status_code=401, detail="Missing or invalid operative task token")
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            declared_length = None
+        if declared_length is not None and declared_length > MAX_OPERATIVE_REPORT_BYTES:
+            logger.warning(
+                "[pubsub-auth] Desktop install: refusing an operative report declaring %s bytes from %s",
+                content_length,
+                client_host,
+            )
+            raise HTTPException(status_code=401, detail="Operative report body too large")
+
+    await _read_capped_body(request, MAX_OPERATIVE_REPORT_BYTES)
+
     task_id = await _reported_task_id(request)
     if task_id and internal.verify_task_token(task_id, token):
         request.state.operative_task_id = task_id
         return
     logger.warning(
         "[pubsub-auth] Desktop install: refusing an operative report without a valid task token from %s",
-        request.client.host if request.client else "unknown",
+        client_host,
     )
     raise HTTPException(status_code=401, detail="Missing or invalid operative task token")
