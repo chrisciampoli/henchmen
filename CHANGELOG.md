@@ -94,6 +94,15 @@ silently ignored, and the Dispatch container never ran its own HTTP app.
   mode and `Open Henchmen: <url>` once running, and fails closed with a readable
   `ERROR:` and exit code 2 on a corrupt `setup-state.json`, an unwritable
   secrets directory, or a non-integer `HENCHMEN_LOCAL_SERVE_PORT`.
+- Desktop hardening (guided setup Phase 2A): `config/posture.py` disables every dev-only fail-open path on
+  data-directory installs; a whole-app Host allowlist; an internal push token and per-task operative
+  tokens in `<data dir>/secrets/`; task-scoped `/mastermind/internal/tasks/{task_id}/...` routes and an
+  operative `HttpDocumentStore`; a one-time, per-start setup token and `henchmen console-link`;
+  server-recorded setup step completion with the `console/steps` router contract; apply-time validation
+  that ignores defaults `henchmen serve` seeded; a generated `HENCHMEN_DISPATCH_API_TOKEN` at apply; a
+  needs-attention Console (`/health` → `degraded`) when a completed setup cannot start; status
+  `problems` and `services`.
+- Settings `local_container_hostname` and `operative_task_token`.
 - Settings `local_docker_network` and `operative_image`.
 
 ### Changed
@@ -158,6 +167,10 @@ silently ignored, and the Dispatch container never ran its own HTTP app.
   `gemini-3*` models to the global endpoint. OpenAI and Bedrock replace another
   vendor's model name with their complex-tier model instead of returning 404.
 - PyGithub is pinned `>=2.4.0,<3` and authenticates with `Auth.Token`.
+- Local-mode lint/test gates no longer bind-mount a host workspace: a gate container from the operative
+  image clones the branch, computes the diff against `origin/<base>` and runs the scoped commands itself.
+- `PUT /console/api/setup/state` no longer accepts `completed_steps`; only a step's validation route marks
+  it complete.
 
 ### Fixed
 - **Tier names reached provider APIs unresolved.** Vertex AI, OpenAI and

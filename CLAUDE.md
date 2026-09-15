@@ -142,7 +142,7 @@ henchmen/
 │   ├── arsenal/               # Tool registry + tools/ (runs inside the operative)
 │   ├── cli/                   # init wizard, doctor, config, chat, serve, embed, eval
 │   ├── config/settings.py     # Pydantic settings (HENCHMEN_ prefix)
-│   ├── console/               # Browser setup Console (state, auth, routes)
+│   ├── console/               # Setup Console: auth, state, steps/, config_store, services
 │   ├── dispatch/              # Intake router + handlers/ + slack_bot.py
 │   ├── dossier/               # Context builder
 │   ├── evals/                 # Offline eval harness + SQLite history
@@ -166,7 +166,10 @@ henchmen/
 Every error/exception path in the scheme executor returns `condition: "fail"`, never `"pass"`:
 - Max retry exhaustion → fail + escalate
 - Clone failures, missing repo, CI exceptions → fail
-- Lair provisioning failure → fail in prod/staging (simulated pass only in dev)
+- Lair provisioning failure → fail in prod/staging (simulated pass only in dev on a repository checkout)
+- A data-directory (desktop) install, and every operative it launches, never takes a dev-only
+  fail-open path, whatever `HENCHMEN_ENVIRONMENT` says: every such check calls
+  `henchmen.config.posture.fail_open_allowed(settings)` and never compares `Environment.DEV` directly
 - Missing repo or GitHub token in `create_pr` → fail, never a fabricated PR URL
 - A deterministic node with no registered handler → fail
 - An undetectable project stack in a CI gate → fail, not "skipped"
@@ -231,3 +234,8 @@ gcloud run jobs update henchmen-${ENV}-lair-template \
   credential on purpose; keep it that way
 - Don't use Claude as the git author — all commits must be authored by the human developer
 - Don't add Co-Authored-By lines attributing Claude to commits
+- Don't mount the data volume (or any host path) into an operative or CI-gate container — operatives use
+  the task-scoped `/mastermind/internal/tasks/{task_id}/...` routes, gates clone inside their container
+- Don't give an operative the internal push token — it gets only `HENCHMEN_OPERATIVE_TASK_TOKEN` for its own task
+- Don't write a secret file by hand — use `henchmen.config.secret_files` (0600, O_BINARY, atomic)
+- Don't let a client write setup completion — steps record it through `SetupStateStore.record_step_complete`
