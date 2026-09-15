@@ -14,6 +14,7 @@ import logging
 import os
 import shutil
 import tempfile
+from collections import deque
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -371,10 +372,61 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
 _GATE_MODULE = "henchmen.mastermind.scheme_executor.ci_gate"
 _GATE_OUTPUT_LIMIT = 5000
 
+# A gate container's stdout/stderr are captured by *this* long-lived server
+# process, not by the disposable container — so, unlike ci_gate's own inner
+# `_run_script` (which runs and buffers inside the ephemeral container), the
+# read here must never accumulate unboundedly. Each pipe is drained to EOF in
+# fixed-size chunks and only the most recent `_GATE_OUTPUT_TAIL_BYTES` are
+# kept; the result marker is always the last line written, so the tail still
+# contains it however much output preceded it.
+_GATE_READ_CHUNK_BYTES = 65536
+_GATE_OUTPUT_TAIL_BYTES = 256 * 1024
+
 
 def _gate_timeout_seconds(settings: Settings) -> float:
     """A gate that never finishes must fail rather than hold the task forever; reuse the operative timeout."""
     return float(settings.lair_default_timeout)
+
+
+class _BoundedTail:
+    """Keeps only the most recent ``cap`` bytes appended to it, in whole chunks.
+
+    Trimming drops whole chunks rather than slicing inside one, so the tail
+    can briefly hold up to one extra chunk beyond ``cap`` — cheap, and still
+    bounded, since chunks are read in fixed (much smaller) sizes.
+    """
+
+    def __init__(self, cap: int = _GATE_OUTPUT_TAIL_BYTES) -> None:
+        self._chunks: deque[bytes] = deque()
+        self._total = 0
+        self._cap = cap
+
+    def add(self, chunk: bytes) -> None:
+        self._chunks.append(chunk)
+        self._total += len(chunk)
+        while self._total > self._cap and len(self._chunks) > 1:
+            self._total -= len(self._chunks.popleft())
+
+    def getvalue(self) -> bytes:
+        return b"".join(self._chunks)
+
+
+async def _drain_stream(stream: asyncio.StreamReader | None, tail: _BoundedTail) -> None:
+    """Read *stream* to EOF in bounded chunks, keeping only *tail*'s most recent bytes.
+
+    The stream is always drained fully, cap or no cap: an unread pipe fills
+    its OS buffer and blocks the child's next write to it, which can wedge a
+    *sibling* pipe too (e.g. line-buffered stdout interleaved with a bulk
+    stderr write) — so stdout and stderr must both be drained concurrently,
+    never one after the other.
+    """
+    if stream is None:
+        return
+    while True:
+        chunk = await stream.read(_GATE_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        tail.add(chunk)
 
 
 async def _kill_gate_container(name: str) -> None:
@@ -409,13 +461,25 @@ async def _run_gate_in_container(
         child_env["HENCHMEN_GITHUB_TOKEN"] = token
 
     logger.info("[SCHEME] Running %s gate for %s@%s in %s", check_type, repo, branch, image)
+    # stdout and stderr are separate pipes (not merged), each drained by its
+    # own task below, so a flood on either one can never block the other.
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=child_env
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=child_env
     )
+    stdout_tail = _BoundedTail()
+    stderr_tail = _BoundedTail()
+    stdout_task = asyncio.ensure_future(_drain_stream(proc.stdout, stdout_tail))
+    stderr_task = asyncio.ensure_future(_drain_stream(proc.stderr, stderr_tail))
+
     timeout = _gate_timeout_seconds(settings)
     try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        await asyncio.wait_for(asyncio.gather(proc.wait(), stdout_task, stderr_task), timeout=timeout)
     except TimeoutError:
+        for task in (stdout_task, stderr_task):
+            task.cancel()
+        for task in (stdout_task, stderr_task):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         await _kill_gate_container(container)
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
@@ -426,13 +490,15 @@ async def _run_gate_in_container(
         }
 
     returncode = proc.returncode if proc.returncode is not None else 1
-    text = stdout.decode(errors="replace") if stdout else ""
-    result = parse_gate_result(text)
+    # The result marker is always written to stdout (ci_gate.main), never stderr.
+    stdout_text = stdout_tail.getvalue().decode(errors="replace")
+    result = parse_gate_result(stdout_text)
     if result is None:
+        combined = stdout_text + stderr_tail.getvalue().decode(errors="replace")
         return {
             "condition": "fail",
             "message": f"{check_type} failed (the gate container exited {returncode} without a result)",
-            "output": scrub_secret(text, token)[:_GATE_OUTPUT_LIMIT],
+            "output": scrub_secret(combined, token)[:_GATE_OUTPUT_LIMIT],
         }
     message = scrub_secret(result.message, token)
     output = scrub_secret(result.output, token)
