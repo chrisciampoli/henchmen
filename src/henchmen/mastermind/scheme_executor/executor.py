@@ -12,6 +12,7 @@ from henchmen.models.llm import ModelTier
 from henchmen.models.operative import OperativeReport, OperativeStatus
 from henchmen.models.scheme import NodeType, SchemeNode
 from henchmen.models.task import HenchmenTask
+from henchmen.providers.pricing import estimate_cost_for_settings
 from henchmen.schemes.base import SchemeGraph
 
 if TYPE_CHECKING:
@@ -34,6 +35,51 @@ _MAX_ERROR_CONTEXT_CHARS = 4_000
 # fails. Interruption is external (SIGTERM), so one retry is worthwhile; more
 # would mask a lair that is being killed every time.
 _MAX_INTERRUPTED_REDISPATCHES = 1
+
+
+def estimate_node_dispatch_cost(settings: "Settings", node: SchemeNode) -> float:
+    """Estimate the USD cost of dispatching ``node``, bounded by what the operative actually sends.
+
+    Every prompt is trimmed to the configured system/message token budgets, so
+    this prices the same figure the operative is bounded by rather than the
+    old ``max_steps x full-dossier-JSON`` estimate that over-shot by an order
+    of magnitude. Shared by the pre-dispatch cost gate
+    (:meth:`SchemeExecutor._estimate_dispatch_cost`) and the Console's AI
+    provider step (:func:`estimate_feature_task_cost`), so both price a node
+    identically.
+    """
+    per_call_input = int(settings.operative_max_system_tokens) + int(settings.operative_max_message_tokens)
+    per_call_output = min(int(settings.operative_max_output_tokens), _ESTIMATED_OUTPUT_TOKENS_PER_CALL)
+    max_calls = max(1, int(node.get_effective_budget().max_steps))
+    model_name = node.model_name or ModelTier.COMPLEX.value
+    return estimate_cost_for_settings(
+        settings,
+        model_name,
+        per_call_input * max_calls,
+        per_call_output * max_calls,
+    )
+
+
+def estimate_feature_task_cost(settings: "Settings") -> float:
+    """Estimate the USD cost of the most expensive agentic node a first feature task can hit.
+
+    Used by the Console's AI provider step to recommend a per-task spending
+    limit that actually covers a real task (ruling C2), rather than a private
+    token profile that could diverge from what the executor's own cost gate
+    enforces. Looks the node up from the registered ``feature_standard``
+    scheme rather than copying its budget.
+    """
+    from henchmen.schemes.registry import SchemeRegistry
+
+    graph = SchemeRegistry.get("feature_standard")
+    if graph is None:
+        import henchmen.schemes.feature_standard  # noqa: F401  (imports register with SchemeRegistry)
+
+        graph = SchemeRegistry.get("feature_standard")
+    node = graph.get_node("implement_feature") if graph is not None else None
+    if node is None:
+        raise RuntimeError("feature_standard scheme has no 'implement_feature' node")
+    return estimate_node_dispatch_cost(settings, node)
 
 
 def validate_deterministic_handlers(scheme_graph: SchemeGraph) -> list[str]:
@@ -207,28 +253,13 @@ class SchemeExecutor:
         magnitude and blocked realistic fix/implement nodes.
         """
         try:
-            from henchmen.providers.pricing import estimate_cost_for_settings
-
-            per_call_input = int(self.settings.operative_max_system_tokens) + int(
-                self.settings.operative_max_message_tokens
-            )
-            per_call_output = min(int(self.settings.operative_max_output_tokens), _ESTIMATED_OUTPUT_TOKENS_PER_CALL)
-            max_calls = max(1, int(node.get_effective_budget().max_steps))
-            model_name = node.model_name or ModelTier.COMPLEX.value
-            return estimate_cost_for_settings(
-                self.settings,
-                model_name,
-                per_call_input * max_calls,
-                per_call_output * max_calls,
-            )
+            return estimate_node_dispatch_cost(self.settings, node)
         except Exception as exc:
             logger.warning("Cost estimation failed for node %s: %s", getattr(node, "id", "?"), exc)
             return 0.0
 
     def _get_cumulative_cost(self) -> float:
         """Sum the cost_usd from all completed agentic node reports."""
-        from henchmen.providers.pricing import estimate_cost_for_settings
-
         total = 0.0
         for _node_id, result in self.node_results.items():
             report_data = result.get("report")
