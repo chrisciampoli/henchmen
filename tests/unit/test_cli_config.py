@@ -37,9 +37,14 @@ class TestSecretDetection:
 
     def test_every_str_credential_field_is_masked(self) -> None:
         """Guard against a new credential field slipping past the name pattern."""
+        # Named after a credential but holding none: the expiry timestamp of github_token.
+        not_credentials = {"github_token_expires_at"}
         for name, field in Settings.model_fields.items():
+            if name in not_credentials:
+                continue
             if field.annotation is str and any(m in name for m in ("token", "secret", "api_key", "password")):
                 assert is_secret_field(name), name
+        assert not any(is_secret_field(name) for name in not_credentials)
 
     def test_agrees_with_config_store_masked_for_every_settings_field(self, tmp_path) -> None:
         """``henchmen config`` and the Console's ``ConfigStore.masked()`` share one classifier.

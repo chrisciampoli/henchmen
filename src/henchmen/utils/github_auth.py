@@ -110,6 +110,14 @@ class GitHubRepositoryAccessError(GitHubAuthError):
     """
 
 
+class GitHubAppKeyError(GitHubAuthError):
+    """The GitHub App private key file is missing, unreadable or cannot sign; retrying cannot help until it is fixed."""
+
+
+class GitHubRepositoryReferenceError(GitHubAuthError):
+    """The repository reference is not ``owner/name`` or a GitHub clone URL; the same input always fails."""
+
+
 class GitHubAppConfig(BaseModel):
     """The three settings that switch GitHub access to a GitHub App."""
 
@@ -198,7 +206,7 @@ def build_app_jwt(app_id: str, private_key_pem: bytes, *, now: float) -> str:
     except Exception:  # ValueError, TypeError, jwt.PyJWTError, cryptography's UnsupportedAlgorithm, ...
         # Any signing failure is the same fail-closed error. ``from None``: the underlying
         # cryptography error must not drag key material into a traceback.
-        raise GitHubAuthError("The GitHub App private key could not sign a token; reconnect GitHub") from None
+        raise GitHubAppKeyError("The GitHub App private key could not sign a token; reconnect GitHub") from None
 
 
 def load_app_private_key(path: Path) -> bytes:
@@ -206,14 +214,14 @@ def load_app_private_key(path: Path) -> bytes:
 
     The file must be a regular file this user owns (``check_secret_path``: a
     symbolic link or another user's file is refused). Any problem is a
-    :class:`GitHubAuthError` naming the path, never the key's content.
+    :class:`GitHubAppKeyError` naming the path, never the key's content.
     """
     try:
         check_secret_path(path)
         return path.read_bytes()
     except OSError:
         # SecretFileError is an OSError. ``from None`` keeps the raw OS error out of the chain.
-        raise GitHubAuthError(f"The GitHub App private key at {path} is missing or unreadable") from None
+        raise GitHubAppKeyError(f"The GitHub App private key at {path} is missing or unreadable") from None
 
 
 def app_jwt_for(app_id: str, private_key_path: Path, *, now: float | None = None) -> str:
@@ -248,7 +256,7 @@ def parse_repository(repo: str | None) -> tuple[str, str] | None:
     Accepted shapes, exactly two path parts each: ``owner/name``,
     ``https://<host>/owner/name[.git]`` and ``git@<host>:owner/name[.git]``.
     Anything else (a bare name, ``owner/name/tree/main``, ``http://``) raises
-    :class:`GitHubAuthError`: an unparseable reference must never widen into a
+    :class:`GitHubRepositoryReferenceError`: an unparseable reference must never widen into a
     token for the whole installation or silently pick another repository.
     """
     if repo is None or not repo.strip():
@@ -266,7 +274,9 @@ def parse_repository(repo: str | None) -> tuple[str, str] | None:
             if name in {".", ".."} or name.endswith(".git"):
                 break
             return match["owner"], name
-    raise GitHubAuthError("The repository for a GitHub installation token must be owner/name or a GitHub clone URL")
+    raise GitHubRepositoryReferenceError(
+        "The repository for a GitHub installation token must be owner/name or a GitHub clone URL"
+    )
 
 
 def _default_client() -> httpx.Client:

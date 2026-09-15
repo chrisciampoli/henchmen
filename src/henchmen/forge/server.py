@@ -25,8 +25,10 @@ from henchmen.utils.git import clone_repo
 from henchmen.utils.github_auth import (
     MAX_MIN_TTL_SECONDS,
     GitHubAppConfigurationError,
+    GitHubAppKeyError,
     GitHubAuthError,
     GitHubRepositoryAccessError,
+    GitHubRepositoryReferenceError,
     get_credentials_provider,
     get_github_token_async,
 )
@@ -358,10 +360,17 @@ def _uses_github_app(settings: Settings) -> bool:
 def _credentials_failure_is_retriable(exc: GitHubAuthError) -> bool:
     """A redelivery can only help with a transient failure (GitHub unreachable, a 5xx).
 
-    GitHub refusing the repository, a partly configured App and a 401/403
-    refusal fail identically until someone changes the configuration.
+    GitHub refusing the repository, a partly configured App, a missing,
+    unreadable or unusable App key file, a PR URL whose repository is not
+    ``owner/name`` and a 401/403 refusal fail identically until someone changes
+    the configuration or the input. Those carry no HTTP status, so they are
+    told apart by type; a status-less plain :class:`GitHubAuthError` (GitHub
+    unreachable, an unreadable response) stays retriable.
     """
-    if isinstance(exc, GitHubRepositoryAccessError | GitHubAppConfigurationError):
+    deterministic = (
+        GitHubRepositoryAccessError | GitHubAppConfigurationError | GitHubAppKeyError | GitHubRepositoryReferenceError
+    )
+    if isinstance(exc, deterministic):
         return False
     return exc.status_code not in (401, 403)
 

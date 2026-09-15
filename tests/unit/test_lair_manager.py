@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from henchmen.config.settings import Environment, Settings, get_settings
+from henchmen.config.settings import Environment, Settings
 from henchmen.mastermind.lair_manager import LairManager
 from henchmen.models.dossier import Dossier
 from henchmen.models.llm import ModelTier
@@ -18,6 +18,13 @@ from henchmen.models.operative import OperativeReport, OperativeStatus
 from henchmen.models.scheme import NodeType, SchemeNode
 from henchmen.models.task import HenchmenTask, TaskContext, TaskSource
 from henchmen.providers.interfaces.container_orchestrator import JobResult, JobStatus
+from henchmen.utils.github_auth import (
+    MAX_MIN_TTL_SECONDS,
+    GitHubAppConfigurationError,
+    GitHubAuthError,
+    GitHubRepositoryReferenceError,
+    InstallationToken,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -25,13 +32,11 @@ from henchmen.providers.interfaces.container_orchestrator import JobResult, JobS
 
 
 def _settings(**overrides) -> Settings:
-    import os
-
-    os.environ.setdefault("HENCHMEN_GCP_PROJECT_ID", "test-project")
-    get_settings.cache_clear()
+    # _env_file=None: a developer's .env.local (a PAT, a GitHub App) must never reach these tests.
+    base = Settings(**{"_env_file": None, "gcp_project_id": "test-project"})
     update: dict = {"provider": "gcp", "environment": Environment.DEV}
     update.update(overrides)
-    return get_settings().model_copy(update=update)
+    return base.model_copy(update=update)
 
 
 def _task(**overrides) -> HenchmenTask:
@@ -68,6 +73,15 @@ def _orchestrator(status: JobStatus = JobStatus.RUNNING) -> MagicMock:
     orch.get_status = AsyncMock(return_value=JobResult(job_id="job", status=status))
     orch.cancel = AsyncMock()
     return orch
+
+
+_PAT = "ghp_" + "p" * 36
+_APP = {
+    "github_app_id": "4242",
+    "github_app_installation_id": "77",
+    "github_app_private_key_path": "/data/secrets/github-app.pem",
+}
+_ISSUED = InstallationToken(token="ghs_installation", expires_at=1_900_000_000.0)
 
 
 def _report(node_id: str = "implement_fix", **overrides) -> OperativeReport:
@@ -122,7 +136,7 @@ class TestBuildEnvVars:
             llm_ollama_base_url="http://localhost:11434",
             local_serve_port=8123,
         )
-        env = LairManager(settings)._build_env_vars(_task(), _node(), "lair-1")
+        env = LairManager(settings)._build_env_vars(_task(), _node(), "lair-1", github_token="ghp_" + "s" * 36)
 
         assert env["GITHUB_TOKEN"] == "ghp_" + "s" * 36
         assert env["HENCHMEN_GITHUB_TOKEN"] == "ghp_" + "s" * 36
@@ -187,6 +201,27 @@ class TestBuildEnvVars:
         env = LairManager(settings)._build_env_vars(_task(), _node(), "lair-1")
 
         assert not any(other_task_token in v for v in env.values())
+
+    def test_settings_token_is_never_forwarded_implicitly(self):
+        settings = _settings(provider="local", gcp_project_id="", github_token="ghp_" + "s" * 36)
+        env = LairManager(settings)._build_env_vars(_task(), _node(), "lair-1")
+        assert "HENCHMEN_GITHUB_TOKEN" not in env
+        assert "GITHUB_TOKEN" not in env
+        assert "HENCHMEN_GITHUB_TOKEN_EXPIRES_AT" not in env
+        assert not any("ghp_" in value for value in env.values())
+
+    def test_installation_token_expiry_is_forwarded(self):
+        env = LairManager(_settings(provider="local", gcp_project_id=""))._build_env_vars(
+            _task(), _node(), "lair-1", github_token="ghs_x", github_token_expires_at="2030-03-17T17:46:40Z"
+        )
+        assert env["HENCHMEN_GITHUB_TOKEN"] == env["GITHUB_TOKEN"] == "ghs_x"
+        assert env["HENCHMEN_GITHUB_TOKEN_EXPIRES_AT"] == "2030-03-17T17:46:40Z"
+
+    def test_an_expiry_without_a_token_is_dropped(self):
+        env = LairManager(_settings(provider="local", gcp_project_id=""))._build_env_vars(
+            _task(), _node(), "lair-1", github_token_expires_at="2030-03-17T17:46:40Z"
+        )
+        assert "HENCHMEN_GITHUB_TOKEN_EXPIRES_AT" not in env
 
     def test_lair_manager_module_never_references_the_push_token(self):
         """Belt-and-suspenders: even if env-building changes shape, the module must not name it."""
@@ -273,6 +308,159 @@ class TestCreateLair:
         await lm.create_lair(task, node)
 
         store.delete.assert_awaited_with("operative_reports", f"{task.id}:{node.id}")
+
+    @pytest.mark.asyncio
+    async def test_local_mode_without_an_app_forwards_the_pat(self):
+        orch = _orchestrator()
+        settings = _settings(provider="local", gcp_project_id="", github_token=_PAT)
+        lm = LairManager(settings, container_orchestrator=orch, document_store=_store())
+
+        await lm.create_lair(_task(), _node())
+
+        env = orch.run_job.call_args.kwargs["env_vars"]
+        assert env["GITHUB_TOKEN"] == env["HENCHMEN_GITHUB_TOKEN"] == _PAT
+        assert "HENCHMEN_GITHUB_TOKEN_EXPIRES_AT" not in env
+
+    @pytest.mark.asyncio
+    async def test_github_app_operatives_get_a_repo_scoped_token_and_its_expiry(self, monkeypatch, tmp_path):
+        from henchmen.config.internal_auth import clear_cache, load_internal_auth
+
+        clear_cache()
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        internal = load_internal_auth(tmp_path / "secrets")
+        minted = AsyncMock(return_value=_ISSUED)
+        monkeypatch.setattr("henchmen.mastermind.lair_manager.get_installation_token_async", minted)
+        orch = _orchestrator()
+        settings = _settings(provider="local", gcp_project_id="", github_token=_PAT, **_APP)
+        lm = LairManager(settings, container_orchestrator=orch, document_store=_store())
+
+        await lm.create_lair(_task(), _node(timeout_seconds=600))
+
+        kwargs = orch.run_job.call_args.kwargs
+        env = kwargs["env_vars"]
+        assert env["GITHUB_TOKEN"] == env["HENCHMEN_GITHUB_TOKEN"] == "ghs_installation"
+        assert env["HENCHMEN_GITHUB_TOKEN_EXPIRES_AT"] == _ISSUED.expires_at_iso()
+        assert kwargs["secrets"] is None
+        # Neither the PAT, the App key path nor the internal push token reaches the operative.
+        assert not any(_PAT in value for value in env.values())
+        assert not any("github-app.pem" in value for value in env.values())
+        assert not any(internal.push_token in value for value in env.values())
+        minted.assert_awaited_once_with("acme/webapp", settings=settings, min_ttl_seconds=900)
+
+    @pytest.mark.asyncio
+    async def test_github_app_token_is_scoped_to_owner_name_for_a_clone_url(self, monkeypatch):
+        minted = AsyncMock(return_value=_ISSUED)
+        monkeypatch.setattr("henchmen.mastermind.lair_manager.get_installation_token_async", minted)
+        settings = _settings(provider="local", gcp_project_id="", **_APP)
+        lm = LairManager(settings, container_orchestrator=_orchestrator(), document_store=_store())
+        task = _task(context=TaskContext(repo="https://github.com/acme/webapp.git", branch="main"))
+
+        await lm.create_lair(task, _node())
+
+        assert minted.await_args.args == ("acme/webapp",)
+
+    @pytest.mark.asyncio
+    async def test_a_node_longer_than_the_token_cap_warns_and_asks_for_the_cap(self, monkeypatch, caplog):
+        minted = AsyncMock(return_value=_ISSUED)
+        monkeypatch.setattr("henchmen.mastermind.lair_manager.get_installation_token_async", minted)
+        lm = LairManager(_settings(**_APP), container_orchestrator=_orchestrator(), document_store=_store())
+
+        with caplog.at_level("WARNING", logger="henchmen.mastermind.lair_manager"):
+            await lm.create_lair(_task(), _node(timeout_seconds=3600))
+
+        assert minted.await_args.kwargs["min_ttl_seconds"] == MAX_MIN_TTL_SECONDS
+        assert any("refresh its token" in record.getMessage() for record in caplog.records)
+        assert "ghs_installation" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_github_app_on_cloud_run_does_not_mount_the_pat_secret(self, monkeypatch):
+        monkeypatch.setattr(
+            "henchmen.mastermind.lair_manager.get_installation_token_async", AsyncMock(return_value=_ISSUED)
+        )
+        orch = _orchestrator()
+        lm = LairManager(_settings(github_token=_PAT, **_APP), container_orchestrator=orch, document_store=_store())
+
+        await lm.create_lair(_task(), _node())
+
+        kwargs = orch.run_job.call_args.kwargs
+        assert kwargs["secrets"] is None
+        assert kwargs["env_vars"]["GITHUB_TOKEN"] == "ghs_installation"
+        assert kwargs["env_vars"]["HENCHMEN_GITHUB_TOKEN_EXPIRES_AT"] == _ISSUED.expires_at_iso()
+        assert not any(_PAT in value for value in kwargs["env_vars"].values())
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_without_an_app_keeps_the_secret_mount(self):
+        orch = _orchestrator()
+        lm = LairManager(_settings(github_token=_PAT), container_orchestrator=orch, document_store=_store())
+
+        await lm.create_lair(_task(), _node())
+
+        kwargs = orch.run_job.call_args.kwargs
+        assert kwargs["secrets"] == {"GITHUB_TOKEN": "projects/test-project/secrets/henchmen-dev-github-token"}
+        assert "GITHUB_TOKEN" not in kwargs["env_vars"]
+        assert not any(_PAT in value for value in kwargs["env_vars"].values())
+
+    @pytest.mark.asyncio
+    async def test_local_provider_with_a_gcp_orchestrator_and_no_app_gets_no_env_token(self):
+        """PI-6: the effective container orchestrator decides, not the coarse ``provider`` field."""
+        orch = _orchestrator()
+        settings = _settings(
+            provider="local", gcp_project_id="", github_token=_PAT, container_orchestrator_provider="gcp"
+        )
+        lm = LairManager(settings, container_orchestrator=orch, document_store=_store())
+
+        assert await lm._operative_github_credentials(_task(), 600) is None
+        await lm.create_lair(_task(), _node())
+
+        env = orch.run_job.call_args.kwargs["env_vars"]
+        assert "GITHUB_TOKEN" not in env
+        assert "HENCHMEN_GITHUB_TOKEN" not in env
+        assert not any(_PAT in value for value in env.values())
+
+    @pytest.mark.asyncio
+    async def test_token_failure_starts_no_job(self, monkeypatch):
+        monkeypatch.setattr(
+            "henchmen.mastermind.lair_manager.get_installation_token_async",
+            AsyncMock(side_effect=GitHubAuthError("GitHub refused to issue an installation token (HTTP 401)")),
+        )
+        orch = _orchestrator()
+        store = _store()
+        lm = LairManager(_settings(**_APP), container_orchestrator=orch, document_store=store)
+
+        with pytest.raises(GitHubAuthError):
+            await lm.create_lair(_task(), _node())
+
+        orch.run_job.assert_not_awaited()
+        store.delete.assert_not_awaited()
+        assert lm._active_lairs == {}
+
+    @pytest.mark.asyncio
+    async def test_a_partly_configured_app_never_falls_back_to_the_pat(self, monkeypatch):
+        minted = AsyncMock(return_value=_ISSUED)
+        monkeypatch.setattr("henchmen.mastermind.lair_manager.get_installation_token_async", minted)
+        orch = _orchestrator()
+        settings = _settings(github_token=_PAT, github_app_id="4242")
+        lm = LairManager(settings, container_orchestrator=orch, document_store=_store())
+
+        with pytest.raises(GitHubAppConfigurationError):
+            await lm.create_lair(_task(), _node())
+
+        orch.run_job.assert_not_awaited()
+        minted.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_github_app_with_no_task_repository_refuses_an_installation_wide_token(self, monkeypatch):
+        minted = AsyncMock(return_value=_ISSUED)
+        monkeypatch.setattr("henchmen.mastermind.lair_manager.get_installation_token_async", minted)
+        orch = _orchestrator()
+        lm = LairManager(_settings(**_APP), container_orchestrator=orch, document_store=_store())
+        task = _task(context=TaskContext(repo="", branch="main"))
+
+        with pytest.raises(GitHubRepositoryReferenceError):
+            await lm.create_lair(task, _node())
+
+        minted.assert_not_awaited()
+        orch.run_job.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

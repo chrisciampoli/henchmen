@@ -17,6 +17,16 @@ from henchmen.observability.tracker import TASK_EXECUTIONS_COLLECTION
 from henchmen.providers.interfaces.container_orchestrator import ContainerOrchestrator, JobStatus
 from henchmen.providers.interfaces.document_store import DocumentStore
 from henchmen.providers.registry import orchestrator_is_local
+from henchmen.utils.github_auth import (
+    MAX_MIN_TTL_SECONDS,
+    GitHubAppConfigurationError,
+    GitHubRepositoryReferenceError,
+    get_credentials_provider,
+    get_github_token_async,
+    get_installation_token_async,
+    parse_repository,
+    partial_app_message,
+)
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -128,6 +138,9 @@ class LairManager:
         lair_id: str,
         scheme_id: str = "",
         dossier: "Dossier | None" = None,
+        *,
+        github_token: str | None = None,
+        github_token_expires_at: str = "",
     ) -> dict[str, str]:
         """Build the environment variable dict for the operative container.
 
@@ -138,6 +151,12 @@ class LairManager:
         defaults. On top of that sits the per-execution runtime contract
         (``TASK_ID``, ``NODE_ID``, ...), which is deliberately unprefixed
         because it is input, not configuration.
+
+        ``github_token`` is the only GitHub credential the container receives,
+        with its expiry when it is an installation token; ``create_lair``
+        decides both. Whatever ``operative_env`` copied from Settings (the PAT,
+        in local mode) is removed first, so the PAT reaches a container only
+        when ``create_lair`` chose it.
         """
         # Gated on the *effective* container orchestrator rather than the coarse
         # `provider` setting: an override (`HENCHMEN_CONTAINER_ORCHESTRATOR_PROVIDER`)
@@ -184,9 +203,6 @@ class LairManager:
                 for host in ("localhost", "127.0.0.1"):
                     ollama_url = ollama_url.replace(host, "host.docker.internal")
                 env["HENCHMEN_LLM_OLLAMA_BASE_URL"] = ollama_url
-            # Also expose the bare name for tooling (git, gh) that reads it directly.
-            if self.settings.github_token:
-                env["GITHUB_TOKEN"] = self.settings.github_token
 
             # Desktop install: a token valid only for this task authenticates the
             # operative's report and its task-state calls (D-P4). The internal push
@@ -194,6 +210,17 @@ class LairManager:
             internal = desktop_internal_auth()
             if internal is not None:
                 env["HENCHMEN_OPERATIVE_TASK_TOKEN"] = internal.task_token(task.id)
+
+        # operative_env copies the PAT in local mode; the token create_lair chose replaces it
+        # (with a GitHub App, a short-lived installation token -- the App key never leaves the server).
+        for name in ("HENCHMEN_GITHUB_TOKEN", "GITHUB_TOKEN", "HENCHMEN_GITHUB_TOKEN_EXPIRES_AT"):
+            env.pop(name, None)
+        if github_token:
+            env["HENCHMEN_GITHUB_TOKEN"] = github_token
+            # The bare name too, for tooling (git, gh) that reads it directly.
+            env["GITHUB_TOKEN"] = github_token
+            if github_token_expires_at:
+                env["HENCHMEN_GITHUB_TOKEN_EXPIRES_AT"] = github_token_expires_at
 
         return env
 
@@ -228,6 +255,63 @@ class LairManager:
         except Exception as exc:
             logger.warning("Could not clear stale operative report for %s: %s", key, exc)
 
+    async def _operative_github_credentials(self, task: HenchmenTask, timeout_seconds: int) -> tuple[str, str] | None:
+        """``(token, expires_at_iso)`` an operative receives as env vars, or ``None`` when it gets none that way.
+
+        * **GitHub App configured:** every orchestrator gets an installation
+          token scoped to the task's repository (``owner/name``) that stays
+          valid for the node timeout plus the wait grace, capped at the
+          provider's ``MAX_MIN_TTL_SECONDS`` (a warning names a longer node;
+          the operative refreshes the token through the internal API before it
+          expires). The PAT and the App's private key never reach the container.
+        * **No App, Docker-launched lair** (``orchestrator_is_local``): the PAT,
+          as before, with no expiry.
+        * **No App, any other orchestrator:** ``None`` -- Cloud Run keeps
+          mounting the PAT from Secret Manager, and nothing travels in env.
+
+        Raises :class:`~henchmen.utils.github_auth.GitHubAuthError` (fail
+        closed, before any job exists) when a configured App cannot mint the
+        token, when the App is only partly configured (never a PAT fallback),
+        or when the task has no usable repository. The scheme executor treats
+        that like any lair provisioning failure: the node fails, except that on
+        a dev *repository checkout* its pre-existing simulated-pass path for
+        implementation nodes still applies (``fail_open_allowed``); a desktop
+        install and staging/prod never take it.
+        """
+        provider = get_credentials_provider(self.settings)
+        if not provider.uses_app:
+            problem = partial_app_message(
+                self.settings.github_app_id,
+                self.settings.github_app_private_key_path,
+                self.settings.github_app_installation_id,
+            )
+            if problem:
+                raise GitHubAppConfigurationError(problem)
+            if not orchestrator_is_local(self.settings):
+                return None
+            return await get_github_token_async(task.context.repo or None, settings=self.settings), ""
+
+        repository = parse_repository(task.context.repo)
+        if repository is None:
+            # A token for the whole installation would reach every repository the App can see.
+            raise GitHubRepositoryReferenceError(
+                "The task has no repository, so no repository-scoped GitHub token can be issued for its operative"
+            )
+        min_ttl_seconds = timeout_seconds + _WAIT_GRACE_SECONDS
+        if min_ttl_seconds > MAX_MIN_TTL_SECONDS:
+            logger.warning(
+                "[LAIR] Node timeout %ss plus %ss grace is longer than a GitHub installation token is guaranteed "
+                "to last (%ss); the operative must refresh its token before it expires",
+                timeout_seconds,
+                _WAIT_GRACE_SECONDS,
+                MAX_MIN_TTL_SECONDS,
+            )
+            min_ttl_seconds = MAX_MIN_TTL_SECONDS
+        issued = await get_installation_token_async(
+            "/".join(repository), settings=self.settings, min_ttl_seconds=min_ttl_seconds
+        )
+        return issued.token, issued.expires_at_iso()
+
     async def create_lair(
         self,
         task: HenchmenTask,
@@ -250,18 +334,35 @@ class LairManager:
         timeout_seconds = node.timeout_seconds or self.settings.lair_default_timeout
 
         image = self._build_image()
-        env_vars = self._build_env_vars(task, node, lair_id, scheme_id, dossier=dossier)
+        # Raises GitHubAuthError before any job exists (or is registered) when a configured App
+        # cannot mint a token.
+        github_credentials = await self._operative_github_credentials(task, timeout_seconds)
+        github_token, github_token_expires_at = github_credentials or (None, "")
+        env_vars = self._build_env_vars(
+            task,
+            node,
+            lair_id,
+            scheme_id,
+            dossier=dossier,
+            github_token=github_token,
+            github_token_expires_at=github_token_expires_at,
+        )
 
         # Local and AWS modes carry credentials in plain env vars; only Cloud Run
         # Jobs take a service account and Secret Manager references.
         if self.settings.provider == "gcp":
             service_account: str | None = self.settings.lair_service_account_email
-            secrets: dict[str, str] | None = {
-                "GITHUB_TOKEN": (
-                    f"projects/{self.settings.gcp_project_id}/secrets/"
-                    f"henchmen-{self.settings.environment.value}-github-token"
-                ),
-            }
+            # When the token travels in env_vars (a GitHub App's short-lived token) the PAT is not mounted.
+            secrets: dict[str, str] | None = (
+                None
+                if github_credentials is not None
+                else {
+                    "GITHUB_TOKEN": (
+                        f"projects/{self.settings.gcp_project_id}/secrets/"
+                        f"henchmen-{self.settings.environment.value}-github-token"
+                    ),
+                }
+            )
         else:
             service_account = None
             secrets = None
