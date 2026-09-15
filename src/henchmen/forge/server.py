@@ -16,7 +16,8 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 
-from henchmen.config.settings import Environment, get_settings
+from henchmen.config.posture import fail_open_allowed
+from henchmen.config.settings import get_settings
 from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
 from henchmen.utils.git import clone_repo
 from henchmen.utils.redaction import install_secret_redaction
@@ -261,7 +262,7 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
 
     # HENCHMEN_GITHUB_TOKEN or the bare GITHUB_TOKEN, via Settings' AliasChoices.
     github_token = settings.github_token
-    if not github_token and settings.environment != Environment.DEV:
+    if not github_token and not fail_open_allowed(settings):
         raise await _fail(
             pr_url,
             task_id,

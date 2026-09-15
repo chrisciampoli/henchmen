@@ -716,6 +716,25 @@ class TestSchemeExecutorLairFailure:
         assert result["node_results"]["agent_node"]["condition"] == "pass"
         assert result["node_results"]["agent_node"].get("dev_mode") is True
 
+    @pytest.mark.asyncio
+    async def test_lair_failure_never_simulates_pass_on_a_desktop_install(self, monkeypatch, tmp_path):
+        """A data-directory install is a real install: no simulated pass, whatever HENCHMEN_ENVIRONMENT says."""
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        graph = _linear_scheme(["agent_node"], node_types={"agent_node": NodeType.AGENTIC})
+        mock_lair = AsyncMock(spec=LairManager)
+        mock_lair.create_lair.side_effect = RuntimeError("docker unavailable")
+        settings = _mock_settings()
+        settings.environment = MagicMock()
+        settings.environment.value = "dev"
+
+        executor = SchemeExecutor(graph, mock_lair, settings)
+        task = _make_task()
+        result = await executor.execute(task, Dossier(task_id=task.id))
+
+        node_result = result["node_results"]["agent_node"]
+        assert node_result["condition"] == "fail"
+        assert "dev_mode" not in node_result
+
 
 class TestSchemeExecutorMaxRetries:
     """Test that max-retry exhaustion forces a fail condition (not pass)."""

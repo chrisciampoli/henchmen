@@ -53,3 +53,13 @@ def secrets_dir() -> Path | None:
     """Directory for secret files (keys, session signing key), or ``None``."""
     base = data_dir()
     return base / _SECRETS_DIR_NAME if base is not None else None
+
+
+def is_desktop_install() -> bool:
+    """True for a data-directory install (the local image run by Henchmen Desktop).
+
+    Such an install is always a real, always-on installation, so it never takes
+    a development-only fail-open path (see :mod:`henchmen.config.posture`). It
+    is Settings-independent because it must work before Settings exist.
+    """
+    return data_dir() is not None

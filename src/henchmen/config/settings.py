@@ -511,6 +511,14 @@ class Settings(BaseSettings):
             "Empty means the image built by `henchmen build-operative` (henchmen-operative:local)."
         ),
     )
+    operative_task_token: str = Field(
+        default="",
+        description=(
+            "Task-scoped bearer token a desktop install's Lair injects into an operative container. "
+            "It authenticates the operative's report and its task-state calls, and marks the process "
+            "as desktop posture. Never set this on a server."
+        ),
+    )
 
     # Dispatch REST intake authentication
     dispatch_api_token: str = Field(

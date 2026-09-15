@@ -5,6 +5,7 @@ import contextlib
 import logging
 from typing import TYPE_CHECKING, Any
 
+from henchmen.config.posture import fail_open_allowed
 from henchmen.mastermind.lair_manager import LairManager
 from henchmen.models.dossier import Dossier
 from henchmen.models.llm import ModelTier
@@ -362,11 +363,11 @@ class SchemeExecutor:
         except Exception as exc:
             logger.error("[SCHEME] Lair provisioning failed for node %s: %s", node.id, exc)
 
-            # Only simulate pass in dev mode for implementation nodes.
-            # Fix nodes (fix_lint, fix_tests) must NEVER simulate pass —
-            # skipping them means broken code gets promoted to PR.
-            is_dev = getattr(self.settings, "environment", None)
-            is_dev = is_dev and getattr(is_dev, "value", str(is_dev)) == "dev"
+            # Only simulate pass in dev on a repository checkout, for implementation
+            # nodes. Fix nodes (fix_lint, fix_tests) must NEVER simulate pass —
+            # skipping them means broken code gets promoted to PR — and a desktop
+            # install never simulates anything.
+            is_dev = fail_open_allowed(self.settings)
             is_fix_node = node.id in _FIX_NODES
 
             if is_dev and not is_fix_node:

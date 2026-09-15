@@ -22,10 +22,11 @@ The verifier:
 - uses ``google.oauth2.id_token.verify_oauth2_token`` to validate the signature
 - checks the ``aud`` claim matches the configured audience (the service URL)
 - optionally checks the ``email`` claim is in an allow-list of publisher SAs
-- in DEV, logs a warning and allows the request through if verification is
-  not configured (so that local ``docker-compose`` and the in-memory broker
-  continue to work)
-- in STAGING/PROD, any verification failure raises 401
+- in DEV on a repository checkout, logs a warning and allows the request
+  through if verification is not configured (so that local
+  ``docker-compose`` and the in-memory broker continue to work) — never on a
+  desktop (data-directory) install; see :mod:`henchmen.config.posture`
+- in STAGING/PROD, and on every desktop install, any verification failure raises 401
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import HTTPException, Request
 
-from henchmen.config.settings import Environment
+from henchmen.config.posture import fail_open_allowed
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -78,7 +79,7 @@ async def verify_pubsub_oidc(request: Request, settings: Settings) -> None:
     # Development escape hatch: in DEV, if no audience is configured and no
     # token is present, we assume the caller is the local in-memory broker
     # and log a loud warning. STAGING/PROD never take this path.
-    if env == Environment.DEV and not audience and not token:
+    if fail_open_allowed(settings) and not audience and not token:
         logger.warning(
             "[pubsub-auth] DEV mode: allowing unauthenticated /pubsub/* request from %s — "
             "configure HENCHMEN_PUBSUB_OIDC_AUDIENCE to enforce verification",
@@ -109,7 +110,7 @@ async def verify_pubsub_oidc(request: Request, settings: Settings) -> None:
     except ImportError as exc:
         logger.error("[pubsub-auth] google-auth not available: %s", exc)
         # In DEV we still let the request through with a warning.
-        if env == Environment.DEV:
+        if fail_open_allowed(settings):
             logger.warning("[pubsub-auth] DEV mode: google-auth missing; skipping OIDC verification")
             return
         raise HTTPException(status_code=500, detail="OIDC verifier unavailable") from exc
