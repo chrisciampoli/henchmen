@@ -22,10 +22,10 @@ from typing import TYPE_CHECKING, Any
 import uvicorn
 from fastapi import FastAPI
 
-try:
-    from uvicorn.main import STARTUP_FAILURE
-except ImportError:  # pragma: no cover - defensive; mirrors uvicorn.main.STARTUP_FAILURE (3)
-    STARTUP_FAILURE = 3
+# uvicorn exits 3 when startup fails. Its constant is private and moves between
+# releases (uvicorn.main in 0.41, uvicorn.config in 0.53, where Server.run also
+# calls sys.exit(3) itself), so the value is pinned here rather than imported.
+STARTUP_FAILURE = 3
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
