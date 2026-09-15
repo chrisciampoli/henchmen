@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -28,6 +30,7 @@ class SetupStep(StrEnum):
 
 
 REQUIRED_STEPS: frozenset[SetupStep] = frozenset({SetupStep.AI_PROVIDER, SetupStep.GITHUB})
+OPTIONAL_STEPS: frozenset[SetupStep] = frozenset({SetupStep.SLACK, SetupStep.JIRA, SetupStep.FIRST_TASK})
 
 
 class SetupState(BaseModel):
@@ -37,6 +40,10 @@ class SetupState(BaseModel):
     completed_steps: list[SetupStep] = Field(default_factory=list, description="Steps finished successfully")
     skipped_steps: list[SetupStep] = Field(default_factory=list, description="Optional steps the user skipped")
     choices: dict[str, str] = Field(default_factory=dict, description="Non-secret selections, e.g. llm_provider")
+    server_choices: dict[str, str] = Field(
+        default_factory=dict,
+        description="Non-secret values only the server writes (e.g. github_app_slug); never client-writable",
+    )
     completed: bool = Field(default=False, description="True once setup was applied and run mode enabled")
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC), description="Last write time (UTC)")
 
@@ -51,6 +58,10 @@ class SetupStateStore:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        # Guards the read-modify-write span of set_server_choices/record_step_complete
+        # (each other) against each other within one process; save() itself is already
+        # atomic on disk via os.replace.
+        self._lock = threading.Lock()
 
     def load(self) -> SetupState:
         """Return the saved state, or a fresh one when no file exists.
@@ -83,8 +94,29 @@ class SetupStateStore:
 
     def mark_completed(self) -> SetupState:
         """Mark setup complete; refuses while a required step is missing."""
-        state = self.load()
-        missing = state.missing_required_steps()
-        if missing:
-            raise ValueError("Setup is missing required steps: " + ", ".join(step.value for step in missing))
-        return self.save(state.model_copy(update={"completed": True}))
+        with self._lock:
+            state = self.load()
+            missing = state.missing_required_steps()
+            if missing:
+                raise ValueError("Setup is missing required steps: " + ", ".join(step.value for step in missing))
+            return self.save(state.model_copy(update={"completed": True}))
+
+    def set_server_choices(self, values: Mapping[str, str]) -> SetupState:
+        """Merge server-only values into ``server_choices`` (the Console's state PUT can never write them)."""
+        with self._lock:
+            state = self.load()
+            return self.save(state.model_copy(update={"server_choices": {**state.server_choices, **dict(values)}}))
+
+    def record_step_complete(self, step: SetupStep) -> SetupState:
+        """Mark ``step`` complete. Called only by that step's own validation route (never by a client)."""
+        with self._lock:
+            state = self.load()
+            done = {*state.completed_steps, step}
+            return self.save(
+                state.model_copy(
+                    update={
+                        "completed_steps": [s for s in SetupStep if s in done],
+                        "skipped_steps": [s for s in state.skipped_steps if s != step],
+                    }
+                )
+            )
