@@ -114,6 +114,22 @@ class SlackScopeError(Exception):
         self.needed = needed
 
 
+class SlackUnreachableError(Exception):
+    """Raised when Slack could not be reached at all: no SDK, or a connection-level failure.
+
+    Distinguished from a definite "no, you can't see this" answer (``None``
+    from :func:`get_slack_channel`, an empty/non-scope failure from
+    :func:`list_slack_channels_page`'s ``ImportError`` branch) so a caller can
+    show "Slack could not be reached, try again" instead of fail-closed advice
+    that assumes Slack actually answered (e.g. "ask for an invite").
+    """
+
+
+def _is_unreachable(exc: BaseException) -> bool:
+    """True when ``exc`` carries no Slack ``response`` -- a connection-level failure, not an API answer."""
+    return getattr(exc, "response", None) is None
+
+
 # ---------------------------------------------------------------------------
 # Client factories (patched in tests)
 # ---------------------------------------------------------------------------
@@ -478,6 +494,42 @@ def check_slack_bot_token(token: str, *, timeout: float = DEFAULT_TIMEOUT) -> Ch
     return CheckResult(name, CheckStatus.OK, f"authenticated as @{user} in workspace {team}")
 
 
+@dataclass(frozen=True)
+class SlackIdentity:
+    """Stable ids for a bot token's workspace and bot user -- never a display name.
+
+    Display names (``check_slack_bot_token``'s ``@user in workspace team``)
+    can collide across two different workspaces or change on a rename;
+    ``team_id``/``user_id`` cannot, so callers that must notice "this token
+    now points at a different workspace or bot user" fingerprint on these
+    instead.
+    """
+
+    team_id: str
+    user_id: str
+    bot_id: str
+
+
+def slack_bot_identity(token: str, *, timeout: float = DEFAULT_TIMEOUT) -> SlackIdentity | None:
+    """``auth.test``'s ``team_id``/``user_id``/``bot_id``; ``None`` on any failure or missing id.
+
+    A second ``auth.test`` call alongside :func:`check_slack_bot_token` rather
+    than a change to its return shape, so every existing caller and test of
+    ``check_slack_bot_token`` is unaffected. Fails closed: a caller comparing
+    identities across two calls must treat ``None`` as "cannot prove this is
+    the same workspace", never as "unchanged".
+    """
+    try:
+        info = _slack_client(token, timeout).auth_test()
+    except Exception:
+        return None
+    team_id = str(info.get("team_id", ""))
+    user_id = str(info.get("user_id", ""))
+    if not team_id or not user_id:
+        return None
+    return SlackIdentity(team_id=team_id, user_id=user_id, bot_id=str(info.get("bot_id", "")))
+
+
 def check_slack_app_token(app_token: str, *, timeout: float = DEFAULT_TIMEOUT) -> CheckResult:
     """Verify a Slack app-level token (Socket Mode) via ``apps.connections.open``."""
     name = "Slack app token"
@@ -517,8 +569,12 @@ def list_slack_channels_page(token: str, *, timeout: float = DEFAULT_TIMEOUT) ->
     reached, so a channel beyond this listing can still be confirmed
     directly by id with :func:`get_slack_channel`. Raises
     :class:`SlackScopeError` when the token lacks ``channels:read`` /
-    ``groups:read``; any other failure returns an empty, non-truncated
-    listing.
+    ``groups:read``, and :class:`SlackUnreachableError` when a page request
+    fails with no Slack response at all (a connection-level failure, once the
+    SDK itself is present). A missing SDK still returns an empty,
+    non-truncated listing -- unchanged so :func:`list_slack_channels`'s
+    existing callers (``henchmen init``/``doctor``) keep falling back to
+    manual input rather than crashing.
     """
     try:
         client = _slack_client(token, timeout)
@@ -558,6 +614,8 @@ def list_slack_channels_page(token: str, *, timeout: float = DEFAULT_TIMEOUT) ->
     except Exception as exc:
         if _slack_error_code(exc) == "missing_scope":
             raise SlackScopeError(_slack_needed_scope(exc) or "channels:read") from exc
+        if _is_unreachable(exc):
+            raise SlackUnreachableError(str(exc)) from exc
         return SlackChannelListing(channels=[], truncated=False)
     return SlackChannelListing(channels=sorted(channels, key=lambda c: c.name), truncated=truncated)
 
@@ -576,17 +634,29 @@ def list_slack_channels(token: str, *, timeout: float = DEFAULT_TIMEOUT) -> list
 
 
 def get_slack_channel(token: str, channel_id: str, *, timeout: float = DEFAULT_TIMEOUT) -> SlackChannel | None:
-    """Look up one channel directly (``conversations.info``); ``None`` on any failure.
+    """Look up one channel directly (``conversations.info``), for a channel beyond a truncated listing.
 
-    For confirming access to a channel beyond a truncated
-    :func:`list_slack_channels_page` result by id: bounded to a single call,
-    and fails closed -- an unknown id, a missing scope, a network error or a
-    missing SDK are all "can't see it", never treated as a pass.
+    Bounded to a single call. Raises :class:`SlackScopeError` when the token
+    lacks the scope, and :class:`SlackUnreachableError` when Slack could not
+    be reached at all (a missing SDK, or a connection-level failure with no
+    Slack response) -- distinguished from ``None``, which means Slack
+    actually answered "no such channel" or "you can't see it". Only ``None``
+    should draw fail-closed advice like "ask for an invite"; the other two
+    are a reason to try again, not a reason to assume the channel is
+    inaccessible.
     """
     try:
         client = _slack_client(token, timeout)
+    except ImportError as exc:
+        raise SlackUnreachableError(str(exc)) from exc
+    try:
         response = client.conversations_info(channel=channel_id)
-    except Exception:
+    except Exception as exc:
+        code = _slack_error_code(exc)
+        if code == "missing_scope":
+            raise SlackScopeError(_slack_needed_scope(exc) or "channels:read") from exc
+        if _is_unreachable(exc):
+            raise SlackUnreachableError(str(exc)) from exc
         return None
     raw = response.get("channel") or {}
     found_id = str(raw.get("id", ""))
@@ -698,7 +768,9 @@ __all__ = [
     "CheckStatus",
     "SlackChannel",
     "SlackChannelListing",
+    "SlackIdentity",
     "SlackScopeError",
+    "SlackUnreachableError",
     "check_anthropic_key",
     "check_bedrock",
     "check_github_repo",
@@ -719,4 +791,5 @@ __all__ = [
     "list_slack_channels",
     "list_slack_channels_page",
     "post_slack_message",
+    "slack_bot_identity",
 ]

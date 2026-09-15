@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from henchmen.cli import checks, init
-from henchmen.cli.checks import CheckResult, CheckStatus, SlackChannel, SlackScopeError
+from henchmen.cli.checks import CheckResult, CheckStatus, SlackChannel, SlackScopeError, SlackUnreachableError
 from henchmen.cli.envfile import EnvFile
 from henchmen.cli.init import (
     SECTIONS,
@@ -333,6 +333,22 @@ class TestSlack:
         assert env.get("HENCHMEN_SLACK_NOTIFICATION_CHANNEL") == "C999"
         assert calls["slack_join"] == [("xoxb-new-token-1234", "C999")]
         assert any("channels:read" in line for line in prompter.output)
+
+    def test_unreachable_slack_falls_back_to_manual_channel_id(
+        self, env_path: Path, monkeypatch: pytest.MonkeyPatch, calls: dict[str, list[Any]]
+    ):
+        self._env_with_basics(env_path)
+
+        def boom(token: str, **kw: Any) -> list[SlackChannel]:
+            raise SlackUnreachableError("connection refused")
+
+        monkeypatch.setattr(checks, "list_slack_channels", boom)
+        answers = ["y", "xoxb-new-token-1234", "xapp-new-token-5678", "", "C999", "y"]
+        code, prompter, env = _run(answers, env_path, sections=("slack",))
+        assert code == 0
+        assert env.get("HENCHMEN_SLACK_NOTIFICATION_CHANNEL") == "C999"
+        assert calls["slack_join"] == [("xoxb-new-token-1234", "C999")]
+        assert any("Slack could not be reached" in line for line in prompter.output)
 
     def test_declining_slack_writes_nothing_for_slack(self, env_path: Path, calls: dict[str, list[Any]]):
         self._env_with_basics(env_path)

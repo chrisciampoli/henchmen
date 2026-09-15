@@ -163,7 +163,12 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"ghs_[A-Za-z0-9]{20,}"), REDACTED),  # GitHub server-to-server tokens
     (re.compile(r"gho_[A-Za-z0-9]{20,}"), REDACTED),  # GitHub OAuth tokens
     (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), REDACTED),  # GitHub fine-grained PATs
-    (re.compile(r"xox[baprs]-[A-Za-z0-9-]+"), REDACTED),  # Slack bot/user/app tokens
+    # Slack's token-rotation refresh/exchange tokens ("xoxe.xoxb-...", "xoxe.xoxp-...")
+    # embed a bot/user token after the dot; matched whole, before the bare-token rule
+    # below would otherwise redact only the part after "xoxe.", leaving that prefix
+    # (harmless on its own, but the point is one clean REDACTED, not a partial one).
+    (re.compile(r"xoxe\.xox[bp]-[A-Za-z0-9-]+"), REDACTED),  # Slack token-rotation refresh/exchange tokens
+    (re.compile(r"xox[abeprs]-[A-Za-z0-9-]+"), REDACTED),  # Slack bot/user/app/enterprise/rotation tokens
     (re.compile(r"xapp-[A-Za-z0-9-]+"), REDACTED),  # Slack app-level tokens
     (re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"), REDACTED),  # Anthropic API keys
     (re.compile(r"sk-proj-[A-Za-z0-9_-]{20,}"), REDACTED),  # OpenAI project-scoped keys

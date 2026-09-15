@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from henchmen.cli import checks
-from henchmen.cli.checks import CheckResult, CheckStatus, SlackChannel, SlackScopeError
+from henchmen.cli.checks import CheckResult, CheckStatus, SlackChannel, SlackScopeError, SlackUnreachableError
 from henchmen.cli.envfile import EnvFile, is_secret_key
 from henchmen.cli.prompts import Choice, ConsolePrompter, PromptAbortedError, Prompter, mask_secret
 from henchmen.config.paths import config_file
@@ -526,6 +526,8 @@ def _choose_slack_channel(prompter: Prompter, state: WizardState, options: InitO
         channels = checks.list_slack_channels(bot_token, timeout=options.timeout)
     except SlackScopeError as exc:
         prompter.warn(f"Cannot list channels: {exc}. Add the scope under OAuth & Permissions and reinstall the app.")
+    except SlackUnreachableError as exc:
+        prompter.warn(f"Cannot list channels: Slack could not be reached ({exc}).")
 
     if options.yes:
         channel_id = current
