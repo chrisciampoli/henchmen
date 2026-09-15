@@ -15,6 +15,7 @@ from henchmen.models.scheme import SchemeNode
 from henchmen.models.task import HenchmenTask
 from henchmen.providers.interfaces.container_orchestrator import ContainerOrchestrator, JobStatus
 from henchmen.providers.interfaces.document_store import DocumentStore
+from henchmen.providers.registry import ProviderRegistry
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -183,9 +184,15 @@ class LairManager:
             if self.settings.github_token:
                 env["GITHUB_TOKEN"] = self.settings.github_token
 
-            # Desktop install: a token valid only for this task authenticates the
-            # operative's report and its task-state calls (D-P4). The internal push
-            # token never enters an operative (amendment A2).
+        # Desktop install whose *effective* container orchestrator resolves to the
+        # local Docker one: a token valid only for this task authenticates the
+        # operative's report and its task-state calls (D-P4). Gated on the
+        # orchestrator resolution rather than the coarse `provider` setting above,
+        # since an override (`HENCHMEN_CONTAINER_ORCHESTRATOR_PROVIDER`) can point
+        # container orchestration at Docker, or away from it, independently of
+        # `provider` — only a Lair actually launched by Docker can be handed this
+        # token. The internal push token never enters an operative (amendment A2).
+        if ProviderRegistry(self.settings).resolve_provider_name("container_orchestrator") == "local":
             internal = desktop_internal_auth()
             if internal is not None:
                 env["HENCHMEN_OPERATIVE_TASK_TOKEN"] = internal.task_token(task.id)

@@ -444,3 +444,11 @@ def test_cloud_lairs_never_receive_a_task_token(monkeypatch, tmp_path):
     monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
     env = LairManager(_settings(provider="gcp"))._build_env_vars(_task(), _node(), "lair-1")
     assert "HENCHMEN_OPERATIVE_TASK_TOKEN" not in env
+
+
+def test_desktop_with_a_gcp_container_orchestrator_override_gets_no_task_token(monkeypatch, tmp_path):
+    """Ruling: the gate is the *effective* container orchestrator, not the coarse `provider` field."""
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    settings = _settings(provider="local", gcp_project_id="", container_orchestrator_provider="gcp")
+    env = LairManager(settings)._build_env_vars(_task(), _node(), "lair-1")
+    assert "HENCHMEN_OPERATIVE_TASK_TOKEN" not in env

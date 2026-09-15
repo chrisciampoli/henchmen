@@ -22,6 +22,14 @@ REDACTED = "***REDACTED***"
 
 _BEARER_PATTERN = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{16,}")
 
+# Any environment-variable-style ``SOMETHING_TOKEN=value`` assignment. This is
+# the shape a Docker `-e` command line, an ``os.environ`` dump, or a crash
+# traceback prints a secret in -- notably ``HENCHMEN_OPERATIVE_TASK_TOKEN``,
+# which is a bare HMAC-SHA256 hex digest with no recognizable prefix pattern
+# of its own, unlike the GitHub/Slack/OpenAI tokens above. The key name is
+# kept in the output (case preserved); only the value is redacted.
+_TOKEN_ENV_VAR_PATTERN = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*_TOKEN)=(\S+)", re.IGNORECASE)
+
 # (pattern, replacement) pairs, applied in order. Every pattern but the bearer
 # one replaces the whole match outright; the bearer pattern captures the word
 # itself (case preserved, whatever whitespace separated it from the token) so
@@ -45,6 +53,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # match and the captured word is kept in the output.
     (_BEARER_PATTERN, r"\1 " + REDACTED),
     (re.compile(r"(?<=setup_token=)[^&#\s\"']+"), REDACTED),  # Console sign-in token (value only)
+    (_TOKEN_ENV_VAR_PATTERN, r"\1=" + REDACTED),  # *_TOKEN=value env assignments (key name kept)
 )
 
 # Loggers whose formatter reads ``record.args`` itself and so cannot have them

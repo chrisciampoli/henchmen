@@ -44,6 +44,46 @@ def _request(headers: dict[str, str] | None = None, body: bytes = b"") -> Reques
     return Request(scope, receive)
 
 
+def _streaming_request(headers: dict[str, str], chunks: list[bytes]) -> Request:
+    """A request whose body arrives over several ASGI receive() calls, like a real stream."""
+    remaining = list(chunks)
+
+    async def receive() -> dict[str, Any]:
+        if not remaining:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        chunk = remaining.pop(0)
+        return {"type": "http.request", "body": chunk, "more_body": bool(remaining)}
+
+    raw = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/pubsub/operative-complete",
+        "headers": raw,
+        "query_string": b"",
+        "client": ("172.18.0.5", 40000),
+    }
+    return Request(scope, receive)
+
+
+def _forbidden_read_request(headers: dict[str, str] | None = None) -> Request:
+    """A request whose body must never be read -- receive() fails the test if it is."""
+
+    async def receive() -> dict[str, Any]:
+        raise AssertionError("the body must not be read without a task-token-shaped bearer")
+
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/pubsub/operative-complete",
+        "headers": raw,
+        "query_string": b"",
+        "client": ("172.18.0.5", 40000),
+    }
+    return Request(scope, receive)
+
+
 @pytest.fixture(autouse=True)
 def _clear_internal_auth_cache():
     """Ruling P7/4: the load cache is keyed by resolved directory and must not leak between tests."""
@@ -271,6 +311,46 @@ class TestOperativeReportAuth:
         with pytest.raises(HTTPException):
             await verify_operative_report(_request({}, _report_body("task-1")), _settings())
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "headers",
+        [{}, {"Authorization": "Bearer not-task-token-shaped"}, {"Authorization": "Bearer " + "a" * 63}],
+        ids=["no-header", "not-hex", "63-chars"],
+    )
+    async def test_missing_or_malformed_bearer_never_reads_the_body(self, desktop, headers: dict[str, str]) -> None:
+        """A caller with no valid-looking credential must never make the server touch the body."""
+        from henchmen.dispatch.pubsub_auth import verify_operative_report
+
+        with pytest.raises(HTTPException) as exc:
+            await verify_operative_report(_forbidden_read_request(headers), _settings())
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_oversized_body_is_rejected_by_content_length_without_reading_it(self, desktop) -> None:
+        from henchmen.dispatch.pubsub_auth import MAX_OPERATIVE_REPORT_BYTES, verify_operative_report
+
+        headers = {
+            "Authorization": f"Bearer {desktop.task_token('task-1')}",
+            "Content-Length": str(MAX_OPERATIVE_REPORT_BYTES + 1),
+        }
+        with pytest.raises(HTTPException) as exc:
+            await verify_operative_report(_forbidden_read_request(headers), _settings())
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_oversized_body_is_rejected_while_streaming_without_content_length(
+        self, desktop, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Even without a Content-Length header, the streamed body is capped -- never buffered whole."""
+        import henchmen.dispatch.pubsub_auth as pubsub_auth_module
+
+        monkeypatch.setattr(pubsub_auth_module, "MAX_OPERATIVE_REPORT_BYTES", 8)
+        headers = {"Authorization": f"Bearer {desktop.task_token('task-1')}"}
+        request = _streaming_request(headers, [b"01234567", b"89"])
+        with pytest.raises(HTTPException) as exc:
+            await pubsub_auth_module.verify_operative_report(request, _settings())
+        assert exc.value.status_code == 401
+
 
 def test_bearer_tokens_are_redacted_from_logs() -> None:
     line = "POST failed with Authorization: Bearer " + "a" * 43
@@ -289,3 +369,22 @@ def test_bearer_redaction_is_case_and_whitespace_insensitive(scheme: str, separa
     redacted = redact(line)
     assert token not in redacted
     assert scheme in redacted
+
+
+def test_operative_task_token_env_assignment_is_redacted_from_logs() -> None:
+    """Ruling 4: operative stdout can print its env (docker -e dump, a crash traceback) verbatim;
+    the task token has no recognizable prefix of its own, so it is caught by key name instead."""
+    token = "c" * 64
+    line = f"Starting Docker container lair-1 -e HENCHMEN_OPERATIVE_TASK_TOKEN={token} -e TASK_ID=task-1"
+    redacted = redact(line)
+    assert token not in redacted
+    assert "HENCHMEN_OPERATIVE_TASK_TOKEN=" in redacted
+    assert "TASK_ID=task-1" in redacted, "unrelated env assignments must survive untouched"
+
+
+@pytest.mark.parametrize("key", ["GITHUB_TOKEN", "DISPATCH_API_TOKEN", "some_other_token", "X_TOKEN"])
+def test_any_token_env_assignment_is_redacted(key: str) -> None:
+    value = "d" * 40
+    redacted = redact(f"{key}={value}")
+    assert value not in redacted
+    assert key in redacted
