@@ -673,15 +673,11 @@ def _serve(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(2)
-            try:
-                setup_token_value = auth.setup_token
-            except OSError as exc:
-                # Mirrors the ConsoleAuth.load guard above: a readable error and exit 2,
-                # never a traceback, if the token file becomes unreadable after load().
-                print(f"ERROR: could not read the sign-in token in {secrets_dir}: {exc}", file=sys.stderr)
-                print("Hint: check permissions on the data volume.", file=sys.stderr)
-                sys.exit(2)
+            setup_token_value = auth.setup_token
             if not setup_token_value:
+                # ConsoleAuth.setup_token never raises (SetupTokenStore.current() already
+                # fails closed to "" on any read problem); a readable error and exit 2 here,
+                # never a broken link with an empty setup_token=, mirrors the load guard above.
                 print(f"ERROR: no usable sign-in token in {secrets_dir}.", file=sys.stderr)
                 print("Hint: check permissions on the data volume.", file=sys.stderr)
                 sys.exit(2)
@@ -726,9 +722,12 @@ def _serve(args: argparse.Namespace) -> None:
         print("Hint: run `henchmen init`, or set HENCHMEN_PROVIDER=local for a fully local run.", file=sys.stderr)
         sys.exit(2)
 
-    if console is not None and setup_token is not None:
+    if console is not None and setup_token:
         # Printed only now, from the port Settings actually resolved (which may
         # come from <data dir>/henchmen.env), not the pre-Settings bootstrap guess.
+        # `setup_token` never comes back as None here (ConsoleAuth.setup_token fails
+        # closed to ""), so this must check truthiness, not identity, to skip an
+        # unusable/unreadable token exactly like setup mode's own guard does.
         print(f"Open Henchmen: {console_url(port, setup_token)}", flush=True)
 
     logger.info(

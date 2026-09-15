@@ -179,7 +179,21 @@ class SetupTokenStore:
                     "issued for this data directory and needs 32+ URL-safe characters."
                 )
             token = candidate if use_seed else secrets.token_urlsafe(32)
-            write_secret_file(self.path, token.encode("ascii"))
+            try:
+                write_secret_file(self.path, token.encode("ascii"))
+            except OSError:
+                if not use_seed:
+                    raise
+                # The marker is already permanently created, so the seed can never be
+                # retried anyway; fall back to a random token rather than leaving no
+                # usable token file at all. If this second write also fails, propagate
+                # it as before -- there is nothing left to fall back to.
+                logger.warning(
+                    "Could not write the seeded setup token to %s; falling back to a random token.",
+                    self.path.name,
+                )
+                token = secrets.token_urlsafe(32)
+                write_secret_file(self.path, token.encode("ascii"))
             return token
 
     def consume(self, candidate: str) -> bool:
@@ -198,33 +212,49 @@ class SetupTokenStore:
                 # Another process claimed or rotated it first; never the token value itself.
                 logger.info("Setup token claim on %s lost a race or failed; failing closed.", self.path.name)
                 return False
+            # The rename preserves the original file's mtime, which can already be older
+            # than the stale-file threshold; refresh it to "now" so a concurrent sweep
+            # (this process's own next call, or another process's) never mistakes this
+            # in-flight claim for an abandoned one while we are still working with it.
+            with suppress(OSError):
+                os.utime(claim, None)
             try:
                 claimed = claim.read_bytes().decode("ascii", errors="replace").strip()
             except OSError:
                 logger.warning("Could not read the claimed setup token file %s; failing closed.", claim.name)
                 claimed = ""
             matched = bool(claimed) and _tokens_match(candidate, claimed)
-            if matched:
-                # Consumed: replace with a fresh random token nobody holds yet.
-                with suppress(FileExistsError):
-                    create_secret_file(self.path, secrets.token_urlsafe(32).encode("ascii"))
-            else:
-                # candidate did not match what we actually claimed: most likely another
-                # process rotated the token between our current() read and the claim rename
-                # above, so what we hold in `claim` is that newer token, not a spent one.
-                # Restore it instead of discarding it under a fresh random value.
-                try:
-                    os.link(str(claim), str(self.path))
-                except FileExistsError:
-                    pass  # a newer token is already back in place; nothing to restore
-                except OSError:
-                    logger.warning(
-                        "Could not restore setup token %s after a failed claim; failing closed.", self.path.name
-                    )
             try:
-                claim.unlink(missing_ok=True)
-            except OSError:
-                logger.debug("Could not remove claim file %s; a later sweep will remove it.", claim.name)
+                if matched:
+                    # Consumed: replace with a fresh random token nobody holds yet.
+                    try:
+                        create_secret_file(self.path, secrets.token_urlsafe(32).encode("ascii"))
+                    except FileExistsError:
+                        pass
+                    except OSError:
+                        logger.warning("Could not write the replacement setup token to %s.", self.path.name)
+                        raise
+                else:
+                    # candidate did not match what we actually claimed: most likely another
+                    # process rotated the token between our current() read and the claim rename
+                    # above, so what we hold in `claim` is that newer token, not a spent one.
+                    # Restore it instead of discarding it under a fresh random value.
+                    try:
+                        os.link(str(claim), str(self.path))
+                    except FileExistsError:
+                        pass  # a newer token is already back in place; nothing to restore
+                    except OSError:
+                        logger.warning(
+                            "Could not restore setup token %s after a failed claim; failing closed.", self.path.name
+                        )
+            finally:
+                # However the write above went, the claim file must never linger:
+                # it holds a real token value and this is the one guaranteed chance
+                # to remove it before returning (or propagating a write failure).
+                try:
+                    claim.unlink(missing_ok=True)
+                except OSError:
+                    logger.debug("Could not remove claim file %s; a later sweep will remove it.", claim.name)
             return matched
 
 
