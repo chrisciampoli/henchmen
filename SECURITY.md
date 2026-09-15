@@ -91,16 +91,35 @@ A data-directory install (`HENCHMEN_DATA_DIR`, the local image) is treated as a 
   calls (cost read, heartbeat, interrupted report) and nothing else. Operatives never mount the data volume.
 - **One-time sign-in links.** The setup token is consumed on use and rotated at every start;
   `docker exec henchmen henchmen console-link` prints a fresh link and invalidates earlier ones.
+  `HENCHMEN_CONSOLE_SETUP_TOKEN` only seeds the very first token a data directory ever issues, so a
+  `console-link` run before the first `serve` uses that seed up. A launcher should therefore always get
+  its link from `henchmen console-link` rather than rely on the seed.
 - **Recovery without a crash loop.** A completed setup that cannot start serves the Console in
-  needs-attention mode; problems shown there are redacted.
-- **Local CI gates run inside their own container, with the token scrubbed.** A gate container clones
-  the branch, computes the diff and runs the scoped lint/test commands entirely inside itself — nothing
-  is bind-mounted from the host. Once the last authenticated git operation has run, the gate removes the
-  GitHub token from `origin`'s URL in `.git/config` and from the environment before any repo-controlled
-  code (an install script, the linter, the test suite) runs. One consequence: a repository whose install
-  step genuinely needs `GITHUB_TOKEN` (for example, to authenticate to GitHub Packages) fails its local
-  CI gate from that point on — a deliberate fail-closed trade-off, not a bug. The cloud CI path is
-  unaffected by this scrubbing.
+  needs-attention mode. The problem list is redacted and returned only to a signed-in Console session;
+  an unauthenticated `/console/api/status` reports the mode with an empty problem list.
+- **Operative-written code never runs in the server process.** On a desktop install (whenever the
+  effective container orchestrator is local Docker) the Mastermind's lint and test gates, the `fix_lint`
+  auto-fixer and Forge's PR lint and tests all run in a separate gate container from the operative image
+  (`ci_gate`). Nothing is bind-mounted from the host, so the data volume and the Docker socket are never
+  reachable from repository code. Forge keeps only its silent-failure scan in the server process: it
+  clones without a checkout and scans the diff text, which executes nothing from the repository.
+- **What the gate container guarantees about the GitHub token.** The token reaches the gate only on its
+  standard input (`docker run -i`). It is never on a command line or in the container's or the docker
+  CLI's environment. The gate process starts as root with every capability dropped except
+  `CHOWN`/`DAC_OVERRIDE`/`FOWNER`/`SETUID`/`SETGID` and `no-new-privileges`. It runs every
+  repository-controlled command (dependency installs, linters, test suites, fixers) as uid/gid 65534 with
+  the workspace handed to that user, so that code cannot read the gate process's memory or
+  `/proc/1/environ`. The gate process keeps the token in memory only, and only root-owned git uses it: the
+  clone and the base-branch fetch, both before any repository code runs, and for `fix_lint` the push.
+  Before repository code runs, `origin`'s URL in `.git/config` is reset to a token-less form. For
+  `fix_lint`, the git directory is moved into a root-only directory first. Every unprivileged process is
+  killed before the commit, and the commit and push run with hooks disabled against that private git
+  directory. The token reaches the push only as an HTTP header in that one git process's environment.
+  Not guaranteed: the token is still usable by the gate container's own root process and by git while it
+  clones, fetches and pushes, and output from repository code is scrubbed of the token and known secret
+  patterns but is otherwise shown in results and PR comments. A repository whose install step genuinely
+  needs `GITHUB_TOKEN` (for example, GitHub Packages) fails its local gate — a deliberate fail-closed
+  trade-off. The cloud CI path is unchanged.
 
 ## Reporting a Vulnerability
 

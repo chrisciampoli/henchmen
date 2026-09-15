@@ -22,8 +22,11 @@ from uuid import uuid4
 
 from henchmen.config.settings import DEFAULT_LOCAL_OPERATIVE_IMAGE
 from henchmen.mastermind.scheme_executor.ci_gate import (
+    GATE_OUTPUT_LIMIT,
     CheckType,
+    GateCommand,
     GateResult,
+    env_without_github_tokens,
     parse_gate_result,
     plan_gate,
     scrub_secret,
@@ -39,7 +42,7 @@ from henchmen.models.scheme import SchemeNode
 from henchmen.models.task import HenchmenTask
 from henchmen.providers.local.docker import cpu_limit as docker_cpu_limit
 from henchmen.providers.local.docker import memory_limit as docker_memory_limit
-from henchmen.providers.registry import ProviderRegistry
+from henchmen.providers.registry import orchestrator_is_local
 from henchmen.utils.git import clone_repo, get_github_token
 from henchmen.utils.stack_detector import Stack, detect_stack
 
@@ -129,6 +132,11 @@ async def handle_fix_lint(
     """Run eslint --fix / ruff --fix and commit the auto-fixed files.
 
     This is deterministic — no LLM needed. Auto-fixers handle most lint issues.
+
+    When the effective container orchestrator is local (a desktop install),
+    the install, the fixers and the commit/push all run in a gate container
+    (``ci_gate fix``) as an unprivileged user, never natively in this server
+    process (decision C18). The cloud path below is unchanged.
     """
     repo = task.context.repo
     branch = task.branch_name
@@ -136,6 +144,9 @@ async def handle_fix_lint(
 
     if not repo:
         return {"condition": "fail", "message": "fix_lint failed (no repo)"}
+
+    if orchestrator_is_local(executor.settings):
+        return await _fix_lint_in_container(executor.settings, task, repo=repo, branch=branch)
 
     workspace = tempfile.mkdtemp(prefix="henchmen-fix-lint-")
     try:
@@ -249,6 +260,29 @@ async def handle_fix_lint(
         shutil.rmtree(workspace, ignore_errors=True)
 
 
+async def _fix_lint_in_container(settings: Settings, task: HenchmenTask, *, repo: str, branch: str) -> dict[str, Any]:
+    """Desktop ``fix_lint``: run ``ci_gate fix`` in a gate container and map its result to the node's edge."""
+    try:
+        result = await run_gate_in_container(
+            settings,
+            "fix",
+            repo=repo,
+            branch=branch,
+            base_branch=task.context.branch or "main",
+            extra_args=(f"--author-name={settings.git_author_name}", f"--author-email={settings.git_author_email}"),
+        )
+    except Exception as exc:
+        detail = scrub_secret(str(exc), settings.github_token)
+        logger.warning("fix_lint failed for task %s: %s", task.id, detail)
+        return {"condition": "fail", "message": f"fix_lint failed (error: {detail})"}
+    if result["condition"] != "pass":
+        logger.warning("[SCHEME] fix_lint failed for task %s: %s", task.id, result["message"])
+        return result
+    logger.info("[SCHEME] %s for task %s", result["message"], task.id)
+    # A finished fix is an unconditional edge to run_lint_retry, exactly like the cloud handler.
+    return {**result, "condition": None}
+
+
 async def _run_git(workspace: str, *args: str) -> tuple[int, str]:
     """Run a git command in *workspace* to completion; return ``(returncode, stderr)``."""
     proc = await asyncio.create_subprocess_exec(
@@ -315,11 +349,9 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
     # Gated on the *effective* container orchestrator, exactly like
     # LairManager._build_env_vars — a container gate must never run where
     # lairs run in the cloud, or the other way round.
-    is_local = ProviderRegistry(settings).resolve_provider_name("container_orchestrator") == "local"
-
-    if is_local:
+    if orchestrator_is_local(settings):
         try:
-            result = await _run_gate_in_container(
+            result = await run_gate_in_container(
                 settings, check_type, repo=repo, branch=branch, base_branch=base_branch
             )
         except Exception as exc:
@@ -372,7 +404,6 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
 
 
 _GATE_MODULE = "henchmen.mastermind.scheme_executor.ci_gate"
-_GATE_OUTPUT_LIMIT = 5000
 # Caps the same runaway-container risk --pids-limit guards against on a lair
 # (fork bombs, thread-exhaustion loops) for a gate container specifically.
 _GATE_PIDS_LIMIT = 1024
@@ -386,6 +417,31 @@ _GATE_PIDS_LIMIT = 1024
 # contains it however much output preceded it.
 _GATE_READ_CHUNK_BYTES = 65536
 _GATE_OUTPUT_TAIL_BYTES = 256 * 1024
+
+
+# The gate process starts as root only to drop privileges: repo-controlled code
+# runs as ci_gate.UNPRIVILEGED_UID. Everything else a root process could do is
+# dropped; CHOWN hands the workspace over, SETUID/SETGID drop to that user,
+# DAC_OVERRIDE/FOWNER let the root-owned git steps of `fix` read and restore
+# files the unprivileged user now owns.
+_GATE_SECURITY_ARGS: tuple[str, ...] = (
+    "--user",
+    "0:0",
+    "--cap-drop",
+    "ALL",
+    "--cap-add",
+    "CHOWN",
+    "--cap-add",
+    "DAC_OVERRIDE",
+    "--cap-add",
+    "FOWNER",
+    "--cap-add",
+    "SETUID",
+    "--cap-add",
+    "SETGID",
+    "--security-opt",
+    "no-new-privileges",
+)
 
 
 def _gate_timeout_seconds(settings: Settings) -> float:
@@ -502,87 +558,90 @@ def _gate_resource_limit_args(settings: Settings) -> list[str]:
     return args
 
 
-async def _run_gate_in_container(
-    settings: Settings, check_type: str, *, repo: str, branch: str, base_branch: str
+async def _deliver_token(proc: asyncio.subprocess.Process, token: str) -> None:
+    """Write the token line to the gate's stdin and close it; the gate reads it before anything else.
+
+    A gate that already exited (docker could not start it) closes the pipe
+    first; that is not an error here — the run then fails on its missing result.
+    """
+    stdin = proc.stdin
+    if stdin is None:
+        return
+    try:
+        stdin.write(f"{token}\n".encode())
+        await stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        logger.warning("The gate container closed its stdin before the token was delivered")
+    finally:
+        stdin.close()
+
+
+async def run_gate_in_container(
+    settings: Settings,
+    command: GateCommand,
+    *,
+    repo: str,
+    branch: str,
+    base_branch: str,
+    extra_args: tuple[str, ...] = (),
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Run ``ci_gate`` in a fresh operative-image container that clones and diffs by itself."""
+    """Run ``ci_gate <command>`` in a fresh operative-image container that clones and diffs by itself.
+
+    The single docker runner for every local gate: the Mastermind's lint and
+    test gates, desktop ``fix_lint`` and desktop Forge CI all come through
+    here. The GitHub token reaches the container only over stdin — never argv,
+    never the docker CLI's or the container's environment (decision C18).
+    """
     token = settings.github_token
     image = settings.operative_image or DEFAULT_LOCAL_OPERATIVE_IMAGE
     container = f"henchmen-gate-{uuid4().hex[:12]}"
-    cmd = ["docker", "run", "--rm", "--name", container]
+    cmd = ["docker", "run", "--rm", "-i", "--name", container]
     if settings.local_docker_network:
         cmd.extend(["--network", settings.local_docker_network])
     cmd.extend(_gate_resource_limit_args(settings))
-    # `-e NAME` without a value copies NAME from the docker CLI's own environment,
-    # so the token never appears on a command line.
-    cmd.extend(["-e", "HENCHMEN_GITHUB_TOKEN", "--entrypoint", "python", image, "-m", _GATE_MODULE, check_type])
-    cmd.extend([f"--repo={repo}", f"--branch={branch}", f"--base={base_branch}"])
-    # The docker CLI needs this process's PATH/DOCKER_HOST; the token is the only addition.
-    child_env = dict(os.environ)
-    child_env.pop("HENCHMEN_GITHUB_TOKEN", None)
-    if token:
-        child_env["HENCHMEN_GITHUB_TOKEN"] = token
+    cmd.extend(_GATE_SECURITY_ARGS)
+    cmd.extend(["--entrypoint", "python", image, "-m", _GATE_MODULE, command])
+    cmd.extend([f"--repo={repo}", f"--branch={branch}", f"--base={base_branch}", *extra_args])
 
-    logger.info("[SCHEME] Running %s gate for %s@%s in %s", check_type, repo, branch, image)
+    logger.info("[SCHEME] Running %s gate for %s@%s in %s", command, repo, branch, image)
     # stdout and stderr are separate pipes (not merged), each drained by its
-    # own task below, so a flood on either one can never block the other.
+    # own task below, so a flood on either one can never block the other. The
+    # docker CLI needs this process's PATH/DOCKER_HOST, but no token variable.
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=child_env
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env_without_github_tokens(),
     )
     stdout_tail = _BoundedTail()
     stderr_tail = _BoundedTail()
     stdout_task = asyncio.ensure_future(_drain_stream(proc.stdout, stdout_tail))
     stderr_task = asyncio.ensure_future(_drain_stream(proc.stderr, stderr_tail))
 
-    timeout = _gate_timeout_seconds(settings)
+    timeout = timeout_seconds if timeout_seconds is not None else _gate_timeout_seconds(settings)
     exited_normally = False
     timeout_result: dict[str, Any] | None = None
     try:
+        await _deliver_token(proc, token)
         await asyncio.wait_for(asyncio.gather(proc.wait(), stdout_task, stderr_task), timeout=timeout)
         exited_normally = True
     except TimeoutError:
         timeout_result = {
             "condition": "fail",
-            "message": f"{check_type} failed (the gate did not finish within {timeout:g}s)",
+            "message": f"{command} failed (the gate did not finish within {timeout:g}s)",
             "output": "",
         }
     finally:
         # Anything other than the gather above completing outright — a
         # timeout, this coroutine itself being cancelled, or any other
-        # exception out of proc.wait()/the drain tasks — leaves the
-        # container and its reader tasks running unless cleaned up here.
-        # CancelledError is deliberately not caught above: it still
-        # propagates once this block finishes, per asyncio's cancellation
-        # contract.
+        # exception out of the token delivery, proc.wait() or the drain tasks —
+        # leaves the container and its reader tasks running unless cleaned up
+        # here. A CancelledError already propagating still propagates once
+        # this block finishes, per asyncio's cancellation contract.
         if not exited_normally:
-            for task in (stdout_task, stderr_task):
-                task.cancel()
-            for task in (stdout_task, stderr_task):
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    # Only ours to swallow if cancelling *this* reader task is
-                    # what actually raised it. If the task somehow isn't
-                    # cancelled, the CancelledError belongs to a cancellation
-                    # aimed at this coroutine itself — let it propagate.
-                    if not task.cancelled():
-                        raise
-                except Exception:
-                    pass
-            # Bounded: a hung or unresponsive docker daemon must not hang this
-            # handler forever on top of the gate's own timeout. A genuine
-            # cancellation of this coroutine while inside this call still
-            # propagates as CancelledError (asyncio.wait_for only converts its
-            # *own* internal timeout to TimeoutError); only that internal
-            # timeout is caught here, logged, and otherwise ignored.
-            try:
-                await asyncio.wait_for(_cleanup_gate_container(container, proc), timeout=_GATE_CLEANUP_TIMEOUT_SECONDS)
-            except TimeoutError:
-                logger.warning(
-                    "Gate container cleanup for %s did not finish within %ss",
-                    container,
-                    _GATE_CLEANUP_TIMEOUT_SECONDS,
-                )
+            await _cleanup_after_abnormal_exit(container, proc, (stdout_task, stderr_task))
 
     if timeout_result is not None:
         return timeout_result
@@ -594,13 +653,13 @@ async def _run_gate_in_container(
     if result is None:
         stderr_text = stderr_tail.getvalue().decode(errors="replace")
         # stderr first (a crash traceback lives there), then stdout, each cut
-        # to its own last ~_GATE_OUTPUT_LIMIT characters. A tail sliced by raw
+        # to its own last ~GATE_OUTPUT_LIMIT characters. A tail sliced by raw
         # character count can start mid-line; drop that partial line (before
         # scrubbing) so the kept text always begins cleanly.
         combined = _tail_chars(stderr_text) + _tail_chars(stdout_text)
         return {
             "condition": "fail",
-            "message": f"{check_type} failed (the gate container exited {returncode} without a result)",
+            "message": f"{command} failed (the gate container exited {returncode} without a result)",
             "output": scrub_secret(combined, token),
         }
     message = scrub_secret(result.message, token)
@@ -608,27 +667,71 @@ async def _run_gate_in_container(
     if result.condition == "pass" and returncode == 0:
         return {"condition": "pass", "message": message, "output": output}
     if result.condition == "pass":
-        message = f"{check_type} failed (the gate reported a pass but exited {returncode})"
+        message = f"{command} failed (the gate reported a pass but exited {returncode})"
     return {"condition": "fail", "message": message, "output": output}
 
 
-def _tail_chars(text: str, limit: int = _GATE_OUTPUT_LIMIT) -> str:
+async def _cleanup_after_abnormal_exit(
+    container: str, proc: asyncio.subprocess.Process, readers: tuple[asyncio.Future[None], ...]
+) -> None:
+    """Cancel the reader tasks, then kill (or force-remove) the container, bounded in time.
+
+    Awaiting a reader task this function just cancelled raises that task's own
+    CancelledError, which is swallowed. A *new* cancellation aimed at the
+    calling task while it waits shows up as a higher
+    ``asyncio.current_task().cancelling()`` count: it is remembered, the
+    container is still cleaned up, and then it is re-raised.
+    """
+    current = asyncio.current_task()
+    baseline = current.cancelling() if current is not None else 0
+    cancelled_meanwhile = False
+    for reader in readers:
+        reader.cancel()
+    for reader in readers:
+        try:
+            await reader
+        except asyncio.CancelledError:
+            if current is not None and current.cancelling() > baseline:
+                cancelled_meanwhile = True
+        except Exception:
+            pass
+    # Bounded: a hung or unresponsive docker daemon must not hang this handler
+    # forever on top of the gate's own timeout. A genuine cancellation of the
+    # calling task while inside this call still propagates as CancelledError
+    # (asyncio.wait_for only converts its *own* internal timeout to
+    # TimeoutError); only that internal timeout is caught here and logged.
+    try:
+        await asyncio.wait_for(_cleanup_gate_container(container, proc), timeout=_GATE_CLEANUP_TIMEOUT_SECONDS)
+    except TimeoutError:
+        logger.warning(
+            "Gate container cleanup for %s did not finish within %ss", container, _GATE_CLEANUP_TIMEOUT_SECONDS
+        )
+    if cancelled_meanwhile:
+        raise asyncio.CancelledError
+
+
+def _tail_chars(text: str, limit: int = GATE_OUTPUT_LIMIT) -> str:
     """The last `limit` characters of `text`, with a trimmed tail's partial leading fragment dropped.
 
     A tail sliced by raw character count can start mid-line, or (with no
     newline anywhere in the kept window) mid-word — either way a fragment of
     a secret token could otherwise survive at the very start of the kept
-    text. When there's a newline, drop up to and including it; otherwise
-    drop up to the next run of whitespace. Text that didn't need trimming is
-    returned unchanged — there's nothing partial to drop.
+    text. When there's a newline, drop up to and including it. Otherwise: a
+    window that starts on whitespace starts on a word boundary, so nothing is
+    partial (only the leading whitespace goes); a window that starts mid-word
+    drops up to the next run of whitespace; and a window with no whitespace at
+    all could be one long secret fragment, so none of it is kept
+    (fail-closed). Text that didn't need trimming is returned unchanged.
     """
     if len(text) <= limit:
         return text
     trimmed = text[-limit:]
     if "\n" in trimmed:
         return trimmed.split("\n", 1)[1]
+    if trimmed[0].isspace():
+        return trimmed.lstrip()
     parts = trimmed.split(None, 1)
-    return parts[1] if len(parts) > 1 else trimmed
+    return parts[1] if len(parts) > 1 else ""
 
 
 async def _run_on_host(workspace: str, stack: Stack, commands: tuple[CheckCommand, ...]) -> dict[str, Any]:

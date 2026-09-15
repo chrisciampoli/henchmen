@@ -435,5 +435,7 @@ class TestCIFailureEndpoint:
     def test_endpoint_exists(self):
         from henchmen.mastermind.server import app
 
-        route_paths = [route.path for route in app.routes]
+        # FastAPI >=0.141 puts included-router entries without a ``path`` into
+        # ``app.routes`` (mastermind includes the internal router), so read it defensively.
+        route_paths = [getattr(route, "path", None) for route in app.routes]
         assert "/pubsub/ci-failure" in route_paths

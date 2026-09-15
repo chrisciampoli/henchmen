@@ -15,7 +15,7 @@ from henchmen.models.scheme import SchemeNode
 from henchmen.models.task import HenchmenTask
 from henchmen.providers.interfaces.container_orchestrator import ContainerOrchestrator, JobStatus
 from henchmen.providers.interfaces.document_store import DocumentStore
-from henchmen.providers.registry import ProviderRegistry
+from henchmen.providers.registry import orchestrator_is_local
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -149,7 +149,7 @@ class LairManager:
         # launched by Docker -- secrets in plain env vars, the host forward URL, the
         # Ollama rewrite, and the task token -- shares this one gate so they can never
         # disagree with each other.
-        is_local = ProviderRegistry(self.settings).resolve_provider_name("container_orchestrator") == "local"
+        is_local = orchestrator_is_local(self.settings)
         env = self.settings.operative_env(include_secrets=is_local)
 
         env.update(
@@ -193,7 +193,7 @@ class LairManager:
 
             # Desktop install: a token valid only for this task authenticates the
             # operative's report and its task-state calls (D-P4). The internal push
-            # token never enters an operative (amendment A2).
+            # token never enters an operative (amendment B2).
             internal = desktop_internal_auth()
             if internal is not None:
                 env["HENCHMEN_OPERATIVE_TASK_TOKEN"] = internal.task_token(task.id)
@@ -201,8 +201,13 @@ class LairManager:
         return env
 
     def _build_image(self) -> str:
-        """Build the operative container image URI."""
-        if self.settings.provider == "local":
+        """Build the operative container image URI.
+
+        Gated on the same effective-orchestrator predicate as the environment
+        above: a Docker-launched lair always gets the local image, a Cloud Run
+        lair always gets the Artifact Registry URI.
+        """
+        if orchestrator_is_local(self.settings):
             return self.settings.operative_image or DEFAULT_LOCAL_OPERATIVE_IMAGE
         return (
             f"{self.settings.gcp_region}-docker.pkg.dev/"

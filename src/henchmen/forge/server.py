@@ -12,15 +12,20 @@ import signal
 import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 
 from henchmen.config.posture import fail_open_allowed
 from henchmen.config.settings import get_settings
 from henchmen.dispatch.pubsub_auth import require_internal_caller, verify_pubsub_oidc
+from henchmen.providers.registry import orchestrator_is_local
 from henchmen.utils.git import clone_repo
 from henchmen.utils.redaction import install_secret_redaction
+
+if TYPE_CHECKING:
+    from henchmen.config.settings import Settings
+    from henchmen.forge.ci_runner import CIRunner
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +302,12 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
             logger.error("[FORGE] GitHub lookup failed for %s: %s", pr_url, exc)
             raise await _fail(pr_url, task_id, request_id, "github-api-error", str(exc), retriable=True) from exc
 
+        # Desktop (effective container orchestrator is local): the PR's code is
+        # operative-written and must never run in this server process. Only the
+        # silent-failure scan (git plumbing plus text analysis, no checkout)
+        # stays here; lint and tests run in the gate container (decision C18).
+        local = orchestrator_is_local(settings)
+
         # --- Clone the repo (shallow, single branch) ----------------------
         try:
             await clone_repo(
@@ -305,6 +316,7 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
                 workspace,
                 token=github_token or None,
                 depth=_CLONE_DEPTH,
+                no_checkout=local,
             )
         except RuntimeError as exc:
             logger.error("[FORGE] %s", exc)
@@ -322,7 +334,12 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
                 total_budget_seconds=budget,
                 redact=[github_token] if github_token else [],
             )
-            result = await runner.run(workspace, base_ref=base_branch)
+            if local:
+                result = await _run_local_ci(
+                    settings, runner, full_repo, head_branch, base_branch, workspace, budget_seconds=budget
+                )
+            else:
+                result = await runner.run(workspace, base_ref=base_branch)
         except Exception as exc:
             raise await _fail(pr_url, task_id, request_id, "ci-error", str(exc), retriable=True) from exc
 
@@ -354,6 +371,59 @@ async def _run_ci_for_pr(pr_url: str, task_id: str, request_id: str) -> None:
         )
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
+
+
+async def _run_local_ci(
+    settings: Settings,
+    runner: CIRunner,
+    full_repo: str,
+    head_branch: str,
+    base_branch: str,
+    workspace: str,
+    *,
+    budget_seconds: int,
+) -> dict[str, Any]:
+    """Desktop Forge CI: lint and tests in the gate container, the silent-failure scan on the no-checkout clone.
+
+    Every check still reports ``passed``/``failed`` and the results are combined
+    by :meth:`CIRunner.aggregate`, so the forge-result status mapping and the PR
+    comment are exactly those of the host path. Lint and tests go through the
+    Mastermind's single container runner (``run_gate_in_container``) and share
+    one wall-clock budget with the scan.
+    """
+    from henchmen.forge.ci_runner import STATUS_FAILED, STATUS_PASSED
+    from henchmen.mastermind.scheme_executor.handlers import run_gate_in_container
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget_seconds
+    checks: list[dict[str, Any]] = []
+    for check in ("lint", "tests"):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            checks.append(
+                runner.check_result(check, STATUS_FAILED, "", f"CI time budget of {budget_seconds}s exhausted")
+            )
+            continue
+        gate = await run_gate_in_container(
+            settings,
+            check,
+            repo=full_repo,
+            branch=head_branch,
+            base_branch=base_branch,
+            timeout_seconds=remaining,
+        )
+        passed = gate.get("condition") == "pass"
+        checks.append(
+            runner.check_result(
+                check,
+                STATUS_PASSED if passed else STATUS_FAILED,
+                str(gate.get("output", "")),
+                "" if passed else str(gate.get("message", "")),
+            )
+        )
+    runner.total_budget_seconds = max(1, int(deadline - loop.time()))
+    checks.append(await runner.run_silent_failure_scan(workspace, base_branch))
+    return runner.aggregate(checks)
 
 
 def _result_status(result: dict[str, Any]) -> str:

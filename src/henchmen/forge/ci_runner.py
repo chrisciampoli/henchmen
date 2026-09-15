@@ -119,6 +119,24 @@ class CIRunner:
         finally:
             self._deadline = None
 
+    async def run_silent_failure_scan(self, workspace_dir: str, base_ref: str | None) -> dict[str, Any]:
+        """Run only the silent-failure scan and return its check result.
+
+        Used on a desktop install, where lint and tests run in the gate
+        container instead. Nothing here executes target-repo code: it is git
+        plumbing on the clone (``fetch``, ``merge-base``, ``diff`` — none of
+        which run hooks, filters or diff drivers from a fresh clone's config)
+        followed by :class:`~henchmen.forge.silent_failure_detector.SilentFailureDetector`,
+        which is pure regex analysis of the diff text. The clone can therefore
+        be made with ``--no-checkout``.
+        """
+        self._deadline = asyncio.get_running_loop().time() + self.total_budget_seconds
+        try:
+            merge_base, base_error = await self._resolve_merge_base(workspace_dir, base_ref)
+            return await self._run_silent_failure_scan(workspace_dir, merge_base, base_error)
+        finally:
+            self._deadline = None
+
     async def _run_checks(self, workspace_dir: str, base_ref: str | None) -> dict[str, Any]:
         merge_base, base_error = await self._resolve_merge_base(workspace_dir, base_ref)
 
@@ -129,7 +147,14 @@ class CIRunner:
             results.append(test_result)
 
         results.append(await self._run_silent_failure_scan(workspace_dir, merge_base, base_error))
+        return self.aggregate(results)
 
+    def aggregate(self, results: list[dict[str, Any]]) -> dict[str, Any]:
+        """Combine per-check results into the run result :meth:`run` returns.
+
+        ``passed`` only when nothing failed and nothing was skipped;
+        ``incomplete`` when something was skipped and nothing failed.
+        """
         failed = [r["name"] for r in results if r["status"] == STATUS_FAILED]
         skipped = [r["name"] for r in results if r["status"] == STATUS_SKIPPED]
         return {
@@ -463,6 +488,11 @@ class CIRunner:
     # ------------------------------------------------------------------
     # Result shaping
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def check_result(name: str, status: str, output: str, error: str) -> dict[str, Any]:
+        """One check's result dict, with output and error truncated for the PR comment."""
+        return CIRunner._check(name, status, output, error)
 
     @staticmethod
     def _check(name: str, status: str, output: str, error: str) -> dict[str, Any]:
