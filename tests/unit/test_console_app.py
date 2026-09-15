@@ -293,6 +293,51 @@ def test_apply_refuses_a_configuration_that_cannot_start_leaves_the_file_untouch
     assert applied.calls == 0
 
 
+def test_apply_returns_500_and_does_not_restart_when_the_token_write_fails(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed write (permissions, full disk) must never mark setup complete or restart."""
+    from henchmen.console.config_store import ConfigStore
+
+    client, store, auth, applied, config = env
+    _signed_in(client, auth)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
+    config.write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+
+    def _boom(self: ConfigStore, token: str) -> None:
+        raise PermissionError("disk full")
+
+    monkeypatch.setattr(ConfigStore, "write_dispatch_api_token", _boom)
+
+    response = client.post("/console/api/apply", headers=ORIGIN)
+
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert "Dispatch API token" in detail
+    assert "permissions" in detail.lower()
+    assert "free space" in detail.lower()
+    assert store.load().completed is False
+    assert applied.calls == 0
+
+
+def test_apply_does_not_generate_a_token_when_the_environment_already_provides_one(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The environment (e.g. a Secret Manager mount) outranks the file, so nothing is generated."""
+    client, store, auth, applied, config = env
+    monkeypatch.setenv("HENCHMEN_DISPATCH_API_TOKEN", "already-configured-by-the-environment")
+    _signed_in(client, auth)
+    store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB]))
+    config.write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+
+    response = client.post("/console/api/apply", headers=ORIGIN)
+
+    assert response.status_code == 202
+    assert "HENCHMEN_DISPATCH_API_TOKEN" not in config.read_text(encoding="utf-8")
+    assert not config.with_name(config.name + ".bak").exists()
+    assert applied.calls == 1
+
+
 def test_non_local_host_is_refused_everywhere(env) -> None:
     client, *_ = env
     assert client.get("/", headers={"host": "evil.example"}).status_code == 403

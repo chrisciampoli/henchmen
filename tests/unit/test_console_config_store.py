@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -48,6 +50,39 @@ def test_replaces_a_blank_or_placeholder_token(tmp_path: Path, value: str) -> No
     assert store.ensure_dispatch_api_token() is True
     token = EnvFile.load(config).get(DISPATCH_API_TOKEN_KEY)
     assert token.strip() and token != SEEDED_SECRET_PLACEHOLDER
+
+
+def test_pending_token_skips_generation_when_the_environment_already_provides_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The environment (e.g. a Secret Manager mount) outranks the file, so nothing is generated."""
+    monkeypatch.setenv("HENCHMEN_DISPATCH_API_TOKEN", "already-configured-by-the-environment")
+    store, config = _store(tmp_path, "HENCHMEN_PROVIDER=local\n")
+    assert store.pending_dispatch_api_token(env_files=(str(config),)) is None
+
+
+def test_pending_token_forwards_seeded_env_to_settings_problems(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """seeded_env must reach settings_problems unchanged, so apply's D-P8 masking applies here too."""
+    import henchmen.console.config_store as config_store_module
+
+    calls: list[tuple[tuple[str, ...], dict[str, str] | None]] = []
+
+    def _fake_settings_problems(
+        env_files: Sequence[str], *, seeded_env: dict[str, str] | None = None, overrides: object = None
+    ) -> tuple[SimpleNamespace, list[str]]:
+        calls.append((tuple(env_files), dict(seeded_env) if seeded_env else None))
+        return SimpleNamespace(dispatch_api_token=""), []
+
+    monkeypatch.setattr(config_store_module, "settings_problems", _fake_settings_problems)
+    store, config = _store(tmp_path, "HENCHMEN_PROVIDER=local\n")
+    seeded = {"HENCHMEN_PROVIDER": "local"}
+
+    token = store.pending_dispatch_api_token(env_files=(str(config),), seeded_env=seeded)
+
+    assert token is not None and len(token) >= 40
+    assert calls == [((str(config),), seeded)]
 
 
 def test_pending_token_is_not_written_until_write_dispatch_api_token_is_called(tmp_path: Path) -> None:

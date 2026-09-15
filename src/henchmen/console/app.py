@@ -7,6 +7,7 @@ transition.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Mapping
 from enum import StrEnum
@@ -25,6 +26,8 @@ from henchmen.console.config_store import DISPATCH_API_TOKEN_KEY, ConfigStore
 from henchmen.console.state import OPTIONAL_STEPS, SetupState, SetupStateStore, SetupStep
 from henchmen.console.steps import STEP_ROUTE_PREFIX, StepRoutes, discover_step_routes, validate_step_routes
 from henchmen.utils.redaction import redact
+
+logger = logging.getLogger(__name__)
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
@@ -186,9 +189,12 @@ def create_console_app(
         # computed here, in memory: it is validated as part of the configuration before
         # anything is written, so a refused apply never touches the file (ruling P6).
         config_store = ConfigStore(config_file, config_file.parent / "secrets")
-        pending_token = config_store.pending_dispatch_api_token()
+        env_files = (str(config_file),)
+        # Skip generating one when the running environment already supplies a usable
+        # token (e.g. a Secret Manager mount): the environment outranks the file anyway.
+        pending_token = config_store.pending_dispatch_api_token(env_files=env_files, seeded_env=seeded_env)
         overrides = {DISPATCH_API_TOKEN_KEY: pending_token} if pending_token is not None else None
-        _settings, problems = settings_problems((str(config_file),), seeded_env=seeded_env, overrides=overrides)
+        _settings, problems = settings_problems(env_files, seeded_env=seeded_env, overrides=overrides)
         if problems:
             # Marking setup complete would restart into a run mode that cannot start,
             # and setup mode would no longer be offered to fix it.
@@ -197,7 +203,19 @@ def create_console_app(
                 detail={"message": "The saved configuration cannot start Henchmen.", "problems": problems},
             )
         if pending_token is not None:
-            config_store.write_dispatch_api_token(pending_token)
+            try:
+                config_store.write_dispatch_api_token(pending_token)
+            except OSError:
+                # Never mark setup complete or restart into a run mode that still has no
+                # usable token; the exception itself (path, errno) carries no secret.
+                logger.exception("Could not write the Dispatch API token to %s", config_file)
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Could not save the Dispatch API token to the configuration file. "
+                        "Check permissions and free space on the data volume."
+                    ),
+                ) from None
         store.mark_completed()
         background.add_task(on_apply)
         return {"restarting": True}
