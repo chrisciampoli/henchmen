@@ -65,6 +65,17 @@ def _parse_iso(value: str) -> datetime | None:
         return None
 
 
+def _operative_token_min_ttl(budget_seconds: float) -> int:
+    """How long an operative's GitHub token must stay valid: the lair's remaining budget plus grace, capped.
+
+    The one rule for the token ``create_lair`` injects and for the refreshed
+    token the internal API hands out later (amendment A5). Installation tokens
+    last an hour, so the result never exceeds ``MAX_MIN_TTL_SECONDS``; a longer
+    node refreshes its token before it expires.
+    """
+    return min(max(int(budget_seconds), 0) + _WAIT_GRACE_SECONDS, MAX_MIN_TTL_SECONDS)
+
+
 class LairManager:
     """Creates and monitors container jobs (Lairs) for Operative execution."""
 
@@ -297,8 +308,7 @@ class LairManager:
             raise GitHubRepositoryReferenceError(
                 "The task has no repository, so no repository-scoped GitHub token can be issued for its operative"
             )
-        min_ttl_seconds = timeout_seconds + _WAIT_GRACE_SECONDS
-        if min_ttl_seconds > MAX_MIN_TTL_SECONDS:
+        if timeout_seconds + _WAIT_GRACE_SECONDS > MAX_MIN_TTL_SECONDS:
             logger.warning(
                 "[LAIR] Node timeout %ss plus %ss grace is longer than a GitHub installation token is guaranteed "
                 "to last (%ss); the operative must refresh its token before it expires",
@@ -306,7 +316,7 @@ class LairManager:
                 _WAIT_GRACE_SECONDS,
                 MAX_MIN_TTL_SECONDS,
             )
-            min_ttl_seconds = MAX_MIN_TTL_SECONDS
+        min_ttl_seconds = _operative_token_min_ttl(timeout_seconds)
         issued = await get_installation_token_async(
             "/".join(repository), settings=self.settings, min_ttl_seconds=min_ttl_seconds
         )
@@ -421,21 +431,43 @@ class LairManager:
         the in-flight scheme died with the process; desktop recovery is the
         Phase 3 poller's job.
         """
-        launched: list[tuple[datetime, str, dict[str, Any]]] = []
+        newest = self._newest_lair(task_id, node_id)
+        if newest is None:
+            return False
+        created_at, lair_id, timeout = newest
+        if operative_id and operative_id != lair_id:
+            return False
+        window = timedelta(seconds=timeout + _WAIT_GRACE_SECONDS + _REPORT_GRACE_SECONDS)
+        return created_at <= datetime.now(UTC) <= created_at + window
+
+    def operative_token_min_ttl_seconds(self, task_id: str, node_id: str) -> int | None:
+        """Minimum lifetime of a refreshed GitHub token for the newest lair of ``task_id``/``node_id``.
+
+        The lair's remaining node budget plus the wait grace, capped at
+        ``MAX_MIN_TTL_SECONDS`` (the same rule ``create_lair`` applies to the
+        token it injects). ``None`` when no such lair is known. Callers bind the
+        request to the lair with :meth:`accepts_report_from` first.
+        """
+        newest = self._newest_lair(task_id, node_id)
+        if newest is None:
+            return None
+        created_at, _, timeout = newest
+        remaining = (created_at + timedelta(seconds=timeout) - datetime.now(UTC)).total_seconds()
+        return _operative_token_min_ttl(remaining)
+
+    def _newest_lair(self, task_id: str, node_id: str) -> tuple[datetime, str, int] | None:
+        """``(created_at, lair_id, timeout_seconds)`` of the most recent lair launched for ``task_id``/``node_id``."""
+        launched: list[tuple[datetime, str, int]] = []
         for lair_id, info in self._active_lairs.items():
             if info.get("task_id") != task_id or info.get("node_id") != node_id:
                 continue
             created_at = _parse_iso(str(info.get("created_at", "")))
             if created_at is not None:
-                launched.append((created_at, lair_id, info))
+                timeout = int(info.get("timeout_seconds", self.settings.lair_default_timeout))
+                launched.append((created_at, lair_id, timeout))
         if not launched:
-            return False
-        created_at, lair_id, info = max(launched, key=lambda entry: entry[0])
-        if operative_id and operative_id != lair_id:
-            return False
-        timeout = int(info.get("timeout_seconds", self.settings.lair_default_timeout))
-        window = timedelta(seconds=timeout + _WAIT_GRACE_SECONDS + _REPORT_GRACE_SECONDS)
-        return created_at <= datetime.now(UTC) <= created_at + window
+            return None
+        return max(launched, key=lambda entry: entry[0])
 
     def notify_operative_complete(self, report: OperativeReport) -> None:
         """Called by the Pub/Sub handler when an operative-complete message arrives.

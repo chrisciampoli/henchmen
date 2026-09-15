@@ -105,6 +105,14 @@ async def _run_git(*args: str, working_dir: str = "") -> dict[str, Any]:
     return await run_command("git", *args, cwd=working_dir)
 
 
+async def _refresh_github_credentials(working_dir: str) -> None:
+    """Refresh the operative's GitHub token and origin URL if it is about to expire (amendment A5; never raises)."""
+    # Imported lazily: ``henchmen.operative`` pulls in the whole agent runtime.
+    from henchmen.operative.github_credentials import get_operative_credentials
+
+    await get_operative_credentials().ensure_fresh(working_dir or current_workspace_dir())
+
+
 @tool(
     name="git_branch_create",
     category="git_ops",
@@ -231,6 +239,7 @@ async def git_push(branch: str | None = None, working_dir: str = "") -> dict[str
         safe_working_dir = _resolve_working_dir(working_dir)
     except PermissionError as exc:
         return {"error": f"access denied: {exc}", "success": False}
+    await _refresh_github_credentials(safe_working_dir)
     return await _run_git("push", "--set-upstream", "origin", branch or "HEAD", working_dir=safe_working_dir)
 
 
@@ -281,6 +290,7 @@ async def git_force_push(branch: str | None = None, working_dir: str = "") -> di
         safe_working_dir = _resolve_working_dir(working_dir)
     except PermissionError as exc:
         return {"error": f"access denied: {exc}", "success": False}
+    await _refresh_github_credentials(safe_working_dir)
     # Use --force-with-lease to avoid clobbering concurrent pushes.
     return await _run_git("push", "--force-with-lease", "origin", branch, working_dir=safe_working_dir)
 

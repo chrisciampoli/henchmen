@@ -7,6 +7,10 @@ interrupts them. These routes expose exactly those operations, each gated by
 the task-scoped token the Lair injected (:mod:`henchmen.config.internal_auth`),
 so an operative can touch only its own task. They exist only on a desktop
 install; elsewhere they answer 404.
+
+One more route (amendment A5) hands a running operative a fresh GitHub App
+installation token, scoped to its task's own repository, before the one it
+started with expires.
 """
 
 from __future__ import annotations
@@ -19,14 +23,21 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi import Path as PathParam
 from pydantic import BaseModel, Field, ValidationError
 
+from henchmen.config.settings import get_settings
 from henchmen.dispatch.pubsub_auth import (
     MAX_OPERATIVE_REPORT_BYTES,
     load_desktop_internal_auth,
     read_capped_body,
     split_bearer,
 )
-from henchmen.models.operative import OperativeReport, OperativeStatus
+from henchmen.models.operative import (
+    OperativeGitHubToken,
+    OperativeGitHubTokenRequest,
+    OperativeReport,
+    OperativeStatus,
+)
 from henchmen.observability.tracker import TASK_EXECUTIONS_COLLECTION, TERMINAL_EXECUTION_STATES
+from henchmen.utils.github_auth import GitHubAppConfig, GitHubAuthError, get_installation_token_async, parse_repository
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +50,8 @@ _RESERVED_TASK_IDS = frozenset({".", ".."})
 # How far into the future a report's own timestamps may drift from the
 # server's clock before it is refused (ordinary clock skew, not a forged report).
 _CLOCK_SKEW_TOLERANCE_SECONDS = 60
+# The github-token request body is two short ids.
+MAX_GITHUB_TOKEN_REQUEST_BYTES = 4096
 
 
 class TaskCost(BaseModel):
@@ -108,27 +121,31 @@ def reject_future_report(report: OperativeReport) -> None:
         raise HTTPException(status_code=422, detail="Report timestamps are too far in the future")
 
 
-def require_report_from_launched_lair(report: OperativeReport) -> None:
-    """409 unless Mastermind launched a still-reportable lair for this report's task and node.
+def require_launched_lair(task_id: str, node_id: str, operative_id: str | None) -> None:
+    """409 unless Mastermind launched a still-active lair for ``task_id``/``node_id`` (and ``operative_id``).
 
     A task token authenticates *a* task, not a node or a moment: without this
-    an operative holding a valid token could report for a node it was never
+    an operative holding a valid token could act for a node it was never
     launched for, or long after its lair finished. The check reuses the
     ``LairManager``'s own record of the lairs it created
     (:meth:`~henchmen.mastermind.lair_manager.LairManager.accepts_report_from`).
+    It is the one binding path for every internal route (reports and GitHub tokens).
     """
     from henchmen.mastermind import server
 
-    accepted = server.get_agent().lair_manager.accepts_report_from(
-        report.task_id, report.node_id, report.operative_id or None
-    )
+    accepted = server.get_agent().lair_manager.accepts_report_from(task_id, node_id, operative_id or None)
     if accepted is not True:
         logger.warning(
-            "[internal-api] Refusing a report for task %s node %s: no matching active lair was launched",
-            report.task_id,
-            report.node_id,
+            "[internal-api] Refusing a request for task %s node %s: no matching active lair was launched",
+            task_id,
+            node_id,
         )
-        raise HTTPException(status_code=409, detail="No active lair was launched for this report")
+        raise HTTPException(status_code=409, detail="No active lair was launched for this request")
+
+
+def require_report_from_launched_lair(report: OperativeReport) -> None:
+    """409 unless Mastermind launched a still-reportable lair for this report's task and node."""
+    require_launched_lair(report.task_id, report.node_id, report.operative_id or None)
 
 
 async def _update_active_task_document(task_id: str, fields: dict[str, Any]) -> None:
@@ -202,3 +219,65 @@ async def put_interrupted_report(task_id: str, request: Request) -> Response:
         },
     )
     return Response(status_code=204)
+
+
+@router.post("/{task_id}/github-token")
+async def refresh_github_token(task_id: str, request: Request) -> OperativeGitHubToken:
+    """A fresh GitHub App installation token for the task's own repository (amendment A5).
+
+    The router's ``require_task_token`` has already authenticated the caller
+    for this ``task_id``. Then, in order:
+
+    * a malformed body -> 422;
+    * no GitHub App configured -> 409 (nothing to refresh; a PAT is never handed out);
+    * no execution record -> 404; a finished task (terminal ``execution_state``) -> 409;
+    * ``node_id``/``operative_id`` must name the newest lair Mastermind launched
+      for this task and node, still inside its window -> else 409 (B4);
+    * the repository comes from the task record, never from the caller -> none -> 404;
+    * the token is scoped to that one repository and must outlive the lair's
+      remaining budget plus grace (capped) -> GitHub refusing -> 502, no GitHub detail.
+
+    The response carries only the token and its expiry; nothing here logs either.
+    """
+    await read_capped_body(request, MAX_GITHUB_TOKEN_REQUEST_BYTES)
+    try:
+        body = OperativeGitHubTokenRequest.model_validate_json(await request.body())
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail="Invalid GitHub token request body") from exc
+
+    settings = get_settings()
+    if GitHubAppConfig.from_settings(settings) is None:
+        raise HTTPException(status_code=409, detail="No GitHub App is configured; there is no token to refresh")
+
+    document: dict[str, Any] | None = await task_store().get(TASK_EXECUTIONS_COLLECTION, task_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="No execution record for this task")
+    if document.get("execution_state") in TERMINAL_EXECUTION_STATES:
+        raise HTTPException(status_code=409, detail="Task has already finished")
+
+    require_launched_lair(task_id, body.node_id, body.operative_id)
+    from henchmen.mastermind import server
+
+    min_ttl_seconds = server.get_agent().lair_manager.operative_token_min_ttl_seconds(task_id, body.node_id)
+    if not isinstance(min_ttl_seconds, int):
+        raise HTTPException(status_code=409, detail="No active lair was launched for this request")
+
+    payload = document.get("task_payload")
+    context = payload.get("context") if isinstance(payload, dict) else None
+    raw_repo = context.get("repo") if isinstance(context, dict) else None
+    if not isinstance(raw_repo, str) or not raw_repo.strip():
+        raise HTTPException(status_code=404, detail="The task has no repository")
+
+    try:
+        # owner/name only: a reference that does not parse raises rather than widening to the installation.
+        repository = parse_repository(raw_repo)
+        if repository is None:
+            raise HTTPException(status_code=404, detail="The task has no repository")
+        issued = await get_installation_token_async(
+            "/".join(repository), settings=settings, min_ttl_seconds=min_ttl_seconds
+        )
+    except GitHubAuthError as exc:
+        # GitHubAuthError messages are redacted by the provider and never carry a token.
+        logger.warning("[internal-api] GitHub token refresh for task %s failed: %s", task_id, exc)
+        raise HTTPException(status_code=502, detail="GitHub did not issue a token") from None
+    return OperativeGitHubToken(token=issued.token, expires_at=datetime.fromtimestamp(issued.expires_at, UTC))

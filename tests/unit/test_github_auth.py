@@ -1027,7 +1027,7 @@ def test_server_components_do_not_read_the_pat_directly() -> None:
         "utils/github_auth.py",  # the provider's PAT fallback
         "cli/doctor.py",  # reports whether a PAT is configured
         "operative/bootstrap.py",  # operative side: reads the token LairManager injected
-        "arsenal/tools/github.py",  # operative side: same
+        "operative/github_credentials.py",  # operative side: the injected token, refreshed via the internal API
     }
     # Attribute reads, string-keyed reads (getattr / model_dump()["github_token"]) and raw environment reads.
     # ``\benviron\b`` / ``\bgetenv\b`` so prose such as "environment sets ... GITHUB_TOKEN" is not a read.

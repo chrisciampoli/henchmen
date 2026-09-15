@@ -30,6 +30,7 @@ from henchmen.operative.git_helpers import (
     detect_remote_default_branch,
     run_git,
 )
+from henchmen.operative.github_credentials import get_operative_credentials, start_refresh_task, stop_refresh_task
 from henchmen.providers.interfaces import MessageBroker, ObjectStore
 from henchmen.providers.interfaces.document_store import DocumentStore
 from henchmen.providers.registry import ProviderRegistry
@@ -306,6 +307,10 @@ async def run_operative() -> None:
 
         heartbeat_task.add_done_callback(_log_heartbeat_exit)
 
+    # Keep a GitHub App installation token fresh for the whole node (amendment A5);
+    # a no-op for a PAT or outside a desktop install. Cancelled in the finally below.
+    github_refresh_task = start_refresh_task(workspace_dir)
+
     # 3. EXECUTE: Build and run the agent
     interrupted = False
     agent = None
@@ -394,6 +399,7 @@ async def run_operative() -> None:
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await heartbeat_task
+        await stop_refresh_task(github_refresh_task)
 
     # 4. REPORT: Publish result
     completed_at = datetime.now(UTC)
@@ -818,9 +824,13 @@ async def _create_branch_and_push(workspace_dir: str, branch_name: str, settings
     else:
         logger.info("[OPERATIVE] No staged changes to commit (agent already committed)")
 
+    # A long node can outlive the installation token it started with; refresh it (and origin) first.
+    await get_operative_credentials().ensure_fresh(workspace_dir)
     # Always push — even if we didn't commit, the agent's earlier commits need to be pushed
     out, err, rc = await _git("push", "-u", "origin", branch_name)
     if rc != 0:
+        # git can echo the authenticated origin URL; the error travels into the report.
+        err = redact(err)
         logger.error("[OPERATIVE] git push failed: %s", err)
         raise RuntimeError(f"git push failed: {err}")
 

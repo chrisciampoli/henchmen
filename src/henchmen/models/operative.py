@@ -88,3 +88,17 @@ class OperativeReport(StrictBase):
     steps_used: int = Field(default=0, description="Number of agentic steps taken during execution")
     context_tokens_at_start: int = Field(default=0, description="Input tokens on the first model call")
     context_tokens_at_end: int = Field(default=0, description="Input tokens on the last model call")
+
+
+class OperativeGitHubTokenRequest(StrictBase):
+    """Which launched lair asks for a refreshed GitHub token (internal API; amendment A5, ruling B4)."""
+
+    node_id: str = Field(..., min_length=1, max_length=128, description="The operative's NODE_ID")
+    operative_id: str = Field(..., min_length=1, max_length=128, description="The operative's LAIR_ID")
+
+
+class OperativeGitHubToken(StrictBase):
+    """A refreshed GitHub installation token for an operative (internal API; amendment A5)."""
+
+    token: str = Field(..., min_length=1, repr=False, description="Installation access token scoped to the task's repo")
+    expires_at: AwareDatetime = Field(..., description="UTC time the token expires")
