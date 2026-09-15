@@ -6,6 +6,7 @@ import subprocess
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from henchmen.config.settings import Settings
@@ -527,6 +528,55 @@ class TestDossierBuilder:
         task = _make_task()
         prs = await builder._fetch_related_prs(task)
         assert prs == []
+
+    @pytest.mark.asyncio
+    async def test_github_reads_use_the_credentials_provider(self):
+        builder = self._make_builder(github_token="")
+        task = _make_task()
+        seen: list[str] = []
+        real_async_client = httpx.AsyncClient
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.headers["authorization"])
+            return httpx.Response(200, json={"items": []})
+
+        with (
+            patch(
+                "henchmen.dossier.builder.get_github_token_async", new_callable=AsyncMock, return_value="ghs_scoped"
+            ) as token,
+            patch(
+                "henchmen.dossier.builder.httpx.AsyncClient",
+                lambda **kwargs: real_async_client(transport=httpx.MockTransport(handler)),
+            ),
+        ):
+            assert await builder._fetch_related_prs(task) == []
+
+        assert seen == ["Bearer ghs_scoped"]
+        token.assert_awaited_once_with(task.context.repo, settings=builder.settings)
+
+    @pytest.mark.asyncio
+    async def test_github_reads_degrade_when_credentials_fail(self):
+        from henchmen.utils.github_auth import GitHubAuthError
+
+        builder = self._make_builder(github_token="")
+        task = _make_task()
+        with (
+            patch(
+                "henchmen.dossier.builder.get_github_token_async",
+                new_callable=AsyncMock,
+                side_effect=GitHubAuthError("no key"),
+            ),
+            patch("henchmen.dossier.builder.clone_repo", new_callable=AsyncMock) as clone,
+            patch("henchmen.dossier.builder.httpx.AsyncClient", side_effect=AssertionError("no GitHub call")),
+        ):
+            assert await builder._fetch_related_prs(task) == []
+            assert await builder._fetch_related_issues(task) == []
+            assert await builder._code_search(task, ["LoginForm"]) == []
+            rules, _conventions = await builder._scan_repo(task, fetch_rules=True)
+
+        # The clone is still attempted anonymously (public repositories), never with a PAT.
+        assert clone.await_args.kwargs["token"] is None
+        assert rules == []
 
 
 # ---------------------------------------------------------------------------

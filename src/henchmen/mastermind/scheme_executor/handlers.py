@@ -43,7 +43,8 @@ from henchmen.models.task import HenchmenTask
 from henchmen.providers.local.docker import cpu_limit as docker_cpu_limit
 from henchmen.providers.local.docker import memory_limit as docker_memory_limit
 from henchmen.providers.registry import orchestrator_is_local
-from henchmen.utils.git import clone_repo, get_github_token
+from henchmen.utils.git import clone_repo
+from henchmen.utils.github_auth import MAX_MIN_TTL_SECONDS, GitHubAuthError, get_github_token_async
 from henchmen.utils.stack_detector import Stack, detect_stack
 
 if TYPE_CHECKING:
@@ -140,13 +141,18 @@ async def handle_fix_lint(
     """
     repo = task.context.repo
     branch = task.branch_name
-    github_token = get_github_token()
+    settings = executor.settings
 
     if not repo:
         return {"condition": "fail", "message": "fix_lint failed (no repo)"}
+    # One token for the whole run: the push at its end must still find it valid.
+    try:
+        github_token = await _gate_github_token(settings, repo)
+    except GitHubAuthError as exc:
+        return {"condition": "fail", "message": f"fix_lint failed (GitHub credentials): {exc}"}
 
-    if orchestrator_is_local(executor.settings):
-        return await _fix_lint_in_container(executor.settings, task, repo=repo, branch=branch)
+    if orchestrator_is_local(settings):
+        return await _fix_lint_in_container(settings, task, repo=repo, branch=branch, token=github_token)
 
     workspace = tempfile.mkdtemp(prefix="henchmen-fix-lint-")
     try:
@@ -260,8 +266,14 @@ async def handle_fix_lint(
         shutil.rmtree(workspace, ignore_errors=True)
 
 
-async def _fix_lint_in_container(settings: Settings, task: HenchmenTask, *, repo: str, branch: str) -> dict[str, Any]:
-    """Desktop ``fix_lint``: run ``ci_gate fix`` in a gate container and map its result to the node's edge."""
+async def _fix_lint_in_container(
+    settings: Settings, task: HenchmenTask, *, repo: str, branch: str, token: str
+) -> dict[str, Any]:
+    """Desktop ``fix_lint``: run ``ci_gate fix`` in a gate container and map its result to the node's edge.
+
+    ``token`` is the credentials provider's token for ``repo`` (fetched once by
+    the caller with :func:`_gate_min_ttl`); it reaches the gate over stdin only.
+    """
     try:
         result = await run_gate_in_container(
             settings,
@@ -269,10 +281,11 @@ async def _fix_lint_in_container(settings: Settings, task: HenchmenTask, *, repo
             repo=repo,
             branch=branch,
             base_branch=task.context.branch or "main",
+            token=token,
             extra_args=(f"--author-name={settings.git_author_name}", f"--author-email={settings.git_author_email}"),
         )
     except Exception as exc:
-        detail = scrub_secret(str(exc), settings.github_token)
+        detail = scrub_secret(str(exc), token)
         logger.warning("fix_lint failed for task %s: %s", task.id, detail)
         return {"condition": "fail", "message": f"fix_lint failed (error: {detail})"}
     if result["condition"] != "pass":
@@ -340,11 +353,16 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
     branch = task.branch_name
     base_branch = task.context.branch or "main"
     settings = get_settings()
-    github_token = settings.github_token
 
     if not repo:
         logger.warning("No repo for CI check, failing")
         return {"condition": "fail", "message": f"{check_type} failed (no repo)"}
+    # A repository-scoped installation token when a GitHub App is configured, else the PAT;
+    # fetched once and valid for the whole gate.
+    try:
+        github_token = await _gate_github_token(settings, repo)
+    except GitHubAuthError as exc:
+        return {"condition": "fail", "message": f"{check_type} failed (GitHub credentials): {exc}"}
 
     # Gated on the *effective* container orchestrator, exactly like
     # LairManager._build_env_vars — a container gate must never run where
@@ -352,7 +370,7 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
     if orchestrator_is_local(settings):
         try:
             result = await run_gate_in_container(
-                settings, check_type, repo=repo, branch=branch, base_branch=base_branch
+                settings, check_type, repo=repo, branch=branch, base_branch=base_branch, token=github_token
             )
         except Exception as exc:
             detail = scrub_secret(str(exc), github_token)
@@ -447,6 +465,35 @@ _GATE_SECURITY_ARGS: tuple[str, ...] = (
 def _gate_timeout_seconds(settings: Settings) -> float:
     """A gate that never finishes must fail rather than hold the task forever; reuse the operative timeout."""
     return float(settings.lair_default_timeout)
+
+
+# How long past the gate timeout a gate's token must stay valid: the clone at its start and
+# the fix push at its end both use the one token fetched before the gate starts.
+_GATE_TOKEN_MARGIN_SECONDS = 300
+
+
+def _gate_min_ttl(settings: Settings) -> int:
+    """The minimum remaining lifetime of the GitHub token a gate or ``fix_lint`` run is given."""
+    return int(_gate_timeout_seconds(settings)) + _GATE_TOKEN_MARGIN_SECONDS
+
+
+async def _gate_github_token(settings: Settings, repo: str) -> str:
+    """The credentials provider's token for ``repo``, requested to outlive the gate.
+
+    Raises :class:`~henchmen.utils.github_auth.GitHubAuthError` (callers fail
+    closed). Installation tokens last an hour, so the provider caps the request
+    at ``MAX_MIN_TTL_SECONDS``; a gate timeout configured beyond that can
+    outlive its token, which then fails a late clone or push.
+    """
+    min_ttl = _gate_min_ttl(settings)
+    if min_ttl > MAX_MIN_TTL_SECONDS:
+        logger.warning(
+            "The gate timeout (%ss) is longer than a GitHub installation token is guaranteed to last (%ss); "
+            "a GitHub App token may expire before a long gate finishes pushing",
+            int(_gate_timeout_seconds(settings)),
+            MAX_MIN_TTL_SECONDS,
+        )
+    return await get_github_token_async(repo, settings=settings, min_ttl_seconds=min_ttl)
 
 
 # Bounds docker kill / docker rm -f / proc.wait() during cleanup: a hung or
@@ -583,6 +630,7 @@ async def run_gate_in_container(
     repo: str,
     branch: str,
     base_branch: str,
+    token: str,
     extra_args: tuple[str, ...] = (),
     timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
@@ -590,10 +638,12 @@ async def run_gate_in_container(
 
     The single docker runner for every local gate: the Mastermind's lint and
     test gates, desktop ``fix_lint`` and desktop Forge CI all come through
-    here. The GitHub token reaches the container only over stdin — never argv,
-    never the docker CLI's or the container's environment (decision C18).
+    here. ``token`` is the caller's token from the credentials provider
+    (:mod:`henchmen.utils.github_auth`); this runner never reads one from
+    ``Settings``. It reaches the container only over stdin — never argv,
+    never the docker CLI's or the container's environment (decision C18) —
+    and is scrubbed from everything the gate reports.
     """
-    token = settings.github_token
     image = settings.operative_image or DEFAULT_LOCAL_OPERATIVE_IMAGE
     container = f"henchmen-gate-{uuid4().hex[:12]}"
     # --init: a tiny init reaps the orphans repo code leaves behind and forwards signals to the gate.
@@ -803,10 +853,13 @@ async def handle_verify_changes(
     branch = task.branch_name
     base_branch = task.context.branch or "main"
     base_ref = f"origin/{base_branch}"
-    github_token = get_github_token()
 
     if not repo:
         return {"condition": "fail", "message": "verify_changes failed (no repo)"}
+    try:
+        github_token = await get_github_token_async(repo, settings=executor.settings)
+    except GitHubAuthError as exc:
+        return {"condition": "fail", "message": f"verify_changes failed (GitHub credentials): {exc}"}
 
     workspace = tempfile.mkdtemp(prefix="henchmen-verify-")
     try:
@@ -908,14 +961,18 @@ async def handle_create_pr(
     """Create a real GitHub pull request."""
     repo = task.context.repo
     branch_name = task.branch_name
-    github_token = get_github_token()
+    try:
+        github_token = await get_github_token_async(repo, settings=executor.settings) if repo else ""
+    except GitHubAuthError as exc:
+        logger.error("Cannot create PR for task %s: GitHub credentials unavailable: %s", task.id, exc)
+        return {"condition": "fail", "message": f"PR creation failed: GitHub credentials unavailable ({exc})"}
 
     if not repo or not github_token:
         # Fail-closed: a fabricated ".../pull/new" URL used to be reported as a
         # successful PR, which finalized the task and triggered CI on a PR that
         # does not exist.
         logger.error("Cannot create PR: repo=%s, token_present=%s", repo, bool(github_token))
-        missing = "repo" if not repo else "GitHub token (HENCHMEN_GITHUB_TOKEN)"
+        missing = "repo" if not repo else "GitHub credentials (GitHub App or HENCHMEN_GITHUB_TOKEN)"
         return {"condition": "fail", "message": f"PR creation failed: missing {missing}"}
 
     try:

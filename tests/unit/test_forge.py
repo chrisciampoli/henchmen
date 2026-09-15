@@ -383,6 +383,72 @@ class TestRunCIForPRFailurePaths:
         assert _published(broker)[0]["reason"] == "missing-github-token"
 
     @pytest.mark.asyncio
+    async def test_github_credentials_failure_publishes_a_retriable_failure(self, forge_app):
+        from henchmen.config.settings import Environment, Settings
+        from henchmen.forge.server import _run_ci_for_pr
+        from henchmen.utils.github_auth import GitHubAuthError
+
+        broker, _store = forge_app
+        staging = Settings(**{"_env_file": None, "environment": Environment.STAGING, "gcp_project_id": "test-project"})
+
+        with (
+            patch("henchmen.forge.server.get_settings", return_value=staging),
+            patch(
+                "henchmen.forge.server.get_github_token_async",
+                new_callable=AsyncMock,
+                side_effect=GitHubAuthError("GitHub refused to issue an installation token (HTTP 401)"),
+            ),
+            patch("github.Github", side_effect=AssertionError("no GitHub client without credentials")),
+            pytest.raises(ForgeCIError) as exc_info,
+        ):
+            await _run_ci_for_pr("https://github.com/acme/repo/pull/7", "task-1", "req-1")
+
+        assert exc_info.value.retriable is True
+        assert _published(broker)[0]["reason"] == "github-credentials"
+
+    @pytest.mark.asyncio
+    async def test_the_pr_comment_uses_a_freshly_fetched_token(self, forge_app):
+        """Ruling PI-15: a long run never comments with the token the PR lookup used."""
+        from henchmen.config.settings import Settings
+        from henchmen.forge.ci_runner import CIRunner
+        from henchmen.forge.server import _run_ci_for_pr
+
+        broker, _store = forge_app
+        settings = Settings(**{"_env_file": None, "provider": "gcp", "gcp_project_id": "test-project"})
+
+        def _client(pr: MagicMock) -> MagicMock:
+            pr.head.ref = "feature"
+            pr.base.ref = "main"
+            client = MagicMock()
+            client.get_repo.return_value.get_pull.return_value = pr
+            return client
+
+        lookup_pr, comment_pr = MagicMock(), MagicMock()
+        clients = [_client(lookup_pr), _client(comment_pr)]
+        result = {"passed": True, "failed": [], "skipped": [], "checks": [], "summary": ""}
+        with (
+            patch("henchmen.forge.server.get_settings", return_value=settings),
+            patch(
+                "henchmen.forge.server.get_github_token_async",
+                new_callable=AsyncMock,
+                side_effect=["ghs_first", "ghs_second"],
+            ) as provider,
+            patch("github.Github", side_effect=clients) as github,
+            patch("github.Auth.Token", side_effect=lambda token: f"auth:{token}"),
+            patch("henchmen.forge.server.clone_repo", new_callable=AsyncMock) as clone,
+            patch.object(CIRunner, "run", AsyncMock(return_value=result)),
+        ):
+            await _run_ci_for_pr("https://github.com/acme/repo/pull/7", "task-1", "req-1")
+
+        assert [call.kwargs["auth"] for call in github.call_args_list] == ["auth:ghs_first", "auth:ghs_second"]
+        assert clone.await_args.kwargs["token"] == "ghs_first"
+        lookup_pr.create_issue_comment.assert_not_called()
+        comment_pr.create_issue_comment.assert_called_once()
+        assert provider.await_args_list[1].args == ("acme/repo",)
+        assert provider.await_args_list[1].kwargs == {"settings": settings}
+        assert _published(broker)[0]["status"] == "passed"
+
+    @pytest.mark.asyncio
     async def test_github_lookup_failure_publishes_retriable_failure(self, forge_settings, forge_app, monkeypatch):
         from henchmen.forge.server import _run_ci_for_pr
 

@@ -178,7 +178,10 @@ class TestSchemeExecutorDeterministic:
         dossier = Dossier(task_id=task.id)
 
         with (
-            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=settings.github_token),
+            patch(
+                "henchmen.mastermind.scheme_executor.handlers.get_github_token_async",
+                return_value=settings.github_token,
+            ),
             patch("github.Github") as mock_github,
         ):
             mock_github.return_value.get_repo.return_value = mock_repo
@@ -201,7 +204,7 @@ class TestSchemeExecutorDeterministic:
         task = _make_task()
         dossier = Dossier(task_id=task.id)
 
-        with patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=""):
+        with patch("henchmen.mastermind.scheme_executor.handlers.get_github_token_async", return_value=""):
             result = await executor.execute(task, dossier)
 
         assert result["node_results"]["create_pr"]["condition"] == "fail"
@@ -230,7 +233,10 @@ class TestSchemeExecutorDeterministic:
         mock_repo.create_pull.return_value = created
 
         with (
-            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=settings.github_token),
+            patch(
+                "henchmen.mastermind.scheme_executor.handlers.get_github_token_async",
+                return_value=settings.github_token,
+            ),
             patch("github.Github") as mock_github,
         ):
             mock_github.return_value.get_repo.return_value = mock_repo
@@ -293,6 +299,96 @@ class TestSchemeExecutorDeterministic:
                 assert validate_deterministic_handlers(graph) == []
         finally:
             SchemeRegistry.clear()
+
+    @pytest.mark.asyncio
+    async def test_create_pr_uses_a_token_scoped_to_the_task_repository(self):
+        from henchmen.mastermind.scheme_executor.handlers import handle_create_pr
+
+        executor = SchemeExecutor(_linear_scheme(["create_pr"]), MagicMock(spec=LairManager), _mock_settings())
+        task = _make_task()
+        created = MagicMock()
+        created.html_url = "https://github.com/acme/webapp/pull/3"
+        created.number = 3
+        mock_repo = MagicMock()
+        mock_repo.get_pulls.return_value = []
+        mock_repo.create_pull.return_value = created
+
+        with (
+            patch(
+                "henchmen.mastermind.scheme_executor.handlers.get_github_token_async",
+                new_callable=AsyncMock,
+                return_value="ghs_installation",
+            ) as token,
+            patch("github.Github") as mock_github,
+            patch("github.Auth.Token") as auth_token,
+        ):
+            mock_github.return_value.get_repo.return_value = mock_repo
+            result = await handle_create_pr(executor, _make_node("create_pr"), task, Dossier(task_id=task.id))
+
+        assert result["condition"] == "pass"
+        token.assert_awaited_once_with("acme/webapp", settings=executor.settings)
+        auth_token.assert_called_once_with("ghs_installation")
+
+    @pytest.mark.asyncio
+    async def test_create_pr_fails_closed_when_github_credentials_fail(self):
+        from henchmen.mastermind.scheme_executor.handlers import handle_create_pr
+        from henchmen.utils.github_auth import GitHubAuthError
+
+        executor = SchemeExecutor(_linear_scheme(["create_pr"]), MagicMock(spec=LairManager), _mock_settings())
+        task = _make_task()
+        with patch(
+            "henchmen.mastermind.scheme_executor.handlers.get_github_token_async",
+            new_callable=AsyncMock,
+            side_effect=GitHubAuthError("GitHub refused to issue an installation token (HTTP 401)"),
+        ):
+            result = await handle_create_pr(executor, _make_node("create_pr"), task, Dossier(task_id=task.id))
+
+        assert result["condition"] == "fail"
+        assert "GitHub credentials unavailable" in result["message"]
+        assert "pr_url" not in result
+
+    @pytest.mark.asyncio
+    async def test_fix_lint_fails_closed_when_github_credentials_fail(self):
+        from henchmen.mastermind.scheme_executor.handlers import handle_fix_lint
+        from henchmen.utils.github_auth import GitHubAuthError
+
+        executor = SchemeExecutor(_linear_scheme(["fix_lint"]), MagicMock(spec=LairManager), _mock_settings())
+        task = _make_task()
+        with (
+            patch(
+                "henchmen.mastermind.scheme_executor.handlers.get_github_token_async",
+                new_callable=AsyncMock,
+                side_effect=GitHubAuthError("The GitHub App private key file is missing or unreadable"),
+            ),
+            patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock) as clone,
+        ):
+            result = await handle_fix_lint(executor, _make_node("fix_lint"), task, Dossier(task_id=task.id))
+
+        assert result["condition"] == "fail"
+        assert "GitHub credentials" in result["message"]
+        clone.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_verify_changes_fails_closed_when_github_credentials_fail(self):
+        from henchmen.mastermind.scheme_executor.handlers import handle_verify_changes
+        from henchmen.utils.github_auth import GitHubAuthError
+
+        executor = SchemeExecutor(_linear_scheme(["verify_changes"]), MagicMock(spec=LairManager), _mock_settings())
+        task = _make_task()
+        with (
+            patch(
+                "henchmen.mastermind.scheme_executor.handlers.get_github_token_async",
+                new_callable=AsyncMock,
+                side_effect=GitHubAuthError("GitHub refused to issue an installation token (HTTP 401)"),
+            ) as token,
+            patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock) as clone,
+        ):
+            result = await handle_verify_changes(executor, _make_node("verify_changes"), task, Dossier(task_id=task.id))
+
+        assert result["condition"] == "fail"
+        assert "verify_changes failed (GitHub credentials)" in result["message"]
+        token.assert_awaited_once_with("acme/webapp", settings=executor.settings)
+        clone.assert_not_awaited()
 
 
 class TestSchemeExecutorAgentic:
@@ -527,7 +623,7 @@ class TestSchemeExecutorCIChecks:
 
         with (
             patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
-            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=""),
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token_async", return_value=""),
             patch("asyncio.create_subprocess_exec", side_effect=_exec),
         ):
             result = await handle_verify_changes(executor, _make_node("verify_changes"), task, Dossier(task_id=task.id))
@@ -561,7 +657,7 @@ class TestSchemeExecutorCIChecks:
             patch("henchmen.mastermind.scheme_executor.handlers.tempfile.mkdtemp", return_value=str(workspace)),
             patch("henchmen.mastermind.scheme_executor.handlers.shutil.rmtree"),
             patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
-            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=""),
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token_async", return_value=""),
             patch("henchmen.mastermind.scheme_executor.handlers.detect_stack", return_value=_python_stack()),
             patch(
                 "henchmen.mastermind.scheme_executor.handlers.changed_files",
@@ -596,7 +692,7 @@ class TestSchemeExecutorCIChecks:
             patch("henchmen.mastermind.scheme_executor.handlers.tempfile.mkdtemp", return_value=str(workspace)),
             patch("henchmen.mastermind.scheme_executor.handlers.shutil.rmtree"),
             patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
-            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=""),
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token_async", return_value=""),
             patch("henchmen.mastermind.scheme_executor.handlers.detect_stack", return_value=_python_stack()),
             patch(
                 "henchmen.mastermind.scheme_executor.handlers.changed_files",
@@ -630,7 +726,7 @@ class TestSchemeExecutorCIChecks:
 
         with (
             patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
-            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token", return_value=""),
+            patch("henchmen.mastermind.scheme_executor.handlers.get_github_token_async", return_value=""),
             patch("henchmen.mastermind.scheme_executor.handlers.detect_stack", return_value=go),
             patch(
                 "henchmen.mastermind.scheme_executor.handlers.changed_files",

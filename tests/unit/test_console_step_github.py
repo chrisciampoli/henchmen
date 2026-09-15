@@ -1388,6 +1388,36 @@ def test_a_repository_github_does_not_confirm_is_refused(
     assert SetupStep.GITHUB not in harness.setup_store.load().completed_steps
 
 
+@pytest.mark.parametrize("failure", ["unreachable", "server-error"])
+def test_a_github_outage_while_confirming_a_repository_is_not_blamed_on_the_repository(
+    tmp_path: Path, github: FakeGitHub, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    harness = _harness(tmp_path, github)
+    _ready_to_choose(harness, github)
+    github.repository_total_count = 5000
+    github.unlisted_repositories = [FakeGitHub.repository("acme/far-away")]
+    real_mint = github._mint
+
+    def flaky_mint(request: httpx.Request) -> httpx.Response:
+        if json.loads(request.content or b"{}").get("repositories"):
+            if failure == "unreachable":
+                raise httpx.ConnectError("offline")
+            return httpx.Response(503, json={"message": "Service Unavailable"})
+        return real_mint(request)
+
+    monkeypatch.setattr(github, "_mint", flaky_mint)
+
+    body = harness.post(f"{BASE}/repository", {"repo": "acme/far-away"}).json()
+
+    assert body["ok"] is False
+    problem = body["problems"][0]
+    assert "can't see" not in problem["message"]
+    assert problem.get("field") != "repo"
+    assert "Could not reach GitHub" in problem["message"] or "HTTP 503" in problem["message"]
+    assert harness.config_store.get("HENCHMEN_GITHUB_DEFAULT_REPO") == ""
+    assert SetupStep.GITHUB not in harness.setup_store.load().completed_steps
+
+
 def test_an_untruncated_listing_is_never_second_guessed(tmp_path: Path, github: FakeGitHub) -> None:
     harness = _harness(tmp_path, github)
     _ready_to_choose(harness, github)

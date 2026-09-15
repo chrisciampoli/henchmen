@@ -351,7 +351,7 @@ class TestSchemeExecution:
         @contextlib.contextmanager
         def _ctx():
             with (
-                patch.object(scheme_handlers, "get_github_token", return_value="test-token"),
+                patch.object(scheme_handlers, "get_github_token_async", return_value="test-token"),
                 patch("github.Github", return_value=client),
             ):
                 yield github_repo

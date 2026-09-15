@@ -356,8 +356,26 @@ def check_llm_credentials(settings: Settings, *, offline: bool = False) -> Check
 
 
 def check_github(settings: Settings, *, offline: bool = False) -> CheckResult:
-    """Verify the GitHub token and, when set, the default target repository."""
+    """Verify GitHub credentials (GitHub App or token) and, when set, the default target repository.
+
+    The credentials provider decides first: a partly configured App makes every
+    token call fail, and ``uses_app`` is False for it, so the problem is reported
+    from the provider's own error rather than falling through to "GitHub OK via PAT".
+    """
+    from henchmen.utils.github_auth import GitHubAuthError, get_credentials_provider
+
     name = "GitHub"
+    app_hint = "Reconnect GitHub in the Henchmen Console, or check the HENCHMEN_GITHUB_APP_* settings."
+    try:
+        provider = get_credentials_provider(settings)
+        if provider.uses_app and offline:
+            return CheckResult(name, CheckStatus.OK, f"GitHub App {settings.github_app_id} configured (not verified)")
+        # No network for a PAT (it is returned as configured) or a partly configured App (it raises at once).
+        provider.token()
+    except GitHubAuthError as exc:
+        return CheckResult(name, CheckStatus.FAIL, f"GitHub App cannot get an installation token: {exc}", hint=app_hint)
+    if provider.uses_app:
+        return CheckResult(name, CheckStatus.OK, f"GitHub App {settings.github_app_id} can get installation tokens")
     if not settings.github_token:
         return CheckResult(
             name,

@@ -93,15 +93,3 @@ async def fetch_remote_ref(workspace: str, remote: str = "origin", ref: str = "m
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
         logger.warning("git fetch %s %s failed: %s", remote, ref, stderr.decode(errors="replace")[:300])
-
-
-def get_github_token() -> str:
-    """Return the configured GitHub token, or an empty string.
-
-    Sourced from ``Settings.github_token``, which accepts both the
-    ``HENCHMEN_GITHUB_TOKEN`` spelling written to ``.env.local`` and the bare
-    ``GITHUB_TOKEN`` that Cloud Run secret mounts inject.
-    """
-    from henchmen.config.settings import get_settings
-
-    return get_settings().github_token

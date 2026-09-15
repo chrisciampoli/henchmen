@@ -332,7 +332,7 @@ class TestHandleCIFailure:
         with (
             _patch("henchmen.mastermind.agent.extract_ci_errors", new_callable=AsyncMock) as mock_extract,
             _patch("henchmen.mastermind.agent.format_errors_for_operative", return_value="errors"),
-            _patch("henchmen.mastermind.agent.get_github_token", return_value="test-token"),
+            _patch("henchmen.mastermind.agent.get_github_token_async", return_value="test-token"),
         ):
             mock_extract.return_value = [
                 CIError(check_name="lint", file_path="foo.py", line=1, message="err", severity="failure")
@@ -351,6 +351,34 @@ class TestHandleCIFailure:
         assert result["status"] == "fix_failed"
         assert result["operative_status"] == status.value
         agent.tracker.clear_ci_fix_in_progress.assert_awaited_once_with("full-task-id")
+
+    @pytest.mark.asyncio
+    async def test_github_credentials_failure_escalates(self, mock_settings):
+        from unittest.mock import patch as _patch
+
+        from henchmen.utils.github_auth import GitHubAuthError
+
+        with (
+            _patch("henchmen.mastermind.agent.extract_ci_errors", new_callable=AsyncMock) as mock_extract,
+            _patch(
+                "henchmen.mastermind.agent.get_github_token_async",
+                new_callable=AsyncMock,
+                side_effect=GitHubAuthError("GitHub refused to issue an installation token (HTTP 401)"),
+            ) as token,
+        ):
+            agent = self._make_agent(mock_settings)
+            agent.tracker.get_task_by_id_prefix = AsyncMock(
+                return_value={"task_id": "full-task-id", "ci_fix_attempts": 0, "ci_fix_in_progress": False}
+            )
+            agent.tracker.mark_escalated = AsyncMock()
+
+            result = await agent.handle_ci_failure("task-prefix", "org/repo", "henchmen/task-prefix", 999)
+
+        assert result["status"] == "escalated"
+        assert "GitHub credentials unavailable" in result["reason"]
+        mock_extract.assert_not_awaited()
+        agent.tracker.mark_escalated.assert_awaited_once()
+        token.assert_awaited_once_with("org/repo", settings=agent.settings)
 
     @pytest.mark.asyncio
     async def test_escalates_after_max_retries(self, mock_settings):

@@ -85,7 +85,25 @@ AsyncClientFactory = Callable[[], httpx.AsyncClient]
 
 
 class GitHubAuthError(RuntimeError):
-    """A GitHub App is configured but a usable token could not be produced."""
+    """A GitHub App is configured but a usable token could not be produced.
+
+    ``status_code`` is GitHub's HTTP status when GitHub answered the token
+    request with a refusal, ``None`` otherwise (unreachable, unreadable
+    response, local key or configuration problem).
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class GitHubRepositoryAccessError(GitHubAuthError):
+    """GitHub will not scope a token to the requested repository: the installation cannot access it.
+
+    Raised for GitHub's 422 refusal of a repository outside the installation's
+    selection, and when GitHub scopes the token to a different repository than
+    the one requested. A network error or a 5xx is a plain :class:`GitHubAuthError`.
+    """
 
 
 class GitHubAppConfig(BaseModel):
@@ -453,7 +471,10 @@ class GitHubCredentialsProvider:
         if response.status_code != 201:
             detail = github_error_detail(response)
             logger.warning("GitHub refused an installation token for %s (%s)", scope, detail)
-            raise GitHubAuthError(f"GitHub refused to issue an installation token ({detail})")
+            message = f"GitHub refused to issue an installation token ({detail})"
+            if response.status_code == 422 and repository is not None:
+                raise GitHubRepositoryAccessError(message, status_code=422)
+            raise GitHubAuthError(message, status_code=response.status_code)
         try:
             payload = response.json()
         except ValueError:
@@ -512,7 +533,7 @@ def _check_token_repositories(listed: object, repository: tuple[str, str]) -> No
             or (isinstance(entry_name, str) and entry_name.lower() != name)
         )
         if mismatched or not any(isinstance(value, str) for value in (full_name, login, entry_name)):
-            raise GitHubAuthError(
+            raise GitHubRepositoryAccessError(
                 f"GitHub scoped the installation token to a different repository than "
                 f"{repository[0]}/{repository[1]}; check that the App is installed on that account"
             )

@@ -15,6 +15,7 @@ from henchmen.models.scheme import DossierRequirement
 from henchmen.models.task import HenchmenTask
 from henchmen.providers.interfaces.object_store import ObjectStore
 from henchmen.utils.git import clone_repo
+from henchmen.utils.github_auth import GitHubAuthError, get_github_token_async
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,14 @@ class DossierBuilder:
     # Private fetch methods
     # ------------------------------------------------------------------
 
+    async def _github_token(self, repo: str) -> str:
+        """A token for GitHub reads, or "" when none is available — enrichment never blocks a task."""
+        try:
+            return await get_github_token_async(repo, settings=self.settings)
+        except GitHubAuthError as exc:
+            logger.warning("GitHub credentials unavailable for %s: %s", repo, exc)
+            return ""
+
     async def _scan_repo(self, task: HenchmenTask, fetch_rules: bool) -> tuple[list[RuleFile], RepoConventions | None]:
         """Clone the repo once and extract rule files plus project conventions.
 
@@ -76,7 +85,7 @@ class DossierBuilder:
         if not repo:
             return [], None
 
-        github_token = self.settings.github_token
+        github_token = await self._github_token(repo)
         branch = task.context.branch or "main"
 
         tmp_dir = tempfile.mkdtemp(prefix="henchmen-dossier-")
@@ -135,9 +144,9 @@ class DossierBuilder:
             if not repo:
                 return []
 
-            github_token = self.settings.github_token
+            github_token = await self._github_token(repo)
             if not github_token:
-                logger.warning("No GitHub token (HENCHMEN_GITHUB_TOKEN); cannot fetch related PRs")
+                logger.warning("No GitHub credentials (GitHub App or HENCHMEN_GITHUB_TOKEN); cannot fetch related PRs")
                 return []
 
             query = task.title
@@ -171,9 +180,11 @@ class DossierBuilder:
             if not repo:
                 return []
 
-            github_token = self.settings.github_token
+            github_token = await self._github_token(repo)
             if not github_token:
-                logger.warning("No GitHub token (HENCHMEN_GITHUB_TOKEN); cannot fetch related issues")
+                logger.warning(
+                    "No GitHub credentials (GitHub App or HENCHMEN_GITHUB_TOKEN); cannot fetch related issues"
+                )
                 return []
 
             url = "https://api.github.com/search/issues"
@@ -206,9 +217,11 @@ class DossierBuilder:
             if not repo:
                 return []
 
-            github_token = self.settings.github_token
+            github_token = await self._github_token(repo)
             if not github_token:
-                logger.warning("No GitHub token (HENCHMEN_GITHUB_TOKEN); cannot perform code search")
+                logger.warning(
+                    "No GitHub credentials (GitHub App or HENCHMEN_GITHUB_TOKEN); cannot perform code search"
+                )
                 return []
 
             results: list[CodeSearchResult] = []
