@@ -470,20 +470,17 @@ async def save(body: AiProviderSave, config: ConfigDep, setup: SetupDep) -> Step
     previous_provider = normalize_llm_provider(config.get("HENCHMEN_LLM_PROVIDER"))
     values = _config_values(body, api_key, config, ceiling)
     try:
-        # `update` first: it validates every key and value (ConfigStore's own
-        # check) before writing anything, so a refused save -- an invalid
-        # character in a free-text field, say -- raises here and `unset`
-        # never runs. Only once the new provider's configuration is
-        # committed do we drop the old provider's now-unused key, and both
-        # writes happen under one lock acquisition (never `await` inside it)
-        # so a concurrent writer can never observe one without the other. A
-        # refused save must leave the config file byte-identical.
-        with config.locked():
-            config.update(values, section=CONFIG_SECTION)
-            if previous_provider and previous_provider != body.provider:
-                stale_key = _API_KEY_SETTINGS.get(previous_provider)
-                if stale_key is not None:
-                    config.unset([stale_key])
+        # One atomic load-modify-write (ruling PM-7): the new provider's values
+        # are set and the old provider's now-unused key is removed together,
+        # after every key and value has been validated -- so a refused save
+        # (an invalid character in a free-text field, say) leaves the config
+        # file byte-identical, and no reader ever sees one change without the other.
+        stale_keys: list[str] = []
+        if previous_provider and previous_provider != body.provider:
+            stale_key = _API_KEY_SETTINGS.get(previous_provider)
+            if stale_key is not None and stale_key not in values:
+                stale_keys.append(stale_key)
+        config.update(values, section=CONFIG_SECTION, unset=stale_keys)
     except ConfigStoreError as exc:
         text = str(exc)
         offending_key = next((key for key in values if key in text), None)

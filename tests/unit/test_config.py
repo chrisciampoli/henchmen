@@ -470,8 +470,7 @@ class TestRemovedSettings:
 # Fields forwarded to operatives whose consumer has not been wired yet. Each
 # entry is a known gap, not a place to park new dead config: remove it as soon
 # as a component reads the field (or the field is deleted).
-# github_web_url gains its reader (console/github_app.py) in Plan 2B Task 5.
-_FIELDS_AWAITING_A_READER: frozenset[str] = frozenset({"github_web_url"})
+_FIELDS_AWAITING_A_READER: frozenset[str] = frozenset()
 
 
 def _unread_settings_fields() -> set[str]:
