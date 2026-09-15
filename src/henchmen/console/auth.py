@@ -22,7 +22,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import logging
 import secrets
 import time
 from pathlib import Path
@@ -31,8 +30,6 @@ from urllib.parse import urlsplit
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from henchmen.config.secret_files import read_or_create_secret
-
-logger = logging.getLogger(__name__)
 
 SESSION_COOKIE = "henchmen_console"
 _KEY_FILE_NAME = "console-session.key"
