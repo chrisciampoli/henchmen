@@ -183,7 +183,55 @@ def _local_settings(**overrides: Any) -> Settings:
     return Settings(_env_file=None, **values)  # type: ignore[call-arg]
 
 
-def _proc(returncode: int, stdout: bytes) -> MagicMock:
+class _FakeStream:
+    """A minimal async stream: ``.read(n)`` yields from a fixed buffer, then EOF (``b""``)."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._pos = 0
+
+    async def read(self, n: int = -1) -> bytes:
+        size = n if n is not None and n >= 0 else len(self._data) - self._pos
+        chunk = self._data[self._pos : self._pos + size]
+        self._pos += len(chunk)
+        return chunk
+
+
+class _HangingStream:
+    """A stream whose ``.read`` never returns within any test's timeout."""
+
+    async def read(self, n: int = -1) -> bytes:
+        await asyncio.sleep(5)
+        return b""
+
+
+def _gate_proc(returncode: int, stdout: bytes = b"", stderr: bytes = b"") -> MagicMock:
+    """A fake ``docker run`` process exposing the streaming interface `_run_gate_in_container` reads."""
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.stdout = _FakeStream(stdout)
+    proc.stderr = _FakeStream(stderr)
+    proc.wait = AsyncMock(return_value=returncode)
+    return proc
+
+
+def _hanging_proc() -> MagicMock:
+    """A fake ``docker run`` process that never produces output or exits on its own."""
+    proc = MagicMock()
+    proc.returncode = None
+    proc.stdout = _HangingStream()
+    proc.stderr = _HangingStream()
+
+    async def _wait() -> int:
+        await asyncio.sleep(5)
+        return 0
+
+    proc.wait = _wait
+    return proc
+
+
+def _communicate_proc(returncode: int, stdout: bytes = b"") -> MagicMock:
+    """A fake process for the simple one-shot ``docker kill`` subprocess call."""
     proc = MagicMock()
     proc.returncode = returncode
     proc.communicate = AsyncMock(return_value=(stdout, None))
@@ -214,7 +262,7 @@ async def _check(settings: Settings, proc: MagicMock, check: str = "lint") -> tu
 class TestLocalGateInvocation:
     @pytest.mark.asyncio
     async def test_no_bind_mount_and_no_token_on_the_command_line(self) -> None:
-        result, exec_mock = await _check(_local_settings(), _proc(0, _marker("pass", "lint passed")))
+        result, exec_mock = await _check(_local_settings(), _gate_proc(0, stdout=_marker("pass", "lint passed")))
         argv = list(exec_mock.await_args.args)
         assert result == {"condition": "pass", "message": "lint passed", "output": ""}
         assert "-v" not in argv and "--volume" not in argv and "--mount" not in argv
@@ -236,7 +284,7 @@ class TestLocalGateInvocation:
     @pytest.mark.asyncio
     async def test_joins_the_configured_network_and_uses_the_default_image(self) -> None:
         settings = _local_settings(operative_image="", local_docker_network="henchmen")
-        _, exec_mock = await _check(settings, _proc(0, _marker("pass", "ok")), check="tests")
+        _, exec_mock = await _check(settings, _gate_proc(0, stdout=_marker("pass", "ok")), check="tests")
         argv = list(exec_mock.await_args.args)
         assert argv[argv.index("--network") + 1] == "henchmen"
         assert "henchmen-operative:local" in argv
@@ -256,7 +304,7 @@ class TestLocalGateInvocation:
         ],
     )
     async def test_every_non_pass_outcome_fails_closed(self, returncode: int, stdout: bytes, fragment: str) -> None:
-        result, _ = await _check(_local_settings(), _proc(returncode, stdout))
+        result, _ = await _check(_local_settings(), _gate_proc(returncode, stdout=stdout))
         assert result["condition"] == "fail"
         assert fragment in result["message"]
         assert TOKEN not in result["message"] and TOKEN not in result["output"]
@@ -265,14 +313,8 @@ class TestLocalGateInvocation:
     async def test_a_hung_gate_is_killed_and_fails(self) -> None:
         from henchmen.mastermind.scheme_executor import handlers
 
-        async def _hang() -> tuple[bytes, None]:
-            await asyncio.sleep(5)
-            return b"", None
-
-        hung = MagicMock()
-        hung.returncode = None
-        hung.communicate = _hang
-        killer = _proc(0, b"")
+        hung = _hanging_proc()
+        killer = _communicate_proc(0, b"")
         with (
             patch("henchmen.config.settings.get_settings", return_value=_local_settings()),
             patch.object(
@@ -292,13 +334,7 @@ class TestLocalGateInvocation:
         """The timeout path must still return a clean fail result even when `docker kill` itself errors."""
         from henchmen.mastermind.scheme_executor import handlers
 
-        async def _hang() -> tuple[bytes, None]:
-            await asyncio.sleep(5)
-            return b"", None
-
-        hung = MagicMock()
-        hung.returncode = None
-        hung.communicate = _hang
+        hung = _hanging_proc()
         with (
             patch("henchmen.config.settings.get_settings", return_value=_local_settings()),
             patch.object(
@@ -323,3 +359,90 @@ class TestLocalGateInvocation:
             result = await handlers._run_ci_check(MagicMock(), _task(), "lint")
         assert result["condition"] == "fail"
         assert "error" in result["message"]
+
+
+class TestBoundedGateOutput:
+    """Ruling 4 (D-P9): a flooding gate container must not exhaust server memory."""
+
+    @pytest.mark.asyncio
+    async def test_flooded_stdout_is_capped_and_the_final_marker_is_still_found(self) -> None:
+        from henchmen.mastermind.scheme_executor import handlers
+
+        noise = b"x" * handlers._GATE_READ_CHUNK_BYTES
+        chunk_count = (handlers._GATE_OUTPUT_TAIL_BYTES * 10) // len(noise) + 1
+        # A newline separates the flood from the marker line: real stdout content
+        # is line-oriented, and `parse_gate_result` looks at the *last line*.
+        stdout = noise * chunk_count + b"\n" + _marker("pass", "lint passed")
+        assert len(stdout) > handlers._GATE_OUTPUT_TAIL_BYTES * 10
+
+        result, _ = await _check(_local_settings(), _gate_proc(0, stdout=stdout))
+        assert result == {"condition": "pass", "message": "lint passed", "output": ""}
+
+    def test_bounded_tail_retains_at_most_cap_plus_one_chunk(self) -> None:
+        from henchmen.mastermind.scheme_executor.handlers import _BoundedTail
+
+        cap = 1000
+        chunk = b"a" * 300
+        tail = _BoundedTail(cap=cap)
+        for _ in range(50):  # 15000 bytes, 15x the cap
+            tail.add(chunk)
+        value = tail.getvalue()
+        assert len(value) <= cap + len(chunk)
+        assert value.endswith(chunk)
+
+    @pytest.mark.asyncio
+    async def test_stderr_flood_does_not_block_stdout_from_being_read(self) -> None:
+        """stdout and stderr must be drained concurrently, not stdout-then-stderr.
+
+        `_CoupledStreams.stdout` only yields its payload once `.stderr` has been
+        fully drained -- modeling a child process whose stdout write is stuck
+        behind a full, undrained stderr pipe. If the implementation read stdout
+        to EOF before ever touching stderr, this would hang forever; the outer
+        `asyncio.wait_for` below turns that into a test failure instead of an
+        actually-hung test process.
+        """
+        from henchmen.mastermind.scheme_executor import handlers
+
+        class _CoupledStreams:
+            def __init__(self, stderr_chunk_count: int, stdout_payload: bytes) -> None:
+                self._stderr_remaining = stderr_chunk_count
+                self._stdout_payload = stdout_payload
+                self._stderr_drained = asyncio.Event()
+                self._stdout_sent = False
+
+            async def read_stdout(self, n: int = -1) -> bytes:
+                if self._stdout_sent:
+                    return b""
+                await self._stderr_drained.wait()
+                self._stdout_sent = True
+                return self._stdout_payload
+
+            async def read_stderr(self, n: int = -1) -> bytes:
+                if self._stderr_remaining <= 0:
+                    self._stderr_drained.set()
+                    return b""
+                self._stderr_remaining -= 1
+                return b"e" * handlers._GATE_READ_CHUNK_BYTES
+
+        class _BoundStream:
+            def __init__(self, read: Any) -> None:
+                self.read = read
+
+        coupled = _CoupledStreams(stderr_chunk_count=50, stdout_payload=_marker("pass", "tests passed"))
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = _BoundStream(coupled.read_stdout)
+        proc.stderr = _BoundStream(coupled.read_stderr)
+        proc.wait = AsyncMock(return_value=0)
+
+        with (
+            patch("henchmen.config.settings.get_settings", return_value=_local_settings()),
+            patch.object(handlers.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)),
+            patch.object(
+                handlers.tempfile,
+                "mkdtemp",
+                side_effect=AssertionError("local gates must not create a host workspace"),
+            ),
+        ):
+            result = await asyncio.wait_for(handlers._run_ci_check(MagicMock(), _task(), "tests"), timeout=2.0)
+        assert result == {"condition": "pass", "message": "tests passed", "output": ""}
