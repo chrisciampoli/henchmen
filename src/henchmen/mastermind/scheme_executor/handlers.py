@@ -12,25 +12,31 @@ import asyncio
 import contextlib
 import logging
 import os
-import shlex
 import shutil
 import tempfile
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from henchmen.config.settings import DEFAULT_LOCAL_OPERATIVE_IMAGE
+from henchmen.mastermind.scheme_executor.ci_gate import (
+    CheckType,
+    GateResult,
+    parse_gate_result,
+    plan_gate,
+    scrub_secret,
+)
 from henchmen.mastermind.scheme_executor.lint_scope import (
     CheckCommand,
     LintScopeError,
     changed_files,
     plan_fix,
-    plan_lint,
-    to_shell_script,
 )
 from henchmen.models.dossier import Dossier
 from henchmen.models.scheme import SchemeNode
 from henchmen.models.task import HenchmenTask
+from henchmen.providers.registry import ProviderRegistry
 from henchmen.utils.git import clone_repo, get_github_token
 from henchmen.utils.stack_detector import Stack, detect_stack
 
@@ -263,23 +269,25 @@ async def handle_run_tests(
     return await _run_ci_check(executor, task, "tests")
 
 
-async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type: str) -> dict[str, Any]:
-    """Clone the task's branch and run a specific CI check.
+async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type: CheckType) -> dict[str, Any]:
+    """Run a lint or test gate against the task's branch.
 
-    Uses :func:`henchmen.utils.stack_detector.detect_stack` to pick the
-    right test / lint commands for the target repo's language.
-
-    In local mode (provider=local), commands are executed inside the
-    operative Docker image via ``docker run`` with the workspace mounted
-    as a volume. This ensures the correct toolchain (Node.js, npm,
-    eslint, etc.) is available regardless of the host OS.
+    Cloud mode clones the branch on this host and runs the stack's commands
+    natively. Local mode never touches a host path: a gate container from the
+    operative image clones the branch itself, computes the diff against
+    ``origin/<base>`` in its own workspace and runs the scoped commands
+    (:mod:`henchmen.mastermind.scheme_executor.ci_gate`), because the Mastermind
+    may itself run in a container whose paths a sibling container cannot mount.
+    Both paths share the same clone/detect/scope logic through
+    :func:`henchmen.mastermind.scheme_executor.ci_gate.plan_gate`.
 
     The lint check only judges files the branch changed against
     ``origin/<base>`` (see :mod:`henchmen.mastermind.scheme_executor.lint_scope`);
     when that diff cannot be computed the gate fails.
 
     Fail-closed throughout: a clone failure, an undetectable stack, an
-    uncomputable diff or a non-zero exit code all return ``condition: "fail"``. A project without a
+    uncomputable diff, a gate container that reports no result, a timeout or a
+    non-zero exit code all return ``condition: "fail"``. A project without a
     lint/test script is expressed through the package manager's
     ``--if-present`` flag (a real exit code of 0), never by masking the exit
     code in the shell.
@@ -289,8 +297,6 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
         task: The task being executed (provides repo and branch info)
         check_type: "lint" or "tests"
     """
-    from pathlib import Path
-
     from henchmen.config.settings import get_settings
 
     repo = task.context.repo
@@ -298,61 +304,49 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
     base_branch = task.context.branch or "main"
     settings = get_settings()
     github_token = settings.github_token
-    is_local = settings.provider == "local"
 
     if not repo:
         logger.warning("No repo for CI check, failing")
         return {"condition": "fail", "message": f"{check_type} failed (no repo)"}
 
+    # Gated on the *effective* container orchestrator, exactly like
+    # LairManager._build_env_vars — a container gate must never run where
+    # lairs run in the cloud, or the other way round.
+    is_local = ProviderRegistry(settings).resolve_provider_name("container_orchestrator") == "local"
+
+    if is_local:
+        try:
+            result = await _run_gate_in_container(
+                settings, check_type, repo=repo, branch=branch, base_branch=base_branch
+            )
+        except Exception as exc:
+            detail = scrub_secret(str(exc), github_token)
+            logger.warning("CI check %s failed for task %s: %s", check_type, task.id, detail)
+            return {"condition": "fail", "message": f"{check_type} failed (error: {detail})"}
+        passed = result["condition"] == "pass"
+        logger.info("[SCHEME] %s %s for task %s", check_type, "PASSED" if passed else "FAILED", task.id)
+        if not passed:
+            logger.warning("[SCHEME] %s output: %s", check_type, str(result.get("output", ""))[:2000])
+        return result
+
     workspace = tempfile.mkdtemp(prefix=f"henchmen-{check_type}-")
     try:
-        # Full clone — monorepo builds need all packages, not just the branch tip.
-        try:
-            await clone_repo(repo, branch, workspace, token=github_token or None)
-        except RuntimeError as exc:
-            logger.warning("Clone failed for %s check: %s", check_type, exc)
-            return {"condition": "fail", "message": f"{check_type} failed (clone failed): {exc}"}
+        planned = await plan_gate(
+            check_type, repo=repo, branch=branch, base_branch=base_branch, token=github_token, workspace=workspace
+        )
+        if isinstance(planned, GateResult):
+            passed = planned.condition == "pass"
+            if passed:
+                logger.info("[SCHEME] %s passed for task %s: %s", check_type, task.id, planned.message)
+            else:
+                logger.warning("[SCHEME] %s failed for task %s: %s", check_type, task.id, planned.message)
+            return planned.model_dump()
 
-        stack = detect_stack(Path(workspace))
+        stack = planned.stack
         logger.info("[SCHEME] Detected stack %s for %s check on task %s", stack.name, check_type, task.id)
 
-        if stack.name == "unknown":
-            # No recognizable manifest — we cannot prove the change is safe,
-            # so escalate for human review rather than waving it through.
-            logger.warning("[SCHEME] %s could not detect a project stack for %s", check_type, repo)
-            return {
-                "condition": "fail",
-                "message": (
-                    f"{check_type} failed — could not detect the project stack for {repo} "
-                    "(no pyproject.toml/package.json/go.mod/Cargo.toml/pom.xml found)"
-                ),
-            }
-
-        if check_type == "lint":
-            # Judge only what the operative changed, never pre-existing violations.
-            # If the diff cannot be computed the gate cannot be scoped: fail closed.
-            try:
-                plan = plan_lint(stack, Path(workspace), await changed_files(workspace, base_branch))
-            except LintScopeError as exc:
-                detail = str(exc).replace(github_token, "***") if github_token else str(exc)
-                logger.warning("[SCHEME] lint scoping failed for task %s: %s", task.id, detail)
-                return {
-                    "condition": "fail",
-                    "message": f"lint failed — could not determine the files changed against {base_branch}: {detail}",
-                }
-            if not plan.commands:
-                logger.info("[SCHEME] lint passed for task %s: %s", task.id, plan.skip_reason)
-                return {"condition": "pass", "message": f"lint passed — {plan.skip_reason}", "output": ""}
-            commands = plan.commands
-        else:
-            commands = (CheckCommand(argv=tuple(stack.test_command)),)
-
-        if is_local:
-            # Run inside the operative Docker image with the workspace mounted.
-            result = await _run_in_docker(workspace, to_shell_script(commands, _install_script(stack)), settings)
-        else:
-            # In cloud mode the host has the toolchain.
-            result = await _run_on_host(workspace, stack, commands)
+        # In cloud mode the host has the toolchain.
+        result = await _run_on_host(workspace, stack, planned.commands)
 
         passed = result["returncode"] == 0
         output = result["output"]
@@ -374,58 +368,79 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
         shutil.rmtree(workspace, ignore_errors=True)
 
 
-async def _run_in_docker(workspace: str, shell_script: str, settings: Settings) -> dict[str, Any]:
-    """Run a CI check command inside the operative Docker image.
+_GATE_MODULE = "henchmen.mastermind.scheme_executor.ci_gate"
+_GATE_OUTPUT_LIMIT = 5000
 
-    Mounts the cloned workspace as a volume so the container has access
-    to the code and the correct toolchain (Node.js, npm, Python, etc.).
-    Only reachable in local mode, which runs the same image the Lairs use:
-    ``operative_image`` when set (the local image pulls only the published
-    operative), else the locally built default.
-    """
-    # Convert Windows paths to Docker-compatible format
-    docker_workspace = workspace.replace("\\", "/")
+
+def _gate_timeout_seconds(settings: Settings) -> float:
+    """A gate that never finishes must fail rather than hold the task forever; reuse the operative timeout."""
+    return float(settings.lair_default_timeout)
+
+
+async def _kill_gate_container(name: str) -> None:
+    """Best-effort ``docker kill``; a failed kill is logged, never raised."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "kill", name, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+        await proc.communicate()
+    except Exception as exc:
+        logger.warning("Could not kill gate container %s: %s", name, exc)
+
+
+async def _run_gate_in_container(
+    settings: Settings, check_type: str, *, repo: str, branch: str, base_branch: str
+) -> dict[str, Any]:
+    """Run ``ci_gate`` in a fresh operative-image container that clones and diffs by itself."""
+    token = settings.github_token
     image = settings.operative_image or DEFAULT_LOCAL_OPERATIVE_IMAGE
+    container = f"henchmen-gate-{uuid4().hex[:12]}"
+    cmd = ["docker", "run", "--rm", "--name", container]
+    if settings.local_docker_network:
+        cmd.extend(["--network", settings.local_docker_network])
+    # `-e NAME` without a value copies NAME from the docker CLI's own environment,
+    # so the token never appears on a command line.
+    cmd.extend(["-e", "HENCHMEN_GITHUB_TOKEN", "--entrypoint", "python", image, "-m", _GATE_MODULE, check_type])
+    cmd.extend([f"--repo={repo}", f"--branch={branch}", f"--base={base_branch}"])
+    # The docker CLI needs this process's PATH/DOCKER_HOST; the token is the only addition.
+    child_env = dict(os.environ)
+    child_env.pop("HENCHMEN_GITHUB_TOKEN", None)
+    if token:
+        child_env["HENCHMEN_GITHUB_TOKEN"] = token
 
-    cmd = [
-        "docker",
-        "run",
-        "--rm",
-        "-v",
-        f"{docker_workspace}:/ci-workspace",
-        "-w",
-        "/ci-workspace",
-        "--entrypoint",
-        "/bin/bash",
-        image,
-        "-c",
-        shell_script,
-    ]
-
-    logger.info("[SCHEME] Running CI check in Docker: %s", shell_script[:200])
+    logger.info("[SCHEME] Running %s gate for %s@%s in %s", check_type, repo, branch, image)
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=child_env
     )
-    stdout, _ = await proc.communicate()
-    output = stdout.decode(errors="replace")[:5000] if stdout else ""
+    timeout = _gate_timeout_seconds(settings)
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        await _kill_gate_container(container)
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        return {
+            "condition": "fail",
+            "message": f"{check_type} failed (the gate did not finish within {timeout:g}s)",
+            "output": "",
+        }
 
-    return {"returncode": proc.returncode if proc.returncode is not None else 1, "output": output}
-
-
-def _install_script(stack: Stack) -> str | None:
-    """The dependency install step as a shell fragment, with a lockfile-less fallback for Node."""
-    if stack.install_command is None:
-        return None
-    install_str = shlex.join(stack.install_command)
-    if stack.name == "node-pnpm":
-        # --frozen-lockfile fails when the lockfile is stale/absent.
-        return f"{install_str} || pnpm install --no-frozen-lockfile"
-    if stack.name == "node-npm":
-        # `npm ci` requires a lockfile; a plain install is the fallback.
-        return f"{install_str} || npm install --no-audit"
-    return install_str
+    returncode = proc.returncode if proc.returncode is not None else 1
+    text = stdout.decode(errors="replace") if stdout else ""
+    result = parse_gate_result(text)
+    if result is None:
+        return {
+            "condition": "fail",
+            "message": f"{check_type} failed (the gate container exited {returncode} without a result)",
+            "output": scrub_secret(text, token)[:_GATE_OUTPUT_LIMIT],
+        }
+    message = scrub_secret(result.message, token)
+    output = scrub_secret(result.output, token)
+    if result.condition == "pass" and returncode == 0:
+        return {"condition": "pass", "message": message, "output": output}
+    if result.condition == "pass":
+        message = f"{check_type} failed (the gate reported a pass but exited {returncode})"
+    return {"condition": "fail", "message": message, "output": output}
 
 
 async def _run_on_host(workspace: str, stack: Stack, commands: tuple[CheckCommand, ...]) -> dict[str, Any]:

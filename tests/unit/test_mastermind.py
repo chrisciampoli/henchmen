@@ -430,7 +430,11 @@ class TestSchemeExecutorCIChecks:
         mock_proc.returncode = 128
         mock_proc.communicate = AsyncMock(return_value=(b"", b"fatal: remote branch not found"))
 
-        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        # Cloud path: the host clones. Local gates clone inside the gate container (tests/unit/test_ci_gate.py).
+        with (
+            patch("henchmen.config.settings.get_settings", return_value=settings),
+            patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        ):
             from henchmen.mastermind.scheme_executor.handlers import _run_ci_check
 
             result = await _run_ci_check(executor, task, "lint")
@@ -481,28 +485,6 @@ class TestSchemeExecutorCIChecks:
         return proc
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("operative_image", "expected"),
-        [
-            ("ghcr.io/acme/henchmen/operative:0.3.0", "ghcr.io/acme/henchmen/operative:0.3.0"),
-            ("", "henchmen-operative:local"),
-        ],
-    )
-    async def test_run_in_docker_uses_the_configured_operative_image(self, operative_image, expected):
-        """Local CI gates run in the same operative image the Lairs use, not a hard-coded one."""
-        from henchmen.config.settings import DEFAULT_LOCAL_OPERATIVE_IMAGE, Settings
-        from henchmen.mastermind.scheme_executor.handlers import _run_in_docker
-
-        assert DEFAULT_LOCAL_OPERATIVE_IMAGE == "henchmen-operative:local"
-        settings = Settings(_env_file=None, provider="local", operative_image=operative_image)
-        with patch("asyncio.create_subprocess_exec", return_value=self._ok_proc(stdout=b"ok")) as exec_mock:
-            result = await _run_in_docker("/tmp/ws", "ruff check .", settings)
-
-        argv = exec_mock.call_args.args
-        assert argv[argv.index("/bin/bash") + 1] == expected
-        assert result == {"returncode": 0, "output": "ok"}
-
-    @pytest.mark.asyncio
     async def test_undetectable_stack_fails_closed(self):
         """No recognisable manifest means nothing was verified — escalate, never skip."""
         from henchmen.mastermind.scheme_executor.handlers import _run_ci_check
@@ -511,6 +493,7 @@ class TestSchemeExecutorCIChecks:
         executor = SchemeExecutor(_linear_scheme(["run_lint"]), MagicMock(spec=LairManager), _mock_settings())
 
         with (
+            patch("henchmen.config.settings.get_settings", return_value=_mock_settings()),
             patch("henchmen.mastermind.scheme_executor.handlers.clone_repo", new_callable=AsyncMock),
             patch("asyncio.create_subprocess_exec", return_value=self._ok_proc()),
             patch("henchmen.mastermind.scheme_executor.handlers.detect_stack", return_value=Stack(name="unknown")),
