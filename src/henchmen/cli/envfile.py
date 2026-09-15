@@ -3,8 +3,14 @@
 ``henchmen init`` uses this to persist configuration. The parser keeps every
 line it does not understand (comments, blank lines, unknown keys) exactly as
 written, updates known keys in place, appends new keys under a section
-header, and writes the result atomically (temp file + rename) with
-owner-only permissions on POSIX.
+header, and writes the result atomically and owner-only.
+
+Both the main file and its ``.bak`` backup go through
+:mod:`henchmen.config.secret_files` (``O_CREAT | O_EXCL | O_WRONLY``, mode
+0600, an atomic ``os.replace`` retried against a transient Windows
+``PermissionError``), so every writer gets the same guarantee: a backup that
+already existed with looser permissions is replaced by an owner-only one, and
+a write interrupted partway through never corrupts the previous content.
 
 The dialect matches what pydantic-settings / python-dotenv read: ``KEY=value``,
 optional ``export`` prefix, single or double quotes, ``#`` comments.
@@ -12,15 +18,12 @@ optional ``export`` prefix, single or double quotes, ``#`` comments.
 
 from __future__ import annotations
 
-import contextlib
-import os
 import re
-import stat
-import sys
-import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from henchmen.config.secret_files import write_secret_file
 
 _ASSIGNMENT_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
 _NEEDS_QUOTES_RE = re.compile(r"[\s#\"'\\$`]")
@@ -142,23 +145,21 @@ class EnvFile:
         return body + "\n" if body else ""
 
     def write(self, *, backup: bool = True) -> Path | None:
-        """Atomically write to :attr:`path`. Returns the backup path if one was made."""
+        """Atomically write to :attr:`path`, owner-only. Returns the backup path if one was made.
+
+        The backup (when requested and a previous file exists) is written
+        first, from the complete previous content, before the main file is
+        touched -- so an interruption during the main write can never lose
+        the previous content, and an existing world-readable ``.bak`` is
+        replaced by an owner-only one rather than reused in place.
+        """
         backup_path: Path | None = None
         if backup and self.path.is_file():
             backup_path = self.path.with_name(self.path.name + ".bak")
-            backup_path.write_bytes(self.path.read_bytes())
+            write_secret_file(backup_path, self.path.read_bytes())
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(prefix=self.path.name + ".", suffix=".tmp", dir=self.path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(self.render())
-            if sys.platform != "win32":
-                os.chmod(tmp_name, stat.S_IRUSR | stat.S_IWUSR)
-            os.replace(tmp_name, self.path)
-        except BaseException:
-            _remove_quietly(tmp_name)
-            raise
+        write_secret_file(self.path, self.render().encode("utf-8"))
         self.exists = True
         return backup_path
 
@@ -184,9 +185,3 @@ class EnvFile:
         while end < len(self._lines) and self._lines[end].key is not None:
             end += 1
         return end
-
-
-def _remove_quietly(path: str) -> None:
-    """Best-effort removal of a temp file; never raises."""
-    with contextlib.suppress(OSError):
-        os.remove(path)

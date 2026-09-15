@@ -26,3 +26,9 @@ class CreateTaskRequest(BaseModel):
     )
     created_by: str = Field(default="cli", description="User or system that created the task")
     id: str | None = Field(default=None, description="Caller-supplied source identifier")
+
+
+def dispatch_auth_headers(token: str) -> dict[str, str]:
+    """Headers for ``POST /api/v1/tasks``: a bearer token when one is configured, otherwise none."""
+    token = token.strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}

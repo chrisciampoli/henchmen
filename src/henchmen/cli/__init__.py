@@ -205,10 +205,21 @@ def _dotenv_keys() -> set[str]:
     return keys
 
 
+# Defaults this process wrote into os.environ, so apply-time validation can
+# tell them apart from values the user set (decision D-P8).
+_SEEDED_ENV_DEFAULTS: dict[str, str] = {}
+
+
 def _default_env(key: str, value: str, *, file_keys: set[str]) -> None:
     """Seed ``key`` only when neither the process env nor a dotenv file defines it."""
     if key not in os.environ and key not in file_keys:
         os.environ[key] = value
+        _SEEDED_ENV_DEFAULTS[key] = value
+
+
+def _seeded_env_defaults() -> dict[str, str]:
+    """The ``HENCHMEN_*`` defaults this process seeded into ``os.environ``."""
+    return dict(_SEEDED_ENV_DEFAULTS)
 
 
 def _build_settings_or_exit() -> Settings:
@@ -689,6 +700,7 @@ def _serve(args: argparse.Namespace) -> None:
                 auth=auth,
                 config_file=paths.config_file(),
                 on_apply=restart.request,
+                seeded_env=_seeded_env_defaults(),
             )
             code = serve_app(
                 build_setup_app(setup_console),
@@ -705,6 +717,7 @@ def _serve(args: argparse.Namespace) -> None:
             auth=auth,
             config_file=paths.config_file(),
             on_apply=restart.request,
+            seeded_env=_seeded_env_defaults(),
         )
         setup_token = auth.setup_token
 

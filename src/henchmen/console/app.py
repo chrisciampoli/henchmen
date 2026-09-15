@@ -16,11 +16,12 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from henchmen import __version__
-from henchmen.config.settings import Settings
+from henchmen.config.validation import settings_problems
 from henchmen.console.auth import SESSION_COOKIE, ConsoleAuth, ConsoleGuard
+from henchmen.console.config_store import DISPATCH_API_TOKEN_KEY, ConfigStore
 from henchmen.console.state import OPTIONAL_STEPS, SetupState, SetupStateStore, SetupStep
 from henchmen.console.steps import STEP_ROUTE_PREFIX, StepRoutes, discover_step_routes, validate_step_routes
 from henchmen.utils.redaction import redact
@@ -102,26 +103,6 @@ class SetupStateUpdate(BaseModel):
         return choices
 
 
-def _runtime_problems(config_file: Path) -> list[str]:
-    """Problems that would stop run mode starting with ``config_file`` (plus the process environment).
-
-    Settings reads the environment as well as the file, which is intended: the
-    container's environment applies in run mode too. Validation error messages
-    carry only the field and the reason, never the rejected value, which may be
-    a credential.
-    """
-    try:
-        settings = Settings(_env_file=(str(config_file),))  # type: ignore[call-arg]
-    except ValidationError as exc:
-        return [
-            f"{'.'.join(str(part) for part in error['loc']) or 'configuration'}: {error['msg']}"
-            for error in exc.errors(include_url=False, include_input=False)
-        ]
-    except ValueError as exc:
-        return [str(exc)]
-    return settings.validate_for_runtime()
-
-
 def create_console_app(
     *,
     mode: ConsoleMode,
@@ -130,11 +111,14 @@ def create_console_app(
     config_file: Path,
     on_apply: Callable[[], None],
     step_routes: Mapping[SetupStep, StepRoutes] | None = None,
+    seeded_env: Mapping[str, str] | None = None,
 ) -> FastAPI:
     """Build the Console app. ``on_apply`` is called after apply's response is sent.
 
     ``step_routes`` defaults to every ``henchmen.console.steps.<step>`` module found
-    (:func:`henchmen.console.steps.discover_step_routes`).
+    (:func:`henchmen.console.steps.discover_step_routes`). ``seeded_env`` are the
+    defaults ``henchmen serve`` put into this process's environment; apply validates
+    as if they were absent unless the file leaves the key out (D-P8).
     """
     app = FastAPI(title="Henchmen Console", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.setup_store = store
@@ -198,7 +182,13 @@ def create_console_app(
             )
         if not config_file.is_file():
             raise HTTPException(status_code=409, detail="No configuration has been saved yet.")
-        problems = _runtime_problems(config_file)
+        # Run mode must start with an authenticated task API (D-P10). The token is only
+        # computed here, in memory: it is validated as part of the configuration before
+        # anything is written, so a refused apply never touches the file (ruling P6).
+        config_store = ConfigStore(config_file, config_file.parent / "secrets")
+        pending_token = config_store.pending_dispatch_api_token()
+        overrides = {DISPATCH_API_TOKEN_KEY: pending_token} if pending_token is not None else None
+        _settings, problems = settings_problems((str(config_file),), seeded_env=seeded_env, overrides=overrides)
         if problems:
             # Marking setup complete would restart into a run mode that cannot start,
             # and setup mode would no longer be offered to fix it.
@@ -206,6 +196,8 @@ def create_console_app(
                 status_code=409,
                 detail={"message": "The saved configuration cannot start Henchmen.", "problems": problems},
             )
+        if pending_token is not None:
+            config_store.write_dispatch_api_token(pending_token)
         store.mark_completed()
         background.add_task(on_apply)
         return {"restarting": True}
