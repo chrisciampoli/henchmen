@@ -412,3 +412,30 @@ def test_sweep_keeps_a_non_matching_old_file(tmp_path: Path) -> None:
     read_or_create_secret(path)
 
     assert unrelated.exists()
+
+
+def test_sweep_keeps_an_old_sibling_whose_random_part_is_not_hex(tmp_path: Path) -> None:
+    """``<name>.other.tmp`` looks similar but never came from this module's own temp-naming scheme."""
+    path = tmp_path / "k"
+    look_alike = path.with_name(f"{path.name}.other.tmp")
+    look_alike.write_bytes(b"leftover")
+    old = time.time() - 400
+    os.utime(look_alike, (old, old))
+
+    read_or_create_secret(path)
+
+    assert look_alike.exists()
+
+
+def test_write_secret_file_also_sweeps_stale_temp_siblings(tmp_path: Path) -> None:
+    path = tmp_path / "k"
+    path.write_bytes(b"old")
+    stale = path.with_name(f"{path.name}.deadbeef.tmp")
+    stale.write_bytes(b"leftover")
+    old = time.time() - 400
+    os.utime(stale, (old, old))
+
+    write_secret_file(path, b"n" * 32)
+
+    assert not stale.exists()
+    assert path.read_bytes() == b"n" * 32

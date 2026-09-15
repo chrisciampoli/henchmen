@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import secrets
 import sys
 import time
@@ -57,16 +58,23 @@ def _unlink_temp_quietly(tmp_path: Path) -> None:
 def _sweep_stale_temp_files(path: Path) -> None:
     """Best-effort removal of this secret's own abandoned ``<name>.<hex>.tmp`` siblings.
 
-    Only files whose name matches this exact secret's temp-file pattern
-    (``<path.name>.*.tmp``) are considered, and only those old enough that they
-    cannot belong to a write in progress right now. This is opportunistic
-    housekeeping, not a correctness requirement, so every error is swallowed:
-    a permission error or a vanished directory should never block creating or
-    reading the actual secret.
+    Only files whose name exactly matches this secret's temp-file naming
+    scheme (``<path.name>.<hex>.tmp``, the pattern ``create_secret_file`` and
+    ``write_secret_file`` build with ``secrets.token_hex``) are considered, and
+    only those old enough that they cannot belong to a write in progress right
+    now. A full-string regex match (rather than a glob, which would also match
+    a sibling like ``<name>.other.tmp`` that never came from this module) is
+    used so a name that merely looks similar is never swept. This is
+    opportunistic housekeeping, not a correctness requirement, so every error
+    is swallowed: a permission error or a vanished directory should never
+    block creating or reading the actual secret.
     """
+    pattern = re.compile(re.escape(path.name) + r"\.[0-9a-f]+\.tmp")
     now = time.time()
     with contextlib.suppress(OSError):
-        for candidate in path.parent.glob(f"{path.name}.*.tmp"):
+        for candidate in path.parent.iterdir():
+            if not pattern.fullmatch(candidate.name):
+                continue
             with contextlib.suppress(OSError):
                 if now - candidate.stat().st_mtime >= _STALE_TEMP_FILE_AGE_SECONDS:
                     candidate.unlink(missing_ok=True)
