@@ -56,8 +56,14 @@ _MESSAGE_HISTORY = 1000
 _shared_instance: InMemoryMessageBroker | None = None
 
 
-def set_shared_broker(broker: InMemoryMessageBroker) -> None:
-    """Designate *broker* as the process-wide singleton."""
+def set_shared_broker(broker: InMemoryMessageBroker | None) -> None:
+    """Designate *broker* as the process-wide singleton, or ``None`` to clear it.
+
+    Clearing matters when a combined app's lifespan fails to start (or shuts
+    down): the broker built for that run must not go on being handed out to
+    unrelated code in the same process (e.g. a needs-attention fallback that
+    never builds one of its own) just because it is still the singleton.
+    """
     global _shared_instance
     _shared_instance = broker
 

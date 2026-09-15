@@ -6,12 +6,18 @@ import argparse
 import logging
 import os
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
+    from fastapi import FastAPI
+
+    from henchmen.cli.serve import RestartSignal
     from henchmen.config.settings import Settings
+    from henchmen.console.app import ConsoleMode
+    from henchmen.console.services import ServiceHealth
     from henchmen.evals.harness import EvalReport, FixtureResult
 
 _LOG_LEVELS = ("critical", "error", "warning", "info", "debug")
@@ -630,15 +636,14 @@ def _compare_baseline(path: Path, provider: str, report: EvalReport) -> int:
 
 
 def _serve(args: argparse.Namespace) -> None:
-    """Run Henchmen in one process: setup mode (Console only) or run mode (all services)."""
-    from henchmen.cli.serve import (
-        RestartSignal,
-        build_serve_app,
-        build_setup_app,
-        configure_serve_logging,
-        console_url,
-        serve_app,
-    )
+    """Run Henchmen in one process.
+
+    Without a data directory: all services, as engineers have always run them.
+    With one (the local image): setup mode until setup is applied, then run
+    mode; a completed setup that cannot start serves the Console in
+    needs-attention mode instead of exiting (decision D-P5).
+    """
+    from henchmen.cli.serve import RestartSignal, configure_serve_logging
     from henchmen.config import paths
 
     _default_env("HENCHMEN_PROVIDER", "local", file_keys=_dotenv_keys())
@@ -646,83 +651,22 @@ def _serve(args: argparse.Namespace) -> None:
         os.environ["HENCHMEN_LOCAL_SERVE_PORT"] = str(args.port)
 
     configure_serve_logging(args.log_level)
-    logger = logging.getLogger("henchmen")
     restart = RestartSignal()
 
-    console = None
-    setup_token: str | None = None
     state_file = paths.setup_state_file()
     secrets_dir = paths.secrets_dir()
-    if state_file is not None and secrets_dir is not None:
-        from henchmen.console.app import ConsoleMode, create_console_app
-        from henchmen.console.auth import ConsoleAuth
-        from henchmen.console.state import SetupStateStore
+    if state_file is None or secrets_dir is None:
+        _serve_without_data_dir(args, restart)
+    else:
+        _serve_data_dir(args, restart, state_file=state_file, secrets_dir=secrets_dir)
 
-        store = SetupStateStore(state_file)
-        try:
-            state = store.load()
-        except (ValueError, OSError) as exc:
-            # ValueError: corrupt JSON; OSError: e.g. a data volume the container user cannot read.
-            print(f"ERROR: {exc}", file=sys.stderr)
-            print(f"Hint: restore or delete {state_file} to restart setup.", file=sys.stderr)
-            sys.exit(2)
 
-        try:
-            auth = ConsoleAuth.load(secrets_dir, setup_token=os.environ.get(paths.SETUP_TOKEN_ENV) or None)
-        except OSError as exc:
-            print(f"ERROR: could not read or write {secrets_dir}: {exc}", file=sys.stderr)
-            print("Hint: check permissions on the data volume.", file=sys.stderr)
-            sys.exit(2)
-
-        if not state.completed:
-            raw_port = args.port or os.environ.get("HENCHMEN_LOCAL_SERVE_PORT") or "8000"
-            try:
-                console_port = int(raw_port)
-            except ValueError:
-                print(
-                    f"ERROR: HENCHMEN_LOCAL_SERVE_PORT must be an integer, got {raw_port!r}.",
-                    file=sys.stderr,
-                )
-                sys.exit(2)
-            setup_token_value = auth.setup_token
-            if not setup_token_value:
-                # ConsoleAuth.setup_token never raises (SetupTokenStore.current() already
-                # fails closed to "" on any read problem); a readable error and exit 2 here,
-                # never a broken link with an empty setup_token=, mirrors the load guard above.
-                print(f"ERROR: no usable sign-in token in {secrets_dir}.", file=sys.stderr)
-                print("Hint: check permissions on the data volume.", file=sys.stderr)
-                sys.exit(2)
-            logger.info("Setup is not complete; serving only the setup Console")
-            print(f"Open Henchmen setup: {console_url(console_port, setup_token_value)}", flush=True)
-            setup_console = create_console_app(
-                mode=ConsoleMode.SETUP,
-                store=store,
-                auth=auth,
-                config_file=paths.config_file(),
-                on_apply=restart.request,
-                seeded_env=_seeded_env_defaults(),
-            )
-            code = serve_app(
-                build_setup_app(setup_console),
-                host=args.host,
-                port=console_port,
-                log_level=args.log_level,
-                restart=restart,
-            )
-            sys.exit(code)
-
-        console = create_console_app(
-            mode=ConsoleMode.RUN,
-            store=store,
-            auth=auth,
-            config_file=paths.config_file(),
-            on_apply=restart.request,
-            seeded_env=_seeded_env_defaults(),
-        )
-        setup_token = auth.setup_token
-
+def _serve_without_data_dir(args: argparse.Namespace, restart: RestartSignal) -> NoReturn:
+    """All services and no Console — the engineer workflow, unchanged."""
+    from henchmen.cli.serve import build_serve_app, serve_app
     from henchmen.providers.tiers import active_llm_provider
 
+    logger = logging.getLogger("henchmen")
     settings = _build_settings_or_exit()
     port = int(settings.local_serve_port)
 
@@ -735,39 +679,154 @@ def _serve(args: argparse.Namespace) -> None:
         print("Hint: run `henchmen init`, or set HENCHMEN_PROVIDER=local for a fully local run.", file=sys.stderr)
         sys.exit(2)
 
-    if console is not None and setup_token:
-        # Printed only now, from the port Settings actually resolved (which may
-        # come from <data dir>/henchmen.env), not the pre-Settings bootstrap guess.
-        # `setup_token` never comes back as None here (ConsoleAuth.setup_token fails
-        # closed to ""), so this must check truthiness, not identity, to skip an
-        # unusable/unreadable token exactly like setup mode's own guard does.
-        print(f"Open Henchmen: {console_url(port, setup_token)}", flush=True)
-
     logger.info(
         "Starting Henchmen in single-process mode (provider=%s, llm=%s, environment=%s)",
         settings.provider,
         llm,
         settings.environment.value,
     )
-    desktop = None
-    if console is not None and secrets_dir is not None:
-        from henchmen.cli.serve import DesktopRuntime
-        from henchmen.config.internal_auth import load_internal_auth
-        from henchmen.console.auth import desktop_allowed_hostnames, forward_host_problem
+    app = build_serve_app(settings, port, console=None, desktop=None)
+    sys.exit(serve_app(app, host=args.host, port=port, log_level=args.log_level, restart=restart))
 
-        try:
-            internal = load_internal_auth(secrets_dir)
-        except OSError as exc:
-            print(f"ERROR: could not read or write {secrets_dir}: {exc}", file=sys.stderr)
+
+def _bootstrap_port(args: argparse.Namespace) -> int:
+    """Port for a Console served before Settings exist (setup and needs-attention modes)."""
+    raw_port = args.port or os.environ.get("HENCHMEN_LOCAL_SERVE_PORT") or "8000"
+    try:
+        return int(raw_port)
+    except ValueError:
+        print(f"ERROR: HENCHMEN_LOCAL_SERVE_PORT must be an integer, got {raw_port!r}.", file=sys.stderr)
+        sys.exit(2)
+
+
+def _console_link_hint() -> str:
+    """One-line hint printed instead of a sign-in URL when no usable token exists."""
+    return "No sign-in link is available right now. Run `henchmen console-link` for one."
+
+
+def _serve_data_dir(
+    args: argparse.Namespace, restart: RestartSignal, *, state_file: Path, secrets_dir: Path
+) -> NoReturn:
+    """Setup, run or needs-attention mode for a data-directory install."""
+    from henchmen.cli.serve import (
+        RESTART_EXIT_CODE,
+        STARTUP_FAILURE,
+        DesktopRuntime,
+        build_attention_app,
+        build_serve_app,
+        build_setup_app,
+        console_url,
+        serve_app,
+    )
+    from henchmen.config import paths
+    from henchmen.config.internal_auth import load_internal_auth
+    from henchmen.config.validation import settings_problems
+    from henchmen.console.app import ConsoleMode, create_console_app
+    from henchmen.console.auth import ConsoleAuth, desktop_allowed_hostnames, forward_host_problem
+    from henchmen.console.services import ServiceHealth
+    from henchmen.console.state import SetupStateStore
+    from henchmen.providers.tiers import active_llm_provider
+    from henchmen.utils.redaction import redact
+
+    logger = logging.getLogger("henchmen")
+    store = SetupStateStore(state_file)
+    try:
+        state = store.load()
+    except (ValueError, OSError) as exc:
+        # ValueError: corrupt JSON; OSError: e.g. a data volume the container user cannot read.
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"Hint: restore or delete {state_file} to restart setup.", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        auth = ConsoleAuth.load(secrets_dir, setup_token=os.environ.get(paths.SETUP_TOKEN_ENV) or None)
+        internal = load_internal_auth(secrets_dir)
+    except OSError as exc:
+        print(f"ERROR: could not read or write {secrets_dir}: {exc}", file=sys.stderr)
+        print("Hint: check permissions on the data volume.", file=sys.stderr)
+        sys.exit(2)
+
+    seeded_env = _seeded_env_defaults()
+
+    def console(mode: ConsoleMode, *, problems: Sequence[str] = (), health: ServiceHealth | None = None) -> FastAPI:
+        return create_console_app(
+            mode=mode,
+            store=store,
+            auth=auth,
+            config_file=paths.config_file(),
+            on_apply=restart.request,
+            seeded_env=seeded_env,
+            problems=problems,
+            service_status=health.snapshot if health is not None else None,
+        )
+
+    def needs_attention(problems: list[str], port: int) -> int:
+        safe_problems = [redact(problem) for problem in problems]
+        logger.warning("Henchmen needs attention: %s", " | ".join(safe_problems))
+        token = auth.setup_token
+        if token:
+            print(f"Henchmen needs attention. Open: {console_url(port, token)}", flush=True)
+        else:
+            print(f"Henchmen needs attention. {_console_link_hint()}", flush=True)
+        app = build_attention_app(console(ConsoleMode.ATTENTION, problems=safe_problems))
+        code = serve_app(app, host=args.host, port=port, log_level=args.log_level, restart=restart)
+        # The recovery Console could not start either: that is a startup failure (D-P5).
+        return code if code in (0, RESTART_EXIT_CODE) else STARTUP_FAILURE
+
+    if not state.completed:
+        setup_port = _bootstrap_port(args)
+        setup_token_value = auth.setup_token
+        if not setup_token_value:
+            # ConsoleAuth.setup_token never raises (SetupTokenStore.current() already
+            # fails closed to "" on any read problem); a readable error and exit 2 here,
+            # never a broken link with an empty setup_token=, mirrors the load guard above.
+            print(f"ERROR: no usable sign-in token in {secrets_dir}.", file=sys.stderr)
             print("Hint: check permissions on the data volume.", file=sys.stderr)
             sys.exit(2)
-        desktop = DesktopRuntime(
-            allowed_hostnames=desktop_allowed_hostnames(settings.local_container_hostname),
-            internal_push_token=internal.push_token,
-        )
-        problem = forward_host_problem(settings)
-        if problem is not None:
-            logger.warning("%s", problem)
+        logger.info("Setup is not complete; serving only the setup Console")
+        print(f"Open Henchmen setup: {console_url(setup_port, setup_token_value)}", flush=True)
+        setup_app = build_setup_app(console(ConsoleMode.SETUP))
+        sys.exit(serve_app(setup_app, host=args.host, port=setup_port, log_level=args.log_level, restart=restart))
 
-    app = build_serve_app(settings, port, console=console, desktop=desktop)
-    sys.exit(serve_app(app, host=args.host, port=port, log_level=args.log_level, restart=restart))
+    settings, problems = settings_problems(paths.env_files())
+    if settings is None or problems:
+        attention_port = int(settings.local_serve_port) if settings is not None else _bootstrap_port(args)
+        sys.exit(needs_attention(problems, attention_port))
+
+    # Ruling P3: a forward host the whole-app Host allowlist would silently refuse (the
+    # default host.docker.internal, or a loopback address unreachable from a container)
+    # would leave every operative failing with an opaque 403. Attention mode surfaces the
+    # fix instead of starting services that could never complete a task.
+    forward_problem = forward_host_problem(settings)
+    if forward_problem is not None:
+        logger.warning("%s", forward_problem)
+        sys.exit(needs_attention([forward_problem], int(settings.local_serve_port)))
+
+    port = int(settings.local_serve_port)
+    health = ServiceHealth()
+    desktop = DesktopRuntime(
+        allowed_hostnames=desktop_allowed_hostnames(settings.local_container_hostname),
+        internal_push_token=internal.push_token,
+    )
+    # Printed only now, from the port Settings actually resolved (which may
+    # come from <data dir>/henchmen.env), not the pre-Settings bootstrap guess.
+    token = auth.setup_token
+    if token:
+        print(f"Open Henchmen: {console_url(port, token)}", flush=True)
+    else:
+        print(_console_link_hint(), flush=True)
+    logger.info(
+        "Starting Henchmen in single-process mode (provider=%s, llm=%s, environment=%s)",
+        settings.provider,
+        active_llm_provider(settings),
+        settings.environment.value,
+    )
+    app = build_serve_app(
+        settings, port, console=console(ConsoleMode.RUN, health=health), desktop=desktop, health=health
+    )
+    code = serve_app(app, host=args.host, port=port, log_level=args.log_level, restart=restart)
+    if code == STARTUP_FAILURE and health.startup_error is not None and not restart.requested:
+        # uvicorn runs the lifespan before binding, so the port is still free for the recovery Console.
+        detail = str(health.startup_error) or type(health.startup_error).__name__
+        code = needs_attention([f"A Henchmen service failed to start: {detail}"], port)
+    sys.exit(code)

@@ -817,10 +817,29 @@ class TestForwardHostProblem:
         settings = _settings(local_forward_base_url="http://henchmen:8000")
         assert forward_host_problem(settings) is None
 
-    def test_desktop_with_loopback_returns_none(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("loopback", ["127.0.0.1", "localhost", "[::1]"])
+    def test_desktop_with_a_loopback_forward_base_reports_a_problem(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, loopback: str
+    ) -> None:
+        """DockerOrchestrator (providers/local/docker.py) never runs an operative container with
+        `--network host` -- only the default bridge network or a named `local_docker_network` --
+        so a loopback forward base names the operative's own container, never this machine.
+        Task 4 originally treated this as fine; Task 11 (ruling P3) corrects it."""
         monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
-        settings = _settings(local_forward_base_url="http://127.0.0.1:8000")
-        assert forward_host_problem(settings) is None
+        settings = _settings(local_forward_base_url=f"http://{loopback}:8000")
+        problem = forward_host_problem(settings)
+        assert problem is not None
+        assert "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8000" in problem
+
+    def test_desktop_with_a_loopback_forward_base_reports_a_problem_even_on_a_named_docker_network(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Unconditional, not gated on local_docker_network: DockerOrchestrator has no
+        `--network host` mode, so a named user-defined network does not make the operative
+        container's own loopback reach the host either."""
+        monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
+        settings = _settings(local_forward_base_url="http://127.0.0.1:8000", local_docker_network="henchmen-net")
+        assert forward_host_problem(settings) is not None
 
     def test_malformed_url_reports_a_problem(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))

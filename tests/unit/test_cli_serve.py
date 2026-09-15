@@ -7,6 +7,7 @@ These tests drive the real sub-app lifespans through a TestClient.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Iterator
@@ -405,7 +406,12 @@ def test_serve_with_completed_setup_mounts_the_console_in_run_mode(
 
     monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
     monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
-    (tmp_path / "henchmen.env").write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+    # _serve_args() defaults to port 8123 (below), and the default container hostname is
+    # "henchmen"; a forward base matching both keeps this test in run mode instead of the
+    # needs-attention mode ruling P3 (Task 11) now enters for the unconfigured default.
+    (tmp_path / "henchmen.env").write_text(
+        "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123\n", encoding="utf-8"
+    )
     store = SetupStateStore(tmp_path / "setup-state.json")
     store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True))
     with (
@@ -439,8 +445,12 @@ def test_run_mode_prints_the_port_settings_actually_resolved(
     # henchmen.env — so R3's pre-registration does not apply to this test.
     monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
     monkeypatch.delenv("HENCHMEN_LOCAL_SERVE_PORT", raising=False)
+    # A forward base matching the resolved port and the default container hostname keeps
+    # this in run mode instead of ruling P3's needs-attention mode for the unconfigured default.
     (tmp_path / "henchmen.env").write_text(
-        "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_SERVE_PORT=9999\n", encoding="utf-8"
+        "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_SERVE_PORT=9999\n"
+        "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:9999\n",
+        encoding="utf-8",
     )
     store = SetupStateStore(tmp_path / "setup-state.json")
     store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True))
@@ -629,11 +639,14 @@ class TestDesktopHostAllowlist:
         assert TestClient(app, base_url="http://evil.example:8000").get("/mastermind/health").status_code == 200
 
 
-def test_desktop_run_mode_warns_when_the_forward_host_is_not_allowed(
+def test_desktop_run_mode_serves_attention_when_the_forward_host_is_not_allowed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """P3: the default local_forward_base (host.docker.internal) would be silently refused by the
-    allowlist, so _serve must log it as a WARNING at startup instead of leaving operatives to fail.
+    """Ruling P3: the default local_forward_base (host.docker.internal) would be silently
+    refused by the allowlist -- every operative would fail with an opaque 403 -- so _serve logs
+    it as a WARNING (Task 4 behaviour, kept) and now serves the needs-attention Console with the
+    fix instead of starting services that could never complete a task (Task 11 supersedes the
+    Task 4 warn-and-continue behaviour).
     """
     from unittest.mock import patch
 
@@ -646,18 +659,23 @@ def test_desktop_run_mode_warns_when_the_forward_host_is_not_allowed(
     store = SetupStateStore(tmp_path / "setup-state.json")
     store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True))
     with (
-        patch("henchmen.cli.serve.build_serve_app", return_value=MagicMock()),
-        patch("henchmen.cli.serve.serve_app", return_value=0),
+        patch("henchmen.cli.serve.build_serve_app", return_value=MagicMock()) as build_services,
+        patch("henchmen.cli.serve.serve_app", return_value=0) as run,
         caplog.at_level(logging.WARNING, logger="henchmen"),
-        pytest.raises(SystemExit),
+        pytest.raises(SystemExit) as exit_info,
     ):
         _serve(_serve_args())
+    assert exit_info.value.code == 0
+    build_services.assert_not_called()
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert warnings, "expected a WARNING about the unreachable forward host"
     assert "host.docker.internal" in caplog.text
     # _serve_args() defaults to port 8123, which _serve writes to HENCHMEN_LOCAL_SERVE_PORT
     # (overriding the pre-registered "8000") before Settings resolves local_serve_port.
     assert "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123" in caplog.text
+    status = TestClient(run.call_args.args[0], base_url=_LOCAL).get("/console/api/status").json()
+    assert status["mode"] == "attention"
+    assert any("host.docker.internal" in p for p in status["problems"])
 
 
 def test_desktop_runtime_authenticates_the_shared_broker(serve_env: Path) -> None:
@@ -681,7 +699,11 @@ def test_run_mode_loads_the_internal_push_token(monkeypatch: pytest.MonkeyPatch,
 
     monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
     monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
-    (tmp_path / "henchmen.env").write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+    # A forward base matching _serve_args()'s default port (8123) and the default container
+    # hostname keeps this in run mode instead of ruling P3's needs-attention mode.
+    (tmp_path / "henchmen.env").write_text(
+        "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123\n", encoding="utf-8"
+    )
     SetupStateStore(tmp_path / "setup-state.json").save(
         SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True)
     )
@@ -693,3 +715,237 @@ def test_run_mode_loads_the_internal_push_token(monkeypatch: pytest.MonkeyPatch,
         _serve(_serve_args())
     desktop = build.call_args.kwargs["desktop"]
     assert desktop.internal_push_token == load_internal_auth(tmp_path / "secrets").push_token
+
+
+# ---------------------------------------------------------------------------
+# Task 11: service health, the attention app and serve_app's own exit codes
+# ---------------------------------------------------------------------------
+
+
+def test_attention_app_serves_degraded_health_and_the_console(tmp_path: Path) -> None:
+    from henchmen.cli.serve import build_attention_app
+
+    client = TestClient(build_attention_app(_console_app(tmp_path, ConsoleMode.ATTENTION)), base_url=_LOCAL)
+    assert client.get("/health").json() == {"status": "degraded", "mode": "attention"}
+    assert client.get("/console/api/status").json()["mode"] == "attention"
+
+
+def test_attention_app_exposes_no_service_routes(tmp_path: Path) -> None:
+    """Ruling 2: the attention app serves /health plus the Console, and no service routes."""
+    from henchmen.cli.serve import build_attention_app
+
+    client = TestClient(build_attention_app(_console_app(tmp_path, ConsoleMode.ATTENTION)), base_url=_LOCAL)
+    for path in ("/dispatch/health", "/mastermind/health", "/forge/health"):
+        assert client.get(path).status_code == 404
+
+
+def test_service_health_tracks_a_normal_start_and_stop(serve_env: Path) -> None:
+    from henchmen.config.settings import get_settings
+    from henchmen.console.services import ServiceHealth
+
+    health = ServiceHealth()
+    app = build_serve_app(get_settings(), 8000, health=health)
+    with TestClient(app):  # type: ignore[arg-type]
+        assert health.snapshot() == {"dispatch": "running", "mastermind": "running", "forge": "running"}
+    assert health.snapshot() == {"dispatch": "off", "mastermind": "off", "forge": "off"}
+    assert health.startup_error is None
+
+
+def test_a_service_startup_failure_is_recorded_and_re_raised(serve_env: Path) -> None:
+    import henchmen.dispatch.slack_bot as slack_bot
+    from henchmen.config.settings import get_settings
+    from henchmen.console.services import ServiceHealth
+
+    health = ServiceHealth()
+    app = build_serve_app(get_settings(), 8000, health=health)
+    with (
+        patch.object(slack_bot, "start_socket_mode", side_effect=RuntimeError("socket mode exploded")),
+        pytest.raises(RuntimeError, match="socket mode exploded"),
+        TestClient(app),  # type: ignore[arg-type]
+    ):
+        pass
+    assert isinstance(health.startup_error, RuntimeError)
+    assert health.snapshot() == {"dispatch": "failed", "mastermind": "off", "forge": "off"}
+
+
+def test_a_failed_lifespan_does_not_leak_the_broker_or_the_store(serve_env: Path) -> None:
+    """Ruling: no resource leak into a same-process fallback -- a failed startup must not
+    leave its broker as the process-wide singleton, and a fresh build_serve_app afterwards
+    must get a working broker and store, never a closed/abandoned one."""
+    import henchmen.dispatch.slack_bot as slack_bot
+    import henchmen.providers.local.memory as memory
+    from henchmen.config.settings import get_settings
+    from henchmen.console.services import ServiceHealth
+
+    health = ServiceHealth()
+    app = build_serve_app(get_settings(), 8000, health=health)
+    with (
+        patch.object(slack_bot, "start_socket_mode", side_effect=RuntimeError("boom")),
+        pytest.raises(RuntimeError),
+        TestClient(app),  # type: ignore[arg-type]
+    ):
+        pass
+    assert memory.get_shared_broker() is None
+
+    health2 = ServiceHealth()
+    app2 = build_serve_app(get_settings(), 8000, health=health2)
+    with TestClient(app2):  # type: ignore[arg-type]
+        assert health2.snapshot() == {"dispatch": "running", "mastermind": "running", "forge": "running"}
+    assert memory.get_shared_broker() is None
+
+
+class TestServeAppSystemExit:
+    @pytest.mark.parametrize("code", [1, 3])
+    def test_uvicorn_system_exit_is_returned_not_raised(self, code: int) -> None:
+        from henchmen.cli.serve import serve_app
+
+        server = MagicMock()
+        server.started = False
+        server.run.side_effect = SystemExit(code)
+        with patch("henchmen.cli.serve.uvicorn.Server", return_value=server):
+            assert (
+                serve_app(MagicMock(), host="127.0.0.1", port=8000, log_level="info", restart=RestartSignal()) == code
+            )
+
+
+def _completed_setup(data_dir: Path, config: str) -> None:
+    from henchmen.console.state import SetupState, SetupStep
+
+    (data_dir / "henchmen.env").write_text(config, encoding="utf-8")
+    SetupStateStore(data_dir / "setup-state.json").save(
+        SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True)
+    )
+
+
+# A forward base matching the default container hostname and _serve_args()'s default port
+# (8123), so tests that are not about ruling P3 exercise service/bind failures instead of
+# needs-attention mode for the unconfigured default forward base.
+_FORWARD_OK = "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123\n"
+
+
+class TestNeedsAttention:
+    """D-P5: a completed setup that cannot start serves the Console instead of exiting."""
+
+    @pytest.fixture(autouse=True)
+    def _data_dir(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+
+    @staticmethod
+    def _status(app: object) -> dict[str, object]:
+        client = TestClient(app, base_url=_LOCAL)  # type: ignore[arg-type]
+        assert client.get("/health").json() == {"status": "degraded", "mode": "attention"}
+        return client.get("/console/api/status").json()
+
+    def test_settings_that_do_not_build_serve_the_attention_console(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from henchmen.cli import _serve
+
+        _completed_setup(tmp_path, "HENCHMEN_PROVIDER=local\nHENCHMEN_OPERATIVE_TASK_COST_CEILING_USD=abc\n")
+        with (
+            patch("henchmen.cli.serve.build_serve_app") as build_services,
+            patch("henchmen.cli.serve.serve_app", return_value=0) as run,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            _serve(_serve_args())
+        assert exit_info.value.code == 0
+        build_services.assert_not_called()
+        status = self._status(run.call_args.args[0])
+        assert status["mode"] == "attention"
+        assert any("operative_task_cost_ceiling_usd" in p for p in status["problems"])  # type: ignore[attr-defined]
+        assert run.call_args.kwargs["port"] == 8123
+        assert "Henchmen needs attention" in capsys.readouterr().out
+
+    def test_runtime_problems_serve_the_attention_console(self, tmp_path: Path) -> None:
+        from henchmen.cli import _serve
+
+        _completed_setup(tmp_path, "HENCHMEN_PROVIDER=local\nHENCHMEN_LLM_PROVIDER=anthropic\n")
+        with (
+            patch("henchmen.cli.serve.build_serve_app") as build_services,
+            patch("henchmen.cli.serve.serve_app", return_value=0) as run,
+            pytest.raises(SystemExit),
+        ):
+            _serve(_serve_args())
+        build_services.assert_not_called()
+        problems = self._status(run.call_args.args[0])["problems"]
+        assert any("HENCHMEN_ANTHROPIC_API_KEY" in p for p in problems)  # type: ignore[attr-defined]
+
+    def test_a_service_startup_failure_falls_back_without_exiting(self, tmp_path: Path) -> None:
+        from henchmen.cli import _serve
+        from henchmen.cli.serve import STARTUP_FAILURE
+
+        _completed_setup(tmp_path, "HENCHMEN_PROVIDER=local\n" + _FORWARD_OK)
+        leaked = "ghp_" + "z" * 36
+
+        def failing_build(settings, port, *, console, desktop, health):
+            health.record_startup_failure("dispatch", RuntimeError(f"Slack refused {leaked}"))
+            return MagicMock()
+
+        with (
+            patch("henchmen.cli.serve.build_serve_app", side_effect=failing_build),
+            patch("henchmen.cli.serve.serve_app", side_effect=[STARTUP_FAILURE, 0]) as run,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            _serve(_serve_args())
+        assert exit_info.value.code == 0
+        status = self._status(run.call_args_list[1].args[0])
+        assert any("A Henchmen service failed to start" in p for p in status["problems"])  # type: ignore[attr-defined]
+        assert leaked not in json.dumps(status)
+
+    def test_a_bind_failure_is_not_attention_mode(self, tmp_path: Path) -> None:
+        from henchmen.cli import _serve
+
+        _completed_setup(tmp_path, "HENCHMEN_PROVIDER=local\n" + _FORWARD_OK)
+        with (
+            patch("henchmen.cli.serve.build_serve_app", return_value=MagicMock()),
+            patch("henchmen.cli.serve.serve_app", return_value=1) as run,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            _serve(_serve_args())
+        assert exit_info.value.code == 1
+        assert run.call_count == 1
+
+    @pytest.mark.parametrize(("attention_code", "exit_code"), [(RESTART_EXIT_CODE, 75), (1, 3), (3, 3)])
+    def test_attention_mode_restarts_on_apply_and_exits_3_when_it_cannot_start(
+        self, tmp_path: Path, attention_code: int, exit_code: int
+    ) -> None:
+        from henchmen.cli import _serve
+
+        _completed_setup(tmp_path, "HENCHMEN_PROVIDER=local\nHENCHMEN_LLM_PROVIDER=anthropic\n")
+        with (
+            patch("henchmen.cli.serve.serve_app", return_value=attention_code),
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            _serve(_serve_args())
+        assert exit_info.value.code == exit_code
+
+    def test_run_mode_hints_at_console_link_when_no_token_is_available(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Deferred Task 3 nit: no usable sign-in token must never mean printing nothing."""
+        from henchmen.cli import _serve
+
+        _completed_setup(tmp_path, "HENCHMEN_PROVIDER=local\n" + _FORWARD_OK)
+        with (
+            patch.object(ConsoleAuth, "setup_token", new_callable=lambda: property(lambda self: "")),
+            patch("henchmen.cli.serve.build_serve_app", return_value=MagicMock()),
+            patch("henchmen.cli.serve.serve_app", return_value=0),
+            pytest.raises(SystemExit),
+        ):
+            _serve(_serve_args())
+        assert "henchmen console-link" in capsys.readouterr().out
+
+    def test_attention_mode_hints_at_console_link_when_no_token_is_available(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from henchmen.cli import _serve
+
+        _completed_setup(tmp_path, "HENCHMEN_PROVIDER=local\nHENCHMEN_LLM_PROVIDER=anthropic\n")
+        with (
+            patch.object(ConsoleAuth, "setup_token", new_callable=lambda: property(lambda self: "")),
+            patch("henchmen.cli.serve.serve_app", return_value=0),
+            pytest.raises(SystemExit),
+        ):
+            _serve(_serve_args())
+        assert "henchmen console-link" in capsys.readouterr().out

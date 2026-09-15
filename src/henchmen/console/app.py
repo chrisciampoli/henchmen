@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
 
@@ -23,6 +23,7 @@ from henchmen import __version__
 from henchmen.config.validation import settings_problems
 from henchmen.console.auth import SESSION_COOKIE, ConsoleAuth, ConsoleGuard
 from henchmen.console.config_store import DISPATCH_API_TOKEN_KEY, ConfigStore
+from henchmen.console.services import ServiceHealth
 from henchmen.console.state import OPTIONAL_STEPS, SetupState, SetupStateStore, SetupStep
 from henchmen.console.steps import STEP_ROUTE_PREFIX, StepRoutes, discover_step_routes, validate_step_routes
 from henchmen.utils.redaction import redact
@@ -49,14 +50,17 @@ class ConsoleMode(StrEnum):
 
     SETUP = "setup"
     RUN = "run"
+    ATTENTION = "attention"
 
 
 class ConsoleStatus(BaseModel):
     """Unauthenticated status the launcher and the UI poll."""
 
-    mode: ConsoleMode = Field(..., description="setup or run")
+    mode: ConsoleMode = Field(..., description="setup, run or attention")
     setup_completed: bool = Field(..., description="Whether setup has been applied")
     version: str = Field(..., description="Henchmen package version")
+    problems: list[str] = Field(default_factory=list, description="Why Henchmen cannot start (attention mode only)")
+    services: dict[str, str] = Field(default_factory=dict, description="State of each service, e.g. running")
 
 
 class SetupStateUpdate(BaseModel):
@@ -115,13 +119,19 @@ def create_console_app(
     on_apply: Callable[[], None],
     step_routes: Mapping[SetupStep, StepRoutes] | None = None,
     seeded_env: Mapping[str, str] | None = None,
+    problems: Sequence[str] = (),
+    service_status: Callable[[], dict[str, str]] | None = None,
 ) -> FastAPI:
     """Build the Console app. ``on_apply`` is called after apply's response is sent.
 
     ``step_routes`` defaults to every ``henchmen.console.steps.<step>`` module found
     (:func:`henchmen.console.steps.discover_step_routes`). ``seeded_env`` are the
     defaults ``henchmen serve`` put into this process's environment; apply validates
-    as if they were absent unless the file leaves the key out (D-P8).
+    as if they were absent unless the file leaves the key out (D-P8). ``problems``
+    (needs-attention mode only) are why Henchmen could not start; each is passed
+    through :func:`redact` before being reported, since a settings problem or a
+    service startup error can carry an exception message from arbitrary code.
+    ``service_status`` reports each service's live state (run mode only).
     """
     app = FastAPI(title="Henchmen Console", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.setup_store = store
@@ -134,9 +144,18 @@ def create_console_app(
         errors = [{key: value for key, value in error.items() if key != "input"} for error in exc.errors()]
         return JSONResponse({"detail": jsonable_encoder(errors)}, status_code=422)
 
+    reported_problems = [redact(problem) for problem in problems] if mode == ConsoleMode.ATTENTION else []
+
     @app.get("/console/api/status")
     async def status() -> ConsoleStatus:
-        return ConsoleStatus(mode=mode, setup_completed=store.load().completed, version=__version__)
+        services = service_status() if service_status is not None else ServiceHealth().snapshot()
+        return ConsoleStatus(
+            mode=mode,
+            setup_completed=store.load().completed,
+            version=__version__,
+            problems=reported_problems,
+            services=services,
+        )
 
     @app.get("/console/session", response_model=None)
     async def session(request: Request, setup_token: str = Query(default="")) -> RedirectResponse | JSONResponse:

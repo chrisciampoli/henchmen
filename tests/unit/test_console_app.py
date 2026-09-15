@@ -387,3 +387,63 @@ def test_session_exchange_with_a_file_backed_token_store_is_one_time(tmp_path: P
     third = client.get("/console/session", params={"setup_token": token})
     assert third.status_code == 303
     assert third.headers["location"] == "/"
+
+
+# ---------------------------------------------------------------------------
+# Task 11: needs-attention mode, service status
+# ---------------------------------------------------------------------------
+
+
+def test_status_has_no_problems_and_services_off_outside_run_mode(env) -> None:
+    client, *_ = env
+    body = client.get("/console/api/status").json()
+    assert body["problems"] == []
+    assert body["services"] == {"dispatch": "off", "mastermind": "off", "forge": "off"}
+
+
+def _console(tmp_path: Path, mode: ConsoleMode, **kwargs):
+    return create_console_app(
+        mode=mode,
+        store=SetupStateStore(tmp_path / "setup-state.json"),
+        auth=ConsoleAuth(setup_token="tok", signing_key=b"k" * 32),
+        config_file=tmp_path / "henchmen.env",
+        on_apply=lambda: None,
+        **kwargs,
+    )
+
+
+def test_attention_mode_status_carries_redacted_problems(tmp_path: Path) -> None:
+    leaked = "sk-ant-" + "x" * 30
+    app = _console(tmp_path, ConsoleMode.ATTENTION, problems=["HENCHMEN_ANTHROPIC_API_KEY is empty.", f"boom {leaked}"])
+    body = TestClient(app, base_url=LOCAL).get("/console/api/status").json()
+    assert body["mode"] == "attention"
+    assert body["problems"][0] == "HENCHMEN_ANTHROPIC_API_KEY is empty."
+    assert leaked not in body["problems"][1]
+
+
+def test_problems_are_reported_only_in_attention_mode(tmp_path: Path) -> None:
+    app = _console(tmp_path, ConsoleMode.RUN, problems=["stale"])
+    assert TestClient(app, base_url=LOCAL).get("/console/api/status").json()["problems"] == []
+
+
+def test_run_mode_status_reports_the_live_service_snapshot(tmp_path: Path) -> None:
+    from henchmen.console.services import ServiceHealth, ServiceState
+
+    health = ServiceHealth()
+    app = _console(tmp_path, ConsoleMode.RUN, service_status=health.snapshot)
+    client = TestClient(app, base_url=LOCAL)
+    health.set_all(ServiceState.RUNNING)
+    assert client.get("/console/api/status").json()["services"] == {
+        "dispatch": "running",
+        "mastermind": "running",
+        "forge": "running",
+    }
+
+
+def test_attention_mode_exposes_no_service_routes(tmp_path: Path) -> None:
+    """Ruling 2: the attention Console keeps the same guard as setup/run -- it never
+    grows service routes, and a non-local Host is refused exactly like every other mode."""
+    app = _console(tmp_path, ConsoleMode.ATTENTION, problems=["boom"])
+    client = TestClient(app, base_url=LOCAL)
+    assert client.get("/console/api/status").status_code == 200
+    assert client.get("/", headers={"host": "evil.example"}).status_code == 403

@@ -457,6 +457,13 @@ def forward_host_problem(settings: Settings) -> str | None:
     :func:`desktop_allowed_hostnames`. The default ``local_forward_base``
     (``http://host.docker.internal:<port>``) is exactly this case, so this
     surfaces it instead of leaving operatives to fail with an opaque 403.
+
+    A loopback hostname (``127.0.0.1``, ``localhost``, ``::1``) is also a
+    problem, unconditionally: :class:`~henchmen.providers.local.docker.DockerOrchestrator`
+    never runs an operative container with ``--network host`` -- it only joins
+    the default bridge network or a named ``local_docker_network`` -- so that
+    hostname always names the operative's own container, never this machine,
+    regardless of ``local_docker_network``.
     """
     from henchmen.config.paths import is_desktop_install
 
@@ -478,9 +485,16 @@ def forward_host_problem(settings: Settings) -> str | None:
         hostname = None
     if not hostname:
         return f"HENCHMEN_LOCAL_FORWARD_BASE_URL ({settings.local_forward_base!r}) is not a usable URL."
-    if hostname.lower() in desktop_allowed_hostnames(container_hostname):
-        return None
+
     suggestion = f"http://{container_hostname}:{settings.local_serve_port}"
+    lowered = hostname.lower()
+    if lowered in _LOOPBACK_NAMES:
+        return (
+            f"Operatives call Henchmen at {hostname}, its own loopback address inside the operative's "
+            f"container, which never reaches this machine. Set HENCHMEN_LOCAL_FORWARD_BASE_URL={suggestion}"
+        )
+    if lowered in desktop_allowed_hostnames(container_hostname):
+        return None
     return (
         f"Operatives call Henchmen at {hostname}, which a desktop install refuses. "
         f"Set HENCHMEN_LOCAL_FORWARD_BASE_URL={suggestion}"
