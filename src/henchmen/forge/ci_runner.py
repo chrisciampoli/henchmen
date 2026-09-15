@@ -76,6 +76,19 @@ _SECRET_ENV_RE = re.compile(r"TOKEN|SECRET|API_?KEY|PASSWORD|CREDENTIAL", re.IGN
 _TEST_DIRS = ("tests", "test", "apps/api/test")
 
 
+def _test_script(manifest_text: str) -> str | None:
+    """The npm ``test`` script declared in a ``package.json`` text, or ``None``."""
+    try:
+        package = json.loads(manifest_text)
+    except ValueError:
+        return None
+    scripts = package.get("scripts") if isinstance(package, dict) else None
+    if not isinstance(scripts, dict):
+        return None
+    script = scripts.get("test")
+    return script if isinstance(script, str) and script.strip() else None
+
+
 def _is_secret_env(name: str) -> bool:
     """True if an environment variable must not be exposed to target-repo code."""
     return name.startswith(_SECRET_ENV_PREFIXES) or bool(_SECRET_ENV_RE.search(name))
@@ -136,6 +149,32 @@ class CIRunner:
             return await self._run_silent_failure_scan(workspace_dir, merge_base, base_error)
         finally:
             self._deadline = None
+
+    async def committed_tests_decision(self, workspace_dir: str) -> tuple[bool, dict[str, Any] | None]:
+        """Decide the tests check from the committed tree alone, exactly as :meth:`_run_tests` decides it.
+
+        For a desktop install's no-checkout clone: ``(True, None)`` means run
+        the suite (in the gate container); ``(False, None)`` means the target
+        has no tests check at all (no ``package.json`` and no test directory);
+        ``(False, check)`` is a check to record instead -- ``skipped`` for a
+        ``package.json`` without a ``test`` script, ``failed`` when the tree
+        could not be read. Only ``git ls-tree``/``git show`` run; nothing from
+        the repository executes.
+        """
+        rc, out, err = await self._run_command(
+            ["git", "ls-tree", "--name-only", "HEAD", "--", "package.json", *_TEST_DIRS], workspace_dir
+        )
+        if rc != 0:
+            return False, self._check("tests", STATUS_FAILED, "", f"Could not read the PR tree: {err or out}")
+        entries = {line.strip() for line in out.splitlines() if line.strip()}
+        if "package.json" in entries:
+            rc, manifest, err = await self._run_command(["git", "show", "HEAD:package.json"], workspace_dir)
+            if rc != 0:
+                return False, self._check("tests", STATUS_FAILED, "", f"Could not read package.json: {err}")
+            if _test_script(manifest) is None:
+                return False, self._check("tests", STATUS_SKIPPED, "", "package.json declares no `test` script.")
+            return True, None
+        return (True, None) if entries & set(_TEST_DIRS) else (False, None)
 
     async def _run_checks(self, workspace_dir: str, base_ref: str | None) -> dict[str, Any]:
         merge_base, base_error = await self._resolve_merge_base(workspace_dir, base_ref)
@@ -476,14 +515,9 @@ class CIRunner:
         """Return the target's npm ``test`` script, or ``None`` if it has none."""
         try:
             with open(os.path.join(workspace_dir, "package.json"), encoding="utf-8") as fh:
-                package = json.load(fh)
-        except (OSError, ValueError):
+                return _test_script(fh.read())
+        except OSError:
             return None
-        scripts = package.get("scripts") if isinstance(package, dict) else None
-        if not isinstance(scripts, dict):
-            return None
-        script = scripts.get("test")
-        return script if isinstance(script, str) and script.strip() else None
 
     # ------------------------------------------------------------------
     # Result shaping
