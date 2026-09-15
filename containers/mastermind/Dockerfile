@@ -25,7 +25,7 @@ RUN npm install -g pnpm@9 && pnpm --version
 # Static client binary only (no daemon). Needed in provider=local mode, where
 # the scheme executor launches operatives as sibling containers against a
 # mounted /var/run/docker.sock.
-FROM docker:28-cli@sha256:625d9431a9f54c5a2bc90f24f0e1c3d55b1349fd857dd85035f98c2c9acbdd4d AS docker-cli
+FROM docker:29-cli@sha256:eccaacfeed644c7de222ff047483568cb988dde95476fbaaf10ea2d04921bb66 AS docker-cli
 
 # --- Runtime stage ---
 FROM python:3.14.7-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f AS runtime
