@@ -166,12 +166,16 @@ class ConfigStore:
         so calling another ``ConfigStore`` method (e.g.
         :meth:`write_dispatch_api_token`) while already holding it, from the
         same thread, re-enters cleanly instead of deadlocking.
+
+        Never ``await`` while holding ``locked()``.
         """
         with self._lock:
             yield
 
     def _check_key(self, key: str) -> None:
-        if key not in self._allowed or key in _NEVER_WRITABLE:
+        if key in _NEVER_WRITABLE:
+            raise ConfigStoreError(f"{key} is set only by the server")
+        if key not in self._allowed:
             raise ConfigStoreError(f"{key!r} is not a Henchmen setting")
 
     def get(self, key: str, default: str = "") -> str:

@@ -122,9 +122,9 @@ def test_concurrent_updates_do_not_lose_keys(store: ConfigStore) -> None:
 
 def test_never_writable_keys_are_refused(store: ConfigStore) -> None:
     """The operative task token and the operative-only GitHub token expiry are server-owned."""
-    with pytest.raises(ConfigStoreError):
+    with pytest.raises(ConfigStoreError, match="is set only by the server"):
         store.update({"HENCHMEN_OPERATIVE_TASK_TOKEN": "x"}, section="S")
-    with pytest.raises(ConfigStoreError):
+    with pytest.raises(ConfigStoreError, match="is set only by the server"):
         store.get("HENCHMEN_OPERATIVE_TASK_TOKEN")
     assert not store.config_file.exists()
 
