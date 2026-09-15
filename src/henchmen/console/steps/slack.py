@@ -51,8 +51,10 @@ tokens mid-flight (through a second browser tab, say) must not attribute a
 channel confirmed with the old bot to the new one. It also skips posting a
 fresh test message when the same channel is already confirmed for the
 current workspace and the step is already complete, and applies a short
-per-process cooldown per channel, so repeatedly re-choosing the same channel
-(or mashing "Check again") does not spam the workspace with test messages.
+per-process cooldown keyed on the current workspace fingerprint and channel
+together (never the channel alone -- a brand-new bot token must still post),
+so repeatedly re-choosing the same channel (or mashing "Check again") does
+not spam the workspace with test messages.
 """
 
 from __future__ import annotations
@@ -101,9 +103,14 @@ WORKSPACE_CHOICE = "slack_workspace"
 # A repeat "Check again"/re-choose of an already-confirmed channel, or a user
 # mashing the choose-channel action, must not spam the workspace with a fresh
 # test message every time (ruling F6). Module-level and per-process: a
-# generous, best-effort cooldown, not a security control.
+# generous, best-effort cooldown, not a security control. Keyed on
+# `(workspace fingerprint, channel_id)`, not the channel alone (ruling F1):
+# otherwise a brand-new bot token (a different workspace, or the same
+# workspace reinstalled with a new bot user) that happens to pick the same
+# channel id within the window would be silently treated as "already
+# confirmed" for a workspace it has never actually posted to.
 _TEST_MESSAGE_COOLDOWN_SECONDS = 30.0
-_last_test_message: dict[str, float] = {}
+_last_test_message: dict[tuple[str, str], float] = {}
 
 SLACK_BOT_SCOPES: tuple[str, ...] = (
     "app_mentions:read",
@@ -227,19 +234,17 @@ def _skip_test_message(config: ConfigStore, setup: SetupStateStore, channel_id: 
     Either this exact channel is already saved as the completed step's
     channel for a confirmed workspace fingerprint (a repeat "Check
     again"/re-choice of the same channel needs no second proof), or a test
-    message was already sent to this channel within the cooldown window --
-    both are best-effort, not security checks: :func:`choose_channel` still
+    message was already sent to this exact ``(workspace fingerprint,
+    channel_id)`` pair within the cooldown window (ruling F1) -- both are
+    best-effort, not security checks: :func:`choose_channel` still
     re-verifies the bot token under lock before writing anything.
     """
     state = setup.load()
-    already_confirmed = (
-        STEP in state.completed_steps
-        and bool(state.server_choices.get(WORKSPACE_CHOICE, ""))
-        and config.get(CHANNEL_KEY) == channel_id
-    )
+    fingerprint = state.server_choices.get(WORKSPACE_CHOICE, "")
+    already_confirmed = STEP in state.completed_steps and bool(fingerprint) and config.get(CHANNEL_KEY) == channel_id
     if already_confirmed:
         return True
-    last_sent = _last_test_message.get(channel_id)
+    last_sent = _last_test_message.get((fingerprint, channel_id))
     return last_sent is not None and (time.monotonic() - last_sent) < _TEST_MESSAGE_COOLDOWN_SECONDS
 
 
@@ -420,14 +425,17 @@ async def choose_channel(body: ChannelChoice, config: ConfigDep, setup: SetupDep
         if joined.status != CheckStatus.OK:
             return step_failed(STEP, problem_from_check(joined, field="channel_id"))
 
-    if _skip_test_message(config, setup, selected.id):
+    fingerprint = setup.load().server_choices.get(WORKSPACE_CHOICE, "")
+    skipped = _skip_test_message(config, setup, selected.id)
+    if skipped:
         posted = CheckResult("Slack test message", CheckStatus.OK, f"already confirmed for {selected.id}")
     else:
         posted = await run_in_threadpool(checks.post_slack_message, bot_token, selected.id, TEST_MESSAGE)
         if posted.status == CheckStatus.OK:
-            _last_test_message[selected.id] = time.monotonic()
+            _last_test_message[(fingerprint, selected.id)] = time.monotonic()
     if posted.status != CheckStatus.OK:
         return step_failed(STEP, problem_from_check(posted, field="channel_id"))
+    test_message_state = "already confirmed" if skipped else "posted"
 
     # Every network call is done before this point (ruling F4: never await while
     # holding the lock). Re-check that the bot token is still the one this request
@@ -445,4 +453,4 @@ async def choose_channel(body: ChannelChoice, config: ConfigDep, setup: SetupDep
         except (OSError, ConfigStoreError, ValueError) as exc:
             logger.warning("Could not save the Slack channel (%s)", type(exc).__name__)
             return step_failed(STEP, _storage_problem())
-        return step_succeeded(setup, STEP, {"channel": _channel_details(selected), "test_message": "posted"})
+        return step_succeeded(setup, STEP, {"channel": _channel_details(selected), "test_message": test_message_state})
