@@ -35,6 +35,8 @@ dependencies = [
     "httpx",
     # <3: a major release may change the Auth/Github constructor API we use.
     "PyGithub>=2.4.0,<3",
+    # GitHub App authentication: RS256 app JWTs (the crypto extra pulls in cryptography).
+    "PyJWT[crypto]>=2.8,<3",
 ]
 
 [project.urls]

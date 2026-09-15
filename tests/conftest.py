@@ -47,6 +47,7 @@ from henchmen.models.scheme import (
     SchemeNode,
 )
 from henchmen.models.task import HenchmenTask, TaskContext, TaskPriority, TaskSource
+from henchmen.utils.github_auth import reset_credentials_providers
 
 # ---------------------------------------------------------------------------
 # The developer's real ~/.henchmen is never touched
@@ -163,10 +164,14 @@ def _isolate_settings() -> Iterator[None]:
     This replaces the 53+ hand-rolled ``get_settings.cache_clear()`` calls
     that previously lived across ``test_config.py``, ``test_dispatch.py``
     and various conftest files.
+
+    Cached GitHub credentials providers are dropped the same way, since they are keyed on Settings values.
     """
     get_settings.cache_clear()
+    reset_credentials_providers()
     yield
     get_settings.cache_clear()
+    reset_credentials_providers()
 
 
 @pytest.fixture(autouse=True)

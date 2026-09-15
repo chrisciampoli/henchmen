@@ -12,6 +12,7 @@ are present the ``HENCHMEN_`` name wins.
 
 from enum import StrEnum
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import AliasChoices, Field, field_validator
@@ -217,6 +218,29 @@ class Settings(BaseSettings):
     )
     github_default_org: str = Field(default="", description="Default GitHub organization")
     github_default_repo: str = Field(default="", description="Default target repo for tasks (owner/repo)")
+    github_app_id: str = Field(
+        default="",
+        description=(
+            "GitHub App ID, written by the Console's GitHub step. With github_app_installation_id and "
+            "github_app_private_key_path also set, Henchmen uses short-lived installation tokens instead of "
+            "github_token."
+        ),
+    )
+    github_app_installation_id: str = Field(
+        default="", description="Installation ID of the GitHub App on the account that owns the target repositories"
+    )
+    github_app_private_key_path: str = Field(
+        default="",
+        description="Path to the GitHub App's PEM private key (mode 0600; <data dir>/secrets/github-app.pem)",
+    )
+    github_api_url: str = Field(
+        default="https://api.github.com",
+        description="GitHub REST API base URL for GitHub App setup and token minting (override only for test fakes)",
+    )
+    github_web_url: str = Field(
+        default="https://github.com",
+        description="GitHub web base URL the Console sends browsers to while creating and installing the GitHub App",
+    )
 
     # Slack integration
     slack_bot_token: str = Field(
@@ -642,6 +666,18 @@ class Settings(BaseSettings):
         missing_tiers = [tier.value for tier, model in tier_models(self).items() if not model]
         if missing_tiers:
             problems.append(f"No model configured for LLM tier(s): {', '.join(sorted(missing_tiers))}.")
+
+        app_values = {
+            "HENCHMEN_GITHUB_APP_ID": self.github_app_id,
+            "HENCHMEN_GITHUB_APP_INSTALLATION_ID": self.github_app_installation_id,
+            "HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH": self.github_app_private_key_path,
+        }
+        missing_app = [name for name, value in app_values.items() if not value.strip()]
+        if missing_app and len(missing_app) < len(app_values):
+            problems.append(f"The GitHub App is only partly configured; set {', '.join(missing_app)} as well.")
+        key_path = self.github_app_private_key_path.strip()
+        if key_path and not Path(key_path).is_file():
+            problems.append("HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH does not point to a readable file.")
 
         if self.environment in (Environment.STAGING, Environment.PROD):
             if not self.pubsub_oidc_audience:
