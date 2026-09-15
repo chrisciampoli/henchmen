@@ -129,7 +129,7 @@ def test_load_creates_and_reuses_the_signing_key(tmp_path: Path) -> None:
 def test_write_key_file_round_trips_newline_and_carriage_return_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression test for the O_BINARY fix in ``_write_key_file``.
+    """Regression test for the O_BINARY fix now in ``secret_files.create_secret_file``.
 
     Opening the key file without ``os.O_BINARY`` puts the descriptor in text
     mode on Windows, which silently rewrites a lone ``\\n`` (0x0A) byte to

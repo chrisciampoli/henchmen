@@ -23,7 +23,6 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import secrets
 import time
 from pathlib import Path
@@ -31,11 +30,12 @@ from urllib.parse import urlsplit
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from henchmen.config.secret_files import read_or_create_secret
+
 logger = logging.getLogger(__name__)
 
 SESSION_COOKIE = "henchmen_console"
 _KEY_FILE_NAME = "console-session.key"
-_MIN_KEY_BYTES = 32
 _LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _DEFAULT_PORTS: dict[str, int] = {"http": 80, "https": 443, "ws": 80, "wss": 443}
@@ -96,22 +96,6 @@ def is_local_origin(origin: str | None) -> bool:
     return _origin_parts(origin) is not None
 
 
-def _write_key_file(path: Path, key: bytes) -> None:
-    """Create ``path`` atomically, mode 0600 from the start (harmless flag on Windows).
-
-    ``O_BINARY`` is required on Windows: without it the file descriptor opens in
-    text mode, which silently rewrites a ``\\n`` (0x0A) byte in the random key
-    to ``\\r\\n``, corrupting roughly one key in eight and invalidating every
-    session signed with it as soon as the file is re-read.
-    """
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
-    fd = os.open(str(path), flags, 0o600)
-    try:
-        os.write(fd, key)
-    finally:
-        os.close(fd)
-
-
 class ConsoleAuth:
     """Setup-token check plus signed, expiring session cookies."""
 
@@ -129,28 +113,11 @@ class ConsoleAuth:
     def load(cls, secrets_dir: Path, setup_token: str | None) -> ConsoleAuth:
         """Load (or create) the signing key; use ``setup_token`` or generate one.
 
-        A missing, empty, or too-short key file is never trusted: it is
-        regenerated (never logging the key material itself).
+        The key file is managed by :func:`henchmen.config.secret_files.read_or_create_secret`:
+        owner-only from creation, atomic, and regenerated when missing, empty or
+        too short (never trusted as an HMAC key, never logged).
         """
-        # Owner-only from creation: it holds the session signing key (mode ignored on Windows).
-        secrets_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        key_path = secrets_dir / _KEY_FILE_NAME
-        key: bytes | None = None
-        file_exists = key_path.is_file()
-        if file_exists:
-            existing = key_path.read_bytes()
-            if len(existing) >= _MIN_KEY_BYTES:
-                key = existing
-            else:
-                logger.warning("Console session key at %s is missing or too short; regenerating it.", key_path)
-        if key is None:
-            key = secrets.token_bytes(32)
-            if file_exists:
-                tmp_path = key_path.with_name(f"{key_path.name}.{secrets.token_hex(8)}.tmp")
-                _write_key_file(tmp_path, key)
-                os.replace(tmp_path, key_path)
-            else:
-                _write_key_file(key_path, key)
+        key = read_or_create_secret(secrets_dir / _KEY_FILE_NAME)
         return cls(setup_token=setup_token or secrets.token_urlsafe(32), signing_key=key)
 
     def check_setup_token(self, candidate: str) -> bool:
