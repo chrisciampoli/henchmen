@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import shlex
 import shutil
 import sys
@@ -54,6 +55,12 @@ from henchmen.utils.stack_detector import Stack, detect_stack
 
 GATE_RESULT_MARKER = "HENCHMEN_GATE_RESULT "
 _OUTPUT_LIMIT = 5000
+
+# Every environment variable a GitHub token could plausibly travel under.
+# Repo-controlled code (an install script, the linter, the test suite, a
+# `gh` CLI invocation) runs as a subprocess of this process and inherits its
+# whole environment unless these are stripped from a copy of it first.
+_TOKEN_ENV_VARS = ("HENCHMEN_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
 
 CheckType = Literal["lint", "tests"]
 
@@ -95,6 +102,50 @@ def scrub_secret(text: str, token: str) -> str:
     return redact(text)
 
 
+def env_without_github_tokens() -> dict[str, str]:
+    """A copy of the current environment with every GitHub token variable removed.
+
+    Repo-controlled code runs as a subprocess of this process and otherwise
+    inherits its whole environment, including whatever token cloned it.
+    Never mutates ``os.environ`` itself — always builds a fresh copy.
+    """
+    return {key: value for key, value in os.environ.items() if key not in _TOKEN_ENV_VARS}
+
+
+async def _strip_remote_token(workspace: str, repo: str, check_type: CheckType) -> GateResult | None:
+    """Reset ``origin``'s URL to a token-less form before any repo-controlled code runs.
+
+    ``clone_repo`` embeds the token in ``origin``'s URL so `git fetch`/`git
+    diff` can authenticate; once the last authenticated git call
+    (``changed_files``, for lint) has run, an install script, the linter or
+    the test suite could otherwise read that URL straight out of
+    ``.git/config``. Returns a fail :class:`GateResult` when the reset itself
+    fails (fail-closed); ``None`` on success, including when there is no git
+    repository to scrub (cloning never actually happened, e.g. a clone
+    failure already returned earlier, or a caller that skipped it in a test).
+    """
+    if not (Path(workspace) / ".git").exists():
+        return None
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "remote",
+        "set-url",
+        "origin",
+        f"https://github.com/{repo}.git",
+        cwd=workspace,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        detail = stderr.decode(errors="replace").strip()[:300]
+        return GateResult(
+            condition="fail",
+            message=f"{check_type} failed (could not remove the token from the git remote): {detail}",
+        )
+    return None
+
+
 async def _run_script(workspace: str, script: str) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(
         "/bin/bash",
@@ -103,6 +154,7 @@ async def _run_script(workspace: str, script: str) -> tuple[int, str]:
         cwd=workspace,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=env_without_github_tokens(),
     )
     stdout, _ = await proc.communicate()
     returncode = proc.returncode if proc.returncode is not None else 1
@@ -149,6 +201,15 @@ async def plan_gate(
         commands = plan.commands
     else:
         commands = (CheckCommand(argv=tuple(stack.test_command)),)
+
+    # From here on, repo-controlled code runs (an install script, the linter,
+    # the test suite) — make sure none of it can read the token back out of
+    # `.git/config` first. This is the last authenticated git call either
+    # branch above made (`changed_files`, for lint; `clone_repo` alone, for
+    # tests), so nothing after this point still needs the token in the URL.
+    scrub_result = await _strip_remote_token(workspace, repo, check_type)
+    if scrub_result is not None:
+        return scrub_result
 
     return GatePlan(stack=stack, commands=commands)
 
@@ -223,6 +284,7 @@ __all__ = [
     "GATE_RESULT_MARKER",
     "GatePlan",
     "GateResult",
+    "env_without_github_tokens",
     "install_script",
     "main",
     "parse_gate_result",

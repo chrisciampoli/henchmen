@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -22,6 +25,7 @@ from henchmen.mastermind.scheme_executor.lint_scope import LintScopeError
 from henchmen.utils.stack_detector import Stack
 
 TOKEN = "ghp_" + "s" * 36
+_HAS_GIT = shutil.which("git") is not None
 
 
 def _write(root: Path, rel: str, text: str = "") -> None:
@@ -216,17 +220,26 @@ def _gate_proc(returncode: int, stdout: bytes = b"", stderr: bytes = b"") -> Mag
 
 
 def _hanging_proc() -> MagicMock:
-    """A fake ``docker run`` process that never produces output or exits on its own."""
+    """A fake ``docker run`` process that never produces output or exits on its own.
+
+    ``.wait()`` only resolves once ``.kill()`` has been called, mirroring a
+    real process: it never returns on its own (so the initial `gather` times
+    out), but a `proc.kill()` afterward must not leave a second `await
+    proc.wait()` hanging too.
+    """
     proc = MagicMock()
     proc.returncode = None
     proc.stdout = _HangingStream()
     proc.stderr = _HangingStream()
+    killed = asyncio.Event()
 
     async def _wait() -> int:
-        await asyncio.sleep(5)
+        await killed.wait()
+        proc.returncode = 0
         return 0
 
     proc.wait = _wait
+    proc.kill = MagicMock(side_effect=killed.set)
     return proc
 
 
@@ -301,6 +314,7 @@ class TestLocalGateInvocation:
                 "could not determine",
             ),
             (137, b"", "without a result"),
+            (0, b"HENCHMEN_GATE_RESULT {not json\n", "without a result"),
         ],
     )
     async def test_every_non_pass_outcome_fails_closed(self, returncode: int, stdout: bytes, fragment: str) -> None:
@@ -331,20 +345,50 @@ class TestLocalGateInvocation:
 
     @pytest.mark.asyncio
     async def test_a_hung_gate_survives_a_failed_kill(self) -> None:
-        """The timeout path must still return a clean fail result even when `docker kill` itself errors."""
+        """When `docker kill` itself errors, cleanup falls back to `docker rm -f` and still fails cleanly."""
         from henchmen.mastermind.scheme_executor import handlers
 
         hung = _hanging_proc()
+        remover = _communicate_proc(0, b"")
         with (
             patch("henchmen.config.settings.get_settings", return_value=_local_settings()),
             patch.object(
-                handlers.asyncio, "create_subprocess_exec", AsyncMock(side_effect=[hung, OSError("docker not running")])
-            ),
+                handlers.asyncio,
+                "create_subprocess_exec",
+                AsyncMock(side_effect=[hung, OSError("docker not running"), remover]),
+            ) as exec_mock,
             patch.object(handlers, "_gate_timeout_seconds", return_value=0.01),
         ):
             result = await handlers._run_ci_check(MagicMock(), _task(), "tests")
         assert result["condition"] == "fail"
         assert "did not finish" in result["message"]
+        rm_argv = exec_mock.await_args_list[2].args
+        assert rm_argv[:3] == ("docker", "rm", "-f") and rm_argv[3].startswith("henchmen-gate-")
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_run_kills_the_container_and_cancellederror_propagates(self) -> None:
+        """Cancelling `_run_gate_in_container` itself (not a timeout) must still clean up
+        the container, and must not swallow the cancellation into a fail result.
+        """
+        from henchmen.mastermind.scheme_executor import handlers
+
+        hung = _hanging_proc()
+        killer = _communicate_proc(0, b"")
+        with patch.object(
+            handlers.asyncio, "create_subprocess_exec", AsyncMock(side_effect=[hung, killer])
+        ) as exec_mock:
+            task = asyncio.ensure_future(
+                handlers._run_gate_in_container(
+                    _local_settings(), "tests", repo="acme/widgets", branch="henchmen/t", base_branch="main"
+                )
+            )
+            await asyncio.sleep(0.01)  # let it reach the gather before cancelling
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        kill_argv = exec_mock.await_args_list[1].args
+        assert kill_argv[:2] == ("docker", "kill") and kill_argv[2].startswith("henchmen-gate-")
+        hung.kill.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_docker_unavailable_fails(self) -> None:
@@ -446,3 +490,144 @@ class TestBoundedGateOutput:
         ):
             result = await asyncio.wait_for(handlers._run_ci_check(MagicMock(), _task(), "tests"), timeout=2.0)
         assert result == {"condition": "pass", "message": "tests passed", "output": ""}
+
+    @pytest.mark.asyncio
+    async def test_no_result_fallback_shows_stderr_first_with_partial_leading_line_dropped(self) -> None:
+        from henchmen.mastermind.scheme_executor import handlers
+
+        limit = handlers._GATE_OUTPUT_LIMIT
+        stderr = b"OLD_STDERR_START\n" + b"e" * (limit * 2) + b"\nSTDERR_TAIL_MARKER\n"
+        stdout = b"OLD_STDOUT_START\n" + b"o" * (limit * 2) + b"\nSTDOUT_TAIL_MARKER\n"
+
+        result, _ = await _check(_local_settings(), _gate_proc(0, stdout=stdout, stderr=stderr))
+
+        assert result["condition"] == "fail"
+        assert "without a result" in result["message"]
+        output = result["output"]
+        assert output == "STDERR_TAIL_MARKER\nSTDOUT_TAIL_MARKER\n"
+        assert output.index("STDERR_TAIL_MARKER") < output.index("STDOUT_TAIL_MARKER")
+        assert "OLD_STDERR_START" not in output
+        assert "OLD_STDOUT_START" not in output
+
+
+class TestGateResourceLimits:
+    """Ruling 1: the gate container gets the same resource limits a lair gets, plus a pids cap."""
+
+    @pytest.mark.asyncio
+    async def test_the_gate_container_gets_lair_memory_and_cpu_limits_and_a_pids_cap(self) -> None:
+        settings = _local_settings(lair_default_memory="2Gi", lair_default_cpu="1.5")
+        _, exec_mock = await _check(settings, _gate_proc(0, stdout=_marker("pass", "ok")))
+        argv = list(exec_mock.await_args.args)
+        assert argv[argv.index("--memory") + 1] == "2g"
+        assert argv[argv.index("--cpus") + 1] == "1.5"
+        assert argv[argv.index("--pids-limit") + 1] == "1024"
+
+    @pytest.mark.asyncio
+    async def test_reuses_the_docker_orchestrator_cpu_limit_helper(self) -> None:
+        """No duplicated `--cpus` formatting logic: an unparsable cpu value is omitted, exactly
+        as `providers.local.docker._cpu_limit` (used by lairs) already behaves.
+        """
+        settings = _local_settings(lair_default_cpu="not-a-number")
+        _, exec_mock = await _check(settings, _gate_proc(0, stdout=_marker("pass", "ok")))
+        argv = list(exec_mock.await_args.args)
+        assert "--cpus" not in argv
+        assert "--memory" in argv  # still present -- only --cpus is conditional
+
+
+class TestTokenNeverReachesRepoCode:
+    """Ruling 2 (D-P9): once cloning/diffing is done, repo-controlled code must not be able
+
+    to read the GitHub token back out of `.git/config` or its own environment.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not _HAS_GIT, reason="git is not installed")
+    async def test_the_git_remote_no_longer_holds_the_token_after_planning(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git_env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@x",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@x",
+        }
+        subprocess.run(["git", "init", "-q"], cwd=repo_dir, check=True, env=git_env)
+        subprocess.run(
+            ["git", "remote", "add", "origin", f"https://x-access-token:{TOKEN}@github.com/acme/widgets.git"],
+            cwd=repo_dir,
+            check=True,
+            env=git_env,
+        )
+
+        result = await ci_gate._strip_remote_token(str(repo_dir), "acme/widgets", "lint")
+
+        assert result is None
+        remote_url = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=git_env,
+        ).stdout.strip()
+        assert remote_url == "https://github.com/acme/widgets.git"
+        assert TOKEN not in remote_url
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not _HAS_GIT, reason="git is not installed")
+    async def test_a_remote_url_reset_failure_fails_the_gate_closed(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo_dir, check=True)
+        # No "origin" remote configured -- `git remote set-url origin` must fail.
+        result = await ci_gate._strip_remote_token(str(repo_dir), "acme/widgets", "lint")
+        assert result is not None
+        assert result.condition == "fail"
+        assert "could not remove the token from the git remote" in result.message
+
+    @pytest.mark.asyncio
+    async def test_run_script_env_has_no_github_token_variables(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("HENCHMEN_GITHUB_TOKEN", TOKEN)
+        monkeypatch.setenv("GITHUB_TOKEN", TOKEN)
+        monkeypatch.setenv("GH_TOKEN", TOKEN)
+        monkeypatch.setenv("SOME_OTHER_VAR", "keep-me")
+        before = dict(os.environ)
+
+        with patch.object(
+            ci_gate.asyncio, "create_subprocess_exec", AsyncMock(return_value=_communicate_proc(0, b"ok"))
+        ) as exec_mock:
+            await ci_gate._run_script(str(tmp_path), "true")
+
+        env = exec_mock.await_args.kwargs["env"]
+        assert "HENCHMEN_GITHUB_TOKEN" not in env
+        assert "GITHUB_TOKEN" not in env
+        assert "GH_TOKEN" not in env
+        assert env.get("SOME_OTHER_VAR") == "keep-me"
+        assert dict(os.environ) == before  # os.environ itself is never mutated
+
+    @pytest.mark.asyncio
+    async def test_run_on_host_env_has_no_github_token_variables(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The cloud path runs the same repo-controlled commands and must scrub the same way."""
+        from henchmen.mastermind.scheme_executor import handlers
+        from henchmen.mastermind.scheme_executor.lint_scope import CheckCommand
+        from henchmen.utils.stack_detector import Stack
+
+        monkeypatch.setenv("GITHUB_TOKEN", TOKEN)
+        before = dict(os.environ)
+        stack = Stack(name="python", test_command=["python", "-m", "pytest"], install_command=None)
+        commands = (CheckCommand(argv=("python", "-m", "pytest")),)
+        ok_proc = MagicMock()
+        ok_proc.returncode = 0
+        ok_proc.communicate = AsyncMock(return_value=(b"3 passed", b""))
+
+        with patch.object(handlers.asyncio, "create_subprocess_exec", AsyncMock(return_value=ok_proc)) as exec_mock:
+            await handlers._run_on_host(str(tmp_path), stack, commands)
+
+        env = exec_mock.await_args.kwargs["env"]
+        assert "GITHUB_TOKEN" not in env
+        assert dict(os.environ) == before

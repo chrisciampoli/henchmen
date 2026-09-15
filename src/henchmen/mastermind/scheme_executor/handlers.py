@@ -24,6 +24,7 @@ from henchmen.config.settings import DEFAULT_LOCAL_OPERATIVE_IMAGE
 from henchmen.mastermind.scheme_executor.ci_gate import (
     CheckType,
     GateResult,
+    env_without_github_tokens,
     parse_gate_result,
     plan_gate,
     scrub_secret,
@@ -37,6 +38,7 @@ from henchmen.mastermind.scheme_executor.lint_scope import (
 from henchmen.models.dossier import Dossier
 from henchmen.models.scheme import SchemeNode
 from henchmen.models.task import HenchmenTask
+from henchmen.providers.local.docker import _cpu_limit, _memory_limit
 from henchmen.providers.registry import ProviderRegistry
 from henchmen.utils.git import clone_repo, get_github_token
 from henchmen.utils.stack_detector import Stack, detect_stack
@@ -371,6 +373,9 @@ async def _run_ci_check(executor: SchemeExecutor, task: HenchmenTask, check_type
 
 _GATE_MODULE = "henchmen.mastermind.scheme_executor.ci_gate"
 _GATE_OUTPUT_LIMIT = 5000
+# Caps the same runaway-container risk --pids-limit guards against on a lair
+# (fork bombs, thread-exhaustion loops) for a gate container specifically.
+_GATE_PIDS_LIMIT = 1024
 
 # A gate container's stdout/stderr are captured by *this* long-lived server
 # process, not by the disposable container — so, unlike ci_gate's own inner
@@ -429,15 +434,57 @@ async def _drain_stream(stream: asyncio.StreamReader | None, tail: _BoundedTail)
         tail.add(chunk)
 
 
+async def _remove_gate_container(name: str) -> None:
+    """Fallback when `docker kill` itself fails: force-remove the container. Never raises."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "rm", "-f", name, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning(
+                "docker rm -f %s exited %s: %s",
+                name,
+                proc.returncode,
+                (stdout or b"").decode(errors="replace").strip(),
+            )
+    except Exception as exc:
+        logger.warning("Could not remove gate container %s via docker rm -f: %s", name, exc)
+
+
 async def _kill_gate_container(name: str) -> None:
-    """Best-effort ``docker kill``; a failed kill is logged, never raised."""
+    """`docker kill`, falling back to `docker rm -f` if the kill itself fails. Never raises."""
+    killed = False
     try:
         proc = await asyncio.create_subprocess_exec(
             "docker", "kill", name, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
         )
-        await proc.communicate()
+        stdout, _ = await proc.communicate()
+        killed = proc.returncode == 0
+        if not killed:
+            logger.warning(
+                "docker kill %s exited %s: %s", name, proc.returncode, (stdout or b"").decode(errors="replace").strip()
+            )
     except Exception as exc:
         logger.warning("Could not kill gate container %s: %s", name, exc)
+
+    if not killed:
+        await _remove_gate_container(name)
+
+
+def _gate_resource_limit_args(settings: Settings) -> list[str]:
+    """The same `--memory`/`--cpus` a lair gets (`Settings.lair_default_memory`/`_cpu`), plus a pids cap.
+
+    A gate container is otherwise unbounded: nothing else limits how much
+    memory or CPU repo-controlled code (an install script, the linter, the
+    test suite) can consume, or how many processes it can fork.
+    """
+    args = ["--memory", _memory_limit(settings.lair_default_memory)]
+    cpu_limit = _cpu_limit(settings.lair_default_cpu)
+    if cpu_limit:
+        args.extend(["--cpus", cpu_limit])
+    args.extend(["--pids-limit", str(_GATE_PIDS_LIMIT)])
+    return args
 
 
 async def _run_gate_in_container(
@@ -450,6 +497,7 @@ async def _run_gate_in_container(
     cmd = ["docker", "run", "--rm", "--name", container]
     if settings.local_docker_network:
         cmd.extend(["--network", settings.local_docker_network])
+    cmd.extend(_gate_resource_limit_args(settings))
     # `-e NAME` without a value copies NAME from the docker CLI's own environment,
     # so the token never appears on a command line.
     cmd.extend(["-e", "HENCHMEN_GITHUB_TOKEN", "--entrypoint", "python", image, "-m", _GATE_MODULE, check_type])
@@ -472,33 +520,55 @@ async def _run_gate_in_container(
     stderr_task = asyncio.ensure_future(_drain_stream(proc.stderr, stderr_tail))
 
     timeout = _gate_timeout_seconds(settings)
+    exited_normally = False
+    timeout_result: dict[str, Any] | None = None
     try:
         await asyncio.wait_for(asyncio.gather(proc.wait(), stdout_task, stderr_task), timeout=timeout)
+        exited_normally = True
     except TimeoutError:
-        for task in (stdout_task, stderr_task):
-            task.cancel()
-        for task in (stdout_task, stderr_task):
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
-        await _kill_gate_container(container)
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        return {
+        timeout_result = {
             "condition": "fail",
             "message": f"{check_type} failed (the gate did not finish within {timeout:g}s)",
             "output": "",
         }
+    finally:
+        # Anything other than the gather above completing outright — a
+        # timeout, this coroutine itself being cancelled, or any other
+        # exception out of proc.wait()/the drain tasks — leaves the
+        # container and its reader tasks running unless cleaned up here.
+        # CancelledError is deliberately not caught above: it still
+        # propagates once this block finishes, per asyncio's cancellation
+        # contract.
+        if not exited_normally:
+            for task in (stdout_task, stderr_task):
+                task.cancel()
+            for task in (stdout_task, stderr_task):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            await _kill_gate_container(container)
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+
+    if timeout_result is not None:
+        return timeout_result
 
     returncode = proc.returncode if proc.returncode is not None else 1
     # The result marker is always written to stdout (ci_gate.main), never stderr.
     stdout_text = stdout_tail.getvalue().decode(errors="replace")
     result = parse_gate_result(stdout_text)
     if result is None:
-        combined = stdout_text + stderr_tail.getvalue().decode(errors="replace")
+        stderr_text = stderr_tail.getvalue().decode(errors="replace")
+        # stderr first (a crash traceback lives there), then stdout, each cut
+        # to its own last ~_GATE_OUTPUT_LIMIT characters. A tail sliced by raw
+        # character count can start mid-line; drop that partial line (before
+        # scrubbing) so the kept text always begins cleanly.
+        combined = _tail_chars(stderr_text) + _tail_chars(stdout_text)
         return {
             "condition": "fail",
             "message": f"{check_type} failed (the gate container exited {returncode} without a result)",
-            "output": scrub_secret(combined, token)[:_GATE_OUTPUT_LIMIT],
+            "output": scrub_secret(combined, token),
         }
     message = scrub_secret(result.message, token)
     output = scrub_secret(result.output, token)
@@ -509,14 +579,34 @@ async def _run_gate_in_container(
     return {"condition": "fail", "message": message, "output": output}
 
 
+def _tail_chars(text: str, limit: int = _GATE_OUTPUT_LIMIT) -> str:
+    """The last `limit` characters of `text`; a tail actually trimmed drops its partial leading line."""
+    if len(text) <= limit:
+        return text
+    trimmed = text[-limit:]
+    if "\n" in trimmed:
+        trimmed = trimmed.split("\n", 1)[1]
+    return trimmed
+
+
 async def _run_on_host(workspace: str, stack: Stack, commands: tuple[CheckCommand, ...]) -> dict[str, Any]:
-    """Run CI check commands natively on the host (cloud mode); the first non-zero exit code wins."""
+    """Run CI check commands natively on the host (cloud mode); the first non-zero exit code wins.
+
+    This runs repo-controlled code (an install script, the linter, the test
+    suite) in a workspace ``plan_gate`` already scrubbed the token's git
+    remote out of; it also strips every GitHub token env var from what these
+    subprocesses inherit, the same way ``ci_gate._run_script`` does for the
+    local gate container — the risk (repo code reaching the token) is
+    identical on the cloud path.
+    """
+    child_env = env_without_github_tokens()
     if stack.install_command is not None:
         proc = await asyncio.create_subprocess_exec(
             *stack.install_command,
             cwd=workspace,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=child_env,
         )
         await proc.communicate()
 
@@ -528,6 +618,7 @@ async def _run_on_host(workspace: str, stack: Stack, commands: tuple[CheckComman
             cwd=os.path.join(workspace, command.cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=child_env,
         )
         stdout, stderr = await proc.communicate()
         stdout_text = stdout.decode(errors="replace")[:3000]
