@@ -23,12 +23,22 @@ REDACTED = "***REDACTED***"
 _BEARER_PATTERN = re.compile(r"(?i)\b(bearer)[ \t]+[A-Za-z0-9._~+/=-]{16,}")
 
 # HTTP Basic auth, as Jira's ``Authorization: Basic <base64(email:token)>`` header
-# would appear in a logged request or an httpx exception's request repr. Same
-# shape and same linearity argument as ``_BEARER_PATTERN`` (bounded word, bounded
-# whitespace run, bounded value character class) -- word boundary before the
-# scheme name plus a fixed-length-quantifier value class, no nested unbounded
-# groups, so a run of "basic " has nowhere to backtrack into.
-_BASIC_AUTH_PATTERN = re.compile(r"(?i)\b(basic)[ \t]+[A-Za-z0-9+/=]{16,}")
+# would appear in a logged request or an httpx exception's request repr.
+# Unlike every other scheme word this module matches, "basic" is also an
+# ordinary English word ("a basic misunderstanding"), so the value alone
+# being 16+ base64-alphabet characters is not enough -- an all-lowercase
+# word like "misunderstanding" satisfies that too. The lookahead requires at
+# least one character that plain lowercase prose essentially never has (an
+# uppercase letter, a digit, ``+``, ``/`` or ``=``), which real base64 almost
+# always does. Only "basic" itself is matched case-insensitively (the scoped
+# ``(?i: ...)`` group); the lookahead's ``[A-Z0-9+/=]`` stays case-sensitive
+# on purpose, or a global ``(?i)`` would fold it back down to
+# ``[A-Za-z0-9+/=]`` and make the lookahead match any lowercase word too.
+# Same linearity argument as ``_BEARER_PATTERN``: the lookahead's inner ``*``
+# excludes whitespace, so it can never run past the next space/tab, bounding
+# every attempt to the single token that follows "basic " -- a run of
+# "basic " has nowhere to backtrack into beyond that one token.
+_BASIC_AUTH_PATTERN = re.compile(r"\b(?i:(basic))[ \t]+(?=[A-Za-z0-9+/=]*[A-Z0-9+/=])[A-Za-z0-9+/=]{16,}")
 
 # A PEM private-key block (PKCS#1 ``RSA PRIVATE KEY``, PKCS#8 ``PRIVATE KEY``,
 # ``ENCRYPTED PRIVATE KEY``, ``EC``/``OPENSSH`` ...) -- the GitHub App key, or

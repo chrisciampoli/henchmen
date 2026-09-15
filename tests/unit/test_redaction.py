@@ -234,6 +234,17 @@ class TestBasicAuthRedaction:
         text = "this is a pretty basic idea"
         assert redact(text) == text
 
+    def test_basic_misunderstanding_is_left_alone(self):
+        """N2: a long, all-lowercase English word after "basic" must not be mistaken for base64."""
+        text = "a basic misunderstanding here"
+        assert redact(text) == text
+
+    def test_prose_with_no_uppercase_digit_or_padding_is_left_alone(self):
+        """A 16+ letter, all-lowercase word still has nothing for the lookahead to require."""
+        text = "the basic characterization holds up"
+        assert redact(text) == text
+        assert len("characterization") >= 16
+
 
 class TestGitHubInstallationTokenRedaction:
     def test_ghs_token_is_redacted(self):
@@ -331,6 +342,9 @@ _NEW_PATTERN_PATHOLOGICAL_INPUTS = (
     # the greedy `[A-Za-z0-9-]+` body, and the compound rotation-token prefix.
     "xoxb-" * 20000,
     "xox" "e.xoxb-" * 20000,
+    # Basic-auth lookahead: a single long lowercase run after "basic " forces the
+    # lookahead's inner `*` to backtrack across the whole run before failing.
+    "basic " + "a" * 100_000,
 )
 
 
