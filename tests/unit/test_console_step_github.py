@@ -655,6 +655,7 @@ def _ready_to_choose(harness: ConsoleHarness, github: FakeGitHub, *, bot_id: int
     github.installations["77"] = FakeGitHub.installation("77", "acme", **installation)
     github.repositories = [FakeGitHub.repository(REPO)]
     github.users[f"{github.app_slug}[bot]"] = {"id": bot_id, "login": f"{github.app_slug}[bot]"}
+    github.restrict_token_repositories = True
 
 
 # -- the public installed callback ------------------------------------------------
@@ -1181,16 +1182,55 @@ def test_recreating_the_app_reopens_a_completed_step(tmp_path: Path, github: Fak
 def test_a_failed_reopen_after_recreating_the_app_fails_closed(
     tmp_path: Path, github: FakeGitHub, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    harness = _harness(tmp_path, github, signed_in=False)
-    _add_conversion(github)
+    harness = _harness(tmp_path, github)
+    _complete_the_step(harness, github)
+    _add_conversion(github, id=5151)
     state = _issue_manifest_state(harness)
+    config_before = harness.config_store.config_file.read_bytes()
+    secrets_before = sorted(path.name for path in (tmp_path / "secrets").glob("github-app*.pem"))
 
     def fail(step: SetupStep) -> None:
         raise OSError("disk full")
 
     monkeypatch.setattr(harness.setup_store, "record_step_incomplete", fail)
     response = harness.get(CALLBACK, code="code123", state=state)
+
     assert response.headers["location"] == "/?step=github&github_error=storage"
+    assert harness.config_store.config_file.read_bytes() == config_before
+    assert not _key_file(tmp_path, "5151").exists()
+    assert sorted(path.name for path in (tmp_path / "secrets").glob("github-app*.pem")) == secrets_before
+    assert SetupStep.GITHUB in harness.setup_store.load().completed_steps
+    assert harness.setup_store.load().server_choices["github_app_slug"] == github.app_slug
+    # The install state issued for the new App was burned with the failure.
+    pending = json.loads(harness.app.state.callback_states.path.read_text(encoding="utf-8"))
+    assert [entry for entry in pending.values() if entry["purpose"] == INSTALL_PURPOSE] == []
+
+
+@pytest.mark.parametrize("route", ["callback", "check"])
+def test_a_failed_reopen_never_saves_a_different_installation(
+    tmp_path: Path, github: FakeGitHub, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    harness = _harness(tmp_path, github)
+    _complete_the_step(harness, github)
+    del github.installations["77"]
+    github.installations["78"] = FakeGitHub.installation("78", "acme")
+    state = _install_state(harness, github)
+    config_before = harness.config_store.config_file.read_bytes()
+
+    def fail(step: SetupStep) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(harness.setup_store, "record_step_incomplete", fail)
+    if route == "callback":
+        response = harness.get(INSTALLED, installation_id="78", state=state)
+        assert response.headers["location"] == "/?step=github&github_error=storage"
+    else:
+        body = harness.post(f"{BASE}/installation/check").json()
+        assert body["ok"] is False
+        assert "writable" in body["problems"][0]["action"]
+    assert harness.config_store.get("HENCHMEN_GITHUB_APP_INSTALLATION_ID") == "77"
+    assert harness.config_store.config_file.read_bytes() == config_before
+    assert SetupStep.GITHUB in harness.setup_store.load().completed_steps
 
 
 def test_a_different_installation_from_the_callback_reopens_the_step(tmp_path: Path, github: FakeGitHub) -> None:
@@ -1300,11 +1340,34 @@ def test_a_repository_beyond_a_truncated_listing_is_confirmed_with_github(tmp_pa
     assert body["details"]["default_repo"] == "acme/far-away"
     assert body["details"]["default_branch"] == "trunk"
     assert harness.config_store.get("HENCHMEN_GITHUB_DEFAULT_REPO") == "acme/far-away"
+    # Access was proven by a token scoped to the repository, and only that token read its details.
+    scoped = [record for record in github.minted if record["repositories"] == ["far-away"]]
+    assert len(scoped) == 1
     lookups = [request for request in github.requests if request.url.path.startswith("/repos/")]
     assert len(lookups) == 1
-    assert lookups[0].headers["authorization"].startswith("Bearer ghs_")
+    assert lookups[0].headers["authorization"] == f"Bearer {scoped[0]['token']}"
     assert "ghs_" not in response.text
     assert SetupStep.GITHUB in harness.setup_store.load().completed_steps
+
+
+def test_a_public_repository_outside_the_selection_is_refused(tmp_path: Path, github: FakeGitHub) -> None:
+    harness = _harness(tmp_path, github)
+    _ready_to_choose(harness, github)
+    github.repository_total_count = 5000
+    # GET /repos answers 200 for a public repository even though the installation cannot access it.
+    github.public_repositories = [FakeGitHub.repository("acme/public-docs", private=False)]
+
+    response = harness.post(f"{BASE}/repository", {"repo": "acme/public-docs"})
+
+    body = response.json()
+    assert body["ok"] is False
+    problem = body["problems"][0]
+    assert problem["field"] == "repo"
+    assert "can't see acme/public-docs" in problem["message"]
+    assert not [request for request in github.requests if request.url.path.startswith("/repos/")]
+    assert harness.config_store.get("HENCHMEN_GITHUB_DEFAULT_REPO") == ""
+    assert SetupStep.GITHUB not in harness.setup_store.load().completed_steps
+    assert "ghs_" not in response.text
 
 
 @pytest.mark.parametrize("unlisted", [[], [{"full_name": "globex/far-away"}]])

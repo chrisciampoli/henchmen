@@ -62,6 +62,11 @@ class FakeGitHub:
         # Repositories the installation can access beyond the listing (found only by GET /repos/{owner}/{name}).
         self.unlisted_repositories: list[dict[str, Any]] = []
         self.repository_total_count: int | None = None
+        # Public repositories outside the installation's selection: GET /repos answers 200 for them anyway.
+        self.public_repositories: list[dict[str, Any]] = []
+        # When set, a repository-scoped token is minted only for repositories the installation can access
+        # (``repositories`` + ``unlisted_repositories`` on the installation's account), else 422 like GitHub.
+        self.restrict_token_repositories = False
         self.users: dict[str, dict[str, Any]] = {}
 
     # -- builders ------------------------------------------------------------
@@ -175,7 +180,7 @@ class FakeGitHub:
             if not self._valid_installation_token(request):
                 return httpx.Response(401, json={"message": "Bad credentials"})
             wanted = f"{parts[1]}/{parts[2]}".lower()
-            for repository in [*self.repositories, *self.unlisted_repositories]:
+            for repository in [*self.repositories, *self.unlisted_repositories, *self.public_repositories]:
                 if repository["full_name"].lower() == wanted:
                     owner = repository["full_name"].split("/", 1)[0]
                     return httpx.Response(200, json={**repository, "owner": {"login": owner}})
@@ -193,6 +198,17 @@ class FakeGitHub:
         body = json.loads(request.content or b"{}")
         token = f"ghs_fake{len(self.minted) + 1:04d}"
         names = body.get("repositories")
+        if names and self.restrict_token_repositories:
+            login = self.installations[request.url.path.strip("/").split("/")[2]]["account"]["login"].lower()
+            accessible = {
+                repository["full_name"].lower() for repository in [*self.repositories, *self.unlisted_repositories]
+            }
+            if any(f"{login}/{name}".lower() not in accessible for name in names):
+                message = (
+                    "There is at least one repository that does not exist or is not accessible "
+                    "to the parent installation."
+                )
+                return httpx.Response(422, json={"message": message})
         self.minted.append({"token": token, "repositories": names})
         expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock() + self.token_lifetime_seconds))
         response: dict[str, Any] = {"token": token, "expires_at": expires}
