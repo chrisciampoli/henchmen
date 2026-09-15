@@ -22,28 +22,73 @@ REDACTED = "***REDACTED***"
 
 _BEARER_PATTERN = re.compile(r"(?i)\b(bearer)[ \t]+[A-Za-z0-9._~+/=-]{16,}")
 
-# Any environment-variable-style ``SOMETHING_TOKEN=value`` assignment. This is
+# A PEM private-key block (PKCS#1 ``RSA PRIVATE KEY``, PKCS#8 ``PRIVATE KEY``,
+# ``ENCRYPTED PRIVATE KEY``, ``EC``/``OPENSSH`` ...) -- the GitHub App key, or
+# a manifest-conversion body's ``pem`` field that ended up in an exception or
+# a logged response. It spans lines, and in a JSON/dict repr its line breaks
+# are the two characters ``\n``, so the body is "anything that does not start
+# another ``-----`` run" rather than a base64 alphabet (legacy encrypted keys
+# also carry ``Proc-Type:``/``DEK-Info:`` header lines with single hyphens).
+#
+# Linear by construction: the header label is bounded (``{0,40}``); the body
+# is one greedy loop in which every character is matched by exactly one
+# branch (a non-hyphen, or a hyphen not followed by four more), so it never
+# backtracks; and the footer is *optional*, so a truncated block (an error
+# message cut at 200 characters) is still redacted up to where it stops, and
+# a run of headers with no footer (``"-----BEGIN PRIVATE KEY-----" * N``)
+# ends each match at the next ``-----`` instead of rescanning to the end of
+# the input from every header.
+_PEM_PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----(?:[^-]|-(?!----))*(?:-----END [A-Z ]{0,40}PRIVATE KEY-----)?"
+)
+
+# A JSON Web Token: three base64url segments separated by dots, the header
+# starting ``eyJ`` (base64 of ``{"``). GitHub App JWTs are sent as
+# ``Authorization: Bearer <jwt>``, which ``_BEARER_PATTERN`` covers, but a JWT
+# can also appear bare (a traceback, a dict repr of request headers). The
+# lookbehind (rather than ``\b``) stops a match from starting *inside* a run
+# of base64url characters: ``\b`` fires between ``-`` and ``e``, so
+# ``"-eyJ" * N`` would restart the unbounded segment scan at every ``eyJ`` in
+# one run, which is quadratic. With the lookbehind a match only starts at the
+# beginning of a run, and each run is scanned by at most three starts.
+_JWT_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
+
+# Atlassian (Jira Cloud) API tokens: ``ATATT3x...`` followed by a long
+# base64-ish body and an ``=``-separated checksum.
+_ATLASSIAN_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9_=-])ATATT[A-Za-z0-9_=-]{20,}")
+
+# Key-name endings that mark a credential in an assignment or a key/value
+# pair. Kept in step with ``henchmen.cli.envfile.is_secret_key``, the
+# secret-name classifier used for display masking.
+_SECRET_KEY_NAME = r"[A-Za-z][A-Za-z0-9_]*(?:_TOKEN|_API_KEY|_SECRET|_PRIVATE_KEY|_PASSWORD)"
+
+# Any environment-variable-style ``SOMETHING_TOKEN=value`` assignment (or
+# ``*_API_KEY`` / ``*_SECRET`` / ``*_PRIVATE_KEY`` / ``*_PASSWORD``). This is
 # the shape a Docker `-e` command line, an ``os.environ`` dump, or a crash
 # traceback prints a secret in -- notably ``HENCHMEN_OPERATIVE_TASK_TOKEN``,
 # which is a bare HMAC-SHA256 hex digest with no recognizable prefix pattern
-# of its own, unlike the GitHub/Slack/OpenAI tokens above. The key name is
-# kept in the output (case preserved); only the value is redacted. This
-# pattern alone does not cover a dict/JSON repr (``'X_TOKEN': 'value'`` or
-# ``"X_TOKEN": "value"``, no ``=``), which is why ``_TOKEN_QUOTED_KV_PATTERN``
-# below exists as a second, independent shape for the same key-ending-in-
-# ``_TOKEN`` idea.
-_TOKEN_ENV_VAR_PATTERN = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*_TOKEN)=(\S+)", re.IGNORECASE)
+# of its own, unlike the GitHub/Slack/OpenAI tokens above, and the unprefixed
+# ``HENCHMEN_GITHUB_WEBHOOK_SECRET``. The key name is kept in the output (case
+# preserved); only the value is redacted. ``HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH``
+# (a path, not a secret) does not end in a secret suffix and is left alone.
+# This pattern alone does not cover a dict/JSON repr (``'X_TOKEN': 'value'``
+# or ``"X_TOKEN": "value"``, no ``=``), which is why
+# ``_SECRET_QUOTED_KV_PATTERN`` below exists as a second, independent shape
+# for the same key-name idea. ``\b`` cannot fire inside a run of word
+# characters, so each run is scanned from at most one start.
+_SECRET_ENV_VAR_PATTERN = re.compile(rf"\b({_SECRET_KEY_NAME})=(\S+)", re.IGNORECASE)
 
-# The same ``*_TOKEN`` idea, but for a quoted key: value pair as it would
+# The same key-name idea, but for a quoted key: value pair as it would
 # appear in a Python dict repr (single quotes) or JSON (double quotes) --
-# e.g. an OperativeConfig/env dict logged via ``%r`` or ``json.dumps``. The
-# quote characters around the key and around the value are each captured and
-# reused verbatim (backreferences \1 and \4) so mixed single/double-quote
-# style is preserved and the two quote pairs need not match each other. Every
-# quantifier here is bounded by a negated character class (`[^'"]*`) rather
-# than nested/overlapping ``.*`` groups, so matching stays linear in input
-# length like the other patterns in this module.
-_TOKEN_QUOTED_KV_PATTERN = re.compile(r"(['\"])([A-Za-z][A-Za-z0-9_]*_TOKEN)\1(\s*:\s*)(['\"])[^'\"]*\4", re.IGNORECASE)
+# e.g. an OperativeConfig/env dict logged via ``%r`` or ``json.dumps``, or a
+# GitHub App manifest conversion body's ``"client_secret"`` /
+# ``"webhook_secret"``. The quote characters around the key and around the
+# value are each captured and reused verbatim (backreferences \1 and \4) so
+# mixed single/double-quote style is preserved and the two quote pairs need
+# not match each other. Every quantifier here is bounded by a negated
+# character class (`[^'"]*`) rather than nested/overlapping ``.*`` groups, so
+# matching stays linear in input length like the other patterns in this module.
+_SECRET_QUOTED_KV_PATTERN = re.compile(rf"(['\"])({_SECRET_KEY_NAME})\1(\s*:\s*)(['\"])[^'\"]*\4", re.IGNORECASE)
 
 # AWS ARNs embed the 12-digit account id as their 5th colon-separated field
 # (e.g. an IAM AccessDenied message: "User: arn:aws:iam::123456789012:user/x
@@ -94,6 +139,11 @@ _URL_USERINFO_PATTERN = re.compile(
 # follows are anchored, bounded quantifiers -- no nested unbounded groups -- so
 # matching stays linear in the input length.
 _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # First: a PEM block contains spaces and hyphens that would otherwise let a
+    # later rule (``*_PRIVATE_KEY=\S+``) redact only its first word.
+    (_PEM_PRIVATE_KEY_PATTERN, REDACTED),  # PEM private-key blocks (multi-line, truncated too)
+    (_JWT_PATTERN, REDACTED),  # JSON Web Tokens (GitHub App JWTs)
+    (_ATLASSIAN_TOKEN_PATTERN, REDACTED),  # Atlassian / Jira Cloud API tokens
     (re.compile(r"ghp_[A-Za-z0-9]{20,}"), REDACTED),  # GitHub personal access tokens
     (re.compile(r"ghs_[A-Za-z0-9]{20,}"), REDACTED),  # GitHub server-to-server tokens
     (re.compile(r"gho_[A-Za-z0-9]{20,}"), REDACTED),  # GitHub OAuth tokens
@@ -114,8 +164,8 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # match and the captured word is kept in the output.
     (_BEARER_PATTERN, r"\1 " + REDACTED),
     (re.compile(r"(?<=setup_token=)[^&#\s\"']+"), REDACTED),  # Console sign-in token (value only)
-    (_TOKEN_ENV_VAR_PATTERN, r"\1=" + REDACTED),  # *_TOKEN=value env assignments (key name kept)
-    (_TOKEN_QUOTED_KV_PATTERN, r"\1\2\1\3\4" + REDACTED + r"\4"),  # quoted "*_TOKEN": "value" (dict/JSON reprs)
+    (_SECRET_ENV_VAR_PATTERN, r"\1=" + REDACTED),  # *_TOKEN=/*_API_KEY=/*_SECRET=... (key name kept)
+    (_SECRET_QUOTED_KV_PATTERN, r"\1\2\1\3\4" + REDACTED + r"\4"),  # quoted "*_SECRET": "value" (dict/JSON reprs)
     (_URL_USERINFO_PATTERN, r"\1" + REDACTED + "@"),  # scheme://user:pass@ basic-auth URLs
 )
 
