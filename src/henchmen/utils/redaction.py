@@ -22,6 +22,14 @@ REDACTED = "***REDACTED***"
 
 _BEARER_PATTERN = re.compile(r"(?i)\b(bearer)[ \t]+[A-Za-z0-9._~+/=-]{16,}")
 
+# HTTP Basic auth, as Jira's ``Authorization: Basic <base64(email:token)>`` header
+# would appear in a logged request or an httpx exception's request repr. Same
+# shape and same linearity argument as ``_BEARER_PATTERN`` (bounded word, bounded
+# whitespace run, bounded value character class) -- word boundary before the
+# scheme name plus a fixed-length-quantifier value class, no nested unbounded
+# groups, so a run of "basic " has nowhere to backtrack into.
+_BASIC_AUTH_PATTERN = re.compile(r"(?i)\b(basic)[ \t]+[A-Za-z0-9+/=]{16,}")
+
 # A PEM private-key block (PKCS#1 ``RSA PRIVATE KEY``, PKCS#8 ``PRIVATE KEY``,
 # ``ENCRYPTED PRIVATE KEY``, ``EC``/``OPENSSH`` ...) -- the GitHub App key, or
 # a manifest-conversion body's ``pem`` field that ended up in an exception or
@@ -183,6 +191,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # any run of whitespace, value redacted -- "Bearer"/"bearer"/"BEARER" all
     # match and the captured word is kept in the output.
     (_BEARER_PATTERN, r"\1 " + REDACTED),
+    (_BASIC_AUTH_PATTERN, r"\1 " + REDACTED),
     (re.compile(r"(?<=setup_token=)[^&#\s\"']+"), REDACTED),  # Console sign-in token (value only)
     (_MANIFEST_CODE_PATH_PATTERN, r"\1" + REDACTED),  # GitHub App manifest code in a conversion URL
     (_CALLBACK_QUERY_PATTERN, r"\1" + REDACTED),  # ?code= / &state= callback query values

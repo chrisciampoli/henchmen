@@ -218,6 +218,23 @@ class TestSlackTokenRedaction:
         assert REDACTED in result
 
 
+class TestBasicAuthRedaction:
+    def test_basic_auth_header_is_redacted(self):
+        # base64("pm@acme.com:ATATT3x-secret-jira-token")
+        token = "cG1AYWNtZS5jb206QVRBVFQzeC1zZWNyZXQtamlyYS10b2tlbg=="
+        result = redact(f"Authorization: Basic {token}")
+        assert token not in result
+        assert "Basic " + REDACTED in result
+
+    def test_basic_is_case_insensitive(self):
+        token = "cG1AYWNtZS5jb206QVRBVFQzeC1zZWNyZXQtamlyYS10b2tlbg=="
+        assert token not in redact(f"authorization: basic {token}")
+
+    def test_short_basic_word_is_left_alone(self):
+        text = "this is a pretty basic idea"
+        assert redact(text) == text
+
+
 class TestGitHubInstallationTokenRedaction:
     def test_ghs_token_is_redacted(self):
         result = redact("push to https://github.com/a/b with ghs_AbCdEf0123456789AbCdEf0123456789AbCd failed")
@@ -347,6 +364,9 @@ class TestRedactionPerformance:
     def test_repeated_bearer_word_is_fast(self):
         self._assert_fast("bearer " * 20000)
 
+    def test_repeated_basic_word_is_fast(self):
+        self._assert_fast("basic " * 20000)
+
     def test_a_long_no_match_string_is_fast(self):
         self._assert_fast("x" * 100_000)
 
@@ -376,6 +396,7 @@ class TestRedactionPerformance:
             "a+" * 20000,
             "a-" * 20000,
             "bearer " * 20000,
+            "basic " * 20000,
             "x" * 100_000,
             *_NEW_PATTERN_PATHOLOGICAL_INPUTS,
         )
