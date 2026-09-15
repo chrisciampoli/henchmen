@@ -603,7 +603,9 @@ class TestJira:
         monkeypatch.setattr(
             checks, "_http_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(handler))
         )
-        assert check_jira("https://x.atlassian.net", "a@b", "tok").status == CheckStatus.FAIL
+        result = check_jira("https://x.atlassian.net", "a@b", "tok")
+        assert result.status == CheckStatus.FAIL
+        assert result.field == "base_url"
 
 
 class TestJiraDistinctErrors:
@@ -637,6 +639,16 @@ class TestJiraDistinctErrors:
         assert result.status == CheckStatus.FAIL
         assert "no Jira site at that address" in result.message
         assert result.hint == "Check the site URL"
+
+    def test_404_names_the_base_url_field(self, monkeypatch: pytest.MonkeyPatch):
+        """N5: the checks layer names the field, so a caller never has to parse message text."""
+        self._serve(monkeypatch, 404)
+        assert check_jira("https://x.atlassian.net", "a@b", "tok").field == "base_url"
+
+    def test_other_failures_leave_the_field_unset(self, monkeypatch: pytest.MonkeyPatch):
+        for status_code in (401, 403, 429):
+            self._serve(monkeypatch, status_code)
+            assert check_jira("https://x.atlassian.net", "a@b", "tok").field is None
 
     def test_429_says_rate_limited(self, monkeypatch: pytest.MonkeyPatch):
         self._serve(monkeypatch, 429)
@@ -808,10 +820,13 @@ class TestValidateJiraBaseUrl:
     def test_loopback_http_is_accepted(self):
         checks.validate_jira_base_url("http://localhost:2990")
 
-    def test_plain_http_on_a_real_host_is_refused(self):
-        """F6: unlike the GitHub validator, no Docker-Compose-service-name exception for Jira."""
+    def test_compose_service_host_over_http_is_accepted(self):
+        """N1 (ruling C23): Jira uses the identical host rule as GitHub, restored after the F6 round."""
+        assert checks.validate_jira_base_url("http://fakes:9000/jira") == "http://fakes:9000/jira"
+
+    def test_plain_http_on_a_dotted_host_is_refused(self):
         with pytest.raises(ValueError):
-            checks.validate_jira_base_url("http://fakes:9000")
+            checks.validate_jira_base_url("http://jira.example.com")
 
     def test_missing_scheme_is_refused(self):
         with pytest.raises(ValueError):

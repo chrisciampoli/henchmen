@@ -2,7 +2,7 @@
 
 import pytest
 
-from henchmen.config.settings import Environment, Settings, get_settings
+from henchmen.config.settings import Environment, Settings, get_settings, require_secure_service_url
 
 # ---------------------------------------------------------------------------
 # Environment enum
@@ -22,6 +22,50 @@ class TestEnvironmentEnum:
     def test_string_enum_pattern(self):
         assert isinstance(Environment.DEV, str)
         assert Environment.DEV == "dev"
+
+
+# ---------------------------------------------------------------------------
+# require_secure_service_url -- the one shared https/host validator (ruling C23/N1)
+# ---------------------------------------------------------------------------
+
+
+class TestRequireSecureServiceUrl:
+    """``require_secure_github_url`` and ``checks.validate_jira_base_url`` are both thin
+    wrappers over this one function, so GitHub and Jira share the identical host rule
+    and cannot silently drift into two near-copies."""
+
+    def test_https_is_accepted(self):
+        assert require_secure_service_url("https://example.com") == "https://example.com"
+
+    def test_loopback_http_is_accepted(self):
+        require_secure_service_url("http://localhost:9000")
+
+    def test_compose_service_host_over_http_is_accepted(self):
+        assert require_secure_service_url("http://fakes:9000/jira") == "http://fakes:9000/jira"
+
+    def test_dotted_host_over_http_is_refused(self):
+        with pytest.raises(ValueError):
+            require_secure_service_url("http://jira.example.com")
+
+    def test_query_string_is_refused(self):
+        with pytest.raises(ValueError):
+            require_secure_service_url("https://example.com?x=1")
+
+    def test_fragment_is_refused(self):
+        with pytest.raises(ValueError):
+            require_secure_service_url("https://example.com#frag")
+
+    def test_url_parameters_are_refused(self):
+        with pytest.raises(ValueError):
+            require_secure_service_url("https://example.com/path;param=1")
+
+    def test_field_name_appears_in_the_error_message(self):
+        with pytest.raises(ValueError, match="Jira site URL"):
+            require_secure_service_url("not-a-url", field="Jira site URL")
+
+    def test_default_field_label(self):
+        with pytest.raises(ValueError, match="URL"):
+            require_secure_service_url("not-a-url")
 
 
 # ---------------------------------------------------------------------------

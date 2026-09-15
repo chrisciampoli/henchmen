@@ -16,7 +16,7 @@ from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import urlparse
 
 from pydantic import AliasChoices, Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -38,37 +38,57 @@ def _is_loopback_host(host: str) -> bool:
     return address.is_loopback
 
 
-def require_secure_github_url(value: str) -> str:
-    """``value`` if it is a usable GitHub base URL, else ``ValueError``.
+def require_secure_service_url(value: str, *, field: str = "URL") -> str:
+    """``value`` if it is a usable https(-or-loopback) base URL for a Henchmen-configured service, else ``ValueError``.
 
-    GitHub App JWTs and installation tokens travel to ``github_api_url``, and
-    the Console sends browsers (with a single-use ``state``) to
-    ``github_web_url``, so both must be ``https``. Plain ``http`` is accepted
-    only for a host that cannot be reached across a network boundary by name:
-    a loopback address (``localhost``, ``127.0.0.0/8``, ``::1``), or a host
-    matching ``^[a-z][a-z0-9-]*$`` -- a Docker Compose service name such as
-    ``http://fakes:9000``, which is how the Phase 2C end-to-end suite
-    addresses its fake GitHub inside the compose network. Every other host,
-    including any other IP literal in any spelling, must use ``https``.
+    Shared by every base URL Henchmen accepts from configuration or a Console
+    step -- GitHub's ``github_api_url``/``github_web_url`` and the Console's
+    Jira site address alike (ruling C23: Jira uses the identical host rule as
+    GitHub) -- so there is exactly one https/host/credentials/query-string
+    policy, never two near-copies that can silently drift apart. ``field``
+    names the value in every error message (e.g. ``"Jira site URL"``), never
+    the value itself, which would put credentials in a raised message.
 
-    A URL carrying a user name or password is refused with a message that
-    never repeats the URL (the credentials would otherwise land in a log).
+    Https is required except for a host that cannot be reached across a
+    network boundary by name: a loopback address (``localhost``,
+    ``127.0.0.0/8``, ``::1``), or a host matching ``^[a-z][a-z0-9-]*$`` -- a
+    Docker Compose service name such as ``http://fakes:9000``, which is how
+    the Phase 2C end-to-end suite addresses its fake GitHub *and* fake Jira
+    inside the compose network. Every other host, including any other IP
+    literal in any spelling, must use ``https``.
+
+    A URL carrying a user name or password, a query string, a fragment or
+    (legacy) URL parameters is refused -- a base URL is an origin plus, at
+    most, a path, never something with its own ``?``/``#``/``;`` component.
     """
     text = value.strip()
     try:
-        parts = urlsplit(text)
+        parts = urlparse(text)
         host = (parts.hostname or "").lower()
         parts.port  # noqa: B018 - raises ValueError on an invalid port
         has_credentials = bool(parts.username or parts.password)
     except ValueError:
-        raise ValueError("must be an http(s) URL with a host") from None
+        raise ValueError(f"{field} must be an http(s) URL with a host") from None
     if has_credentials or "@" in parts.netloc:
-        raise ValueError("must not contain a user name or password")
+        raise ValueError(f"{field} must not contain a user name or password")
     if not host or parts.scheme not in ("https", "http"):
-        raise ValueError("must be an https URL with a host")
+        raise ValueError(f"{field} must be an https URL with a host")
+    if parts.query or parts.fragment or parts.params:
+        raise ValueError(f"{field} must not contain a query string, a fragment or URL parameters")
     if parts.scheme == "http" and not (_is_loopback_host(host) or _COMPOSE_SERVICE_HOST.fullmatch(host)):
-        raise ValueError("must use https (plain http is allowed only for loopback or a compose service name)")
+        raise ValueError(f"{field} must use https (plain http is allowed only for loopback or a compose service name)")
     return text
+
+
+def require_secure_github_url(value: str) -> str:
+    """``value`` if it is a usable GitHub base URL, else ``ValueError``. See :func:`require_secure_service_url`.
+
+    GitHub App JWTs and installation tokens travel to ``github_api_url``, and
+    the Console sends browsers (with a single-use ``state``) to
+    ``github_web_url``, so both must be ``https`` (or loopback/compose-host
+    http, for the end-to-end fakes).
+    """
+    return require_secure_service_url(value, field="GitHub URL")
 
 
 class Environment(StrEnum):

@@ -191,6 +191,12 @@ def test_loopback_http_base_url_is_accepted(harness: ConsoleHarness, jira: FakeJ
     assert body["ok"] is True
 
 
+def test_compose_service_host_over_http_is_accepted(harness: ConsoleHarness, jira: FakeJira) -> None:
+    """N1 (ruling C23): Jira uses the identical host rule as GitHub -- the 2C end-to-end fakes need this."""
+    body = harness.post(f"{BASE}/credentials", {**CREDENTIALS, "base_url": "http://fakes:9000/jira"}).json()
+    assert body["ok"] is True
+
+
 def test_options_need_saved_credentials(harness: ConsoleHarness, jira: FakeJira) -> None:
     assert harness.get(f"{BASE}/options").json()["ok"] is False
     _connected(harness)
@@ -309,6 +315,37 @@ def test_intake_label_survives_a_reopening_reconnect(harness: ConsoleHarness, ji
     assert harness.config_store.get("HENCHMEN_JIRA_INTAKE_LABEL") == "henchmen"
 
 
+def test_a_stale_config_without_a_recorded_fingerprint_still_reopens_on_a_changed_base_url(
+    harness: ConsoleHarness, jira: FakeJira
+) -> None:
+    """N3: credentials a prior ``henchmen init`` wrote directly never went through ``connect``,
+    so no account fingerprint was ever recorded -- a changed base URL must still reopen the step."""
+    _connected(harness)
+    harness.config_store.update({"HENCHMEN_JIRA_PROJECT_KEY": "WEB"}, section="Jira")
+    harness.setup_store.record_step_complete(SetupStep.JIRA)
+    assert SetupStep.JIRA in harness.setup_store.load().completed_steps
+
+    response = harness.post(f"{BASE}/credentials", {**CREDENTIALS, "base_url": "https://other.atlassian.net/"})
+    assert response.json()["ok"] is True
+    assert SetupStep.JIRA not in harness.setup_store.load().completed_steps
+    assert harness.config_store.get("HENCHMEN_JIRA_PROJECT_KEY") == ""
+    assert harness.config_store.get("HENCHMEN_JIRA_BASE_URL") == "https://other.atlassian.net"
+
+
+def test_a_stale_config_without_a_recorded_fingerprint_keeps_the_step_on_the_same_base_url(
+    harness: ConsoleHarness, jira: FakeJira
+) -> None:
+    """The N3 fix must not make every reconnect with an unrecorded fingerprint look like a change."""
+    _connected(harness)
+    harness.config_store.update({"HENCHMEN_JIRA_PROJECT_KEY": "WEB"}, section="Jira")
+    harness.setup_store.record_step_complete(SetupStep.JIRA)
+
+    response = harness.post(f"{BASE}/credentials", CREDENTIALS)
+    assert response.json()["ok"] is True
+    assert SetupStep.JIRA in harness.setup_store.load().completed_steps
+    assert harness.config_store.get("HENCHMEN_JIRA_PROJECT_KEY") == "WEB"
+
+
 def test_save_rechecks_credentials_under_lock(
     harness: ConsoleHarness, jira: FakeJira, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -416,3 +453,37 @@ def test_distinct_credential_errors_reach_the_step(harness: ConsoleHarness, monk
     assert body["ok"] is False
     assert "no access to this Jira site" in body["problems"][0]["message"]
     assert "admin" in body["problems"][0]["action"]
+
+
+def test_404_targets_the_base_url_field(harness: ConsoleHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+    """N5: the step routes on checks.CheckResult.field, never by matching result.message text."""
+
+    def check_404(base_url: str, email: str, api_token: str, *, timeout: float = checks.DEFAULT_TIMEOUT) -> CheckResult:
+        return CheckResult(
+            "Jira",
+            CheckStatus.FAIL,
+            f"{base_url}: no Jira site at that address",
+            hint="Check the site URL",
+            field="base_url",
+        )
+
+    monkeypatch.setattr(checks, "check_jira", check_404)
+    body = harness.post(f"{BASE}/credentials", CREDENTIALS).json()
+    assert body["ok"] is False
+    assert body["problems"][0]["field"] == "base_url"
+
+
+def test_a_result_with_no_field_falls_back_to_api_token(
+    harness: ConsoleHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CheckResult that leaves ``field`` unset (the default) still routes somewhere sensible."""
+
+    def check_fail_no_field(
+        base_url: str, email: str, api_token: str, *, timeout: float = checks.DEFAULT_TIMEOUT
+    ) -> CheckResult:
+        return CheckResult("Jira", CheckStatus.FAIL, "rejected", hint="Try again")
+
+    monkeypatch.setattr(checks, "check_jira", check_fail_no_field)
+    body = harness.post(f"{BASE}/credentials", CREDENTIALS).json()
+    assert body["ok"] is False
+    assert body["problems"][0]["field"] == "api_token"

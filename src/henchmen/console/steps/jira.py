@@ -31,7 +31,11 @@ deliberately *not* cleared on a site or account change: it is a Henchmen-side
 label name, not a value that means anything to a particular Jira site, so it
 carries over unchanged (ruling F8). When the account id cannot be confirmed
 at all, the change is assumed (fail closed) rather than trusted, exactly like
-the Slack step's workspace identity.
+the Slack step's workspace identity. A changed base URL is *also* always
+treated as a change even when no fingerprint was ever recorded (ruling N3) --
+credentials a prior ``henchmen init`` wrote directly, never through
+:func:`connect`, leave the fingerprint unset, and an unset fingerprint must
+never read as "nothing to compare against, so assume unchanged".
 
 :func:`~henchmen.cli.checks.list_jira_projects` is page-bounded by
 ``checks._JIRA_MAX_PAGES`` (20 pages of ``checks._JIRA_PAGE_SIZE`` (50) each);
@@ -51,7 +55,10 @@ listing, so it is never mistaken for "no projects" and never produces "ask a
 Jira admin for Browse access" advice for what is really a connectivity
 problem (ruling F4). A credentials failure is itself distinguished by cause
 (unreachable, wrong credentials, no site access, no such site, rate limited)
-by :func:`~henchmen.cli.checks.check_jira` (ruling F3).
+by :func:`~henchmen.cli.checks.check_jira` (ruling F3), which also names
+which field the problem belongs to (``CheckResult.field``, e.g. ``"base_url"``
+for "no such site") -- the step routes on that field, never by matching
+``result.message`` text (ruling N5).
 
 :func:`save` re-checks, under the config file's lock and only after every
 network call, that the saved credentials are still the ones it started with
@@ -117,7 +124,7 @@ class JiraCredentials(BaseModel):
     @field_validator("base_url", mode="after")
     @classmethod
     def _valid_base_url(cls, value: str) -> str:
-        """Jira-specific tightening of the shared https/host rules (ruling F6; no separate copy)."""
+        """The same shared https/host rules as GitHub's endpoint validator (ruling C23; no separate copy)."""
         return checks.validate_jira_base_url(value)
 
 
@@ -183,9 +190,9 @@ def _options(
 
 def _credentials_problem(result: CheckResult) -> StepProblem:
     # `check_jira` already distinguishes unreachable/wrong-credentials/no-access/no-such-site/
-    # rate-limited (ruling F3); a "no such site" message points at the address field, not the token.
-    field = "base_url" if "no Jira site at that address" in result.message else "api_token"
-    problem = problem_from_check(result, field=field)
+    # rate-limited (ruling F3) and names which input each one is about via `result.field`
+    # (ruling N5) -- routed here on that field, never by matching `result.message` text.
+    problem = problem_from_check(result, field=result.field or "api_token")
     if problem.action:
         return problem
     return problem.model_copy(
@@ -277,12 +284,21 @@ async def connect(body: JiraCredentials, config: ConfigDep, setup: SetupDep) -> 
         # The intake label is deliberately left out of `unset`: it names nothing
         # site-specific, so it survives a reconnect unchanged (ruling F8).
         # `identity is None` (the id could not be confirmed) is itself treated as a
-        # change: fail closed rather than assume nothing moved. `record_step_incomplete`
+        # change: fail closed rather than assume nothing moved. A changed base URL is
+        # also always treated as a change even with no recorded fingerprint yet (ruling
+        # N3) -- credentials a prior `henchmen init` wrote directly, never through this
+        # route, leave `server_choices` empty, and an empty previous fingerprint must
+        # never read as "nothing to compare against, so assume unchanged". `record_step_incomplete`
         # touches a different file, but is called only while nothing else can also be
         # mutating this config file (no `await` inside the lock).
         with config.locked():
+            previous_base_url = config.get(BASE_URL_KEY)
             previous_fingerprint = setup.load().server_choices.get(JIRA_ACCOUNT_CHOICE, "")
-            changed = identity is None or (previous_fingerprint and previous_fingerprint != new_fingerprint)
+            changed = (
+                identity is None
+                or (previous_fingerprint and previous_fingerprint != new_fingerprint)
+                or (previous_base_url and previous_base_url != base_url)
+            )
             if changed:
                 setup.record_step_incomplete(STEP)
                 config.update(
