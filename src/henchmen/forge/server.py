@@ -27,6 +27,7 @@ from henchmen.utils.redaction import install_secret_redaction
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
     from henchmen.forge.ci_runner import CIRunner
+    from henchmen.mastermind.scheme_executor.ci_gate import GateCommand
 
 logger = logging.getLogger(__name__)
 
@@ -390,9 +391,12 @@ async def _run_local_ci(
 ) -> dict[str, Any]:
     """Desktop Forge CI: lint and tests in the gate container, the silent-failure scan on the no-checkout clone.
 
-    Every check still reports ``passed``/``failed`` and the results are combined
-    by :meth:`CIRunner.aggregate`, so the forge-result status mapping and the PR
-    comment are exactly those of the host path. Lint and tests go through the
+    The results are combined by :meth:`CIRunner.aggregate`, so the forge-result
+    status mapping (``passed``/``failed``/``incomplete``) and the PR comment are
+    those of the host path. Whether there is a tests check at all -- and whether
+    it is ``skipped`` for a ``package.json`` without a ``test`` script -- is
+    decided from the committed tree exactly as the host path decides it
+    (:meth:`CIRunner.committed_tests_decision`). Lint and tests go through the
     Mastermind's single container runner (``run_gate_in_container``) and share
     one wall-clock budget with the scan.
     """
@@ -402,7 +406,9 @@ async def _run_local_ci(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + budget_seconds
     checks: list[dict[str, Any]] = []
-    for check in ("lint", "tests"):
+    run_tests, tests_check = await runner.committed_tests_decision(workspace)
+    gates: list[GateCommand] = ["lint", "tests"] if run_tests else ["lint"]
+    for check in gates:
         remaining = deadline - loop.time()
         if remaining <= 0:
             checks.append(
@@ -426,6 +432,8 @@ async def _run_local_ci(
                 "" if passed else str(gate.get("message", "")),
             )
         )
+    if tests_check is not None:
+        checks.append(tests_check)
     runner.total_budget_seconds = max(1, int(deadline - loop.time()))
     checks.append(await runner.run_silent_failure_scan(workspace, base_branch))
     return runner.aggregate(checks)

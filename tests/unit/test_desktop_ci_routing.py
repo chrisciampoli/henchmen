@@ -230,6 +230,7 @@ class TestForgeRouting:
             patch.object(server, "clone_repo", AsyncMock()) as clone,
             patch.object(handlers, "run_gate_in_container", gate),
             patch.object(CIRunner, "run", AsyncMock(side_effect=AssertionError("no host CI on desktop"))),
+            patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=(True, None))),
             patch.object(CIRunner, "run_silent_failure_scan", AsyncMock(return_value=_scan())) as scan,
         ):
             await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
@@ -262,20 +263,64 @@ class TestForgeRouting:
             patch("github.Github", return_value=_github_client(MagicMock())),
             patch.object(server, "clone_repo", AsyncMock()),
             patch.object(handlers, "run_gate_in_container", AsyncMock(return_value=ok)),
+            patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=(True, None))),
             patch.object(CIRunner, "run_silent_failure_scan", AsyncMock(return_value=_scan())),
         ):
             await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
         assert _published(forge_state)[0]["status"] == "passed"
 
     @pytest.mark.asyncio
+    async def test_a_node_repo_without_a_test_script_stays_incomplete_on_desktop(self, forge_state: AsyncMock) -> None:
+        """The host path's "skipped, never a pass" rule survives the move into the gate container."""
+        from henchmen.forge import server
+        from henchmen.forge.ci_runner import STATUS_SKIPPED, CIRunner
+
+        skipped = CIRunner.check_result("tests", STATUS_SKIPPED, "", "package.json declares no `test` script.")
+        pr = MagicMock()
+        gate = AsyncMock(return_value={"condition": "pass", "message": "lint passed", "output": ""})
+        with (
+            patch.object(server, "get_settings", return_value=_settings()),
+            patch("github.Github", return_value=_github_client(pr)),
+            patch.object(server, "clone_repo", AsyncMock()),
+            patch.object(handlers, "run_gate_in_container", gate),
+            patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=(False, skipped))),
+            patch.object(CIRunner, "run_silent_failure_scan", AsyncMock(return_value=_scan())),
+        ):
+            await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
+        assert [call.args[1] for call in gate.await_args_list] == ["lint"]
+        payload = _published(forge_state)[0]
+        assert payload["status"] == "incomplete" and payload["skipped"] == ["tests"]
+        assert "INCOMPLETE" in pr.create_issue_comment.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_a_repo_with_no_tests_has_no_tests_check_on_desktop(self, forge_state: AsyncMock) -> None:
+        from henchmen.forge import server
+        from henchmen.forge.ci_runner import CIRunner
+
+        gate = AsyncMock(return_value={"condition": "pass", "message": "lint passed", "output": ""})
+        with (
+            patch.object(server, "get_settings", return_value=_settings()),
+            patch("github.Github", return_value=_github_client(MagicMock())),
+            patch.object(server, "clone_repo", AsyncMock()),
+            patch.object(handlers, "run_gate_in_container", gate),
+            patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=(False, None))),
+            patch.object(CIRunner, "run_silent_failure_scan", AsyncMock(return_value=_scan())),
+        ):
+            await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
+        assert [call.args[1] for call in gate.await_args_list] == ["lint"]
+        assert _published(forge_state)[0]["status"] == "passed"
+
+    @pytest.mark.asyncio
     async def test_a_desktop_gate_runner_error_is_a_ci_error(self, forge_state: AsyncMock) -> None:
         from henchmen.forge import server
+        from henchmen.forge.ci_runner import CIRunner
 
         with (
             patch.object(server, "get_settings", return_value=_settings()),
             patch("github.Github", return_value=_github_client(MagicMock())),
             patch.object(server, "clone_repo", AsyncMock()),
             patch.object(handlers, "run_gate_in_container", AsyncMock(side_effect=FileNotFoundError("docker"))),
+            patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=(True, None))),
             pytest.raises(server.ForgeCIError),
         ):
             await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
@@ -322,3 +367,56 @@ class TestSilentFailureScanOnly:
         assert check["name"] == "silent_failure_scan"
         assert {cmd[0] for cmd in commands} == {"git"}
         assert [cmd[1] for cmd in commands] == ["fetch", "merge-base", "diff"]
+
+
+_HAS_GIT = __import__("shutil").which("git") is not None
+
+
+def _commit_tree(root: Any, files: dict[str, str]) -> None:
+    import os
+    import subprocess
+
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "HOME": str(root)}
+    subprocess.run(["git", "init", "-q", str(root / "repo")], check=True, env=env)
+    for rel, text in files.items():
+        path = root / "repo" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    subprocess.run(["git", "-C", str(root / "repo"), "add", "-A"], check=True, env=env)
+    subprocess.run(
+        ["git", "-C", str(root / "repo"), "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-qm", "c"],
+        check=True,
+        env=env,
+    )
+
+
+@pytest.mark.skipif(not _HAS_GIT, reason="git is not installed")
+class TestCommittedTestsDecision:
+    """The desktop tests decision reads only committed objects and matches the host path's rules."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("files", "run", "status"),
+        [
+            ({"package.json": '{"scripts": {"test": "jest"}}'}, True, None),
+            ({"package.json": '{"scripts": {"build": "tsc"}}'}, False, "skipped"),
+            ({"pyproject.toml": "", "tests/test_x.py": "def test_x(): pass\n"}, True, None),
+            ({"pyproject.toml": "", "src/x.py": "x = 1\n"}, False, None),
+        ],
+        ids=["node-with-script", "node-without-script", "python-with-tests", "no-tests"],
+    )
+    async def test_decision(self, tmp_path: Any, files: dict[str, str], run: bool, status: str | None) -> None:
+        from henchmen.forge.ci_runner import CIRunner
+
+        _commit_tree(tmp_path, files)
+        decided_run, check = await CIRunner(timeout_seconds=30).committed_tests_decision(str(tmp_path / "repo"))
+        assert decided_run is run
+        assert (check["status"] if check else None) == status
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_tree_fails_closed(self, tmp_path: Any) -> None:
+        from henchmen.forge.ci_runner import CIRunner
+
+        (tmp_path / "not-a-repo").mkdir()
+        run, check = await CIRunner(timeout_seconds=30).committed_tests_decision(str(tmp_path / "not-a-repo"))
+        assert run is False and check is not None and check["status"] == "failed"
