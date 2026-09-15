@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import HTTPException, Request
 
+from henchmen.config.internal_auth import InternalAuth, desktop_internal_auth
 from henchmen.config.posture import fail_open_allowed
 
 if TYPE_CHECKING:
@@ -52,6 +53,50 @@ def _split_bearer(header_value: str | None) -> str | None:
     if len(parts) != 2 or parts[0].lower() != "bearer":
         return None
     return parts[1].strip() or None
+
+
+def local_push_auth(settings: Settings) -> InternalAuth | None:
+    """Internal credentials when this is a desktop install whose pushes come from the local broker.
+
+    ``None`` when this is not a data-directory install, or when the message
+    broker is not ``local`` (a desktop install can still be pointed at a real
+    Pub/Sub broker, in which case OIDC -- not this internal token -- is the
+    right check).
+    """
+    internal = desktop_internal_auth()
+    if internal is None:
+        return None
+    from henchmen.providers.registry import ProviderRegistry
+
+    if ProviderRegistry(settings).resolve_provider_name("message_broker") != "local":
+        return None
+    return internal
+
+
+async def require_internal_caller(request: Request) -> None:
+    """FastAPI dependency guarding Henchmen's own maintenance routes (amendment A8).
+
+    In the cloud these routes (watchdog, DLQ check, cleanup, merge-queue tick)
+    are invoked by Cloud Scheduler behind Cloud Run IAM, which this dependency
+    leaves unchanged. On *every* desktop install -- whatever the message
+    broker provider resolves to -- anyone who can reach the port can otherwise
+    call them, so the check is based on :func:`desktop_internal_auth` directly
+    rather than on :func:`local_push_auth`. Without a data directory this is a
+    no-op.
+    """
+    internal = desktop_internal_auth()
+    if internal is None:
+        return
+    if not internal.verify_push_token(_split_bearer(request.headers.get("Authorization"))):
+        logger.warning(
+            "[pubsub-auth] Desktop install: refusing maintenance request without the internal push token from %s",
+            request.client.host if request.client else "unknown",
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid internal token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 async def verify_pubsub_oidc(request: Request, settings: Settings) -> None:
@@ -75,6 +120,20 @@ async def verify_pubsub_oidc(request: Request, settings: Settings) -> None:
     env = settings.environment
 
     token = _split_bearer(request.headers.get("Authorization"))
+
+    # Desktop install with the local broker: the only valid caller is this
+    # server's own broker, which carries the internal push token. No OIDC, no
+    # fail-open, and an operative's task token is not accepted here.
+    internal = local_push_auth(settings)
+    if internal is not None:
+        if internal.verify_push_token(token):
+            request.state.pubsub_internal_caller = True
+            return
+        logger.warning(
+            "[pubsub-auth] Desktop install: refusing /pubsub/* request without the internal push token from %s",
+            request.client.host if request.client else "unknown",
+        )
+        raise HTTPException(status_code=401, detail="Missing or invalid internal push token")
 
     # Development escape hatch: in DEV, if no audience is configured and no
     # token is present, we assume the caller is the local in-memory broker

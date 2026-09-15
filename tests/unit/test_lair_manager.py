@@ -160,6 +160,30 @@ class TestBuildEnvVars:
         env = lm._build_env_vars(task, _node(), "l", dossier=dossier)
         assert env["DOSSIER_URI"] == "gs://bucket/dossiers/x.json"
 
+    def test_desktop_install_env_never_carries_the_internal_push_token(self, monkeypatch, tmp_path):
+        """Amendment B2: operatives never receive the internal push token."""
+        from henchmen.config.internal_auth import clear_cache, load_internal_auth
+
+        clear_cache()
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        internal = load_internal_auth(tmp_path / "secrets")
+        settings = _settings(provider="local", gcp_project_id="")
+
+        env = LairManager(settings)._build_env_vars(_task(), _node(), "lair-1")
+
+        assert internal.push_token not in env.values()
+        assert not any("PUSH_TOKEN" in key.upper() for key in env)
+
+    def test_lair_manager_module_never_references_the_push_token(self):
+        """Belt-and-suspenders: even if env-building changes shape, the module must not name it."""
+        import inspect
+
+        from henchmen.mastermind import lair_manager
+
+        source = inspect.getsource(lair_manager)
+        assert "internal_push_token" not in source
+        assert "INTERNAL_PUSH_TOKEN_FILE_NAME" not in source
+
 
 # ---------------------------------------------------------------------------
 # create_lair
