@@ -194,16 +194,20 @@ class TestRunLintGate:
 
     @pytest.mark.asyncio
     async def test_uncomputable_diff_fails_closed(self, tmp_path: Path) -> None:
-        from henchmen.mastermind.scheme_executor import handlers
+        # Clone/detect/scope now live in ci_gate.plan_gate (shared with the local
+        # gate container, per Task 8's anti-duplication ruling), so that is what
+        # gets patched; handlers._run_on_host is still where the cloud path runs
+        # the scoped commands.
+        from henchmen.mastermind.scheme_executor import ci_gate, handlers
 
         _write(tmp_path, "pyproject.toml", "")
         with (
             patch("henchmen.config.settings.get_settings", return_value=self._settings()),
             patch.object(handlers.tempfile, "mkdtemp", return_value=str(tmp_path)),
             patch.object(handlers.shutil, "rmtree"),
-            patch.object(handlers, "clone_repo", new=AsyncMock()),
+            patch.object(ci_gate, "clone_repo", new=AsyncMock()),
             patch.object(
-                handlers, "changed_files", new=AsyncMock(side_effect=LintScopeError("git fetch failed: ghp_secret"))
+                ci_gate, "changed_files", new=AsyncMock(side_effect=LintScopeError("git fetch failed: ghp_secret"))
             ),
             patch.object(handlers, "_run_on_host", new=AsyncMock()) as run,
         ):
@@ -215,7 +219,7 @@ class TestRunLintGate:
 
     @pytest.mark.asyncio
     async def test_no_relevant_changes_passes_without_running_the_linter(self, tmp_path: Path) -> None:
-        from henchmen.mastermind.scheme_executor import handlers
+        from henchmen.mastermind.scheme_executor import ci_gate, handlers
 
         _write(tmp_path, "pyproject.toml", "")
         _write(tmp_path, "README.md", "")
@@ -223,8 +227,8 @@ class TestRunLintGate:
             patch("henchmen.config.settings.get_settings", return_value=self._settings()),
             patch.object(handlers.tempfile, "mkdtemp", return_value=str(tmp_path)),
             patch.object(handlers.shutil, "rmtree"),
-            patch.object(handlers, "clone_repo", new=AsyncMock()),
-            patch.object(handlers, "changed_files", new=AsyncMock(return_value=["README.md"])),
+            patch.object(ci_gate, "clone_repo", new=AsyncMock()),
+            patch.object(ci_gate, "changed_files", new=AsyncMock(return_value=["README.md"])),
             patch.object(handlers, "_run_on_host", new=AsyncMock()) as run,
         ):
             result = await handlers._run_ci_check(MagicMock(), self._task(), "lint")
@@ -234,7 +238,7 @@ class TestRunLintGate:
 
     @pytest.mark.asyncio
     async def test_host_lint_receives_only_changed_files(self, tmp_path: Path) -> None:
-        from henchmen.mastermind.scheme_executor import handlers
+        from henchmen.mastermind.scheme_executor import ci_gate, handlers
 
         _write(tmp_path, "pyproject.toml", "")
         _write(tmp_path, "src/changed.py")
@@ -243,8 +247,8 @@ class TestRunLintGate:
             patch("henchmen.config.settings.get_settings", return_value=self._settings()),
             patch.object(handlers.tempfile, "mkdtemp", return_value=str(tmp_path)),
             patch.object(handlers.shutil, "rmtree"),
-            patch.object(handlers, "clone_repo", new=AsyncMock()),
-            patch.object(handlers, "changed_files", new=AsyncMock(return_value=["src/changed.py"])),
+            patch.object(ci_gate, "clone_repo", new=AsyncMock()),
+            patch.object(ci_gate, "changed_files", new=AsyncMock(return_value=["src/changed.py"])),
             patch.object(handlers, "_run_on_host", new=AsyncMock(return_value={"returncode": 1, "output": "E"})) as run,
         ):
             result = await handlers._run_ci_check(MagicMock(), self._task(), "lint")
@@ -255,15 +259,15 @@ class TestRunLintGate:
 
     @pytest.mark.asyncio
     async def test_tests_check_does_not_need_a_diff(self, tmp_path: Path) -> None:
-        from henchmen.mastermind.scheme_executor import handlers
+        from henchmen.mastermind.scheme_executor import ci_gate, handlers
 
         _write(tmp_path, "pyproject.toml", "")
         with (
             patch("henchmen.config.settings.get_settings", return_value=self._settings()),
             patch.object(handlers.tempfile, "mkdtemp", return_value=str(tmp_path)),
             patch.object(handlers.shutil, "rmtree"),
-            patch.object(handlers, "clone_repo", new=AsyncMock()),
-            patch.object(handlers, "changed_files", new=AsyncMock(side_effect=AssertionError("diffed"))),
+            patch.object(ci_gate, "clone_repo", new=AsyncMock()),
+            patch.object(ci_gate, "changed_files", new=AsyncMock(side_effect=AssertionError("diffed"))),
             patch.object(handlers, "_run_on_host", new=AsyncMock(return_value={"returncode": 0, "output": ""})) as run,
         ):
             result = await handlers._run_ci_check(MagicMock(), self._task(), "tests")
