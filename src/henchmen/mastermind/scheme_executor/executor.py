@@ -15,6 +15,7 @@ from henchmen.models.task import HenchmenTask
 from henchmen.providers.pricing import estimate_cost_for_settings
 from henchmen.schemes.base import SchemeGraph
 from henchmen.schemes.feature_standard import FEATURE_STANDARD
+from henchmen.utils.git import WORKFLOW_PUSH_REFUSED_MESSAGE
 
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
@@ -200,6 +201,12 @@ class SchemeExecutor:
                         )
                     except Exception as exc:
                         logger.warning("Checkpoint failed for node %s: %s", current_node.id, exc)
+
+            # A node that names an escalation reason cannot be fixed by retrying: stop here.
+            if result.get("escalation_reason"):
+                self._escalation_node = current_node.id
+                self.node_results[current_node.id]["escalated"] = True
+                break
 
             # Determine next node based on result condition
             condition = result.get("condition")  # "pass", "fail", or None
@@ -392,6 +399,15 @@ class SchemeExecutor:
 
             if report.status == OperativeStatus.COMPLETED:
                 return {"condition": "pass", "report": report.model_dump(), "lair_id": lair_id}
+            if report.block_reason == WORKFLOW_PUSH_REFUSED_MESSAGE:
+                # Retrying cannot help: the permission is withheld on purpose (amendment A4).
+                return {
+                    "condition": "fail",
+                    "report": report.model_dump(),
+                    "lair_id": lair_id,
+                    "message": WORKFLOW_PUSH_REFUSED_MESSAGE,
+                    "escalation_reason": WORKFLOW_PUSH_REFUSED_MESSAGE,
+                }
             return {"condition": "fail", "report": report.model_dump(), "lair_id": lair_id}
         except Exception as exc:
             logger.error("[SCHEME] Lair provisioning failed for node %s: %s", node.id, exc)

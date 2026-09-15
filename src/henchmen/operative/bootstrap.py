@@ -35,7 +35,13 @@ from henchmen.providers.interfaces import MessageBroker, ObjectStore
 from henchmen.providers.interfaces.document_store import DocumentStore
 from henchmen.providers.registry import ProviderRegistry
 from henchmen.providers.tiers import resolve_model_name
-from henchmen.utils.git import build_clone_url, clone_repo
+from henchmen.utils.git import (
+    WORKFLOW_PUSH_REFUSED_MESSAGE,
+    WorkflowPushRefusedError,
+    build_clone_url,
+    clone_repo,
+    is_workflow_push_refusal,
+)
 from henchmen.utils.redaction import install_secret_redaction, redact
 
 logger = logging.getLogger(__name__)
@@ -330,9 +336,9 @@ async def run_operative() -> None:
         branch_name = config.branch_name
         has_changes = await _check_for_changes(workspace_dir)
         if has_changes:
-            await _create_branch_and_push(workspace_dir, branch_name, settings)
-            result["branch_pushed"] = branch_name
-            logger.info("Pushed branch %s", branch_name)
+            await _push_changes(workspace_dir, branch_name, settings, result)
+            if result.get("branch_pushed"):
+                logger.info("Pushed branch %s", branch_name)
         else:
             logger.info("No changes detected in workspace — skipping branch push")
 
@@ -361,9 +367,9 @@ async def run_operative() -> None:
             branch_name = config.branch_name
             has_changes = await _check_for_changes(workspace_dir)
             if has_changes:
-                await _create_branch_and_push(workspace_dir, branch_name, settings)
-                result["branch_pushed"] = branch_name
-                logger.info("Pushed changes despite timeout (status remains TIMED_OUT)")
+                await _push_changes(workspace_dir, branch_name, settings, result)
+                if result.get("branch_pushed"):
+                    logger.info("Pushed changes despite timeout (status remains TIMED_OUT)")
         except Exception:
             logger.warning("Could not push changes after timeout", exc_info=True)
     except Exception as e:
@@ -387,9 +393,9 @@ async def run_operative() -> None:
             branch_name = config.branch_name
             has_changes = await _check_for_changes(workspace_dir)
             if has_changes:
-                await _create_branch_and_push(workspace_dir, branch_name, settings)
-                result["branch_pushed"] = branch_name
-                logger.info("Pushed changes despite error")
+                await _push_changes(workspace_dir, branch_name, settings, result)
+                if result.get("branch_pushed"):
+                    logger.info("Pushed changes despite error")
         except Exception:
             logger.warning("Could not push changes after failure", exc_info=True)
     finally:
@@ -830,11 +836,31 @@ async def _create_branch_and_push(workspace_dir: str, branch_name: str, settings
     out, err, rc = await _git("push", "-u", "origin", branch_name)
     if rc != 0:
         # git can echo the authenticated origin URL; the error travels into the report.
+        refused = is_workflow_push_refusal(err)
         err = redact(err)
         logger.error("[OPERATIVE] git push failed: %s", err)
+        if refused:
+            raise WorkflowPushRefusedError(WORKFLOW_PUSH_REFUSED_MESSAGE)
         raise RuntimeError(f"git push failed: {err}")
 
     logger.info("[OPERATIVE] Pushed branch %s to origin", branch_name)
+
+
+async def _push_changes(workspace_dir: str, branch_name: str, settings: Settings, result: dict[str, Any]) -> None:
+    """Push the workspace; a push refused for changing CI workflows blocks the node with a clear reason.
+
+    GitHub refuses the push outright when the branch changes ``.github/workflows/`` (amendment A4: the
+    GitHub App is never granted the ``workflows`` permission). Retrying cannot help, so the node is
+    reported BLOCKED with a plain-language reason instead of FAILED.
+    """
+    try:
+        await _create_branch_and_push(workspace_dir, branch_name, settings)
+    except WorkflowPushRefusedError:
+        result["blocked"] = True
+        result["block_reason"] = WORKFLOW_PUSH_REFUSED_MESSAGE
+        result["error"] = WORKFLOW_PUSH_REFUSED_MESSAGE
+        return
+    result["branch_pushed"] = branch_name
 
 
 async def download_dossier(uri: str, workspace: str, object_store: ObjectStore | None = None) -> None:

@@ -97,6 +97,23 @@ class TestFixLintRouting:
         assert result == failed
 
     @pytest.mark.asyncio
+    async def test_desktop_workflow_push_refusal_escalates(self) -> None:
+        """PI-10 (preflight §3.19): the desktop gate's fix_lint push refusal escalates too, not only the cloud path."""
+        failed = {
+            "condition": "fail",
+            "message": "fix_lint failed (git push failed): refusing to allow a GitHub App to create or "
+            "update workflow `.github/workflows/ci.yml` without `workflows` permission",
+            "output": "",
+        }
+        with patch.object(handlers, "run_gate_in_container", AsyncMock(return_value=failed)):
+            result = await handlers.handle_fix_lint(_executor(_settings()), MagicMock(), _task(), Dossier(task_id="t"))
+        assert result == {
+            "condition": "fail",
+            "message": handlers.WORKFLOW_PUSH_REFUSED_MESSAGE,
+            "escalation_reason": handlers.WORKFLOW_PUSH_REFUSED_MESSAGE,
+        }
+
+    @pytest.mark.asyncio
     async def test_a_desktop_runner_error_fails_closed_without_the_token(self) -> None:
         boom = AsyncMock(side_effect=FileNotFoundError(f"docker not found {TOKEN}"))
         with patch.object(handlers, "run_gate_in_container", boom):

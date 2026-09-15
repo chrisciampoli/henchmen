@@ -2,8 +2,38 @@
 
 import asyncio
 import logging
+import re
 
 logger = logging.getLogger(__name__)
+
+# GitHub's wording when a token without the `workflows` permission (App) or scope (OAuth/PAT) pushes a
+# commit that changes .github/workflows/. Henchmen never requests that permission (amendment A4).
+_WORKFLOW_REFUSAL_RE = re.compile(
+    r"refusing to allow an? [\w ]+ to create or update workflow|without `?workflows?`? (permission|scope)",
+    re.IGNORECASE,
+)
+
+WORKFLOW_PUSH_REFUSED_MESSAGE = (
+    "Henchmen could not push its branch because the change edits GitHub Actions workflows "
+    "(.github/workflows/). Henchmen is not allowed to change CI workflows, so a person needs to make "
+    "that part of the change."
+)
+
+WORKFLOW_PUSH_TOOL_ERROR = (
+    "push refused: this branch changes files under .github/workflows/, and Henchmen may not modify CI "
+    "workflows. Undo those changes (for example `git checkout origin/<base branch> -- .github/workflows` "
+    "and commit), then push again. If the task cannot be done without changing a workflow, stop and report "
+    "that a person must make that change."
+)
+
+
+class WorkflowPushRefusedError(RuntimeError):
+    """GitHub refused a push because it changes CI workflows."""
+
+
+def is_workflow_push_refusal(stderr: str) -> bool:
+    """True when ``git push`` output is GitHub refusing a change to ``.github/workflows/``."""
+    return bool(stderr) and _WORKFLOW_REFUSAL_RE.search(stderr) is not None
 
 
 async def clone_repo(

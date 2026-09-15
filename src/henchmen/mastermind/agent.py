@@ -14,6 +14,7 @@ checkpoint fields written by the executor.
 import json
 import logging
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from henchmen.config.settings import Settings, get_settings
@@ -82,6 +83,16 @@ _GOAL_KEYWORDS = (
 def _matches_keyword(text: str, keywords: tuple[str, ...]) -> bool:
     """True when any keyword appears in *text* as a whole word/phrase."""
     return any(re.search(rf"\b{re.escape(kw)}\b", text) for kw in keywords)
+
+
+def escalation_reason(result: Mapping[str, Any]) -> str:
+    """Why a scheme run escalated: the escalating node's own ``escalation_reason`` if it gave one."""
+    escalation_node = result.get("escalation_node")
+    node_results = result.get("node_results") or {}
+    node_result = node_results.get(escalation_node) if escalation_node else None
+    if isinstance(node_result, Mapping) and node_result.get("escalation_reason"):
+        return str(node_result["escalation_reason"])
+    return f"Escalated at node: {escalation_node}" if escalation_node else "Escalated during execution"
 
 
 class MastermindAgent:
@@ -211,7 +222,7 @@ class MastermindAgent:
             # otherwise the task never gets an escalation record.
             if final_status == "escalated":
                 escalation_node = result.get("escalation_node")
-                reason = f"Escalated at node: {escalation_node}" if escalation_node else "Escalated during execution"
+                reason = escalation_reason(result)
                 await self.tracker.mark_escalated(task.id, reason=reason, escalation_node=escalation_node)
 
             # Log to Vertex AI Experiments if enabled

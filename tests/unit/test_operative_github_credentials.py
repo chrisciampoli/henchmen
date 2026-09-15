@@ -287,6 +287,61 @@ async def test_no_workspace_means_no_remote_rewrite() -> None:
     run_git.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_a_failed_repoint_is_retried_on_the_next_ensure_fresh_without_a_new_fetch() -> None:
+    """Carry-over from the Task 9 review (a): a failed ``git remote set-url`` is retried later,
+    using the token already fetched — not by asking Mastermind again."""
+    server = _Server()
+    credentials = _credentials(server)
+    attempts: list[tuple[str, ...]] = []
+
+    async def flaky_run_git(workspace_dir: str, *args: str) -> tuple[str, str, int]:
+        attempts.append(args)
+        if len(attempts) == 1:
+            return "", "fatal: could not set", 128
+        return "", "", 0
+
+    with patch.object(github_credentials, "run_git", new=AsyncMock(side_effect=flaky_run_git)):
+        assert await credentials.ensure_fresh("/workspace/task-1") == REFRESHED
+        assert credentials.token == REFRESHED  # updated even though the repoint failed
+        # Not expiring any more (the new token's expiry is far away) — only the
+        # pending repoint should be retried, with no second call to Mastermind.
+        assert await credentials.ensure_fresh("/workspace/task-1") == REFRESHED
+    assert len(server.requests) == 1
+    assert len(attempts) == 2
+
+
+@pytest.mark.asyncio
+async def test_repoint_is_not_retried_once_it_succeeds() -> None:
+    server = _Server()
+    credentials = _credentials(server)
+    with patch.object(github_credentials, "run_git", new=AsyncMock(return_value=("", "", 0))) as run_git:
+        assert await credentials.ensure_fresh("/workspace/task-1") == REFRESHED
+        assert await credentials.ensure_fresh("/workspace/task-1") == REFRESHED
+    run_git.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_same_token_skips_the_log_and_the_repoint(caplog: pytest.LogCaptureFixture) -> None:
+    """Carry-over from the Task 9 review (b): an unchanged token means nothing to repoint."""
+
+    class _SameServer(_Server):
+        def __call__(self, request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            return httpx.Response(200, json={"token": INITIAL, "expires_at": _iso(NOW + 3600)})
+
+    server = _SameServer()
+    credentials = _credentials(server)
+    with (
+        caplog.at_level(logging.INFO),
+        patch.object(github_credentials, "run_git", new=AsyncMock()) as run_git,
+    ):
+        assert await credentials.ensure_fresh("/workspace/task-1") == INITIAL
+    run_git.assert_not_awaited()
+    assert "Refreshed the GitHub token" not in caplog.text
+    assert len(server.requests) == 1
+
+
 def test_refresh_client_ignores_proxy_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")

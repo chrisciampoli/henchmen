@@ -110,6 +110,10 @@ class OperativeGitHubCredentials:
         self._sleep = sleep
         self._lock: asyncio.Lock | None = None
         self._refused = False
+        # Set when a refresh replaced ``self._token`` but the origin remote (for lack of a
+        # workspace_dir, or a failed ``git remote set-url``) does not point at it yet. Cleared
+        # once the repoint succeeds, from this refresh or a later ``ensure_fresh`` call.
+        self._needs_repoint = False
 
     def __repr__(self) -> str:
         return f"OperativeGitHubCredentials(refreshable={self.refreshable})"
@@ -143,18 +147,25 @@ class OperativeGitHubCredentials:
         """Refresh the token if it expires within :data:`REFRESH_BEFORE_EXPIRY_SECONDS`; return the token to use.
 
         Never raises. ``workspace_dir``, when given, is the clone whose
-        ``origin`` remote is pointed at a refreshed token.
+        ``origin`` remote is pointed at a refreshed token. When a *previous*
+        refresh updated the token but could not repoint that remote (no
+        ``workspace_dir`` yet, or a failed ``git remote set-url``), this call
+        retries only the repoint — using the token already held, with no new
+        request to Mastermind — before returning.
         """
-        if not self.refreshable or not self._expiring():
-            return self._token
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        async with self._lock:
-            if self.refreshable and self._expiring():
-                try:
-                    await self._refresh(workspace_dir)
-                except Exception as exc:  # never raise into a push or a tool call
-                    logger.warning("GitHub token refresh failed (%s); keeping the current token", type(exc).__name__)
+        if self.refreshable and self._expiring():
+            if self._lock is None:
+                self._lock = asyncio.Lock()
+            async with self._lock:
+                if self.refreshable and self._expiring():
+                    try:
+                        await self._refresh(workspace_dir)
+                    except Exception as exc:  # never raise into a push or a tool call
+                        logger.warning(
+                            "GitHub token refresh failed (%s); keeping the current token", type(exc).__name__
+                        )
+        elif workspace_dir and self._needs_repoint:
+            await self._retry_pending_repoint(workspace_dir)
         return self._token
 
     async def run_refresh_loop(self, workspace_dir: str | None = None) -> None:
@@ -195,23 +206,42 @@ class OperativeGitHubCredentials:
         except (ValueError, ValidationError):
             logger.warning("GitHub token refresh returned an unreadable response; keeping the current token")
             return
+        unchanged = issued.token == self._token
         self._token = issued.token
         self._expires_at = issued.expires_at.timestamp()
         expires_iso = issued.expires_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         # Settings is where the clone and any later reader find the token.
         self._settings.github_token = issued.token
         self._settings.github_token_expires_at = expires_iso
+        if unchanged:
+            # Nothing actually changed: the origin remote (if set up at all) already
+            # points at this token, so there is nothing to log or repoint.
+            return
         logger.info("Refreshed the GitHub token; it now expires at %s", expires_iso)
+        # Not "fresh" until the remote actually points at the new token: a
+        # missing workspace_dir or a failed set-url leaves this set so the
+        # next ensure_fresh(workspace_dir) retries just the repoint.
+        self._needs_repoint = True
         if workspace_dir and self._repo_slug:
-            await self._repoint_origin(workspace_dir, issued.token)
+            await self._retry_pending_repoint(workspace_dir)
 
-    async def _repoint_origin(self, workspace_dir: str, token: str) -> None:
+    async def _retry_pending_repoint(self, workspace_dir: str) -> None:
+        """Point ``origin`` at the current token; clears :attr:`_needs_repoint` only on success."""
+        if not self._repo_slug:
+            return
+        if await self._repoint_origin(workspace_dir, self._token):
+            self._needs_repoint = False
+
+    async def _repoint_origin(self, workspace_dir: str, token: str) -> bool:
+        """``git remote set-url`` the workspace's origin to *token*; True on success."""
         # The command line carries the token (same exposure as the clone, B9): never log it.
         clone_url = build_clone_url(self._repo_slug, token)
         _, stderr, returncode = await run_git(workspace_dir, "remote", "set-url", "origin", clone_url)
         if returncode != 0:
             detail = redact(stderr.replace(token, "***"))[:300]
             logger.warning("Could not point the origin remote at the refreshed GitHub token: %s", detail)
+            return False
+        return True
 
 
 _credentials: OperativeGitHubCredentials | None = None
