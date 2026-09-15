@@ -342,6 +342,46 @@ async def test_same_token_skips_the_log_and_the_repoint(caplog: pytest.LogCaptur
     assert len(server.requests) == 1
 
 
+@pytest.mark.asyncio
+async def test_a_pending_repoint_is_retried_even_when_the_next_refresh_returns_the_same_token() -> None:
+    """Review carry-over: `_refresh` must not drop a pending repoint just because the newly
+    fetched token happens to be unchanged (it returned early before checking `_needs_repoint`)."""
+
+    class _StillExpiringThenSameServer(_Server):
+        def __call__(self, request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                # Still within the refresh window, so the next ensure_fresh call goes
+                # through the full _refresh path again instead of the repoint-only retry.
+                return httpx.Response(200, json={"token": REFRESHED, "expires_at": _iso(NOW + 60)})
+            return httpx.Response(200, json={"token": REFRESHED, "expires_at": _iso(NOW + 3600)})
+
+    server = _StillExpiringThenSameServer()
+    credentials = _credentials(server)
+    attempts: list[tuple[str, ...]] = []
+
+    async def flaky_run_git(workspace_dir: str, *args: str) -> tuple[str, str, int]:
+        attempts.append(args)
+        if len(attempts) == 1:
+            return "", "fatal: could not set", 128
+        return "", "", 0
+
+    with patch.object(github_credentials, "run_git", new=AsyncMock(side_effect=flaky_run_git)) as run_git:
+        # First refresh: token changes, but the repoint fails — _needs_repoint stays set.
+        assert await credentials.ensure_fresh("/workspace/task-1") == REFRESHED
+        assert credentials.expires_at == NOW + 60  # still expiring
+        # Second refresh: the server returns the *same* token (unchanged), but the pending
+        # repoint from before must still be retried, not silently dropped.
+        assert await credentials.ensure_fresh("/workspace/task-1") == REFRESHED
+
+    assert len(server.requests) == 2
+    assert run_git.await_count == 2
+    for call in run_git.await_args_list:
+        assert call.args[1:4] == ("remote", "set-url", "origin")
+    assert credentials.expires_at == NOW + 3600
+    assert credentials._needs_repoint is False
+
+
 def test_refresh_client_ignores_proxy_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
