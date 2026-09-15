@@ -55,22 +55,35 @@ def _split_bearer(header_value: str | None) -> str | None:
     return parts[1].strip() or None
 
 
-def local_push_auth(settings: Settings) -> InternalAuth | None:
-    """Internal credentials when this is a desktop install whose pushes come from the local broker.
+def _load_desktop_internal_auth() -> InternalAuth | None:
+    """``desktop_internal_auth()``, turned into a 503 (never an unhandled 500) on a secrets I/O failure.
 
-    ``None`` when this is not a data-directory install, or when the message
-    broker is not ``local`` (a desktop install can still be pointed at a real
-    Pub/Sub broker, in which case OIDC -- not this internal token -- is the
-    right check).
+    A permissions problem or a full disk while reading or creating the internal secret files under
+    ``<data dir>/secrets`` must fail closed inside a request, not surface as a raw traceback. The
+    log line names only the exception -- a path/errno message -- which never carries secret content;
+    the secret bytes themselves are never logged here or anywhere else.
     """
-    internal = desktop_internal_auth()
-    if internal is None:
-        return None
-    from henchmen.providers.registry import ProviderRegistry
+    try:
+        return desktop_internal_auth()
+    except OSError as exc:
+        logger.error("[pubsub-auth] Could not load internal push credentials: %s", exc)
+        raise HTTPException(status_code=503, detail="Internal credentials unavailable") from exc
 
-    if ProviderRegistry(settings).resolve_provider_name("message_broker") != "local":
-        return None
-    return internal
+
+def local_push_auth(settings: Settings) -> InternalAuth | None:
+    """This install's internal push credentials, for a desktop install on any broker provider.
+
+    A thin alias of :func:`desktop_internal_auth` (via :func:`_load_desktop_internal_auth`), kept so
+    callers that already carry a ``Settings`` instance (:func:`verify_pubsub_oidc`) have a single
+    name to call. ``settings`` is accepted only for that interface convenience and is never
+    consulted: ``henchmen serve`` always wires the shared in-memory broker as the transport for
+    every desktop install's ``/pubsub/*`` pushes, whatever ``message_broker_provider`` resolves to
+    in ``henchmen.env`` -- a desktop install naming a cloud broker there does not mean Google
+    Pub/Sub, rather than this process's own broker, is what actually delivers the push. So a
+    desktop install accepts *only* the internal push token here, never OIDC or the DEV fail-open,
+    regardless of its broker setting (controller ruling).
+    """
+    return _load_desktop_internal_auth()
 
 
 async def require_internal_caller(request: Request) -> None:
@@ -84,7 +97,7 @@ async def require_internal_caller(request: Request) -> None:
     rather than on :func:`local_push_auth`. Without a data directory this is a
     no-op.
     """
-    internal = desktop_internal_auth()
+    internal = _load_desktop_internal_auth()
     if internal is None:
         return
     if not internal.verify_push_token(_split_bearer(request.headers.get("Authorization"))):
@@ -121,9 +134,10 @@ async def verify_pubsub_oidc(request: Request, settings: Settings) -> None:
 
     token = _split_bearer(request.headers.get("Authorization"))
 
-    # Desktop install with the local broker: the only valid caller is this
-    # server's own broker, which carries the internal push token. No OIDC, no
-    # fail-open, and an operative's task token is not accepted here.
+    # Any desktop install, whatever the message broker provider resolves to:
+    # the only valid caller is this server's own shared broker, which carries
+    # the internal push token. No OIDC, no fail-open, and an operative's task
+    # token is not accepted here.
     internal = local_push_auth(settings)
     if internal is not None:
         if internal.verify_push_token(token):

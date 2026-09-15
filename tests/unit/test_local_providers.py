@@ -1418,6 +1418,23 @@ class TestInMemoryBrokerForwarding:
         assert client.headers == [{}]
 
     @pytest.mark.asyncio
+    async def test_forwarding_client_never_trusts_proxy_env_vars(self):
+        """A configured HTTP(S)_PROXY must never receive the internal push token."""
+        from henchmen.providers.local.memory import InMemoryMessageBroker
+
+        recording_client = _RecordingHTTPClient([_FakeHTTPResponse(200)])
+        broker = InMemoryMessageBroker()
+        broker.set_forward_map({"topic": "http://localhost:8000/hook"})
+        broker.set_forward_token("p" * 43)
+        with (
+            patch("httpx.AsyncClient", return_value=recording_client) as async_client_cls,
+            patch("henchmen.providers.local.memory._FORWARD_RETRY_BACKOFF_SECONDS", 0),
+        ):
+            await broker.publish("topic", b"{}")
+            await broker.drain()
+        async_client_cls.assert_called_once_with(trust_env=False)
+
+    @pytest.mark.asyncio
     async def test_retained_message_history_is_bounded(self):
         from henchmen.providers.local import memory as memory_module
         from henchmen.providers.local.memory import InMemoryMessageBroker
