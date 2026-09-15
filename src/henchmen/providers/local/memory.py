@@ -97,7 +97,7 @@ class InMemoryMessageBroker:
         # Strong references to in-flight forward tasks. Without this, the asyncio
         # event loop only holds weak references and background tasks can be
         # garbage collected mid-run (silent message loss in local dev).
-        self._background_tasks: set[asyncio.Task[None]] = set()
+        self._background_tasks: set[asyncio.Task[bool]] = set()
         # Operative containers on a desktop install authenticate with their task token.
         if settings is not None and settings.operative_task_token.strip():
             self._forward_token = settings.operative_task_token.strip()
@@ -129,12 +129,26 @@ class InMemoryMessageBroker:
         """Bearer token sent with every forwarded POST (desktop installs authenticate internal pushes)."""
         self._forward_token = token or None
 
-    async def publish(self, topic: str, data: bytes, ordering_key: str | None = None, **attributes: str) -> str:
-        """Publish a message to the given topic. Returns a local message ID."""
+    def _record_publish(self, topic: str, data: bytes, attributes: dict[str, str]) -> str:
+        """Append to message history and invoke synchronous subscribers. Returns the local message id."""
         msg_id = f"local-{uuid4().hex[:8]}"
         self._messages[topic].append({"id": msg_id, "data": data, "attributes": attributes})
         for callback in self._subscribers.get(topic, []):
             callback(data, **attributes)
+        return msg_id
+
+    async def publish(self, topic: str, data: bytes, ordering_key: str | None = None, **attributes: str) -> str:
+        """Publish a message to the given topic. Returns a local message ID.
+
+        Non-blocking and best-effort: the server-side shared broker inside
+        ``henchmen serve`` must never block a caller on a slow or failing
+        forward, so any HTTP delivery happens in a background task whose
+        outcome this method does not wait for. A caller that must know
+        whether delivery actually succeeded (an operative container
+        confirming its own completion report) uses :meth:`publish_and_confirm`
+        instead.
+        """
+        msg_id = self._record_publish(topic, data, attributes)
 
         # HTTP forwarding (non-blocking, best-effort). Hold a strong reference
         # to the task and clean up via a done-callback to prevent GC from reaping
@@ -147,8 +161,31 @@ class InMemoryMessageBroker:
 
         return msg_id
 
-    async def _forward_to_http(self, url: str, msg_id: str, data: bytes, attributes: dict[str, str]) -> None:
-        """POST a Pub/Sub-style envelope to a local HTTP endpoint.
+    def has_forward_target(self, topic: str) -> bool:
+        """True when a forward URL is configured for ``topic``.
+
+        An operative container has one; so does the shared server-side broker
+        forwarding to itself inside ``henchmen serve``.
+        """
+        return topic in self._forward_map
+
+    async def publish_and_confirm(self, topic: str, data: bytes, **attributes: str) -> bool:
+        """Publish and await actual HTTP delivery. True only on a 2xx response from the forward URL.
+
+        Unlike :meth:`publish`, this awaits :meth:`_forward_to_http` directly
+        instead of scheduling a background task — so a caller (the operative
+        process reporting its own completion) does not exit before delivery
+        is confirmed one way or the other. Returns False when no forward URL
+        is configured for ``topic`` — there is nothing to confirm.
+        """
+        msg_id = self._record_publish(topic, data, attributes)
+        url = self._forward_map.get(topic)
+        if not url:
+            return False
+        return await self._forward_to_http(url, msg_id, data, attributes)
+
+    async def _forward_to_http(self, url: str, msg_id: str, data: bytes, attributes: dict[str, str]) -> bool:
+        """POST a Pub/Sub-style envelope to a local HTTP endpoint. Returns True only on a 2xx response.
 
         Real Pub/Sub push retries a delivery that never reached the handler,
         so a connection failure (the target service is still booting) is
@@ -174,13 +211,13 @@ class InMemoryMessageBroker:
                     resp = await client.post(url, json=envelope, headers=headers, timeout=_FORWARD_TIMEOUT_SECONDS)
                 if resp.status_code >= 400:
                     logger.warning("HTTP forward of %s to %s returned %d", msg_id, url, resp.status_code)
-                else:
-                    logger.debug("Forwarded %s to %s (status=%d)", msg_id, url, resp.status_code)
-                return
+                    return False
+                logger.debug("Forwarded %s to %s (status=%d)", msg_id, url, resp.status_code)
+                return True
             except Exception as exc:
                 if attempt >= _FORWARD_RETRIES:
                     logger.warning("HTTP forward failed for %s -> %s: %s", msg_id, url, exc)
-                    return
+                    return False
                 logger.debug(
                     "HTTP forward attempt %d/%d for %s -> %s failed: %s",
                     attempt,
@@ -190,6 +227,7 @@ class InMemoryMessageBroker:
                     exc,
                 )
                 await asyncio.sleep(_FORWARD_RETRY_BACKOFF_SECONDS * attempt)
+        return False
 
     async def pull_dlq(
         self,

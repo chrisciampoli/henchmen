@@ -7,6 +7,7 @@ bootstrap git plumbing (default-branch detection, exclusions, push) against
 real throwaway git repositories.
 """
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -646,3 +647,140 @@ class TestDocumentStoreFailClosed:
         registry.get_document_store.return_value = store
 
         assert _get_document_store(registry, _settings(environment="prod")) is store
+
+
+class TestPublishReportAwaitsDelivery:
+    """Ruling P8: an operative must confirm its completion report reached Mastermind before exiting."""
+
+    def _report(self) -> Any:
+        from datetime import UTC, datetime
+
+        from henchmen.models.operative import OperativeReport
+
+        return OperativeReport(
+            task_id="task-p8",
+            scheme_id="bugfix_standard",
+            node_id="implement_fix",
+            operative_id="op-1",
+            status=OperativeStatus.COMPLETED,
+            summary="done",
+            confidence_score=0.9,
+            started_at=datetime.now(UTC),
+        )
+
+    @pytest.mark.asyncio
+    async def test_delivery_success_sends_exactly_one_post_and_returns(self):
+        from henchmen.operative.bootstrap import publish_report
+        from henchmen.providers.local.memory import InMemoryMessageBroker
+
+        broker = InMemoryMessageBroker()
+        broker.set_forward_map({"operative-complete": "http://localhost:8000/hook"})
+        response = MagicMock(status_code=204)
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.post = AsyncMock(return_value=response)
+        settings = _settings(pubsub_topic_operative_complete="operative-complete")
+
+        with patch("httpx.AsyncClient", return_value=client):
+            await publish_report(self._report(), settings, broker=broker)
+
+        assert client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_delivery_failure_after_retries_raises(self):
+        from henchmen.operative.bootstrap import publish_report
+        from henchmen.providers.local import memory as memory_module
+        from henchmen.providers.local.memory import InMemoryMessageBroker
+
+        broker = InMemoryMessageBroker()
+        broker.set_forward_map({"operative-complete": "http://localhost:8000/hook"})
+        response = MagicMock(status_code=500)
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.post = AsyncMock(return_value=response)
+        settings = _settings(pubsub_topic_operative_complete="operative-complete")
+
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            patch.object(memory_module, "_FORWARD_RETRY_BACKOFF_SECONDS", 0),
+            pytest.raises(RuntimeError, match="Failed to deliver"),
+        ):
+            await publish_report(self._report(), settings, broker=broker)
+        # 500 is a response, not a transport failure — not retried, so exactly one POST.
+        assert client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_connection_failure_after_retries_raises(self):
+        from henchmen.operative.bootstrap import publish_report
+        from henchmen.providers.local import memory as memory_module
+        from henchmen.providers.local.memory import InMemoryMessageBroker
+
+        broker = InMemoryMessageBroker()
+        broker.set_forward_map({"operative-complete": "http://localhost:8000/hook"})
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.post = AsyncMock(side_effect=ConnectionError("boom"))
+        settings = _settings(pubsub_topic_operative_complete="operative-complete")
+
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            patch.object(memory_module, "_FORWARD_RETRY_BACKOFF_SECONDS", 0),
+            pytest.raises(RuntimeError, match="Failed to deliver"),
+        ):
+            await publish_report(self._report(), settings, broker=broker)
+        assert client.post.await_count == memory_module._FORWARD_RETRIES
+
+    @pytest.mark.asyncio
+    async def test_no_forward_target_uses_the_non_blocking_path(self):
+        """No token/URL configured for this broker (e.g. dev without HENCHMEN_LOCAL_FORWARD_BASE_URL): unchanged."""
+        from henchmen.operative.bootstrap import publish_report
+        from henchmen.providers.local.memory import InMemoryMessageBroker
+
+        broker = InMemoryMessageBroker()
+        settings = _settings(pubsub_topic_operative_complete="operative-complete")
+
+        await publish_report(self._report(), settings, broker=broker)
+
+        assert len(broker.get_messages("operative-complete")) == 1
+
+    def test_main_exits_non_zero_on_undeliverable_report(self, caplog):
+        import logging
+
+        from henchmen.operative import bootstrap
+
+        with (
+            patch.object(bootstrap, "run_operative", new=AsyncMock(side_effect=RuntimeError("Failed to deliver X"))),
+            caplog.at_level(logging.ERROR, logger="henchmen.operative.bootstrap"),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            bootstrap.main()
+
+        assert exc_info.value.code != 0
+        assert "Fatal error" in caplog.text
+
+
+class TestServerSideBrokerPublishStaysNonBlocking:
+    """The shared broker inside ``henchmen serve`` must not block a caller on the HTTP forward (ruling P8)."""
+
+    @pytest.mark.asyncio
+    async def test_publish_returns_before_the_forward_completes(self):
+        from henchmen.providers.local.memory import InMemoryMessageBroker
+
+        broker = InMemoryMessageBroker()
+        broker.set_forward_map({"topic": "http://localhost:8000/hook"})
+        started = AsyncMock()
+
+        async def _slow_forward(*args: Any, **kwargs: Any) -> bool:
+            await started()
+            await asyncio.sleep(10)
+            return True
+
+        with patch.object(broker, "_forward_to_http", new=_slow_forward):
+            msg_id = await asyncio.wait_for(broker.publish("topic", b"{}"), timeout=1.0)
+
+        assert msg_id.startswith("local-")
+        for task in list(broker._background_tasks):
+            task.cancel()
