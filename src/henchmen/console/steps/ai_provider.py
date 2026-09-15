@@ -3,13 +3,14 @@
 Credentials are checked with the same ``cli.checks`` functions ``henchmen
 init`` and ``henchmen doctor`` use, so the Console and the CLI accept exactly
 the same keys. The blocking SDK calls run in a worker thread. The recommended
-model per tier is the ``Settings`` default for that tier, and the per-task
-cost estimate prices the executor's own most expensive first-task node
-(``implement_feature``) through
+model per tier is the ``Settings`` default for that tier (or, when the
+account cannot reach it, the first model the account's own listing offers),
+and the per-task cost estimate prices a full feature task -- including one
+round of test fixes -- through
 ``mastermind.scheme_executor.executor.estimate_feature_task_cost`` --
 which itself goes through ``providers.pricing.estimate_cost_for_settings`` --
 so the number shown here always agrees with the cost gate that would
-otherwise refuse the task (ruling C2). There is no second price table or
+otherwise refuse the task (ruling C2a). There is no second price table or
 token profile here.
 
 A save re-validates the credential (an earlier ``/validate`` is never
@@ -19,6 +20,7 @@ complete.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Annotated, Any, Literal
 
@@ -30,7 +32,7 @@ from henchmen.cli import checks
 from henchmen.cli.checks import CheckResult, CheckStatus
 from henchmen.config.settings import Settings
 from henchmen.console.check_problems import problem_from_check
-from henchmen.console.config_store import CONFIGURED, ConfigStore
+from henchmen.console.config_store import CONFIGURED, ConfigStore, ConfigStoreError
 from henchmen.console.deps import get_config_store
 from henchmen.console.state import SetupStateStore, SetupStep
 from henchmen.console.steps import (
@@ -43,7 +45,9 @@ from henchmen.console.steps import (
 )
 from henchmen.mastermind.scheme_executor.executor import estimate_feature_task_cost
 from henchmen.models.llm import ModelTier
-from henchmen.providers.tiers import TIER_FIELDS
+from henchmen.providers.tiers import TIER_FIELDS, normalize_llm_provider
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 STEP = SetupStep.AI_PROVIDER
@@ -105,6 +109,33 @@ _NO_MODELS_PROBLEM = StepProblem(
     message="Henchmen could not list the models this account can use.",
     action="Choose Check again.",
 )
+_COULD_NOT_ESTIMATE_PROBLEM = StepProblem(
+    message="Henchmen could not estimate the cost of a task with these models.",
+    action="Try again, or choose Check again.",
+)
+
+# Token-budget Settings fields the estimate must reflect if they were already
+# customized (ruling: "estimate_task_cost ... applies them, so it matches
+# runtime"), rather than always assuming the Settings hard-coded defaults.
+_TOKEN_BUDGET_FIELDS: tuple[str, ...] = (
+    "operative_max_system_tokens",
+    "operative_max_message_tokens",
+    "operative_max_output_tokens",
+)
+
+# Reverse mapping from a settings env key back to the request field it came
+# from, used only to attribute a ConfigStoreError to a field instead of
+# surfacing a bare 500 (per-tier model keys are matched separately, since
+# they depend on the chosen provider).
+_KEY_TO_FIELD: dict[str, str] = {
+    "HENCHMEN_LLM_OLLAMA_BASE_URL": "ollama_base_url",
+    "HENCHMEN_GCP_PROJECT_ID": "gcp_project_id",
+    "HENCHMEN_GCP_REGION": "gcp_region",
+    "HENCHMEN_AWS_REGION": "aws_region",
+    "HENCHMEN_ANTHROPIC_API_KEY": "api_key",
+    "HENCHMEN_OPENAI_API_KEY": "api_key",
+    _CEILING_KEY: "task_cost_ceiling_usd",
+}
 
 ConfigDep = Annotated[ConfigStore, Depends(get_config_store)]
 SetupDep = Annotated[SetupStateStore, Depends(get_setup_store)]
@@ -140,7 +171,7 @@ class AiProviderSave(AiCredentials):
     """A full AI provider configuration to save.
 
     ``task_cost_ceiling_usd`` is optional: when omitted, the save writes the
-    recommended ceiling for the chosen models (ruling C2). When given below
+    recommended ceiling for the chosen models (ruling C2a). When given below
     the estimate it is still saved as-is -- the user's explicit choice always
     wins -- and the response carries a warning.
     """
@@ -159,38 +190,102 @@ def _env_key(field_name: str) -> str:
     return f"HENCHMEN_{field_name.upper()}"
 
 
+def _field_for_key(provider: str, key: str) -> str | None:
+    """Map a settings env key back to the request field it came from, for error attribution."""
+    if key in _KEY_TO_FIELD:
+        return _KEY_TO_FIELD[key]
+    for tier, field_name in TIER_FIELDS.get(provider, {}).items():
+        if _env_key(field_name) == key:
+            return f"models.{_tier_key(tier)}"
+    return None
+
+
 def recommended_models(provider: str, available: list[str]) -> dict[str, str]:
-    """The ``Settings`` default model for each tier (Ollama falls back to a pulled model)."""
+    """The ``Settings`` default model per tier when the account can reach it.
+
+    When ``available`` is non-empty and the default is not in it, falls back
+    to the first model the account's own listing offers for that tier --
+    never a model the key or server cannot actually use.
+    """
     picks: dict[str, str] = {}
     for tier, field_name in TIER_FIELDS[provider].items():
         default = str(Settings.model_fields[field_name].default or "")
         if not default and provider == "local":
-            fallback = str(Settings.model_fields["llm_ollama_model"].default or "")
-            default = fallback if (fallback in available or not available) else available[0]
+            default = str(Settings.model_fields["llm_ollama_model"].default or "")
+        if available and default not in available:
+            default = available[0]
         picks[_tier_key(tier)] = default
     return picks
 
 
-def estimate_task_cost(provider: str, models: dict[str, str]) -> float:
-    """USD cost of the executor's most expensive first-task node with ``models``, rounded to cents."""
+def _token_budget_overrides(config: ConfigStore | None) -> dict[str, int]:
+    """Any ``HENCHMEN_OPERATIVE_MAX_*`` token budgets already saved, so the estimate matches runtime."""
+    if config is None:
+        return {}
+    overrides: dict[str, int] = {}
+    for field_name in _TOKEN_BUDGET_FIELDS:
+        raw = config.get(_env_key(field_name)).strip()
+        if not raw:
+            continue
+        try:
+            overrides[field_name] = int(raw)
+        except ValueError:
+            logger.warning("Ignoring non-integer %s in the config file", _env_key(field_name))
+    return overrides
+
+
+def _raw_task_cost(provider: str, models: dict[str, str], config: ConfigStore | None = None) -> float:
+    """Unrounded USD cost of a full feature task; see :func:`estimate_task_cost`.
+
+    A ``ceiling_below_estimate`` decision must compare against this, not the
+    rounded display figure, since rounding down a cent could hide a limit
+    that is actually below what the executor's cost gate would charge.
+    """
     overrides: dict[str, Any] = {"_env_file": None, "provider": "local", "llm_provider": provider}
     for tier, field_name in TIER_FIELDS[provider].items():
         overrides[field_name] = models[_tier_key(tier)]
+    overrides.update(_token_budget_overrides(config))
     settings = Settings(**overrides)
-    return round(estimate_feature_task_cost(settings), 2)
+    return estimate_feature_task_cost(settings)
+
+
+def estimate_task_cost(provider: str, models: dict[str, str], config: ConfigStore | None = None) -> float:
+    """USD cost of a full feature task with ``models``, rounded to cents for display.
+
+    Sums every agentic node of the ``feature_standard`` scheme -- not only
+    ``implement_feature`` but also one round of ``fix_tests`` -- so this
+    always agrees with what the executor's own pre-dispatch cost gate would
+    charge (ruling C2a). When ``config`` is given, any already-saved
+    ``HENCHMEN_OPERATIVE_MAX_*`` token budgets are applied instead of the
+    ``Settings`` defaults, so the estimate matches the configured runtime.
+    """
+    return round(_raw_task_cost(provider, models, config), 2)
 
 
 def recommended_ceiling_usd(estimate: float) -> float:
-    """A per-task spending limit that covers ``estimate`` with headroom (ruling C2)."""
+    """A per-task spending limit that covers ``estimate`` with headroom (ruling C2a)."""
     default = float(Settings.model_fields["operative_task_cost_ceiling_usd"].default)
     return float(max(default, math.ceil(estimate * 1.5)))
 
 
 def _spending_limit_explanation(estimate: float, recommended: float) -> str:
     return (
-        f"A typical feature task can cost up to about ${estimate:.2f} with these models. "
-        f"We suggest a limit of ${recommended:.0f} per task; Henchmen stops a task before it would go over."
+        f"A feature task, including one round of test fixes, can cost up to about ${estimate:.2f} "
+        f"with these models. We suggest a limit of ${recommended:.0f} per task; Henchmen stops a "
+        "task before it would go over."
     )
+
+
+def _price_or_none(
+    provider: str, models: dict[str, str], config: ConfigStore | None = None
+) -> tuple[float, float] | None:
+    """``(raw, rounded)`` cost of a feature task, or ``None`` (logged) when pricing fails."""
+    try:
+        raw = _raw_task_cost(provider, models, config)
+    except Exception:
+        logger.exception("Could not estimate the feature-task cost for provider %s", provider)
+        return None
+    return raw, round(raw, 2)
 
 
 def _check_and_list(body: AiCredentials, api_key: str) -> tuple[CheckResult, list[str]]:
@@ -261,12 +356,13 @@ def _ceiling(config: ConfigStore, provider: str, models: dict[str, str]) -> floa
         try:
             return float(saved)
         except ValueError:
-            pass
+            logger.warning("Ignoring non-numeric %s in the config file: %r", _CEILING_KEY, saved)
     default = float(Settings.model_fields["operative_task_cost_ceiling_usd"].default)
     if provider in TIER_FIELDS and all(models.values()):
         try:
-            return recommended_ceiling_usd(estimate_task_cost(provider, models))
+            return recommended_ceiling_usd(_raw_task_cost(provider, models, config))
         except Exception:
+            logger.exception("Could not compute the recommended ceiling for provider %s", provider)
             return default
     return default
 
@@ -300,7 +396,7 @@ def _config_values(body: AiProviderSave, api_key: str, config: ConfigStore, ceil
 @router.get("")
 async def current(config: ConfigDep) -> StepSuccess:
     """Provider options and what is saved now (secrets masked)."""
-    provider = config.get("HENCHMEN_LLM_PROVIDER")
+    provider = normalize_llm_provider(config.get("HENCHMEN_LLM_PROVIDER"))
     models = _saved_models(config, provider)
     key_setting = _API_KEY_SETTINGS.get(provider)
     credential = config.masked([key_setting])[key_setting] if key_setting else ""
@@ -323,8 +419,11 @@ async def validate(body: AiCredentials, config: ConfigDep) -> StepSuccess | Step
     if failure is not None:
         return failure
     recommended = recommended_models(body.provider, models)
-    estimate = estimate_task_cost(body.provider, recommended)
-    recommended_ceiling = recommended_ceiling_usd(estimate)
+    priced = _price_or_none(body.provider, recommended, config)
+    if priced is None:
+        return step_failed(STEP, _COULD_NOT_ESTIMATE_PROBLEM)
+    raw_estimate, estimate = priced
+    recommended_ceiling = recommended_ceiling_usd(raw_estimate)
     return StepSuccess(
         step=STEP,
         details={
@@ -357,12 +456,33 @@ async def save(body: AiProviderSave, config: ConfigDep, setup: SetupDep) -> Step
     if unknown:
         return step_failed(STEP, *unknown)
 
-    estimate = estimate_task_cost(body.provider, chosen)
-    recommended_ceiling = recommended_ceiling_usd(estimate)
+    priced = _price_or_none(body.provider, chosen, config)
+    if priced is None:
+        return step_failed(STEP, _COULD_NOT_ESTIMATE_PROBLEM)
+    raw_estimate, estimate = priced
+    recommended_ceiling = recommended_ceiling_usd(raw_estimate)
     ceiling = body.task_cost_ceiling_usd if body.task_cost_ceiling_usd is not None else recommended_ceiling
-    ceiling_below_estimate = ceiling < estimate
+    ceiling_below_estimate = ceiling < raw_estimate
 
-    config.update(_config_values(body, api_key, config, ceiling), section=CONFIG_SECTION)
+    previous_provider = normalize_llm_provider(config.get("HENCHMEN_LLM_PROVIDER"))
+    values = _config_values(body, api_key, config, ceiling)
+    try:
+        # Both writes happen under one lock acquisition (never `await` inside
+        # it) so a concurrent writer can never observe the stale key sitting
+        # alongside the new provider's configuration.
+        with config.locked():
+            if previous_provider and previous_provider != body.provider:
+                stale_key = _API_KEY_SETTINGS.get(previous_provider)
+                if stale_key is not None:
+                    config.unset([stale_key])
+            config.update(values, section=CONFIG_SECTION)
+    except ConfigStoreError as exc:
+        text = str(exc)
+        offending_key = next((key for key in values if key in text), None)
+        field = _field_for_key(body.provider, offending_key) if offending_key else None
+        logger.warning("Rejected AI provider save: %s", text)
+        return step_failed(STEP, StepProblem(field=field, message=text, action="Check the values and try again."))
+
     details: dict[str, Any] = {
         "provider": body.provider,
         "models": chosen,

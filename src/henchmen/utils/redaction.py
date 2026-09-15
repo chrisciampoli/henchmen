@@ -59,6 +59,14 @@ _AWS_ARN_PATTERN = re.compile(r"arn:aws[a-z-]*:[a-z0-9-]*:[a-z0-9-]*:\d{12}:\S+"
 # \1) so the redacted text still reads "Account: ***REDACTED***".
 _AWS_ACCOUNT_ID_PATTERN = re.compile(r"(?i)(\baccount\b\s*:?\s*)\d{12}\b")
 
+# Basic-auth credentials embedded in a URL ("scheme://user:pass@host/..."), as
+# a misconfigured Jira base URL or a git remote can carry. The scheme is kept
+# (captured and replayed via \1) so the redacted text still reads
+# "https://***REDACTED***@host/..." rather than losing the URL entirely. Both
+# quantifiers are bounded (stop at the next "@", "/" or whitespace), so this
+# stays linear in input length like the other patterns here.
+_URL_USERINFO_PATTERN = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s@/]+:[^\s@/]+@")
+
 # (pattern, replacement) pairs, applied in order. Every pattern but the bearer
 # one replaces the whole match outright; the bearer pattern captures the word
 # itself (case preserved, whatever whitespace separated it from the token) so
@@ -74,6 +82,9 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"xox[baprs]-[A-Za-z0-9-]+"), REDACTED),  # Slack bot/user/app tokens
     (re.compile(r"xapp-[A-Za-z0-9-]+"), REDACTED),  # Slack app-level tokens
     (re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"), REDACTED),  # Anthropic API keys
+    (re.compile(r"sk-proj-[A-Za-z0-9_-]{20,}"), REDACTED),  # OpenAI project-scoped keys
+    (re.compile(r"sk-svcacct-[A-Za-z0-9_-]{20,}"), REDACTED),  # OpenAI service-account keys
+    (re.compile(r"sk-admin-[A-Za-z0-9_-]{20,}"), REDACTED),  # OpenAI admin keys
     (re.compile(r"sk-[A-Za-z0-9]{32,}"), REDACTED),  # OpenAI / generic secret keys
     (re.compile(r"AIza[A-Za-z0-9_-]{30,}"), REDACTED),  # Google API keys
     (re.compile(r"x-access-token:[^@\s]+"), REDACTED),  # Authenticated git clone URLs
@@ -86,6 +97,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?<=setup_token=)[^&#\s\"']+"), REDACTED),  # Console sign-in token (value only)
     (_TOKEN_ENV_VAR_PATTERN, r"\1=" + REDACTED),  # *_TOKEN=value env assignments (key name kept)
     (_TOKEN_QUOTED_KV_PATTERN, r"\1\2\1\3\4" + REDACTED + r"\4"),  # quoted "*_TOKEN": "value" (dict/JSON reprs)
+    (_URL_USERINFO_PATTERN, r"\1" + REDACTED + "@"),  # scheme://user:pass@ basic-auth URLs
 )
 
 # Loggers whose formatter reads ``record.args`` itself and so cannot have them

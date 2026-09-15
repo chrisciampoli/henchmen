@@ -46,3 +46,33 @@ class TestAwsRedaction:
     def test_arn_pattern_does_not_match_a_plain_url(self):
         text = "See https://console.aws.amazon.com/bedrock/home?region=us-east-1"
         assert redact(text) == text
+
+
+class TestOpenAiKeyRedaction:
+    """OpenAI's newer project/service-account/admin key shapes embed a hyphen right after the
+    ``sk-`` prefix, which the generic ``sk-[A-Za-z0-9]{32,}`` pattern cannot match."""
+
+    def test_project_scoped_key_is_redacted(self):
+        result = redact("Authorization: Bearer sk-proj-abcDEF0123456789abcDEF0123456789")
+        assert "sk-proj-" not in result
+        assert REDACTED in result
+
+    def test_service_account_key_is_redacted(self):
+        assert "sk-svcacct-" not in redact("key=sk-svcacct-abcDEF0123456789abcDEF0123456789")
+
+    def test_admin_key_is_redacted(self):
+        assert "sk-admin-" not in redact("key=sk-admin-abcDEF0123456789abcDEF0123456789")
+
+
+class TestUrlUserinfoRedaction:
+    def test_basic_auth_credentials_are_stripped_from_a_url(self):
+        result = redact("cannot reach http://admin:hunter2@localhost:11434 (connection refused)")
+        assert "admin:hunter2" not in result
+        assert REDACTED in result
+        # The scheme and host survive so the message is still useful.
+        assert "http://" in result
+        assert "localhost:11434" in result
+
+    def test_url_without_credentials_is_left_alone(self):
+        text = "reachable at http://localhost:11434 (3 models pulled)"
+        assert redact(text) == text
