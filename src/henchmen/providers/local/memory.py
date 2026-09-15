@@ -165,7 +165,9 @@ class InMemoryMessageBroker:
         headers = {"Authorization": f"Bearer {self._forward_token}"} if self._forward_token else {}
         for attempt in range(1, _FORWARD_RETRIES + 1):
             try:
-                async with httpx.AsyncClient() as client:
+                # trust_env=False: never read HTTP(S)_PROXY / NO_PROXY from the environment for this
+                # loopback call. A configured proxy would otherwise receive the internal push token.
+                async with httpx.AsyncClient(trust_env=False) as client:
                     resp = await client.post(url, json=envelope, headers=headers, timeout=_FORWARD_TIMEOUT_SECONDS)
                 if resp.status_code >= 400:
                     logger.warning("HTTP forward of %s to %s returned %d", msg_id, url, resp.status_code)

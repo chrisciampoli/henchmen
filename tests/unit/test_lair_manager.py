@@ -171,7 +171,7 @@ class TestBuildEnvVars:
 
         env = LairManager(settings)._build_env_vars(_task(), _node(), "lair-1")
 
-        assert internal.push_token not in env.values()
+        assert not any(internal.push_token in v for v in env.values())
         assert not any("PUSH_TOKEN" in key.upper() for key in env)
 
     def test_lair_manager_module_never_references_the_push_token(self):

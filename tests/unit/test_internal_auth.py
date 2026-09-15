@@ -128,14 +128,50 @@ class TestPubsubOnDesktop:
         assert exc.value.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_non_local_broker_uses_oidc_and_fails_closed(self, desktop) -> None:
-        from henchmen.dispatch.pubsub_auth import local_push_auth, verify_pubsub_oidc
+    async def test_gcp_broker_still_accepts_only_the_push_token(self, desktop) -> None:
+        """Controller ruling: on any desktop install, verify_pubsub_oidc accepts ONLY the internal
+        push token and never falls back to OIDC or fail-open, whatever the broker resolves to.
+
+        ``henchmen serve`` always wires the shared in-memory broker as the actual transport for a
+        desktop install's ``/pubsub/*`` pushes, so a ``henchmen.env`` naming a cloud broker must not
+        reopen the OIDC/fail-open path.
+        """
+        from henchmen.dispatch.pubsub_auth import verify_pubsub_oidc
 
         settings = _settings(message_broker_provider="gcp")
-        assert local_push_auth(settings) is None
+
+        request = _request({"Authorization": f"Bearer {desktop.push_token}"})
+        await verify_pubsub_oidc(request, settings)
+        assert request.state.pubsub_internal_caller is True
+
         with pytest.raises(HTTPException) as exc:
-            await verify_pubsub_oidc(_request({"Authorization": f"Bearer {desktop.push_token}"}), settings)
+            await verify_pubsub_oidc(_request(), settings)
         assert exc.value.status_code == 401
+
+        # An OIDC-looking bearer (three dot-separated base64url segments, the shape of a real
+        # Google-signed ID token) must still be refused outright, not handed to the OIDC verifier.
+        oidc_looking = "eyJhbGciOiJSUzI1NiJ9." + "e" * 40 + "." + "s" * 40
+        with pytest.raises(HTTPException) as exc:
+            await verify_pubsub_oidc(_request({"Authorization": f"Bearer {oidc_looking}"}), settings)
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_secrets_directory_failure_is_a_503_not_a_crash(
+        self, desktop, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ruling: an OSError loading the internal auth inside a request fails closed as 503, and
+        the log line never carries secret content."""
+        import henchmen.dispatch.pubsub_auth as pubsub_auth_module
+
+        def _boom() -> None:
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(pubsub_auth_module, "desktop_internal_auth", _boom)
+        request = _request({"Authorization": f"Bearer {desktop.push_token}"})
+        with pytest.raises(HTTPException) as exc:
+            await pubsub_auth_module.verify_pubsub_oidc(request, _settings())
+        assert exc.value.status_code == 503
+        assert desktop.push_token not in str(exc.value.detail)
 
 
 class TestMaintenanceGuardIgnoresBrokerProvider:
@@ -146,19 +182,21 @@ class TestMaintenanceGuardIgnoresBrokerProvider:
     """
 
     @pytest.mark.asyncio
-    async def test_non_local_broker_still_requires_the_token(self, desktop) -> None:
-        from henchmen.dispatch.pubsub_auth import local_push_auth, require_internal_caller
+    async def test_non_local_broker_still_requires_the_token(self, desktop, monkeypatch: pytest.MonkeyPatch) -> None:
+        from henchmen.dispatch.pubsub_auth import require_internal_caller
 
-        settings = _settings(message_broker_provider="gcp")
-        assert local_push_auth(settings) is None  # confirms the broker really is non-local here
+        monkeypatch.setenv("HENCHMEN_MESSAGE_BROKER_PROVIDER", "gcp")
         with pytest.raises(HTTPException) as exc:
             await require_internal_caller(_request())
         assert exc.value.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_non_local_broker_still_accepts_the_push_token(self, desktop) -> None:
+    async def test_non_local_broker_still_accepts_the_push_token(
+        self, desktop, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from henchmen.dispatch.pubsub_auth import require_internal_caller
 
+        monkeypatch.setenv("HENCHMEN_MESSAGE_BROKER_PROVIDER", "gcp")
         await require_internal_caller(_request({"Authorization": f"Bearer {desktop.push_token}"}))
 
     @pytest.mark.asyncio
@@ -168,7 +206,38 @@ class TestMaintenanceGuardIgnoresBrokerProvider:
         monkeypatch.delenv("HENCHMEN_DATA_DIR", raising=False)
         await require_internal_caller(_request())
 
+    @pytest.mark.asyncio
+    async def test_secrets_directory_failure_is_a_503_not_a_crash(
+        self, desktop, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import henchmen.dispatch.pubsub_auth as pubsub_auth_module
+
+        def _boom() -> None:
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(pubsub_auth_module, "desktop_internal_auth", _boom)
+        with pytest.raises(HTTPException) as exc:
+            await pubsub_auth_module.require_internal_caller(
+                _request({"Authorization": f"Bearer {desktop.push_token}"})
+            )
+        assert exc.value.status_code == 503
+        assert desktop.push_token not in str(exc.value.detail)
+
 
 def test_bearer_tokens_are_redacted_from_logs() -> None:
     line = "POST failed with Authorization: Bearer " + "a" * 43
     assert "a" * 43 not in redact(line)
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [" ", "\t", "   "],
+    ids=["single-space", "tab", "several-spaces"],
+)
+@pytest.mark.parametrize("scheme", ["Bearer", "bearer", "BEARER"])
+def test_bearer_redaction_is_case_and_whitespace_insensitive(scheme: str, separator: str) -> None:
+    token = "b" * 43
+    line = f"Authorization:{separator}{scheme}{separator}{token}"
+    redacted = redact(line)
+    assert token not in redacted
+    assert scheme in redacted

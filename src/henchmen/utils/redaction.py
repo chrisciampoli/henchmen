@@ -20,19 +20,31 @@ from typing import Any
 
 REDACTED = "***REDACTED***"
 
-_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"ghp_[A-Za-z0-9]{20,}"),  # GitHub personal access tokens
-    re.compile(r"ghs_[A-Za-z0-9]{20,}"),  # GitHub server-to-server tokens
-    re.compile(r"gho_[A-Za-z0-9]{20,}"),  # GitHub OAuth tokens
-    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),  # GitHub fine-grained PATs
-    re.compile(r"xox[baprs]-[A-Za-z0-9-]+"),  # Slack bot/user/app tokens
-    re.compile(r"xapp-[A-Za-z0-9-]+"),  # Slack app-level tokens
-    re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"),  # Anthropic API keys
-    re.compile(r"sk-[A-Za-z0-9]{32,}"),  # OpenAI / generic secret keys
-    re.compile(r"AIza[A-Za-z0-9_-]{30,}"),  # Google API keys
-    re.compile(r"x-access-token:[^@\s]+"),  # Authenticated git clone URLs
-    re.compile(r"(?<=Bearer )[A-Za-z0-9._~+/=-]{16,}"),  # Internal push / task / API bearer tokens (value only)
-    re.compile(r"(?<=setup_token=)[^&#\s\"']+"),  # Console sign-in token in a request line (value only)
+_BEARER_PATTERN = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{16,}")
+
+# (pattern, replacement) pairs, applied in order. Every pattern but the bearer
+# one replaces the whole match outright; the bearer pattern captures the word
+# itself (case preserved, whatever whitespace separated it from the token) so
+# a redacted line still reads "Bearer ***REDACTED***" rather than losing the
+# scheme entirely. Both `\bbearer\b` and the fixed-length character class that
+# follows are anchored, bounded quantifiers -- no nested unbounded groups -- so
+# matching stays linear in the input length.
+_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"ghp_[A-Za-z0-9]{20,}"), REDACTED),  # GitHub personal access tokens
+    (re.compile(r"ghs_[A-Za-z0-9]{20,}"), REDACTED),  # GitHub server-to-server tokens
+    (re.compile(r"gho_[A-Za-z0-9]{20,}"), REDACTED),  # GitHub OAuth tokens
+    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), REDACTED),  # GitHub fine-grained PATs
+    (re.compile(r"xox[baprs]-[A-Za-z0-9-]+"), REDACTED),  # Slack bot/user/app tokens
+    (re.compile(r"xapp-[A-Za-z0-9-]+"), REDACTED),  # Slack app-level tokens
+    (re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"), REDACTED),  # Anthropic API keys
+    (re.compile(r"sk-[A-Za-z0-9]{32,}"), REDACTED),  # OpenAI / generic secret keys
+    (re.compile(r"AIza[A-Za-z0-9_-]{30,}"), REDACTED),  # Google API keys
+    (re.compile(r"x-access-token:[^@\s]+"), REDACTED),  # Authenticated git clone URLs
+    # Internal push / task / API bearer tokens: case-insensitive scheme name,
+    # any run of whitespace, value redacted -- "Bearer"/"bearer"/"BEARER" all
+    # match and the captured word is kept in the output.
+    (_BEARER_PATTERN, r"\1 " + REDACTED),
+    (re.compile(r"(?<=setup_token=)[^&#\s\"']+"), REDACTED),  # Console sign-in token (value only)
 )
 
 # Loggers whose formatter reads ``record.args`` itself and so cannot have them
@@ -43,8 +55,8 @@ _ARGS_PRESERVING_LOGGERS = frozenset({"uvicorn.access"})
 
 def redact(text: str) -> str:
     """Return *text* with every known secret pattern replaced."""
-    for pattern in _PATTERNS:
-        text = pattern.sub(REDACTED, text)
+    for pattern, replacement in _PATTERNS:
+        text = pattern.sub(replacement, text)
     return text
 
 
