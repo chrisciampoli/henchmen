@@ -21,6 +21,12 @@ from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
 from henchmen.config.settings import Settings
 
+#: The only key ``overrides`` may set (see :func:`settings_problems`). Apply uses
+#: this to validate a pending Dispatch API token before it is written to the
+#: file (ruling P6); nothing else may be overridden this way.
+DISPATCH_API_TOKEN_KEY = "HENCHMEN_DISPATCH_API_TOKEN"
+_ALLOWED_OVERRIDE_KEYS = frozenset({DISPATCH_API_TOKEN_KEY})
+
 
 class _MaskedEnvSource(PydanticBaseSettingsSource):
     """The environment source with some keys removed."""
@@ -90,8 +96,10 @@ def settings_problems(
     decides exactly as it will on the next real start (D-P8, amendment A5).
 
     ``overrides`` are applied unconditionally, regardless of what the file or
-    environment say -- used by apply to validate a Dispatch API token before
-    it is written, "as if" it were already in the file (ruling P6).
+    environment say -- used by apply to validate a pending Dispatch API token
+    before it is written, "as if" it were already in the file (ruling P6). Only
+    :data:`DISPATCH_API_TOKEN_KEY` may be set this way; any other key raises
+    ``ValueError`` rather than silently validating the wrong thing.
 
     Messages carry only the field and the reason, never the rejected value,
     which may be a credential.
@@ -105,6 +113,11 @@ def settings_problems(
             continue
     defaults = {_field_name(key): value for key, value in seeded.items() if key not in file_keys}
     if overrides:
+        unknown = {key.upper() for key in overrides} - _ALLOWED_OVERRIDE_KEYS
+        if unknown:
+            raise ValueError(
+                f"settings_problems overrides may only set {sorted(_ALLOWED_OVERRIDE_KEYS)}; refused {sorted(unknown)}"
+            )
         defaults.update({_field_name(key): value for key, value in overrides.items()})
     settings_cls = _settings_class(frozenset(seeded))
     try:

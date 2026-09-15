@@ -72,3 +72,10 @@ def test_overrides_are_applied_regardless_of_the_file_or_seeded_env(tmp_path: Pa
     assert settings is not None
     assert settings.dispatch_api_token == "fresh-token"
     assert problems == []
+
+
+def test_overrides_only_allow_the_dispatch_api_token_key(tmp_path: Path) -> None:
+    """overrides exists solely to validate a pending Dispatch token; nothing else may use it."""
+    config = _config(tmp_path, "HENCHMEN_PROVIDER=local\n")
+    with pytest.raises(ValueError, match="HENCHMEN_PROVIDER"):
+        settings_problems(config, overrides={"HENCHMEN_PROVIDER": "gcp"})
