@@ -733,17 +733,41 @@ def post_slack_message(token: str, channel_id: str, text: str, *, timeout: float
 # Jira
 # ---------------------------------------------------------------------------
 
+_JIRA_PAGE_SIZE = 50
+_JIRA_MAX_PAGES = 20
+
+
+@dataclass(frozen=True)
+class JiraProject:
+    """A Jira project the account can browse."""
+
+    key: str
+    name: str
+
+
+@dataclass(frozen=True)
+class JiraField:
+    """A Jira issue field; ``custom`` fields are the ones webhooks send as customfield_<n>."""
+
+    id: str
+    name: str
+    custom: bool
+
+
+def _jira_headers(email: str, api_token: str) -> dict[str, str]:
+    auth = base64.b64encode(f"{email}:{api_token}".encode()).decode()
+    return {"Authorization": f"Basic {auth}", "Accept": "application/json"}
+
 
 def check_jira(base_url: str, email: str, api_token: str, *, timeout: float = DEFAULT_TIMEOUT) -> CheckResult:
     """Verify Jira credentials via ``GET /rest/api/3/myself``."""
     name = "Jira"
     if not base_url or not email or not api_token:
         return CheckResult(name, CheckStatus.FAIL, "base URL, email and API token are all required")
-    auth = base64.b64encode(f"{email}:{api_token}".encode()).decode()
     url = f"{base_url.rstrip('/')}/rest/api/3/myself"
     try:
         with _http_client(timeout) as client:
-            response = client.get(url, headers={"Authorization": f"Basic {auth}", "Accept": "application/json"})
+            response = client.get(url, headers=_jira_headers(email, api_token))
     except Exception as exc:
         return CheckResult(name, CheckStatus.FAIL, f"cannot reach {base_url}: {_short(exc)}")
     if response.status_code != 200:
@@ -760,12 +784,64 @@ def check_jira(base_url: str, email: str, api_token: str, *, timeout: float = DE
     return CheckResult(name, CheckStatus.OK, f"authenticated as {display_name}")
 
 
+def list_jira_projects(
+    base_url: str, email: str, api_token: str, *, timeout: float = DEFAULT_TIMEOUT
+) -> list[JiraProject]:
+    """Projects the account can browse (``GET /rest/api/3/project/search``), sorted by key; ``[]`` on failure."""
+    url = f"{base_url.rstrip('/')}/rest/api/3/project/search"
+    projects: list[JiraProject] = []
+    try:
+        with _http_client(timeout) as client:
+            for page in range(_JIRA_MAX_PAGES):
+                response = client.get(
+                    url,
+                    params={"startAt": page * _JIRA_PAGE_SIZE, "maxResults": _JIRA_PAGE_SIZE, "orderBy": "key"},
+                    headers=_jira_headers(email, api_token),
+                )
+                if response.status_code != 200:
+                    return []
+                body = response.json()
+                values = body.get("values", [])
+                for raw in values:
+                    key = str(raw.get("key", ""))
+                    if key:
+                        projects.append(JiraProject(key=key, name=str(raw.get("name") or key)))
+                if body.get("isLast", True) or not values:
+                    break
+    except Exception:
+        return []
+    return sorted(projects, key=lambda project: project.key)
+
+
+def list_jira_fields(base_url: str, email: str, api_token: str, *, timeout: float = DEFAULT_TIMEOUT) -> list[JiraField]:
+    """Every issue field (``GET /rest/api/3/field``), sorted by display name; ``[]`` on failure."""
+    url = f"{base_url.rstrip('/')}/rest/api/3/field"
+    try:
+        with _http_client(timeout) as client:
+            response = client.get(url, headers=_jira_headers(email, api_token))
+        if response.status_code != 200:
+            return []
+        raw_fields = response.json()
+    except Exception:
+        return []
+    fields = [
+        JiraField(
+            id=str(raw.get("id", "")), name=str(raw.get("name") or raw.get("id", "")), custom=bool(raw.get("custom"))
+        )
+        for raw in raw_fields
+        if isinstance(raw, dict) and raw.get("id")
+    ]
+    return sorted(fields, key=lambda field: field.name.lower())
+
+
 __all__ = [
     "DEFAULT_TIMEOUT",
     "RECOMMENDED_OLLAMA_MODELS",
     "VERTEX_MODELS",
     "CheckResult",
     "CheckStatus",
+    "JiraField",
+    "JiraProject",
     "SlackChannel",
     "SlackChannelListing",
     "SlackIdentity",
@@ -786,6 +862,8 @@ __all__ = [
     "join_slack_channel",
     "list_anthropic_models",
     "list_bedrock_models",
+    "list_jira_fields",
+    "list_jira_projects",
     "list_ollama_models",
     "list_openai_models",
     "list_slack_channels",
