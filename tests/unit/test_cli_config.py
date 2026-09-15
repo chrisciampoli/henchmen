@@ -41,6 +41,28 @@ class TestSecretDetection:
             if field.annotation is str and any(m in name for m in ("token", "secret", "api_key", "password")):
                 assert is_secret_field(name), name
 
+    def test_agrees_with_config_store_masked_for_every_settings_field(self, tmp_path) -> None:
+        """``henchmen config`` and the Console's ``ConfigStore.masked()`` share one classifier.
+
+        Every field ConfigStore will accept is written with the same probe
+        value, then whether ``masked()`` shows it as ``CONFIGURED`` (a secret)
+        or echoes it back (not a secret) must match ``is_secret_field``.
+        """
+        from henchmen.console.config_store import CONFIGURED, ConfigStore, ConfigStoreError
+
+        store = ConfigStore(config_file=tmp_path / "henchmen.env", secrets_dir=tmp_path / "secrets")
+        checked = 0
+        for name in Settings.model_fields:
+            env_key = f"HENCHMEN_{name.upper()}"
+            try:
+                store.update({env_key: "probe-value"}, section="Probe")
+            except ConfigStoreError:
+                continue  # never-writable keys are out of scope for this parity check
+            masked_as_secret = store.masked([env_key])[env_key] == CONFIGURED
+            assert masked_as_secret == is_secret_field(name), name
+            checked += 1
+        assert checked > 0
+
 
 class TestRenderSettings:
     def test_masks_secrets_and_shows_config(self) -> None:

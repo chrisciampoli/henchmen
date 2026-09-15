@@ -236,42 +236,46 @@ def create_console_app(
         # computed here, in memory: it is validated as part of the configuration before
         # anything is written, so a refused apply never touches the file (ruling P6).
         # Uses the app's own store, sharing its config-file lock with every step write
-        # (ruling C16) rather than building a second instance over the same file.
+        # (ruling C16) rather than building a second instance over the same file. The
+        # whole compute-pending-token -> validate -> write sequence holds that lock
+        # (`locked()`, an RLock) so no step write can land between validating this
+        # exact configuration and writing the token it was validated with.
         config_store = app.state.config_store
         env_files = (str(config_file),)
-        # Skip generating one when the running environment already supplies a usable
-        # token (e.g. a Secret Manager mount): the environment outranks the file anyway.
-        pending_token = config_store.pending_dispatch_api_token(env_files=env_files, seeded_env=seeded_env)
-        overrides = {DISPATCH_API_TOKEN_KEY: pending_token} if pending_token is not None else None
-        _settings, problems = settings_problems(env_files, seeded_env=seeded_env, overrides=overrides)
-        if _settings is not None:
-            # Otherwise a saved config that builds and validates fine, but whose forward
-            # host the whole-app allowlist would refuse, would apply, restart, and land
-            # straight back in needs-attention mode instead of being refused here.
-            forward_problem = forward_host_problem(_settings)
-            if forward_problem is not None:
-                problems = [*problems, forward_problem]
-        if problems:
-            # Marking setup complete would restart into a run mode that cannot start,
-            # and setup mode would no longer be offered to fix it.
-            raise HTTPException(
-                status_code=409,
-                detail={"message": "The saved configuration cannot start Henchmen.", "problems": problems},
-            )
-        if pending_token is not None:
-            try:
-                config_store.write_dispatch_api_token(pending_token)
-            except OSError:
-                # Never mark setup complete or restart into a run mode that still has no
-                # usable token; the exception itself (path, errno) carries no secret.
-                logger.exception("Could not write the Dispatch API token to %s", config_file)
+        with config_store.locked():
+            # Skip generating one when the running environment already supplies a usable
+            # token (e.g. a Secret Manager mount): the environment outranks the file anyway.
+            pending_token = config_store.pending_dispatch_api_token(env_files=env_files, seeded_env=seeded_env)
+            overrides = {DISPATCH_API_TOKEN_KEY: pending_token} if pending_token is not None else None
+            _settings, problems = settings_problems(env_files, seeded_env=seeded_env, overrides=overrides)
+            if _settings is not None:
+                # Otherwise a saved config that builds and validates fine, but whose forward
+                # host the whole-app allowlist would refuse, would apply, restart, and land
+                # straight back in needs-attention mode instead of being refused here.
+                forward_problem = forward_host_problem(_settings)
+                if forward_problem is not None:
+                    problems = [*problems, forward_problem]
+            if problems:
+                # Marking setup complete would restart into a run mode that cannot start,
+                # and setup mode would no longer be offered to fix it.
                 raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        "Could not save the Dispatch API token to the configuration file. "
-                        "Check permissions and free space on the data volume."
-                    ),
-                ) from None
+                    status_code=409,
+                    detail={"message": "The saved configuration cannot start Henchmen.", "problems": problems},
+                )
+            if pending_token is not None:
+                try:
+                    config_store.write_dispatch_api_token(pending_token)
+                except OSError:
+                    # Never mark setup complete or restart into a run mode that still has no
+                    # usable token; the exception itself (path, errno) carries no secret.
+                    logger.exception("Could not write the Dispatch API token to %s", config_file)
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "Could not save the Dispatch API token to the configuration file. "
+                            "Check permissions and free space on the data volume."
+                        ),
+                    ) from None
         store.mark_completed()
         background.add_task(on_apply)
         return {"restarting": True}
