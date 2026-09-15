@@ -391,6 +391,61 @@ class TestLocalGateInvocation:
         hung.kill.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_a_hung_kill_does_not_hang_the_handler(self) -> None:
+        """`_kill_gate_container` itself hanging (an unresponsive docker daemon) must not hang
+        the handler forever -- cleanup is bounded and gives up, logging, well short of it.
+        """
+        from henchmen.mastermind.scheme_executor import handlers
+
+        hung = _hanging_proc()
+
+        async def _slow_kill(name: str) -> None:
+            await asyncio.sleep(5)
+
+        with (
+            patch("henchmen.config.settings.get_settings", return_value=_local_settings()),
+            patch.object(handlers.asyncio, "create_subprocess_exec", AsyncMock(return_value=hung)),
+            patch.object(handlers, "_gate_timeout_seconds", return_value=0.01),
+            patch.object(handlers, "_kill_gate_container", AsyncMock(side_effect=_slow_kill)) as kill_mock,
+            patch.object(handlers, "_GATE_CLEANUP_TIMEOUT_SECONDS", 0.01),
+        ):
+            result = await asyncio.wait_for(handlers._run_ci_check(MagicMock(), _task(), "tests"), timeout=2.0)
+        assert result["condition"] == "fail"
+        assert "did not finish" in result["message"]
+        kill_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_outer_cancel_during_cleanup_still_propagates(self) -> None:
+        """A cancellation aimed at this coroutine itself, arriving *while cleanup is already
+        running*, must still propagate as CancelledError -- the bounded
+        `asyncio.wait_for` around cleanup only converts its own internal
+        timeout, never an external cancellation, into a caught exception.
+        """
+        from henchmen.mastermind.scheme_executor import handlers
+
+        hung = _hanging_proc()
+        cleanup_started = asyncio.Event()
+
+        async def _slow_kill(name: str) -> None:
+            cleanup_started.set()
+            await asyncio.sleep(5)
+
+        with (
+            patch.object(handlers.asyncio, "create_subprocess_exec", AsyncMock(return_value=hung)),
+            patch.object(handlers, "_gate_timeout_seconds", return_value=0.01),
+            patch.object(handlers, "_kill_gate_container", AsyncMock(side_effect=_slow_kill)),
+        ):
+            task = asyncio.ensure_future(
+                handlers._run_gate_in_container(
+                    _local_settings(), "tests", repo="acme/widgets", branch="henchmen/t", base_branch="main"
+                )
+            )
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    @pytest.mark.asyncio
     async def test_docker_unavailable_fails(self) -> None:
         from henchmen.mastermind.scheme_executor import handlers
 
@@ -433,6 +488,35 @@ class TestBoundedGateOutput:
         value = tail.getvalue()
         assert len(value) <= cap + len(chunk)
         assert value.endswith(chunk)
+
+    def test_tail_chars_untrimmed_text_is_returned_unchanged(self) -> None:
+        from henchmen.mastermind.scheme_executor.handlers import _tail_chars
+
+        assert _tail_chars("short", limit=100) == "short"
+
+    def test_tail_chars_drops_the_partial_leading_line_when_trimmed(self) -> None:
+        from henchmen.mastermind.scheme_executor.handlers import _tail_chars
+
+        text = "A" * 20 + "\nCLEAN LINE"
+        assert _tail_chars(text, limit=15) == "CLEAN LINE"
+
+    def test_tail_chars_drops_to_the_next_whitespace_when_no_newline_survives(self) -> None:
+        """A tail with no newline anywhere in the kept window must not leave a partial
+        token/word fragment at the very start -- drop up to the next whitespace instead.
+        """
+        from henchmen.mastermind.scheme_executor.handlers import _tail_chars
+
+        text = "ghp_supersecrettokenfragment CLEAN_WORD_AFTER"
+        result = _tail_chars(text, limit=len("secrettokenfragment CLEAN_WORD_AFTER"))
+        assert result == "CLEAN_WORD_AFTER"
+        assert "ghp_" not in result and "secrettokenfragment" not in result
+
+    def test_tail_chars_with_no_whitespace_at_all_falls_back_to_the_raw_slice(self) -> None:
+        from henchmen.mastermind.scheme_executor.handlers import _tail_chars
+
+        text = "a" * 40
+        result = _tail_chars(text, limit=10)
+        assert result == "a" * 10
 
     @pytest.mark.asyncio
     async def test_stderr_flood_does_not_block_stdout_from_being_read(self) -> None:
@@ -525,7 +609,7 @@ class TestGateResourceLimits:
     @pytest.mark.asyncio
     async def test_reuses_the_docker_orchestrator_cpu_limit_helper(self) -> None:
         """No duplicated `--cpus` formatting logic: an unparsable cpu value is omitted, exactly
-        as `providers.local.docker._cpu_limit` (used by lairs) already behaves.
+        as `providers.local.docker.cpu_limit` (used by lairs) already behaves.
         """
         settings = _local_settings(lair_default_cpu="not-a-number")
         _, exec_mock = await _check(settings, _gate_proc(0, stdout=_marker("pass", "ok")))
@@ -535,9 +619,11 @@ class TestGateResourceLimits:
 
 
 class TestTokenNeverReachesRepoCode:
-    """Ruling 2 (D-P9): once cloning/diffing is done, repo-controlled code must not be able
+    """Ruling 2 (D-P9): inside the gate container only, once cloning/diffing is done,
 
-    to read the GitHub token back out of `.git/config` or its own environment.
+    repo-controlled code must not be able to read the GitHub token back out of
+    `.git/config` or its own environment. The cloud host path is unaffected
+    (global constraint: non-desktop behaviour is unchanged).
     """
 
     @pytest.mark.asyncio
@@ -560,7 +646,7 @@ class TestTokenNeverReachesRepoCode:
             env=git_env,
         )
 
-        result = await ci_gate._strip_remote_token(str(repo_dir), "acme/widgets", "lint")
+        result = await ci_gate._strip_remote_token(str(repo_dir), "acme/widgets", "lint", TOKEN)
 
         assert result is None
         remote_url = subprocess.run(
@@ -581,7 +667,7 @@ class TestTokenNeverReachesRepoCode:
         repo_dir.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=repo_dir, check=True)
         # No "origin" remote configured -- `git remote set-url origin` must fail.
-        result = await ci_gate._strip_remote_token(str(repo_dir), "acme/widgets", "lint")
+        result = await ci_gate._strip_remote_token(str(repo_dir), "acme/widgets", "lint", TOKEN)
         assert result is not None
         assert result.condition == "fail"
         assert "could not remove the token from the git remote" in result.message
@@ -609,16 +695,51 @@ class TestTokenNeverReachesRepoCode:
         assert dict(os.environ) == before  # os.environ itself is never mutated
 
     @pytest.mark.asyncio
-    async def test_run_on_host_env_has_no_github_token_variables(
+    async def test_run_gate_resets_the_remote_before_running_the_script(self, tmp_path: Path) -> None:
+        """The container path (run_gate) strips the remote token; plan_gate itself never does."""
+        _write(tmp_path, "pyproject.toml")
+        with (
+            patch.object(ci_gate, "clone_repo", AsyncMock()),
+            patch.object(ci_gate, "changed_files", AsyncMock(side_effect=AssertionError("tests need no diff"))),
+            patch.object(ci_gate, "_strip_remote_token", AsyncMock(return_value=None)) as strip,
+            patch.object(ci_gate, "_run_script", AsyncMock(return_value=(0, "3 passed"))) as run,
+        ):
+            result = await _gate("tests", tmp_path)
+
+        assert result.condition == "pass"
+        strip.assert_awaited_once_with(str(tmp_path), "acme/widgets", "tests", TOKEN)
+        run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_plan_gate_never_resets_the_remote_the_cloud_path_shares_it(self, tmp_path: Path) -> None:
+        """Global constraint: non-desktop behaviour is unchanged -- only `run_gate` scrubs, not `plan_gate`."""
+        _write(tmp_path, "pyproject.toml")
+        with (
+            patch.object(ci_gate, "clone_repo", AsyncMock()),
+            patch.object(ci_gate, "changed_files", AsyncMock(side_effect=AssertionError("tests need no diff"))),
+            patch.object(ci_gate, "_strip_remote_token", AsyncMock()) as strip,
+        ):
+            planned = await ci_gate.plan_gate(
+                "tests",
+                repo="acme/widgets",
+                branch="henchmen/t",
+                base_branch="main",
+                token=TOKEN,
+                workspace=str(tmp_path),
+            )
+        assert isinstance(planned, ci_gate.GatePlan)
+        strip.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_on_host_inherits_the_ambient_environment_unchanged(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """The cloud path runs the same repo-controlled commands and must scrub the same way."""
+        """Global constraint: non-desktop behaviour is unchanged -- the cloud path must not scrub."""
         from henchmen.mastermind.scheme_executor import handlers
         from henchmen.mastermind.scheme_executor.lint_scope import CheckCommand
         from henchmen.utils.stack_detector import Stack
 
         monkeypatch.setenv("GITHUB_TOKEN", TOKEN)
-        before = dict(os.environ)
         stack = Stack(name="python", test_command=["python", "-m", "pytest"], install_command=None)
         commands = (CheckCommand(argv=("python", "-m", "pytest")),)
         ok_proc = MagicMock()
@@ -628,6 +749,6 @@ class TestTokenNeverReachesRepoCode:
         with patch.object(handlers.asyncio, "create_subprocess_exec", AsyncMock(return_value=ok_proc)) as exec_mock:
             await handlers._run_on_host(str(tmp_path), stack, commands)
 
-        env = exec_mock.await_args.kwargs["env"]
-        assert "GITHUB_TOKEN" not in env
-        assert dict(os.environ) == before
+        # No `env=` kwarg at all: the subprocess inherits this process's full,
+        # unfiltered environment (including GITHUB_TOKEN), exactly as before.
+        assert "env" not in exec_mock.await_args.kwargs

@@ -24,7 +24,6 @@ from henchmen.config.settings import DEFAULT_LOCAL_OPERATIVE_IMAGE
 from henchmen.mastermind.scheme_executor.ci_gate import (
     CheckType,
     GateResult,
-    env_without_github_tokens,
     parse_gate_result,
     plan_gate,
     scrub_secret,
@@ -38,7 +37,8 @@ from henchmen.mastermind.scheme_executor.lint_scope import (
 from henchmen.models.dossier import Dossier
 from henchmen.models.scheme import SchemeNode
 from henchmen.models.task import HenchmenTask
-from henchmen.providers.local.docker import _cpu_limit, _memory_limit
+from henchmen.providers.local.docker import cpu_limit as docker_cpu_limit
+from henchmen.providers.local.docker import memory_limit as docker_memory_limit
 from henchmen.providers.registry import ProviderRegistry
 from henchmen.utils.git import clone_repo, get_github_token
 from henchmen.utils.stack_detector import Stack, detect_stack
@@ -393,6 +393,12 @@ def _gate_timeout_seconds(settings: Settings) -> float:
     return float(settings.lair_default_timeout)
 
 
+# Bounds docker kill / docker rm -f / proc.wait() during cleanup: a hung or
+# unresponsive docker daemon must not hang this handler forever on top of the
+# gate's own timeout above.
+_GATE_CLEANUP_TIMEOUT_SECONDS = 30
+
+
 class _BoundedTail:
     """Keeps only the most recent ``cap`` bytes appended to it, in whole chunks.
 
@@ -472,6 +478,15 @@ async def _kill_gate_container(name: str) -> None:
         await _remove_gate_container(name)
 
 
+async def _cleanup_gate_container(container: str, proc: asyncio.subprocess.Process) -> None:
+    """Kill (or force-remove) the container and reap the process. Never raises except cancellation."""
+    await _kill_gate_container(container)
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    with contextlib.suppress(Exception):
+        await proc.wait()
+
+
 def _gate_resource_limit_args(settings: Settings) -> list[str]:
     """The same `--memory`/`--cpus` a lair gets (`Settings.lair_default_memory`/`_cpu`), plus a pids cap.
 
@@ -479,10 +494,10 @@ def _gate_resource_limit_args(settings: Settings) -> list[str]:
     memory or CPU repo-controlled code (an install script, the linter, the
     test suite) can consume, or how many processes it can fork.
     """
-    args = ["--memory", _memory_limit(settings.lair_default_memory)]
-    cpu_limit = _cpu_limit(settings.lair_default_cpu)
-    if cpu_limit:
-        args.extend(["--cpus", cpu_limit])
+    args = ["--memory", docker_memory_limit(settings.lair_default_memory)]
+    cpus = docker_cpu_limit(settings.lair_default_cpu)
+    if cpus:
+        args.extend(["--cpus", cpus])
     args.extend(["--pids-limit", str(_GATE_PIDS_LIMIT)])
     return args
 
@@ -543,13 +558,31 @@ async def _run_gate_in_container(
             for task in (stdout_task, stderr_task):
                 task.cancel()
             for task in (stdout_task, stderr_task):
-                with contextlib.suppress(asyncio.CancelledError, Exception):
+                try:
                     await task
-            await _kill_gate_container(container)
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            with contextlib.suppress(Exception):
-                await proc.wait()
+                except asyncio.CancelledError:
+                    # Only ours to swallow if cancelling *this* reader task is
+                    # what actually raised it. If the task somehow isn't
+                    # cancelled, the CancelledError belongs to a cancellation
+                    # aimed at this coroutine itself — let it propagate.
+                    if not task.cancelled():
+                        raise
+                except Exception:
+                    pass
+            # Bounded: a hung or unresponsive docker daemon must not hang this
+            # handler forever on top of the gate's own timeout. A genuine
+            # cancellation of this coroutine while inside this call still
+            # propagates as CancelledError (asyncio.wait_for only converts its
+            # *own* internal timeout to TimeoutError); only that internal
+            # timeout is caught here, logged, and otherwise ignored.
+            try:
+                await asyncio.wait_for(_cleanup_gate_container(container, proc), timeout=_GATE_CLEANUP_TIMEOUT_SECONDS)
+            except TimeoutError:
+                logger.warning(
+                    "Gate container cleanup for %s did not finish within %ss",
+                    container,
+                    _GATE_CLEANUP_TIMEOUT_SECONDS,
+                )
 
     if timeout_result is not None:
         return timeout_result
@@ -580,33 +613,40 @@ async def _run_gate_in_container(
 
 
 def _tail_chars(text: str, limit: int = _GATE_OUTPUT_LIMIT) -> str:
-    """The last `limit` characters of `text`; a tail actually trimmed drops its partial leading line."""
+    """The last `limit` characters of `text`, with a trimmed tail's partial leading fragment dropped.
+
+    A tail sliced by raw character count can start mid-line, or (with no
+    newline anywhere in the kept window) mid-word — either way a fragment of
+    a secret token could otherwise survive at the very start of the kept
+    text. When there's a newline, drop up to and including it; otherwise
+    drop up to the next run of whitespace. Text that didn't need trimming is
+    returned unchanged — there's nothing partial to drop.
+    """
     if len(text) <= limit:
         return text
     trimmed = text[-limit:]
     if "\n" in trimmed:
-        trimmed = trimmed.split("\n", 1)[1]
-    return trimmed
+        return trimmed.split("\n", 1)[1]
+    parts = trimmed.split(None, 1)
+    return parts[1] if len(parts) > 1 else trimmed
 
 
 async def _run_on_host(workspace: str, stack: Stack, commands: tuple[CheckCommand, ...]) -> dict[str, Any]:
     """Run CI check commands natively on the host (cloud mode); the first non-zero exit code wins.
 
-    This runs repo-controlled code (an install script, the linter, the test
-    suite) in a workspace ``plan_gate`` already scrubbed the token's git
-    remote out of; it also strips every GitHub token env var from what these
-    subprocesses inherit, the same way ``ci_gate._run_script`` does for the
-    local gate container — the risk (repo code reaching the token) is
-    identical on the cloud path.
+    Deliberately unchanged from before Task 8's token-scrubbing work: the
+    global constraint that non-desktop behaviour is unchanged overrides
+    scrubbing the token out of this path too, so these subprocesses inherit
+    the ambient environment exactly as they always have. Only the gate
+    container path (``ci_gate.run_gate``) scrubs the token, per that
+    ruling.
     """
-    child_env = env_without_github_tokens()
     if stack.install_command is not None:
         proc = await asyncio.create_subprocess_exec(
             *stack.install_command,
             cwd=workspace,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=child_env,
         )
         await proc.communicate()
 
@@ -618,7 +658,6 @@ async def _run_on_host(workspace: str, stack: Stack, commands: tuple[CheckComman
             cwd=os.path.join(workspace, command.cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=child_env,
         )
         stdout, stderr = await proc.communicate()
         stdout_text = stdout.decode(errors="replace")[:3000]

@@ -112,7 +112,7 @@ def env_without_github_tokens() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key not in _TOKEN_ENV_VARS}
 
 
-async def _strip_remote_token(workspace: str, repo: str, check_type: CheckType) -> GateResult | None:
+async def _strip_remote_token(workspace: str, repo: str, check_type: CheckType, token: str) -> GateResult | None:
     """Reset ``origin``'s URL to a token-less form before any repo-controlled code runs.
 
     ``clone_repo`` embeds the token in ``origin``'s URL so `git fetch`/`git
@@ -123,6 +123,12 @@ async def _strip_remote_token(workspace: str, repo: str, check_type: CheckType) 
     fails (fail-closed); ``None`` on success, including when there is no git
     repository to scrub (cloning never actually happened, e.g. a clone
     failure already returned earlier, or a caller that skipped it in a test).
+
+    Only called from :func:`run_gate`, i.e. only inside the gate container:
+    the cloud host path (``handlers._run_on_host``) must behave exactly as it
+    did before this existed (global constraint: non-desktop behaviour is
+    unchanged), so it is never called from :func:`plan_gate`, which the cloud
+    path shares.
     """
     if not (Path(workspace) / ".git").exists():
         return None
@@ -139,10 +145,8 @@ async def _strip_remote_token(workspace: str, repo: str, check_type: CheckType) 
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
         detail = stderr.decode(errors="replace").strip()[:300]
-        return GateResult(
-            condition="fail",
-            message=f"{check_type} failed (could not remove the token from the git remote): {detail}",
-        )
+        message = f"{check_type} failed (could not remove the token from the git remote): {detail}"
+        return GateResult(condition="fail", message=scrub_secret(message, token))
     return None
 
 
@@ -202,15 +206,6 @@ async def plan_gate(
     else:
         commands = (CheckCommand(argv=tuple(stack.test_command)),)
 
-    # From here on, repo-controlled code runs (an install script, the linter,
-    # the test suite) — make sure none of it can read the token back out of
-    # `.git/config` first. This is the last authenticated git call either
-    # branch above made (`changed_files`, for lint; `clone_repo` alone, for
-    # tests), so nothing after this point still needs the token in the URL.
-    scrub_result = await _strip_remote_token(workspace, repo, check_type)
-    if scrub_result is not None:
-        return scrub_result
-
     return GatePlan(stack=stack, commands=commands)
 
 
@@ -223,6 +218,21 @@ async def run_gate(
     )
     if isinstance(planned, GateResult):
         return planned
+
+    # From here on, repo-controlled code runs *inside this container* (an
+    # install script, the linter, the test suite) — make sure none of it can
+    # read the token back out of `.git/config` or its own environment first.
+    # This is deliberately only done here, in the gate container, and not in
+    # `plan_gate` (shared with the cloud path): the global constraint that
+    # non-desktop behaviour is unchanged overrides scrubbing the cloud host
+    # path too, so `handlers._run_on_host` keeps inheriting the ambient
+    # environment exactly as it did before this existed. One consequence: a
+    # repo whose install step genuinely needs GITHUB_TOKEN (e.g. to
+    # authenticate to GitHub Packages) fails its *local* gate from this point
+    # on — a deliberate fail-closed trade-off, not a bug.
+    scrub_result = await _strip_remote_token(workspace, repo, check_type, token)
+    if scrub_result is not None:
+        return scrub_result
 
     script = to_shell_script(planned.commands, install_script(planned.stack))
     returncode, output = await _run_script(workspace, script)
