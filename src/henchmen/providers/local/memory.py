@@ -30,10 +30,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# In local mode the "push subscription" handler runs the whole scheme inline,
-# so a forwarded POST legitimately stays open for as long as an operative run.
-# Used only by the background, fire-and-forget path (``publish``).
-_FORWARD_TIMEOUT_SECONDS = 1800.0
+#: In local mode the "push subscription" handler runs the whole scheme inline,
+#: so a forwarded POST legitimately stays open for as long as an operative run.
+#: Used only by the background, fire-and-forget path (``publish``), which
+#: re-sends on a read timeout -- so a handler that may run long (desktop Forge
+#: CI) must finish well inside it (see ``henchmen.forge.server``).
+FORWARD_TIMEOUT_SECONDS = 1800.0
 # The awaited confirmation path (``publish_and_confirm``) is on an operative's
 # exit path -- it must not hang for anywhere near that long.
 _CONFIRM_TIMEOUT_SECONDS = 30.0
@@ -174,7 +176,7 @@ class InMemoryMessageBroker:
         url = self._forward_map.get(topic)
         if url:
             task = asyncio.create_task(
-                self._forward_to_http(url, msg_id, data, attributes, timeout_seconds=_FORWARD_TIMEOUT_SECONDS)
+                self._forward_to_http(url, msg_id, data, attributes, timeout_seconds=FORWARD_TIMEOUT_SECONDS)
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)

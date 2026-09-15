@@ -262,8 +262,9 @@ class TestForgeRouting:
         assert args == (settings, "forge")
         assert (kwargs["repo"], kwargs["branch"], kwargs["base_branch"]) == ("acme/widgets", "feature-branch", "main")
         assert kwargs.get("extra_args", ()) == ()
-        # The gate timeout applies (run_gate_in_container's default), never the Pub/Sub budget.
-        assert "timeout_seconds" not in kwargs
+        # The desktop budget (gate timeout capped below the broker re-send), never the Pub/Sub budget.
+        assert 0 < kwargs["timeout_seconds"] <= server.desktop_ci_budget_seconds(settings)
+        assert kwargs["timeout_seconds"] > settings.forge_ci_timeout_seconds
         # Only a no-checkout clone reaches the host, for the text-only silent-failure scan.
         assert clone.await_args.kwargs["no_checkout"] is True
         payload = _published(forge_state)[0]
@@ -274,7 +275,7 @@ class TestForgeRouting:
         assert "lint — passed" in comment
 
     @pytest.mark.asyncio
-    async def test_the_desktop_scan_budget_is_the_gate_timeout(self, forge_state: AsyncMock) -> None:
+    async def test_the_desktop_budget_is_capped_below_the_broker_forward_timeout(self, forge_state: AsyncMock) -> None:
         from henchmen.forge import server
         from henchmen.forge.ci_runner import CIRunner
 
@@ -290,7 +291,8 @@ class TestForgeRouting:
 
             with patch.object(CIRunner, "__init__", _recording_init):
                 await server._run_ci_for_pr("https://github.com/acme/widgets/pull/7", "task-1", "req-1")
-        assert budgets == [1800]
+        assert budgets == [server.desktop_ci_budget_seconds(settings)]
+        assert budgets[0] < 1800
 
     @pytest.mark.asyncio
     async def test_desktop_forge_passes_only_when_every_check_passed(self, forge_state: AsyncMock) -> None:
@@ -305,7 +307,7 @@ class TestForgeRouting:
     @pytest.mark.parametrize(
         "gate_result",
         [
-            {"condition": "fail", "message": "forge failed (the gate did not finish within 1800s)", "output": ""},
+            {"condition": "fail", "message": "forge failed (the gate did not finish within 1680s)", "output": ""},
             {
                 "condition": "fail",
                 "message": "forge failed (the gate container exited 137 without a result)",
@@ -327,7 +329,10 @@ class TestForgeRouting:
         payload = _published(forge_state)[0]
         assert payload["status"] == "failed"
         assert payload["failed"] == ["lint", "tests"]
-        assert gate_result["message"] in pr.create_issue_comment.call_args.args[0]
+        comment = pr.create_issue_comment.call_args.args[0]
+        # Each row says which check it is, instead of repeating the same gate message.
+        assert f"lint: {gate_result['message']}" in comment
+        assert f"tests: {gate_result['message']}" in comment
 
     @pytest.mark.asyncio
     async def test_a_node_repo_without_a_test_script_stays_incomplete_on_desktop(self, forge_state: AsyncMock) -> None:
@@ -463,3 +468,192 @@ class TestCommittedTestsDecision:
         (tmp_path / "not-a-repo").mkdir()
         run, check = await CIRunner(timeout_seconds=30).committed_tests_decision(str(tmp_path / "not-a-repo"))
         assert run is False and check is not None and check["status"] == "failed"
+
+
+class TestDesktopForgeDeadline:
+    """A desktop Forge run always ends before the in-memory broker re-sends the request."""
+
+    @pytest.mark.parametrize("lair_timeout", [600, 1700, 1800, 7200])
+    def test_the_desktop_budget_is_strictly_below_the_forward_timeout(self, lair_timeout: int) -> None:
+        from henchmen.forge import server
+        from henchmen.providers.local.memory import FORWARD_TIMEOUT_SECONDS
+
+        budget = server.desktop_ci_budget_seconds(_settings(lair_default_timeout=lair_timeout))
+        assert budget < FORWARD_TIMEOUT_SECONDS
+        assert budget <= lair_timeout
+        assert FORWARD_TIMEOUT_SECONDS - budget >= 120 or budget == lair_timeout
+
+    @pytest.mark.asyncio
+    async def test_time_spent_in_the_gate_reduces_the_scan_budget(self) -> None:
+        from henchmen.forge import server
+        from henchmen.forge.ci_runner import CIRunner
+
+        loop = asyncio.get_running_loop()
+        runner = CIRunner(timeout_seconds=1000, total_budget_seconds=1000)
+        budgets: list[int] = []
+
+        async def _scan(self: CIRunner, workspace: str, base_ref: str) -> dict[str, Any]:
+            budgets.append(self.total_budget_seconds)
+            return _scan_check()
+
+        gate = AsyncMock(return_value=_gate_checks(lint="pass", tests="pass"))
+        with (
+            patch.object(handlers, "run_gate_in_container", gate),
+            patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=(True, None))),
+            patch.object(CIRunner, "run_silent_failure_scan", _scan),
+        ):
+            # 300s of the budget are already gone: the gate gets what is left, the scan less still.
+            result = await server._run_local_ci(
+                _settings(), runner, "acme/widgets", "f", "main", "/ws", deadline=loop.time() + 700
+            )
+        assert gate.await_args.kwargs["timeout_seconds"] <= 700
+        assert budgets and budgets[0] <= 700
+        assert result["passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_no_time_left_for_the_scan_is_incomplete_not_passed(self) -> None:
+        from henchmen.forge import server
+        from henchmen.forge.ci_runner import CIRunner
+
+        loop = asyncio.get_running_loop()
+        runner = CIRunner(timeout_seconds=1000, total_budget_seconds=1000)
+
+        async def _gate_uses_up_the_budget(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            await asyncio.sleep(0.3)
+            return _gate_checks(lint="pass", tests="pass")
+
+        with (
+            patch.object(handlers, "run_gate_in_container", AsyncMock(side_effect=_gate_uses_up_the_budget)),
+            patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=(True, None))),
+            patch.object(CIRunner, "run_silent_failure_scan", AsyncMock(side_effect=AssertionError("no time left"))),
+        ):
+            result = await server._run_local_ci(
+                _settings(), runner, "a/b", "f", "main", "/ws", deadline=loop.time() + 0.2
+            )
+        assert result["passed"] is False and result["incomplete"] is True
+        assert result["skipped"] == ["silent_failure_scan"]
+
+    @pytest.mark.asyncio
+    async def test_no_time_left_for_the_gate_fails_every_check_without_a_container(self) -> None:
+        from henchmen.forge import server
+        from henchmen.forge.ci_runner import CIRunner
+
+        loop = asyncio.get_running_loop()
+        runner = CIRunner(timeout_seconds=10, total_budget_seconds=10)
+        with (
+            patch.object(handlers, "run_gate_in_container", AsyncMock(side_effect=AssertionError("no container"))),
+            patch.object(CIRunner, "committed_tests_decision", AsyncMock(return_value=(True, None))),
+        ):
+            result = await server._run_local_ci(
+                _settings(), runner, "a/b", "f", "main", "/ws", deadline=loop.time() - 1
+            )
+        assert result["failed"] == ["lint", "tests"]
+
+
+def _scan_check() -> dict[str, Any]:
+    return {"name": "silent_failure_scan", "status": "passed", "passed": True, "output": "", "error": ""}
+
+
+class TestForgeRequestDedup:
+    """A re-sent forge-request (same request id) never runs CI or comments twice on a desktop install."""
+
+    @staticmethod
+    def _envelope(request_id: str = "req-42") -> dict[str, Any]:
+        import base64
+
+        data = {"pr_url": "https://github.com/acme/widgets/pull/7", "task_id": "t1", "request_id": request_id}
+        return {"message": {"data": base64.b64encode(json.dumps(data).encode()).decode(), "messageId": "m-1"}}
+
+    @pytest.fixture
+    def store(self) -> Any:
+        from henchmen.forge.server import app
+
+        class _Store:
+            def __init__(self) -> None:
+                self.docs: dict[tuple[str, str], dict[str, Any]] = {}
+
+            async def get(self, collection: str, key: str) -> dict[str, Any] | None:
+                return self.docs.get((collection, key))
+
+            async def set(self, collection: str, key: str, data: dict[str, Any]) -> None:
+                self.docs[(collection, key)] = data
+
+            async def delete(self, collection: str, key: str) -> None:
+                self.docs.pop((collection, key), None)
+
+        fake = _Store()
+        app.state.document_store = fake
+        app.state.message_broker = AsyncMock()
+        yield fake
+        for attr in ("document_store", "message_broker"):
+            if hasattr(app.state, attr):
+                delattr(app.state, attr)
+
+    def _post(self, request_id: str = "req-42") -> Any:
+        from fastapi.testclient import TestClient
+
+        from henchmen.forge.server import app
+
+        return TestClient(app, raise_server_exceptions=False).post(
+            "/pubsub/forge-request", json=self._envelope(request_id)
+        )
+
+    def test_a_duplicate_request_id_does_not_run_ci_twice(self, store: Any) -> None:
+        from henchmen.forge import server
+
+        run = AsyncMock()
+        with (
+            patch.object(server, "get_settings", return_value=_settings()),
+            patch.object(server, "verify_pubsub_oidc", AsyncMock()),
+            patch.object(server, "_run_ci_for_pr", run),
+        ):
+            first = self._post()
+            second = self._post()
+        assert first.status_code == 200 and first.json()["status"] == "accepted"
+        assert second.status_code == 200 and second.json()["status"] == "duplicate"
+        run.assert_awaited_once()
+        assert store.docs[("processed_messages", "forge-request:req-42")]["status"] == "done"
+
+    def test_a_re_send_while_the_first_run_is_still_going_is_a_duplicate(self, store: Any) -> None:
+        from datetime import UTC, datetime
+
+        from henchmen.forge import server
+
+        store.docs[("processed_messages", "forge-request:req-42")] = {
+            "status": "in_flight",
+            "acquired_at": datetime.now(UTC).isoformat(),
+        }
+        run = AsyncMock()
+        with (
+            patch.object(server, "get_settings", return_value=_settings()),
+            patch.object(server, "verify_pubsub_oidc", AsyncMock()),
+            patch.object(server, "_run_ci_for_pr", run),
+        ):
+            assert self._post().json()["status"] == "duplicate"
+        run.assert_not_awaited()
+
+    def test_a_retriable_failure_releases_the_claim(self, store: Any) -> None:
+        from henchmen.forge import server
+
+        with (
+            patch.object(server, "get_settings", return_value=_settings()),
+            patch.object(server, "verify_pubsub_oidc", AsyncMock()),
+            patch.object(server, "_run_ci_for_pr", AsyncMock(side_effect=[RuntimeError("boom"), None])) as run,
+        ):
+            assert self._post().status_code == 500
+            assert self._post().json()["status"] == "accepted"
+        assert run.await_count == 2
+
+    def test_the_cloud_path_does_not_dedup(self, store: Any) -> None:
+        from henchmen.forge import server
+
+        run = AsyncMock()
+        with (
+            patch.object(server, "get_settings", return_value=_settings(provider="gcp")),
+            patch.object(server, "verify_pubsub_oidc", AsyncMock()),
+            patch.object(server, "_run_ci_for_pr", run),
+        ):
+            assert self._post().json()["status"] == "accepted"
+            assert self._post().json()["status"] == "accepted"
+        assert run.await_count == 2
+        assert store.docs == {}

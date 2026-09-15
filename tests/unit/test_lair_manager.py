@@ -593,3 +593,26 @@ class TestProvisionalLairRegistration:
             await manager.create_lair(*self._task_and_node())
         assert manager._active_lairs == {}
         assert manager.accepts_report_from("task-7", "implement_fix") is False
+
+
+@pytest.mark.asyncio
+async def test_a_lair_evicted_during_run_job_does_not_raise() -> None:
+    """Residual minor: an entry evicted while run_job was awaited is skipped, never a KeyError."""
+    from henchmen.config.settings import Settings
+    from henchmen.mastermind.lair_manager import LairManager
+
+    manager: LairManager
+
+    async def _run_job(**kwargs):
+        manager._active_lairs.pop(kwargs["job_id"], None)
+        return "exec-9"
+
+    orchestrator = MagicMock()
+    orchestrator.run_job = AsyncMock(side_effect=_run_job)
+    store = MagicMock()
+    store.delete = AsyncMock()
+    manager = LairManager(Settings(_env_file=None, provider="gcp", gcp_project_id="p"), orchestrator, store)
+    task, node = TestProvisionalLairRegistration._task_and_node()
+    lair_id = await manager.create_lair(task, node)
+    assert lair_id.startswith("lair-")
+    assert lair_id not in manager._active_lairs

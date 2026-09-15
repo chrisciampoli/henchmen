@@ -297,7 +297,12 @@ class LairManager:
             raise
 
         logger.info("[LAIR] Execution started: %s", exec_id)
-        self._active_lairs[lair_id]["execution_id"] = exec_id
+        entry = self._active_lairs.get(lair_id)
+        if entry is not None:
+            entry["execution_id"] = exec_id
+        else:
+            # Evicted while run_job was awaited (a concurrent create_lair's stale-entry cleanup).
+            logger.warning("[LAIR] Lair %s was evicted before its execution id could be recorded", lair_id)
 
         return lair_id
 
