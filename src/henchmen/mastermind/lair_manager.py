@@ -13,6 +13,7 @@ from henchmen.models.llm import ModelTier
 from henchmen.models.operative import OperativeReport, OperativeStatus
 from henchmen.models.scheme import SchemeNode
 from henchmen.models.task import HenchmenTask
+from henchmen.observability.tracker import TASK_EXECUTIONS_COLLECTION
 from henchmen.providers.interfaces.container_orchestrator import ContainerOrchestrator, JobStatus
 from henchmen.providers.interfaces.document_store import DocumentStore
 from henchmen.providers.registry import orchestrator_is_local
@@ -45,10 +46,6 @@ _WAIT_GRACE_SECONDS = 300
 # After the job is observed as finished, how long to wait for its Pub/Sub
 # report to land before falling back to the stores.
 _REPORT_GRACE_SECONDS = 15
-
-# Where the operative persists task execution state, including the partial
-# report it writes when SIGTERM interrupts a node.
-_TASK_EXECUTIONS_COLLECTION = "task_executions"
 
 
 def _parse_iso(value: str) -> datetime | None:
@@ -297,6 +294,35 @@ class LairManager:
 
         return lair_id
 
+    def accepts_report_from(self, task_id: str, node_id: str, operative_id: str | None = None) -> bool:
+        """True only when this manager launched a lair for ``task_id``/``node_id`` that is still reportable.
+
+        Reuses the ``_active_lairs`` record ``create_lair`` writes (no second
+        registry). ``operative_id``, when given, must be that lair's id — the
+        operative reports ``LAIR_ID`` as its ``operative_id``. "Still
+        reportable" is the window :meth:`wait_for_completion` itself waits: the
+        node timeout plus the start-up and report grace periods from launch.
+        Only the most recent lair for the task and node counts: a lair a
+        re-execution superseded cannot report over its replacement. A lair
+        launched by a previous process (a restart) is unknown here and refused;
+        the watchdog re-dispatches that work instead.
+        """
+        launched: list[tuple[datetime, str, dict[str, Any]]] = []
+        for lair_id, info in self._active_lairs.items():
+            if info.get("task_id") != task_id or info.get("node_id") != node_id:
+                continue
+            created_at = _parse_iso(str(info.get("created_at", "")))
+            if created_at is not None:
+                launched.append((created_at, lair_id, info))
+        if not launched:
+            return False
+        created_at, lair_id, info = max(launched, key=lambda entry: entry[0])
+        if operative_id and operative_id != lair_id:
+            return False
+        timeout = int(info.get("timeout_seconds", self.settings.lair_default_timeout))
+        window = timedelta(seconds=timeout + _WAIT_GRACE_SECONDS + _REPORT_GRACE_SECONDS)
+        return created_at <= datetime.now(UTC) <= created_at + window
+
     def notify_operative_complete(self, report: OperativeReport) -> None:
         """Called by the Pub/Sub handler when an operative-complete message arrives.
 
@@ -363,7 +389,7 @@ class LairManager:
         key = f"{task_id}:{node_id}"
         try:
             store = self._get_store()
-            data = await store.get(_TASK_EXECUTIONS_COLLECTION, task_id)
+            data = await store.get(TASK_EXECUTIONS_COLLECTION, task_id)
             if not data or data.get("interrupted_node_id") != node_id or not data.get("interrupted_report"):
                 return None
             report = OperativeReport.model_validate(data["interrupted_report"])
@@ -381,7 +407,7 @@ class LairManager:
         # Consume it so a re-dispatch of the same node cannot pick it up again.
         try:
             await self._get_store().update(
-                _TASK_EXECUTIONS_COLLECTION,
+                TASK_EXECUTIONS_COLLECTION,
                 task_id,
                 {"interrupted_node_id": None, "interrupted_report": None},
             )

@@ -21,6 +21,7 @@ from henchmen.config.settings import get_settings
 from henchmen.dispatch.pubsub_auth import require_internal_caller, verify_pubsub_oidc
 from henchmen.providers.registry import orchestrator_is_local
 from henchmen.utils.git import clone_repo
+from henchmen.utils.lifespan import run_shutdown
 from henchmen.utils.redaction import install_secret_redaction
 
 if TYPE_CHECKING:
@@ -84,21 +85,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.document_store = registry.get_document_store()
 
     logger.info("[forge] Service started")
+
+    async def _shutdown() -> None:
+        shutdown_tracing()
+        logger.info("[forge] Shutting down")
+        if owns_broker:
+            await _close_broker()
+
+    original: BaseException | None = None
     try:
         yield
+    except BaseException as exc:
+        original = exc
+        raise
     finally:
         # A sub-app entered after this one can fail to start; the combined app's
         # AsyncExitStack then unwinds this lifespan by throwing that exception in at
-        # `yield`, so shutdown must run from `finally`, not after a bare `yield`.
-        try:
-            shutdown_tracing()
-            logger.info("[forge] Shutting down")
-            if owns_broker:
-                await _close_broker()
-        except Exception:
-            # Never let a shutdown-path error mask the exception (if any) already
-            # propagating through `yield`.
-            logger.warning("[forge] Shutdown raised", exc_info=True)
+        # `yield`, so shutdown must run from `finally`, not after a bare `yield`, and a
+        # shutdown-path error (a CancelledError included) never masks `original`.
+        await run_shutdown("forge", _shutdown, original=original)
 
 
 app = FastAPI(title="Henchmen Forge", description="CI/merge pipeline", lifespan=lifespan)

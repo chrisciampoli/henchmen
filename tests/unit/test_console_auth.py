@@ -888,3 +888,72 @@ class TestForwardHostProblem:
         monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
         settings = _settings(local_forward_base_url="http://henchmen:abc")
         assert forward_host_problem(settings) is not None
+
+
+class TestFinalReviewHostAndForwardChecks:
+    @pytest.mark.parametrize("host", [" 127.0.0.1:8000", "127.0.0.1:8000 ", "\t127.0.0.1\t", " localhost "])
+    def test_spaces_and_tabs_around_the_host_value_are_stripped_first(self, host: str) -> None:
+        """D5: h11/httptools strip optional whitespace around a header value, so this must agree."""
+        assert is_local_host(host)
+
+    @pytest.mark.parametrize("host", ["127.0.0.1 :8000", "127.0.0.1\n", "127.0.0.1\x0b"])
+    def test_whitespace_inside_or_other_whitespace_is_still_refused(self, host: str) -> None:
+        assert not is_local_host(host)
+
+    @pytest.mark.parametrize(
+        "hostname", ["henchmen@x", "henchmen/x", "henchmen?x", "henchmen#x", "hench\\men", "henchmen:1", "hench men"]
+    )
+    def test_container_hostname_rejects_the_whole_netloc_forbidden_set(
+        self, hostname: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
+        settings = _settings(
+            local_container_hostname=hostname,
+            local_forward_base_url="http://henchmen:8000",
+            local_docker_network="henchmen",
+        )
+        problem = forward_host_problem(settings)
+        assert problem is not None and "HENCHMEN_LOCAL_CONTAINER_HOSTNAME" in problem
+
+    def test_a_forward_port_other_than_the_serve_port_is_a_problem(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """C5: an allowed hostname on the wrong port reaches nothing."""
+        monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
+        settings = _settings(
+            local_forward_base_url="http://henchmen:9000", local_docker_network="henchmen", local_serve_port=8000
+        )
+        problem = forward_host_problem(settings)
+        assert problem is not None
+        assert "port 9000" in problem and "port 8000" in problem
+        assert "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8000" in problem
+
+    def test_a_forward_url_without_a_port_uses_the_scheme_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path))
+        matching = _settings(
+            local_forward_base_url="http://henchmen", local_docker_network="henchmen", local_serve_port=80
+        )
+        assert forward_host_problem(matching) is None
+        other = _settings(
+            local_forward_base_url="http://henchmen", local_docker_network="henchmen", local_serve_port=8000
+        )
+        assert forward_host_problem(other) is not None
+
+    def test_a_port_mismatch_off_a_desktop_install_is_not_checked(self) -> None:
+        assert forward_host_problem(_settings(local_forward_base_url="http://henchmen:9000")) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_a_symlinked_setup_token_file_is_treated_as_absent(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """D3: the token store never follows a symbolic link to read a token."""
+    target = tmp_path / "elsewhere"
+    target.write_text("A" * 40, encoding="utf-8")
+    link = tmp_path / SETUP_TOKEN_FILE_NAME
+    link.symlink_to(target)
+    store = SetupTokenStore(link)
+    with caplog.at_level(logging.WARNING):
+        assert store.current() is None
+    assert "symbolic link" in caplog.text
+    assert "A" * 40 not in caplog.text

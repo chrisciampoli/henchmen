@@ -28,11 +28,13 @@ import henchmen.schemes.goal_decomposition  # noqa: F401
 from henchmen.config.settings import get_settings
 from henchmen.dispatch.pubsub_auth import require_internal_caller, verify_operative_report, verify_pubsub_oidc
 from henchmen.mastermind.agent import MastermindAgent
+from henchmen.mastermind.internal_api import reject_future_report, require_report_from_launched_lair
 from henchmen.mastermind.internal_api import router as internal_router
 from henchmen.mastermind.scheme_executor import validate_deterministic_handlers
 from henchmen.models.task import HenchmenTask
 from henchmen.observability.api import create_metrics_router, require_metrics_auth
 from henchmen.schemes.registry import SchemeRegistry
+from henchmen.utils.lifespan import run_shutdown
 from henchmen.utils.redaction import install_secret_redaction
 
 logger = logging.getLogger(__name__)
@@ -141,20 +143,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)
 
     logger.info("[mastermind] Service started")
+
+    async def _shutdown() -> None:
+        shutdown_tracing()
+        logger.info("[mastermind] Shutting down — active tasks: %d", len(agent._active_tasks))
+        await _close_providers()
+
+    original: BaseException | None = None
     try:
         yield
+    except BaseException as exc:
+        original = exc
+        raise
     finally:
         # A sub-app entered after this one (forge) can fail to start; the combined app's
         # AsyncExitStack then unwinds this lifespan by throwing that exception in at
-        # `yield`, so shutdown must run from `finally`, not after a bare `yield`.
-        try:
-            shutdown_tracing()
-            logger.info("[mastermind] Shutting down — active tasks: %d", len(agent._active_tasks))
-            await _close_providers()
-        except Exception:
-            # Never let a shutdown-path error mask the exception (if any) already
-            # propagating through `yield`.
-            logger.warning("[mastermind] Shutdown raised", exc_info=True)
+        # `yield`, so shutdown must run from `finally`, not after a bare `yield`, and a
+        # shutdown-path error (a CancelledError included) never masks `original`.
+        await run_shutdown("mastermind", _shutdown, original=original)
 
 
 app = FastAPI(title="Henchmen Mastermind", description="Task orchestration engine", lifespan=lifespan)
@@ -348,6 +354,22 @@ async def _mark_message_done(message_id: str, dedup_key: str | None = None, hand
             )
         except Exception as exc:
             logger.warning("[dedup] Failed to mark %s as done: %s", key, exc)
+
+
+async def _release_message_claim(message_id: str, dedup_key: str | None = None) -> None:
+    """Drop the ``in_flight`` dedup marker(s) a failed handler claimed, so a retry is not a "duplicate".
+
+    Best-effort: a marker that cannot be deleted still expires after
+    ``_DEDUP_INFLIGHT_TTL_SECONDS``.
+    """
+    store = get_agent().tracker._store
+    for key in (dedup_key, message_id):
+        if not key:
+            continue
+        try:
+            await store.delete("processed_messages", key)
+        except Exception as exc:
+            logger.warning("[dedup] Failed to release the in-flight marker %s: %s", key, exc)
 
 
 @app.get("/health")
@@ -627,8 +649,20 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
 
     Feeds the real OperativeReport (with tokens, cost, files_changed) to the
     LairManager so wait_for_completion() returns accurate telemetry.
+
+    On a desktop install's task-token path the operative itself is the caller
+    and waits on the status code: a report is accepted only for a lair
+    Mastermind launched for that task and node (409 otherwise), a report dated
+    more than a minute ahead is 422, and a processing error is a 500 with a
+    generic detail. Every refusal and error releases the in-flight dedup
+    marker so a retry is not mistaken for a duplicate. The push-token and
+    cloud paths are unchanged.
     """
     await verify_operative_report(request, get_settings())
+    verified_task_id = getattr(request.state, "operative_task_id", None)
+    dedup_message_id = ""
+    dedup_key: str | None = None
+    claimed = False
     try:
         envelope = await request.json()
 
@@ -638,7 +672,6 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
         # suppress task B's report by reusing (or guessing) the same message_id
         # -- Pub/Sub message ids are not secret and are not scoped to a task.
         message_id = envelope.get("message", {}).get("messageId", "")
-        verified_task_id = getattr(request.state, "operative_task_id", None)
         if verified_task_id:
             dedup_message_id = ""
             dedup_key = f"{verified_task_id}:{message_id}" if message_id else None
@@ -647,6 +680,7 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
         if await _check_message_dedup(dedup_message_id, dedup_key=dedup_key, handler="operative-complete"):
             logger.info("Duplicate operative-complete message %s, skipping", message_id)
             return {"status": "duplicate", "message_id": message_id}
+        claimed = True
 
         message = envelope.get("message", {})
         data_b64 = message.get("data", "")
@@ -669,6 +703,9 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
                 verified_task_id,
             )
             raise HTTPException(status_code=401, detail="Report task_id does not match the verified task token")
+        if verified_task_id is not None:
+            reject_future_report(report)
+            require_report_from_launched_lair(report)
 
         agent = get_agent()
 
@@ -705,10 +742,18 @@ async def operative_complete_handler(request: Request) -> dict[str, Any]:
         await _mark_message_done(dedup_message_id, dedup_key=dedup_key, handler="operative-complete")
         return {"status": "ok"}
     except HTTPException:
+        if verified_task_id is not None and claimed:
+            await _release_message_claim(dedup_message_id, dedup_key)
         raise
     except Exception as exc:
-        logger.error("Failed to process operative-complete: %s", exc)
-        return {"status": "error", "detail": str(exc)}
+        if verified_task_id is None:
+            logger.error("Failed to process operative-complete: %s", exc)
+            return {"status": "error", "detail": str(exc)}
+        # The operative is waiting on this status: a 200 would read as delivered.
+        logger.error("Failed to process operative-complete for task %s: %s", verified_task_id, exc)
+        if claimed:
+            await _release_message_claim(dedup_message_id, dedup_key)
+        raise HTTPException(status_code=500, detail="Failed to process the operative report") from None
 
 
 @app.post("/pubsub/forge-result")

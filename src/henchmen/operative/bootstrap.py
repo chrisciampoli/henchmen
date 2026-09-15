@@ -22,6 +22,7 @@ from henchmen.config.posture import fail_open_allowed
 from henchmen.config.settings import Settings, get_settings
 from henchmen.models.llm import ModelTier
 from henchmen.models.operative import OperativeConfig, OperativeReport, OperativeStatus
+from henchmen.observability.tracker import TASK_EXECUTIONS_COLLECTION
 from henchmen.operative.agent_builder import build_operative_agent
 from henchmen.operative.git_helpers import (
     DEFAULT_BASE_BRANCH,
@@ -38,9 +39,26 @@ from henchmen.utils.redaction import install_secret_redaction, redact
 
 logger = logging.getLogger(__name__)
 
-# Firestore collection written by the heartbeat and partial report paths.
-# Kept aligned with ``henchmen.observability.tracker._COLLECTION``.
-_TASK_EXECUTIONS_COLLECTION = "task_executions"
+#: Largest ``git_diff`` an operative puts in its report, in UTF-8 bytes. The
+#: report travels to Mastermind in one request capped at
+#: ``henchmen.dispatch.pubsub_auth.MAX_OPERATIVE_REPORT_BYTES``; nothing in
+#: Mastermind reads the diff back (PRs, CI and fix nodes all work from the pushed
+#: branch), so a huge change only loses the tail of an informational field.
+MAX_REPORT_GIT_DIFF_BYTES = 512 * 1024
+_GIT_DIFF_TRUNCATION_MARKER = "\n[henchmen: git diff truncated to {kept} of {total} bytes]\n"
+
+
+def cap_report_git_diff(diff: str | None) -> str | None:
+    """``diff`` unchanged when it fits :data:`MAX_REPORT_GIT_DIFF_BYTES`, else its head plus a truncation marker."""
+    if diff is None:
+        return None
+    encoded = diff.encode("utf-8")
+    if len(encoded) <= MAX_REPORT_GIT_DIFF_BYTES:
+        return diff
+    marker = _GIT_DIFF_TRUNCATION_MARKER.format(kept=MAX_REPORT_GIT_DIFF_BYTES, total=len(encoded))
+    head = encoded[: MAX_REPORT_GIT_DIFF_BYTES - len(marker.encode("utf-8"))].decode("utf-8", errors="ignore")
+    logger.warning("git diff of %d bytes truncated to %d bytes for the report", len(encoded), MAX_REPORT_GIT_DIFF_BYTES)
+    return head + marker
 
 
 class _RedactingFormatter(logging.Formatter):
@@ -104,7 +122,7 @@ async def _heartbeat_loop(
     while True:
         try:
             await document_store.update(
-                _TASK_EXECUTIONS_COLLECTION,
+                TASK_EXECUTIONS_COLLECTION,
                 task_id,
                 {"last_heartbeat": datetime.now(UTC).isoformat()},
             )
@@ -136,7 +154,7 @@ async def _persist_interrupted_report(
     """
     try:
         await document_store.update(
-            _TASK_EXECUTIONS_COLLECTION,
+            TASK_EXECUTIONS_COLLECTION,
             report.task_id,
             {
                 "interrupted_node_id": report.node_id,
@@ -387,7 +405,7 @@ async def run_operative() -> None:
         node_id=config.node_id,
         operative_id=operative_id,
         status=status,
-        git_diff=result.get("git_diff"),
+        git_diff=cap_report_git_diff(result.get("git_diff")),
         summary=result.get("summary", ""),
         confidence_score=result.get("confidence", 0.5),
         files_changed=result.get("files_changed", []),

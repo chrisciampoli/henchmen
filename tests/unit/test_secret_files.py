@@ -497,3 +497,67 @@ def test_replace_with_retry_succeeds_immediately_without_sleeping(
 
     assert dst.read_bytes() == b"data"
     assert sleeps == []
+
+
+symlinks_supported = pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+
+
+@symlinks_supported
+@pytest.mark.parametrize("dangling", [True, False])
+def test_a_symlinked_secret_is_a_readable_error_never_followed(tmp_path: Path, dangling: bool) -> None:
+    """D3: neither a dangling nor a live symbolic link is read, replaced through, or trusted."""
+    secrets_dir = tmp_path / "secrets"
+    ensure_secrets_dir(secrets_dir)
+    target = tmp_path / "attacker-chosen"
+    if not dangling:
+        target.write_bytes(b"x" * 64)
+    link = secrets_dir / "internal-push.token"
+    link.symlink_to(target)
+    with pytest.raises(secret_files.SecretFileError, match="symbolic link") as exc_info:
+        read_or_create_secret(link)
+    assert isinstance(exc_info.value, OSError)
+    assert str(link) in str(exc_info.value)
+    with pytest.raises(secret_files.SecretFileError):
+        write_secret_file(link, b"y" * 32)
+    assert link.is_symlink()
+    assert dangling or target.read_bytes() == b"x" * 64
+
+
+@posix_only
+def test_a_secret_owned_by_another_user_is_a_readable_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    secrets_dir = tmp_path / "secrets"
+    path = secrets_dir / "operative-task.key"
+    read_or_create_secret(path)
+    monkeypatch.setattr(secret_files.os, "geteuid", lambda: os.stat(path).st_uid + 1)
+    with pytest.raises(secret_files.SecretFileError, match="owned by another user"):
+        read_or_create_secret(path)
+
+
+def test_a_directory_where_a_secret_should_be_is_a_readable_error(tmp_path: Path) -> None:
+    path = tmp_path / "secrets" / "console-session.key"
+    path.mkdir(parents=True)
+    with pytest.raises(secret_files.SecretFileError, match="not a regular file"):
+        read_or_create_secret(path)
+
+
+def test_secret_bytes_are_fsynced_before_they_are_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """D3: the temp file is flushed to disk before os.replace publishes it under the final name."""
+    events: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def _fsync(fd: int) -> None:
+        events.append("fsync")
+        real_fsync(fd)
+
+    def _replace(src: object, dst: object) -> None:
+        events.append("replace")
+        real_replace(src, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(secret_files.os, "fsync", _fsync)
+    monkeypatch.setattr(secret_files.os, "replace", _replace)
+    path = tmp_path / "secrets" / "setup-token"
+    ensure_secrets_dir(path.parent)
+    write_secret_file(path, b"z" * 32)
+    assert "replace" in events
+    assert events.index("fsync") < events.index("replace")
+    assert path.read_bytes() == b"z" * 32

@@ -1349,22 +1349,54 @@ class TestWebhookSignatures:
 
 
 class TestRequireSigningSecret:
-    def test_dev_allows_missing_secret(self):
-        from henchmen.config.settings import Environment
+    def test_dev_allows_missing_secret(self, monkeypatch, caplog):
+        from henchmen.config.settings import Environment, Settings
         from henchmen.dispatch.server import _require_signing_secret
 
-        _require_signing_secret(Environment.DEV, "", integration="slack")
+        monkeypatch.delenv("HENCHMEN_DATA_DIR", raising=False)
+        with caplog.at_level("WARNING", logger="henchmen.dispatch.server"):
+            _require_signing_secret(Settings(_env_file=None, environment=Environment.DEV), "", integration="slack")
+        assert "fail-open is allowed" in caplog.text
 
     @pytest.mark.parametrize("env_name", ["staging", "prod"])
-    def test_staging_and_prod_reject_missing_secret(self, env_name):
+    def test_staging_and_prod_reject_missing_secret(self, env_name, monkeypatch):
         from fastapi import HTTPException
 
-        from henchmen.config.settings import Environment
+        from henchmen.config.settings import Environment, Settings
         from henchmen.dispatch.server import _require_signing_secret
 
+        monkeypatch.delenv("HENCHMEN_DATA_DIR", raising=False)
         with pytest.raises(HTTPException) as exc:
-            _require_signing_secret(Environment(env_name), "", integration="github")
+            _require_signing_secret(
+                Settings(_env_file=None, environment=Environment(env_name), gcp_project_id="p"),
+                "",
+                integration="github",
+            )
         assert exc.value.status_code == 401
+
+    @pytest.mark.parametrize(
+        ("env_name", "desktop", "refused"),
+        [("dev", False, False), ("dev", True, True), ("staging", False, True), ("prod", True, True)],
+    )
+    def test_equivalent_to_the_old_environment_or_desktop_rule(self, env_name, desktop, refused, monkeypatch, tmp_path):
+        """C2: routing through fail_open_allowed keeps the old "staging/prod or desktop" decision."""
+        from fastapi import HTTPException
+
+        from henchmen.config.settings import Environment, Settings
+        from henchmen.dispatch.server import _require_signing_secret
+
+        if desktop:
+            monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        else:
+            monkeypatch.delenv("HENCHMEN_DATA_DIR", raising=False)
+        settings = Settings(_env_file=None, environment=Environment(env_name), gcp_project_id="p")
+        if refused:
+            with pytest.raises(HTTPException) as exc:
+                _require_signing_secret(settings, "", integration="jira")
+            assert exc.value.status_code == 401
+        else:
+            _require_signing_secret(settings, "", integration="jira")
+        _require_signing_secret(settings, "configured", integration="jira")  # a configured secret always passes
 
 
 # ---------------------------------------------------------------------------

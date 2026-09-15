@@ -36,6 +36,7 @@ from urllib.parse import urlsplit
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from henchmen.config.secret_files import (
+    check_secret_path,
     create_secret_file,
     ensure_secrets_dir,
     read_or_create_secret,
@@ -69,8 +70,10 @@ def _parse_netloc(netloc: str, default_scheme: str) -> tuple[str, int] | None:
     — a bare Host or Origin netloc must never legitimately contain any of
     these, and ``urlsplit`` silently strips a path/query/fragment suffix
     (``127.0.0.1/x`` would otherwise parse as the bare, allowed hostname
-    ``127.0.0.1``) rather than rejecting it.
+    ``127.0.0.1``) rather than rejecting it. Spaces and tabs around the whole
+    value are stripped first, as h11 and httptools do for a header value.
     """
+    netloc = netloc.strip(" \t")
     if "@" in netloc or any(char in _FORBIDDEN_NETLOC_CHARS or char.isspace() for char in netloc):
         return None
     try:
@@ -173,11 +176,12 @@ class SetupTokenStore:
     def current(self) -> str | None:
         """The token a sign-in link must carry, or ``None`` when there is no usable token."""
         try:
+            check_secret_path(self.path)
             raw = self.path.read_bytes()
         except FileNotFoundError:
             return None
-        except OSError:
-            logger.warning("Could not read the setup token file %s; treating it as absent.", self.path.name)
+        except OSError as exc:
+            logger.warning("Could not use the setup token file %s (%s); treating it as absent.", self.path.name, exc)
             return None
         token = raw.decode("ascii", errors="replace").strip()
         if not _SETUP_TOKEN_PATTERN.fullmatch(token):
@@ -457,6 +461,8 @@ def forward_host_problem(settings: Settings) -> str | None:
     :func:`desktop_allowed_hostnames`. The default ``local_forward_base``
     (``http://host.docker.internal:<port>``) is exactly this case, so this
     surfaces it instead of leaving operatives to fail with an opaque 403.
+    A forward base on an allowed hostname but another port than
+    ``local_serve_port`` is a problem too: nothing listens there.
 
     A loopback hostname (``127.0.0.1``, ``localhost``, ``::1``) is also a
     problem, unconditionally: :class:`~henchmen.providers.local.docker.DockerOrchestrator`
@@ -477,7 +483,9 @@ def forward_host_problem(settings: Settings) -> str | None:
         return None
 
     container_hostname = settings.local_container_hostname.strip().lower()
-    if not container_hostname or any(char in ":/" or char.isspace() for char in container_hostname):
+    if not container_hostname or any(
+        char in _FORBIDDEN_NETLOC_CHARS or char in ":@" or char.isspace() for char in container_hostname
+    ):
         return (
             f"HENCHMEN_LOCAL_CONTAINER_HOSTNAME ({settings.local_container_hostname!r}) must be a bare "
             "hostname such as 'henchmen', with no port, path or whitespace."
@@ -486,9 +494,10 @@ def forward_host_problem(settings: Settings) -> str | None:
     try:
         split = urlsplit(settings.local_forward_base)
         hostname = split.hostname
-        _ = split.port  # accessed for its side effect: raises ValueError on an unparsable port
+        forward_port = split.port or _DEFAULT_PORTS.get(split.scheme, 80)  # ValueError on an unparsable port
     except ValueError:
         hostname = None
+        forward_port = 0
     if not hostname:
         return f"HENCHMEN_LOCAL_FORWARD_BASE_URL ({settings.local_forward_base!r}) is not a usable URL."
 
@@ -511,9 +520,14 @@ def forward_host_problem(settings: Settings) -> str | None:
             "network is configured -- on the default bridge network a container cannot resolve another "
             f"container's name. Set {network_fix}"
         )
-    if lowered in desktop_allowed_hostnames(container_hostname):
-        return None
-    return f"Operatives call Henchmen at {hostname}, which a desktop install refuses. Set {network_fix}"
+    if lowered not in desktop_allowed_hostnames(container_hostname):
+        return f"Operatives call Henchmen at {hostname}, which a desktop install refuses. Set {network_fix}"
+    if forward_port != settings.local_serve_port:
+        return (
+            f"Operatives call Henchmen on port {forward_port}, but it listens on port {settings.local_serve_port} "
+            f"inside its container. Set {network_fix}"
+        )
+    return None
 
 
 def _cookie(header: str, name: str) -> str | None:

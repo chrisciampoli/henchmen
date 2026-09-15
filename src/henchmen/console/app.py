@@ -59,7 +59,10 @@ class ConsoleStatus(BaseModel):
     mode: ConsoleMode = Field(..., description="setup, run or attention")
     setup_completed: bool = Field(..., description="Whether setup has been applied")
     version: str = Field(..., description="Henchmen package version")
-    problems: list[str] = Field(default_factory=list, description="Why Henchmen cannot start (attention mode only)")
+    problems: list[str] = Field(
+        default_factory=list,
+        description="Why Henchmen cannot start (attention mode, and only for a signed-in Console session)",
+    )
     services: dict[str, str] = Field(default_factory=dict, description="State of each service, e.g. running")
 
 
@@ -116,6 +119,7 @@ def create_console_app(
     store: SetupStateStore,
     auth: ConsoleAuth,
     config_file: Path,
+    secrets_dir: Path,
     on_apply: Callable[[], None],
     step_routes: Mapping[SetupStep, StepRoutes] | None = None,
     seeded_env: Mapping[str, str] | None = None,
@@ -124,14 +128,20 @@ def create_console_app(
 ) -> FastAPI:
     """Build the Console app. ``on_apply`` is called after apply's response is sent.
 
+    ``secrets_dir`` is the install's secrets directory (``paths.secrets_dir()``),
+    never derived from ``config_file``'s location.
+
     ``step_routes`` defaults to every ``henchmen.console.steps.<step>`` module found
     (:func:`henchmen.console.steps.discover_step_routes`). ``seeded_env`` are the
     defaults ``henchmen serve`` put into this process's environment; apply validates
     as if they were absent unless the file leaves the key out (D-P8). ``problems``
     (needs-attention mode only) are why Henchmen could not start; each is passed
     through :func:`redact` before being reported, since a settings problem or a
-    service startup error can carry an exception message from arbitrary code.
-    ``service_status`` reports each service's live state (run mode only).
+    service startup error can carry an exception message from arbitrary code,
+    and are returned only to a request carrying a valid Console session
+    (decision C17): an unauthenticated status poll still sees ``mode:
+    "attention"`` but an empty problem list. ``service_status`` reports each
+    service's live state (run mode only).
     """
     app = FastAPI(title="Henchmen Console", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.setup_store = store
@@ -147,13 +157,14 @@ def create_console_app(
     reported_problems = [redact(problem) for problem in problems] if mode == ConsoleMode.ATTENTION else []
 
     @app.get("/console/api/status")
-    async def status() -> ConsoleStatus:
+    async def status(request: Request) -> ConsoleStatus:
         services = service_status() if service_status is not None else ServiceHealth().snapshot()
+        signed_in = bool(reported_problems) and auth.verify_session(request.cookies.get(SESSION_COOKIE))
         return ConsoleStatus(
             mode=mode,
             setup_completed=store.load().completed,
             version=__version__,
-            problems=reported_problems,
+            problems=reported_problems if signed_in else [],
             services=services,
         )
 
@@ -162,7 +173,14 @@ def create_console_app(
         if auth.verify_session(request.cookies.get(SESSION_COOKIE)):
             # Already signed in: an old or reused link must neither fail nor burn the current token.
             return RedirectResponse("/", status_code=303)
-        if not auth.consume_setup_token(setup_token):
+        try:
+            consumed = auth.consume_setup_token(setup_token)
+        except OSError:
+            # e.g. a full disk while replacing the spent token: the token is already
+            # spent (the claim happened), so this link must not grant a session.
+            logger.warning("Could not finish consuming the Console sign-in token; refusing the sign-in")
+            consumed = False
+        if not consumed:
             return JSONResponse(
                 {
                     "detail": (
@@ -207,7 +225,7 @@ def create_console_app(
         # Run mode must start with an authenticated task API (D-P10). The token is only
         # computed here, in memory: it is validated as part of the configuration before
         # anything is written, so a refused apply never touches the file (ruling P6).
-        config_store = ConfigStore(config_file, config_file.parent / "secrets")
+        config_store = ConfigStore(config_file, secrets_dir)
         env_files = (str(config_file),)
         # Skip generating one when the running environment already supplies a usable
         # token (e.g. a Secret Manager mount): the environment outranks the file anyway.

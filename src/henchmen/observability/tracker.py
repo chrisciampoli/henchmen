@@ -107,7 +107,10 @@ def estimate_cost(
 # TaskTracker
 # ---------------------------------------------------------------------------
 
-_COLLECTION = "task_executions"
+#: The one name of the task execution collection, shared by every reader and writer of task state
+#: (the tracker, the lair manager, the operative, the desktop task-scoped routes and their client).
+TASK_EXECUTIONS_COLLECTION = "task_executions"
+_COLLECTION = TASK_EXECUTIONS_COLLECTION
 _RETENTION_DAYS = 30
 
 # Final statuses that mean "the task did what it was asked to do". The

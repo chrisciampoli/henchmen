@@ -79,3 +79,72 @@ def test_overrides_only_allow_the_dispatch_api_token_key(tmp_path: Path) -> None
     config = _config(tmp_path, "HENCHMEN_PROVIDER=local\n")
     with pytest.raises(ValueError, match="HENCHMEN_PROVIDER"):
         settings_problems(config, overrides={"HENCHMEN_PROVIDER": "gcp"})
+
+
+def test_a_seeded_alias_masks_only_its_own_key_not_a_real_bare_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """D10: seeding HENCHMEN_GITHUB_TOKEN must not hide a genuine bare GITHUB_TOKEN from the environment."""
+    monkeypatch.setenv("HENCHMEN_GITHUB_TOKEN", "seeded-default")
+    monkeypatch.setenv("GITHUB_TOKEN", "real-bare-token")
+    config = _config(tmp_path, "HENCHMEN_PROVIDER=local\n")
+    settings, _ = settings_problems(config, seeded_env={"HENCHMEN_GITHUB_TOKEN": "seeded-default"})
+    assert settings is not None
+    assert settings.github_token == "real-bare-token"
+
+
+def test_a_seeded_alias_is_still_masked_itself(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HENCHMEN_GITHUB_TOKEN", "seeded-default")
+    config = _config(tmp_path, "HENCHMEN_PROVIDER=local\nHENCHMEN_GITHUB_TOKEN=from-file\n")
+    settings, _ = settings_problems(config, seeded_env={"HENCHMEN_GITHUB_TOKEN": "seeded-default"})
+    assert settings is not None and settings.github_token == "from-file"
+
+
+class TestDesktopDispatchToken:
+    """C8: run mode on a desktop install needs a usable Dispatch API token."""
+
+    @pytest.fixture(autouse=True)
+    def _desktop(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+
+    @pytest.mark.parametrize(
+        "line",
+        ["", "HENCHMEN_DISPATCH_API_TOKEN=\n", "HENCHMEN_DISPATCH_API_TOKEN=placeholder-replace-with-a-real-value\n"],
+    )
+    def test_an_empty_or_placeholder_token_is_a_problem_naming_the_fix(self, tmp_path: Path, line: str) -> None:
+        settings, problems = settings_problems(_config(tmp_path, "HENCHMEN_PROVIDER=local\n" + line))
+        assert settings is not None
+        (problem,) = [p for p in problems if "HENCHMEN_DISPATCH_API_TOKEN" in p]
+        assert "environment variable" in problem and "apply setup again" in problem
+
+    @pytest.mark.parametrize("value", ["", "placeholder-replace-with-a-real-value"])
+    def test_a_blank_or_placeholder_environment_variable_shadowing_the_file_is_a_problem(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str
+    ) -> None:
+        monkeypatch.setenv("HENCHMEN_DISPATCH_API_TOKEN", value)
+        config = _config(tmp_path, "HENCHMEN_PROVIDER=local\nHENCHMEN_DISPATCH_API_TOKEN=a-real-token-in-the-file\n")
+        _, problems = settings_problems(config)
+        assert any("HENCHMEN_DISPATCH_API_TOKEN is empty" in p for p in problems)
+
+    def test_a_usable_token_is_not_a_problem(self, tmp_path: Path) -> None:
+        _, problems = settings_problems(
+            _config(tmp_path, "HENCHMEN_PROVIDER=local\nHENCHMEN_DISPATCH_API_TOKEN=real\n")
+        )
+        assert not any("HENCHMEN_DISPATCH_API_TOKEN" in p for p in problems)
+
+    def test_a_pending_override_ranks_like_the_file_below_a_blank_environment_variable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("HENCHMEN_DISPATCH_API_TOKEN", "")
+        config = _config(tmp_path, "HENCHMEN_PROVIDER=local\n")
+        settings, problems = settings_problems(config, overrides={"HENCHMEN_DISPATCH_API_TOKEN": "fresh-token"})
+        assert settings is not None and settings.dispatch_api_token == ""
+        assert any("HENCHMEN_DISPATCH_API_TOKEN is empty" in p for p in problems)
+
+
+def test_an_empty_token_off_a_desktop_install_is_not_a_validation_problem(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("HENCHMEN_DATA_DIR", raising=False)
+    _, problems = settings_problems(_config(tmp_path, "HENCHMEN_PROVIDER=local\n"))
+    assert not any("HENCHMEN_DISPATCH_API_TOKEN" in p for p in problems)

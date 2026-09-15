@@ -5,7 +5,7 @@ stand-in (the in-memory broker POSTing to the mounted services) has no such
 issuer, so a desktop install keeps two secrets under ``<data dir>/secrets``:
 
 * ``internal-push.token`` — the bearer the server's own broker sends with every
-  forwarded push. It never leaves the server process (amendment A2): it is not
+  forwarded push. It never leaves the server process (amendment B2): it is not
   injected into an operative's container environment, unlike the operative
   runtime contract in ``lair_manager``.
 * ``operative-task.key`` — an HMAC key. Each Lair receives

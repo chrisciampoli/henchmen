@@ -153,7 +153,12 @@ class TestCleanupCancellation:
         proc.stdin = MagicMock(drain=AsyncMock())
         proc.stdout = _StubbornStream()
         proc.stderr = _StubbornStream()
-        proc.wait = AsyncMock(side_effect=lambda: asyncio.sleep(10))
+
+        async def _never_exits() -> int:
+            await asyncio.sleep(10)
+            return 0
+
+        proc.wait = _never_exits
         cleanup = AsyncMock()
 
         with (

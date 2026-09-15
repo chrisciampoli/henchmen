@@ -180,6 +180,7 @@ def _console_app(tmp_path: Path, mode: ConsoleMode = ConsoleMode.SETUP):
         store=SetupStateStore(tmp_path / "setup-state.json"),
         auth=ConsoleAuth(setup_token="tok", signing_key=b"k" * 32),
         config_file=tmp_path / "henchmen.env",
+        secrets_dir=tmp_path / "secrets",
         on_apply=lambda: None,
     )
 
@@ -412,7 +413,7 @@ def test_serve_with_completed_setup_mounts_the_console_in_run_mode(
     # unconfigured default (and, without a network, for the container hostname alone).
     (tmp_path / "henchmen.env").write_text(
         "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123\n"
-        "HENCHMEN_LOCAL_DOCKER_NETWORK=henchmen\n",
+        "HENCHMEN_LOCAL_DOCKER_NETWORK=henchmen\nHENCHMEN_DISPATCH_API_TOKEN=test-dispatch-token-0123456789abcdef\n",
         encoding="utf-8",
     )
     store = SetupStateStore(tmp_path / "setup-state.json")
@@ -452,7 +453,8 @@ def test_run_mode_prints_the_port_settings_actually_resolved(
     # container hostname keep this in run mode instead of ruling P3's needs-attention gate.
     (tmp_path / "henchmen.env").write_text(
         "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_SERVE_PORT=9999\n"
-        "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:9999\nHENCHMEN_LOCAL_DOCKER_NETWORK=henchmen\n",
+        "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:9999\nHENCHMEN_LOCAL_DOCKER_NETWORK=henchmen\n"
+        "HENCHMEN_DISPATCH_API_TOKEN=test-dispatch-token-0123456789abcdef\n",
         encoding="utf-8",
     )
     store = SetupStateStore(tmp_path / "setup-state.json")
@@ -658,7 +660,9 @@ def test_desktop_run_mode_serves_attention_when_the_forward_host_is_not_allowed(
 
     monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
     monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
-    (tmp_path / "henchmen.env").write_text("HENCHMEN_PROVIDER=local\n", encoding="utf-8")
+    (tmp_path / "henchmen.env").write_text(
+        "HENCHMEN_PROVIDER=local\nHENCHMEN_DISPATCH_API_TOKEN=test-dispatch-token-0123456789abcdef\n", encoding="utf-8"
+    )
     store = SetupStateStore(tmp_path / "setup-state.json")
     store.save(SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True))
     with (
@@ -676,9 +680,9 @@ def test_desktop_run_mode_serves_attention_when_the_forward_host_is_not_allowed(
     # _serve_args() defaults to port 8123, which _serve writes to HENCHMEN_LOCAL_SERVE_PORT
     # (overriding the pre-registered "8000") before Settings resolves local_serve_port.
     assert "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123" in caplog.text
-    status = TestClient(run.call_args.args[0], base_url=_LOCAL).get("/console/api/status").json()
+    status = TestNeedsAttention._status(run.call_args.args[0], tmp_path)
     assert status["mode"] == "attention"
-    assert any("host.docker.internal" in p for p in status["problems"])
+    assert any("host.docker.internal" in p for p in status["problems"])  # type: ignore[attr-defined]
 
 
 def test_desktop_runtime_authenticates_the_shared_broker(serve_env: Path) -> None:
@@ -706,7 +710,7 @@ def test_run_mode_loads_the_internal_push_token(monkeypatch: pytest.MonkeyPatch,
     # default container hostname keep this in run mode instead of ruling P3's attention gate.
     (tmp_path / "henchmen.env").write_text(
         "HENCHMEN_PROVIDER=local\nHENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123\n"
-        "HENCHMEN_LOCAL_DOCKER_NETWORK=henchmen\n",
+        "HENCHMEN_LOCAL_DOCKER_NETWORK=henchmen\nHENCHMEN_DISPATCH_API_TOKEN=test-dispatch-token-0123456789abcdef\n",
         encoding="utf-8",
     )
     SetupStateStore(tmp_path / "setup-state.json").save(
@@ -872,8 +876,8 @@ def test_get_container_orchestrator_failure_falls_back_to_attention_with_the_sto
         _serve(_serve_args())
 
     assert exit_info.value.code == 0
-    status = TestClient(run.call_args.args[0], base_url=_LOCAL).get("/console/api/status").json()
-    assert any("A Henchmen service failed to start" in p for p in status["problems"])
+    status = TestNeedsAttention._status(run.call_args.args[0], serve_env)
+    assert any("A Henchmen service failed to start" in p for p in status["problems"])  # type: ignore[attr-defined]
     assert memory.get_shared_broker() is None
     with pytest.raises(sqlite3.ProgrammingError):
         mastermind_server.app.state.document_store._conn.execute("SELECT 1")
@@ -906,7 +910,10 @@ def _completed_setup(data_dir: Path, config: str) -> None:
 # _serve_args()'s default port (8123), so tests that are not about ruling P3 exercise
 # service/bind failures instead of needs-attention mode for the unconfigured default
 # forward base or the container-hostname-without-a-network case.
-_FORWARD_OK = "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123\nHENCHMEN_LOCAL_DOCKER_NETWORK=henchmen\n"
+_FORWARD_OK = (
+    "HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8123\nHENCHMEN_LOCAL_DOCKER_NETWORK=henchmen\n"
+    "HENCHMEN_DISPATCH_API_TOKEN=test-dispatch-token-0123456789abcdef\n"
+)
 
 
 class TestNeedsAttention:
@@ -918,8 +925,14 @@ class TestNeedsAttention:
         monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
 
     @staticmethod
-    def _status(app: object) -> dict[str, object]:
+    def _status(app: object, data_dir: Path) -> dict[str, object]:
+        """Status as a signed-in Console sees it: problems are only returned to a session (C17)."""
+        from henchmen.config.secret_files import read_or_create_secret
+        from henchmen.console.auth import SESSION_COOKIE
+
+        key = read_or_create_secret(data_dir / "secrets" / "console-session.key")
         client = TestClient(app, base_url=_LOCAL)  # type: ignore[arg-type]
+        client.cookies.set(SESSION_COOKIE, ConsoleAuth(setup_token="", signing_key=key).issue_session())
         assert client.get("/health").json() == {"status": "degraded", "mode": "attention"}
         return client.get("/console/api/status").json()
 
@@ -937,7 +950,7 @@ class TestNeedsAttention:
             _serve(_serve_args())
         assert exit_info.value.code == 0
         build_services.assert_not_called()
-        status = self._status(run.call_args.args[0])
+        status = self._status(run.call_args.args[0], tmp_path)
         assert status["mode"] == "attention"
         assert any("operative_task_cost_ceiling_usd" in p for p in status["problems"])  # type: ignore[attr-defined]
         assert run.call_args.kwargs["port"] == 8123
@@ -954,7 +967,7 @@ class TestNeedsAttention:
         ):
             _serve(_serve_args())
         build_services.assert_not_called()
-        problems = self._status(run.call_args.args[0])["problems"]
+        problems = self._status(run.call_args.args[0], tmp_path)["problems"]
         assert any("HENCHMEN_ANTHROPIC_API_KEY" in p for p in problems)  # type: ignore[attr-defined]
 
     def test_a_service_startup_failure_falls_back_without_exiting(self, tmp_path: Path) -> None:
@@ -975,7 +988,7 @@ class TestNeedsAttention:
         ):
             _serve(_serve_args())
         assert exit_info.value.code == 0
-        status = self._status(run.call_args_list[1].args[0])
+        status = self._status(run.call_args_list[1].args[0], tmp_path)
         assert any("A Henchmen service failed to start" in p for p in status["problems"])  # type: ignore[attr-defined]
         assert leaked not in json.dumps(status)
 
@@ -995,7 +1008,7 @@ class TestNeedsAttention:
         ):
             _serve(_serve_args())
         assert exit_info.value.code == 0
-        status = self._status(run.call_args.args[0])
+        status = self._status(run.call_args.args[0], tmp_path)
         assert any("A Henchmen service failed to start" in p for p in status["problems"])  # type: ignore[attr-defined]
         assert memory.get_shared_broker() is None
 

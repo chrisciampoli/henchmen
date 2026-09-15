@@ -19,11 +19,12 @@ from urllib.parse import quote
 
 import httpx
 
+from henchmen.observability.tracker import TASK_EXECUTIONS_COLLECTION
+
 if TYPE_CHECKING:
     from henchmen.config.settings import Settings
 
 _TIMEOUT_SECONDS = 15.0
-_COLLECTION = "task_executions"
 _HEARTBEAT_FIELDS = frozenset({"last_heartbeat"})
 _INTERRUPTED_FIELDS = frozenset({"interrupted_node_id", "interrupted_at", "interrupted_report", "execution_state"})
 
@@ -47,7 +48,7 @@ class HttpDocumentStore:
         self._transport = transport
 
     def _url(self, collection: str, document_id: str, action: str) -> str:
-        if collection != _COLLECTION:
+        if collection != TASK_EXECUTIONS_COLLECTION:
             raise OperationNotAllowedError(f"collection {collection!r} is not available to operatives")
         if not document_id:
             raise OperationNotAllowedError("a task id is required")

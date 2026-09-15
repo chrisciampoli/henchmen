@@ -90,16 +90,25 @@ def _close_after_build_failure(resource: object, name: str) -> None:
 
     No lifespan will ever run for a store or broker built this early -- the failure happens
     before ``build_serve_app`` ever returns an app for uvicorn to run -- so it must be closed
-    here instead of leaking. ``build_serve_app`` itself is a plain (non-async) function with
-    no event loop of its own, so this spins one up just to await an async ``close``/``aclose``.
+    here instead of leaking. ``build_serve_app`` is a plain (non-async) function: with no
+    running event loop this spins one up to await an async ``close``/``aclose``. Called from
+    inside a running loop (async code building the app), the close is scheduled on that loop
+    instead -- ``asyncio.run`` would refuse, and blocking on it would deadlock -- and a strong
+    reference is kept until it finishes.
     """
     try:
-        asyncio.run(_aclose(resource, name))
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        # Already inside a running event loop (e.g. called from async code) -- there is no
-        # safe way to synchronously await the close from here. Best effort: log and move on
-        # rather than raising a second exception out of an already-exceptional build path.
-        logger.warning("[serve] Could not close %s: already inside a running event loop", name)
+        asyncio.run(_aclose(resource, name))
+        return
+    task = loop.create_task(_aclose(resource, name))
+    _pending_closes.add(task)
+    task.add_done_callback(_pending_closes.discard)
+
+
+# Closes scheduled by _close_after_build_failure on an already-running loop; the loop only
+# keeps weak references to tasks, so these are held here until each finishes.
+_pending_closes: set[asyncio.Task[None]] = set()
 
 
 @dataclass(frozen=True)
@@ -136,6 +145,7 @@ def build_serve_app(
         set_shared_broker,
     )
     from henchmen.providers.registry import ProviderRegistry
+    from henchmen.utils.lifespan import run_shutdown
 
     # One broker for every mounted service. InMemoryMessageBroker() returns the
     # shared instance once set, so a sub-app lifespan that builds "its own"
@@ -166,9 +176,13 @@ def build_serve_app(
         sub_apps: tuple[FastAPI, ...] = (dispatch_app, mastermind_app, forge_app)
         tracker = health if health is not None else ServiceHealth()
 
+        async def _close_shared_store() -> None:
+            await _aclose(shared_store, "shared document store")
+
         @asynccontextmanager
         async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             tracker.set_all(ServiceState.STARTING)
+            original: BaseException | None = None
             try:
                 async with AsyncExitStack() as stack:
                     with _uvicorn_owns_signals(asyncio.get_running_loop()):
@@ -198,18 +212,22 @@ def build_serve_app(
                         await shared_broker.drain()
                         logger.info("Shutting down")
                     # Leaving the AsyncExitStack runs the sub-app shutdowns in reverse order.
+            except BaseException as exc:
+                original = exc
+                raise
             finally:
                 tracker.finish()
-                await _aclose(shared_store, "shared document store")
                 # A failed startup (or a normal shutdown) must not leave this run's broker as
                 # the process-wide singleton (ruling: no resource leak into a same-process
                 # fallback): a later build_serve_app call already replaces it, but a
                 # needs-attention app built after a startup failure builds no broker of its
                 # own and must never reach this one. (A startup failure happens before the
                 # success path's own drain() above ever runs, so there is nothing in flight
-                # here to wait for -- only the singleton to release.)
+                # here to wait for -- only the singleton to release.) Released before the
+                # store close, which a cancellation could interrupt.
                 if get_shared_broker() is shared_broker:
                     set_shared_broker(None)
+                await run_shutdown("serve", _close_shared_store, original=original)
 
         app = FastAPI(title="Henchmen (Local Dev)", version=__version__, lifespan=lifespan)
         app.mount("/dispatch", dispatch_app)

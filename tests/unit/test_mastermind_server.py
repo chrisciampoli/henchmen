@@ -49,6 +49,8 @@ def _agent() -> MagicMock:
     agent.tracker.get_task = AsyncMock(return_value=None)
     agent.tracker.mark_escalated = AsyncMock()
     agent.lair_manager = MagicMock()
+    # Reports are bound to a lair Mastermind launched (B4); these fakes launched one.
+    agent.lair_manager.accepts_report_from = MagicMock(return_value=True)
     return agent
 
 
@@ -645,3 +647,94 @@ class TestOperativeReportTaskIdCrossCheck:
 
         assert resp.status_code == 401
         agent.lair_manager.notify_operative_complete.assert_not_called()
+
+
+class TestOperativeReportBindingAndErrors:
+    """B2/B4/D7 on the desktop task-token path; the push-token path keeps its behaviour."""
+
+    @pytest.fixture
+    def desktop_client(self, monkeypatch, tmp_path):
+        from henchmen.config.internal_auth import load_internal_auth
+        from henchmen.mastermind.server import app
+
+        monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+        fake = _agent()
+        fake.tracker._store = _DictBackedStore()
+        with patch("henchmen.mastermind.server.get_agent", return_value=fake):
+            yield TestClient(app, raise_server_exceptions=False), fake, load_internal_auth(tmp_path / "secrets")
+
+    @staticmethod
+    def _post(client, internal, report, message_id="op-1", token_for="task-abcdef01"):
+        return client.post(
+            "/pubsub/operative-complete",
+            json=_envelope(report, message_id=message_id),
+            headers={"Authorization": f"Bearer {internal.task_token(token_for)}"},
+        )
+
+    def test_a_report_for_a_lair_that_was_never_launched_is_409_and_can_be_retried(self, desktop_client):
+        client, fake, internal = desktop_client
+        fake.lair_manager.accepts_report_from.return_value = False
+        report = TestOperativeReportOnDesktop._report("task-abcdef01")
+
+        first = self._post(client, internal, report)
+        assert first.status_code == 409
+        fake.lair_manager.accepts_report_from.assert_called_once_with("task-abcdef01", "implement_fix", "lair-1")
+        fake.lair_manager.notify_operative_complete.assert_not_called()
+
+        # The refusal released its in-flight marker: a later legitimate delivery is not a "duplicate".
+        fake.lair_manager.accepts_report_from.return_value = True
+        second = self._post(client, internal, report)
+        assert second.status_code == 200 and second.json()["status"] == "ok"
+        fake.lair_manager.notify_operative_complete.assert_called_once()
+
+    @pytest.mark.parametrize("field", ["started_at", "completed_at"])
+    def test_a_report_dated_in_the_future_is_422(self, desktop_client, field):
+        from datetime import timedelta
+
+        client, fake, internal = desktop_client
+        report = TestOperativeReportOnDesktop._report("task-abcdef01")
+        report[field] = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+        resp = self._post(client, internal, report)
+        assert resp.status_code == 422
+        fake.lair_manager.notify_operative_complete.assert_not_called()
+
+    def test_a_processing_error_is_a_generic_500_that_releases_the_marker(self, desktop_client, caplog):
+        client, fake, internal = desktop_client
+        fake.lair_manager.notify_operative_complete.side_effect = [
+            RuntimeError("tracker exploded: internal-detail"),
+            None,
+        ]
+        report = TestOperativeReportOnDesktop._report("task-abcdef01")
+
+        with caplog.at_level("ERROR", logger="henchmen.mastermind.server"):
+            failed = self._post(client, internal, report)
+        assert failed.status_code == 500
+        assert "internal-detail" not in failed.text
+        assert "tracker exploded" in caplog.text
+        assert internal.task_token("task-abcdef01") not in caplog.text
+
+        retried = self._post(client, internal, report)
+        assert retried.status_code == 200 and retried.json()["status"] == "ok"
+
+    def test_same_task_and_same_message_id_is_a_duplicate(self, desktop_client):
+        """D7: the scoped dedup key still deduplicates a genuine redelivery."""
+        client, fake, internal = desktop_client
+        report = TestOperativeReportOnDesktop._report("task-abcdef01")
+        assert self._post(client, internal, report, message_id="op-same").json()["status"] == "ok"
+        again = self._post(client, internal, report, message_id="op-same")
+        assert again.status_code == 200 and again.json()["status"] == "duplicate"
+        fake.lair_manager.notify_operative_complete.assert_called_once()
+
+    def test_push_token_processing_errors_keep_the_200_error_shape(self, desktop_client):
+        """Non-task-token callers are unchanged (B2): 200 with status "error", no binding check."""
+        client, fake, internal = desktop_client
+        fake.lair_manager.accepts_report_from.return_value = False
+        fake.lair_manager.notify_operative_complete.side_effect = RuntimeError("boom")
+        resp = client.post(
+            "/pubsub/operative-complete",
+            json=_envelope(TestOperativeReportOnDesktop._report("task-abcdef01")),
+            headers={"Authorization": f"Bearer {internal.push_token}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "error"
+        fake.lair_manager.accepts_report_from.assert_not_called()
