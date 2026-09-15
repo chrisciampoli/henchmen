@@ -74,6 +74,34 @@ container can start, stop or inspect any container on the machine.
   bundled `docker-compose.yml` publishes `8000:8000` on every interface, so
   change it to `127.0.0.1:8000:8000` on any machine reachable by others.
 
+## Desktop Install Hardening
+
+A data-directory install (`HENCHMEN_DATA_DIR`, the local image) is treated as a real installation:
+
+- **No development fail-open paths.** Even with `HENCHMEN_ENVIRONMENT=dev`, unauthenticated Pub/Sub
+  pushes, an open task API, unsigned webhooks, open `/metrics`, CI without a GitHub token, operatives
+  without task state and simulated lair passes are all refused.
+- **Host allowlist on the whole app.** Every route except `/health` refuses a `Host` other than
+  `127.0.0.1`, `localhost`, `[::1]` or the operatives' container name (`HENCHMEN_LOCAL_CONTAINER_HOSTNAME`,
+  default `henchmen`), which blocks DNS rebinding.
+- **Internal authentication.** `<data dir>/secrets/` holds, owner-only: the Console session key, the
+  one-time setup token, the internal push token (sent by the server's own broker on every simulated
+  Pub/Sub push and required by the maintenance routes) and the operative task-token key. Each operative
+  receives only an HMAC token for its own task, which authenticates its report and its three task-state
+  calls (cost read, heartbeat, interrupted report) and nothing else. Operatives never mount the data volume.
+- **One-time sign-in links.** The setup token is consumed on use and rotated at every start;
+  `docker exec henchmen henchmen console-link` prints a fresh link and invalidates earlier ones.
+- **Recovery without a crash loop.** A completed setup that cannot start serves the Console in
+  needs-attention mode; problems shown there are redacted.
+- **Local CI gates run inside their own container, with the token scrubbed.** A gate container clones
+  the branch, computes the diff and runs the scoped lint/test commands entirely inside itself — nothing
+  is bind-mounted from the host. Once the last authenticated git operation has run, the gate removes the
+  GitHub token from `origin`'s URL in `.git/config` and from the environment before any repo-controlled
+  code (an install script, the linter, the test suite) runs. One consequence: a repository whose install
+  step genuinely needs `GITHUB_TOKEN` (for example, to authenticate to GitHub Packages) fails its local
+  CI gate from that point on — a deliberate fail-closed trade-off, not a bug. The cloud CI path is
+  unaffected by this scrubbing.
+
 ## Reporting a Vulnerability
 
 Please use GitHub Security Advisories:

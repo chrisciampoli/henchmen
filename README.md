@@ -127,6 +127,13 @@ docker run -d --name henchmen --network henchmen --restart unless-stopped \
 docker logs -f henchmen
 ```
 
+`HENCHMEN_LOCAL_DOCKER_NETWORK=henchmen` and `HENCHMEN_LOCAL_FORWARD_BASE_URL=http://henchmen:8000`,
+together with `--network henchmen --name henchmen`, are required exactly as shown: they are how an
+operative container calls back to this one by name. Leave any of them out (or point
+`HENCHMEN_LOCAL_FORWARD_BASE_URL` at a loopback address) and Henchmen still starts, but opens in
+needs-attention mode with a named fix, since the whole-app Host allowlist would otherwise silently
+refuse the callback.
+
 Look for the line starting `Open Henchmen setup:` and open it.
 
 ### Prebuilt images
