@@ -397,6 +397,25 @@ class TestSlack:
         assert ".[slack]" in (result.hint or "")
         assert list_slack_channels("xoxb-1") == []
 
+    def test_list_channels_pagination_is_bounded(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """A server that never returns an empty cursor must not hang the check."""
+
+        def conversations_list(**kw: Any) -> dict[str, Any]:
+            return {
+                "channels": [{"id": "C1", "name": "always-more", "is_private": False, "is_member": False}],
+                "response_metadata": {"next_cursor": "always-more"},
+            }
+
+        monkeypatch.setattr(
+            checks, "_slack_client", lambda token, timeout: _slack_client(conversations_list=conversations_list)
+        )
+        with caplog.at_level("WARNING"):
+            channels = list_slack_channels("xoxb-1")
+        assert len(channels) == checks.MAX_LIST_PAGES
+        assert any("stopped after" in record.getMessage() for record in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # Jira
@@ -525,3 +544,34 @@ class TestBedrock:
         result = checks.check_bedrock("us-east-1")
         assert result.status == CheckStatus.WARN
         assert "aws" in (result.hint or "")
+
+    def test_error_message_is_redacted(self, monkeypatch: pytest.MonkeyPatch):
+        def broken(region: str, timeout: float) -> Any:
+            raise RuntimeError("AccessDeniedException: User: arn:aws:iam::123456789012:user/henchmen is not authorized")
+
+        monkeypatch.setattr(checks, "_bedrock_client", broken)
+        result = checks.check_bedrock("us-east-1")
+        assert result.status == CheckStatus.FAIL
+        assert "123456789012" not in result.message
+
+    def test_inference_profile_pagination_is_bounded(self, monkeypatch: pytest.MonkeyPatch):
+        """A page that always carries a nextToken must not hang the check."""
+        calls: list[int] = []
+
+        def list_foundation_models(**kwargs: Any) -> dict[str, Any]:
+            return {"modelSummaries": []}
+
+        def list_inference_profiles(**kwargs: Any) -> dict[str, Any]:
+            calls.append(1)
+            return {"inferenceProfileSummaries": [{"inferenceProfileId": "p"}], "nextToken": "always-more"}
+
+        client = SimpleNamespace(
+            list_foundation_models=list_foundation_models, list_inference_profiles=list_inference_profiles
+        )
+        monkeypatch.setattr(checks, "_bedrock_client", lambda region, timeout: client)
+
+        result = checks.check_bedrock("us-east-1")
+
+        assert result.status == CheckStatus.FAIL
+        assert len(calls) == checks.MAX_LIST_PAGES
+        assert checks.list_bedrock_models("us-east-1") == []
