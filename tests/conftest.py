@@ -12,10 +12,26 @@ Conventions enforced here (see CONTRIBUTING.md for the full rationale):
 * ``mock_settings`` returns a real ``Settings`` instance constructed from
   environment variables, avoiding the duplicated ``_mock_settings()``
   helpers that used to live in ~8 test modules.
+* No test may touch the developer's real ``~/.henchmen`` (the local
+  DocumentStore, ObjectStore and eval history default there). Two layers keep
+  it out of reach: :func:`pytest_configure` points ``Path.home()`` at a
+  throwaway directory for the whole session -- before any test module is
+  imported, so import-time defaults such as ``evals.storage._DEFAULT_DB_PATH``
+  land there too -- and ``_isolate_local_state`` gives every test its own
+  SQLite file, storage directory and eval database, so no state survives from
+  one test (or one run) to the next. As a guard, the real directory is
+  fingerprinted when the session starts and compared when it ends; any change
+  fails the session.
 """
 
 import os
+import pathlib
+import shutil
+import sys
+import tempfile
 from collections.abc import Iterator
+from contextlib import suppress
+from typing import Any
 
 import pytest
 
@@ -31,6 +47,107 @@ from henchmen.models.scheme import (
     SchemeNode,
 )
 from henchmen.models.task import HenchmenTask, TaskContext, TaskPriority, TaskSource
+
+# ---------------------------------------------------------------------------
+# The developer's real ~/.henchmen is never touched
+# ---------------------------------------------------------------------------
+
+_REAL_HOME_HENCHMEN_KEY = pytest.StashKey[pathlib.Path]()
+_REAL_HOME_SNAPSHOT_KEY = pytest.StashKey[dict[str, tuple[int, int]]]()
+_FAKE_HOME_KEY = pytest.StashKey[pathlib.Path]()
+_ORIGINAL_HOME_KEY = pytest.StashKey[Any]()
+
+
+def _fingerprint(directory: pathlib.Path) -> dict[str, tuple[int, int]]:
+    """``{relative path: (size, mtime_ns)}`` for every file under ``directory`` (empty when it does not exist)."""
+    if not directory.is_dir():
+        return {}
+    result: dict[str, tuple[int, int]] = {}
+    for path in directory.rglob("*"):
+        with suppress(OSError):
+            if path.is_file():
+                info = path.stat()
+                result[str(path.relative_to(directory))] = (info.st_size, info.st_mtime_ns)
+    return result
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Redirect ``Path.home()`` to a session-scoped temp dir and fingerprint the real ``~/.henchmen``."""
+    real_henchmen = pathlib.Path.home() / ".henchmen"
+    config.stash[_REAL_HOME_HENCHMEN_KEY] = real_henchmen
+    config.stash[_REAL_HOME_SNAPSHOT_KEY] = _fingerprint(real_henchmen)
+    fake_home = pathlib.Path(tempfile.mkdtemp(prefix="henchmen-test-home-"))
+    config.stash[_FAKE_HOME_KEY] = fake_home
+    config.stash[_ORIGINAL_HOME_KEY] = pathlib.Path.__dict__["home"]
+    pathlib.Path.home = classmethod(lambda cls: fake_home)  # type: ignore[assignment,method-assign]
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Fail the session if anything under the developer's real ``~/.henchmen`` changed."""
+    config = session.config
+    real_henchmen = config.stash.get(_REAL_HOME_HENCHMEN_KEY, None)
+    if real_henchmen is None:
+        return
+    before = config.stash[_REAL_HOME_SNAPSHOT_KEY]
+    after = _fingerprint(real_henchmen)
+    if after != before:
+        changed = sorted(key for key in before.keys() | after.keys() if before.get(key) != after.get(key))
+        sys.stderr.write(
+            f"\nERROR: the test session modified the developer's real {real_henchmen}: {changed}. "
+            "Tests must use the isolated home and per-test stores from tests/conftest.py.\n"
+        )
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    original = config.stash.get(_ORIGINAL_HOME_KEY, None)
+    if original is not None:
+        pathlib.Path.home = original  # type: ignore[method-assign]
+    fake_home = config.stash.get(_FAKE_HOME_KEY, None)
+    if fake_home is not None:
+        shutil.rmtree(fake_home, ignore_errors=True)
+
+
+def real_home_henchmen_dir(config: pytest.Config) -> pathlib.Path:
+    """The developer's real ``~/.henchmen`` as it was before the session redirected ``Path.home()``."""
+    return config.stash[_REAL_HOME_HENCHMEN_KEY]
+
+
+_SERVER_MODULES = ("henchmen.forge.server", "henchmen.mastermind.server", "henchmen.dispatch.server")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_local_state(
+    _hermetic_settings_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[None]:
+    """Give every test its own local DocumentStore file, ObjectStore directory and eval database.
+
+    Runs after ``_hermetic_settings_env`` strips ``HENCHMEN_*`` (it depends on it), and
+    drops any document store a server module created lazily on its ``app.state``
+    during the test, so the next test cannot reuse it.
+    """
+    state_dir = tmp_path_factory.mktemp("local-state")
+    monkeypatch.setenv("HENCHMEN_LOCAL_SQLITE_PATH", str(state_dir / "henchmen.db"))
+    monkeypatch.setenv("HENCHMEN_LOCAL_STORAGE_DIR", str(state_dir / "storage"))
+    monkeypatch.setenv("HENCHMEN_EVAL_DB_PATH", str(state_dir / "eval-results.db"))
+    had_store = {
+        name: hasattr(sys.modules[name].app.state, "document_store")
+        for name in _SERVER_MODULES
+        if name in sys.modules and hasattr(sys.modules[name], "app")
+    }
+    yield
+    for name in _SERVER_MODULES:
+        module = sys.modules.get(name)
+        app = getattr(module, "app", None)
+        if app is None or had_store.get(name, False) or not hasattr(app.state, "document_store"):
+            continue
+        store = app.state.document_store
+        connection = getattr(store, "_conn", None)
+        with suppress(Exception):
+            if connection is not None:
+                connection.close()
+        with suppress(AttributeError):
+            delattr(app.state, "document_store")
 
 
 @pytest.fixture(autouse=True)

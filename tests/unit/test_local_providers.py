@@ -1036,6 +1036,8 @@ class TestSQLiteQueryOperators:
         home = tmp_path / "home"
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
         monkeypatch.chdir(tmp_path)
+        # tests/conftest.py gives every test its own SQLite file; the unconfigured default is under test here.
+        monkeypatch.delenv("HENCHMEN_LOCAL_SQLITE_PATH", raising=False)
         settings = _mock_settings()
         expected = default_db_path(settings)
         assert expected.parent == home / ".henchmen"
