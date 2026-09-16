@@ -189,6 +189,11 @@ class TestJwtRedaction:
         assert redact(text) == text
 
 
+# Slack refresh-token prefix, assembled at runtime: a literal "xoxe" in the source
+# trips GitHub push protection even in an invented fixture.
+XOXE = "xox" + "e"
+
+
 class TestSlackTokenRedaction:
     def test_bot_token_is_redacted(self):
         result = redact("Slack rejected xoxb-1111-2222-secretbot: invalid_auth")
@@ -201,20 +206,20 @@ class TestSlackTokenRedaction:
         assert REDACTED in result
 
     def test_enterprise_token_is_redacted(self):
-        result = redact("enterprise install token xox" "e-1-secretenterprise rejected")
+        result = redact(f"enterprise install token {XOXE}-1-secretenterprise rejected")
         assert "secretenterprise" not in result
         assert REDACTED in result
 
     def test_rotation_refresh_token_is_redacted(self):
-        result = redact("refresh token xox" "e.xoxb-1-secretrotationbot rejected")
+        result = redact(f"refresh token {XOXE}.xoxb-1-secretrotationbot rejected")
         assert "secretrotationbot" not in result
-        assert "xox" "e" not in result
+        assert XOXE not in result
         assert REDACTED in result
 
     def test_rotation_user_token_is_redacted(self):
-        result = redact("refresh token xox" "e.xoxp-1-secretrotationuser rejected")
+        result = redact(f"refresh token {XOXE}.xoxp-1-secretrotationuser rejected")
         assert "secretrotationuser" not in result
-        assert "xox" "e" not in result
+        assert XOXE not in result
         assert REDACTED in result
 
 
@@ -341,7 +346,7 @@ _NEW_PATTERN_PATHOLOGICAL_INPUTS = (
     # Slack token shapes: a run with no trailing non-alphanumeric character to stop
     # the greedy `[A-Za-z0-9-]+` body, and the compound rotation-token prefix.
     "xoxb-" * 20000,
-    "xox" "e.xoxb-" * 20000,
+    (XOXE + ".xoxb-") * 20000,
     # Basic-auth lookahead: a single long lowercase run after "basic " forces the
     # lookahead's inner `*` to backtrack across the whole run before failing.
     "basic " + "a" * 100_000,
