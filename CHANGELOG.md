@@ -104,8 +104,31 @@ silently ignored, and the Dispatch container never ran its own HTTP app.
   `problems` and `services`.
 - Settings `local_container_hostname` and `operative_task_token`.
 - Settings `local_docker_network` and `operative_image`.
+- Setup Console connection steps (`/console/api/steps/*`): AI provider (live
+  key check, model list, per-task cost estimate and spending limit), GitHub
+  (GitHub App created from a manifest, installation, default repository),
+  Slack (manifest link, token checks, channel join and test message), Jira
+  (project and custom-field pickers, intake label) and a first task with a
+  live timeline. Every write goes through one configuration writer that
+  accepts only real settings and never returns a saved secret.
+- GitHub App authentication (`henchmen.utils.github_auth`): installation
+  tokens minted from the App's key, cached until five minutes before expiry,
+  scoped to one repository; every server-side GitHub call uses them, and
+  operatives receive only a short-lived token and refresh it before it
+  expires (`POST /mastermind/internal/tasks/{task_id}/github-token`). The App
+  requests contents, pull requests and issues write plus metadata, checks and
+  actions read — never workflows — so a change to `.github/workflows/`
+  escalates with a clear message. Without an App, `HENCHMEN_GITHUB_TOKEN`
+  works as before.
+- Settings `HENCHMEN_GITHUB_APP_ID`, `HENCHMEN_GITHUB_APP_INSTALLATION_ID`,
+  `HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH`, `HENCHMEN_GITHUB_API_URL`,
+  `HENCHMEN_GITHUB_WEB_URL`, `HENCHMEN_GITHUB_TOKEN_EXPIRES_AT`, `HENCHMEN_JIRA_INTAKE_LABEL`.
+- `henchmen init` and `henchmen doctor` validate AWS Bedrock live, and doctor
+  verifies GitHub App token minting.
 
 ### Changed
+- Operative containers no longer inherit the GitHub token implicitly from
+  settings; LairManager passes exactly one token.
 - **Local-orchestrator CI runs in a gate container.** Whenever the effective container orchestrator is
   local Docker, which includes a repository checkout running `HENCHMEN_PROVIDER=local`, Forge CI and the
   `fix_lint` node run in a gate container from the operative image, so both now need Docker and that

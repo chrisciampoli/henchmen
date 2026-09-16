@@ -271,7 +271,7 @@ the bare names a Cloud Run secret mount injects (`GITHUB_TOKEN`,
 | `HENCHMEN_PROVIDER` | `local`, `gcp`, or `aws` | `gcp` |
 | `HENCHMEN_ENVIRONMENT` | `dev`, `staging`, or `prod` | `dev` |
 | `HENCHMEN_LLM_PROVIDER` | `anthropic`, `openai`, `local`, `gcp`, `aws` | follows `HENCHMEN_PROVIDER` |
-| `HENCHMEN_GITHUB_TOKEN` | Classic PAT with the `repo` scope | *(required for PRs)* |
+| `HENCHMEN_GITHUB_TOKEN` | Classic PAT with the `repo` scope (used when no GitHub App is configured) | *(required for PRs)* |
 | `HENCHMEN_GITHUB_DEFAULT_REPO` | Target repository, `owner/repo` | *(required)* |
 | `HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD` | Spend allowed per task | `6.0` |
 | `HENCHMEN_DISPATCH_API_TOKEN` | Bearer token for `POST /api/v1/tasks` (open in dev when empty, 401 in staging/prod) | *(empty)* |
@@ -301,8 +301,22 @@ On Ollama each tier falls back to `HENCHMEN_LLM_OLLAMA_MODEL` unless you set
 <details>
 <summary><strong>GitHub setup</strong></summary>
 
-Henchmen pushes branches and opens pull requests with a **classic personal
-access token**, not a GitHub App.
+Henchmen pushes branches and opens pull requests one of two ways. The
+guided-setup Console's GitHub step does the first for you (it creates a
+GitHub App from a manifest and walks you through installing it); a **classic
+personal access token** works too, and is what a hand-edited `.env.local`
+uses.
+
+**GitHub App (created by the Console).** Henchmen then mints short-lived,
+repository-scoped installation tokens on demand — operatives never see a
+long-lived credential. The App requests contents, pull requests and issues
+write plus metadata, checks and actions read, and deliberately never
+`workflows`, so a push touching `.github/workflows/` is refused by GitHub and
+the task escalates with a clear message instead of failing silently. See
+`.env.example` for the `HENCHMEN_GITHUB_APP_*` settings the Console writes; a
+partly configured App fails closed rather than falling back to a token.
+
+**Classic personal access token.**
 
 1. Create one at **Settings > Developer settings > Personal access tokens >
    Tokens (classic)** with the **`repo`** scope.

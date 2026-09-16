@@ -195,6 +195,23 @@ Run secret mount in production and a `HENCHMEN_`-prefixed value from
 | `DISPATCH_API_TOKEN` | `dispatch_api_token` | Dispatch (`POST /api/v1/tasks` bearer token; empty is open in dev with a warning, 401 in staging/prod) |
 | `HENCHMEN_METRICS_AUTH_TOKEN` | `metrics_auth_token` | Mastermind (`/metrics/*` and `/api/v1/metrics/summary` bearer token; Terraform also mounts it on Dispatch and Forge) |
 
+### GitHub App credentials
+
+When `HENCHMEN_GITHUB_APP_ID`, `HENCHMEN_GITHUB_APP_INSTALLATION_ID` and
+`HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH` are all set, Mastermind, Forge and the
+Dossier use GitHub App installation tokens (minted on demand, cached until five
+minutes before expiry) instead of `GITHUB_TOKEN`, and LairManager passes each
+operative a token scoped to its repository in `HENCHMEN_GITHUB_TOKEN` /
+`GITHUB_TOKEN` rather than mounting the `github-token` secret. A partly set App
+or a missing key file is reported by `henchmen doctor` and blocks startup
+validation. Installation tokens last one hour: desktop operatives refresh
+theirs ten minutes before expiry through
+`POST /mastermind/internal/tasks/{task_id}/github-token` (task token required),
+while cloud operatives, which hold no task token, keep the token they started
+with. The App never requests `workflows`, so a push that changes
+`.github/workflows/` is refused by GitHub and the task escalates with that
+reason.
+
 ### Operative-Specific Variables (injected by LairManager)
 
 LairManager builds each operative's environment in two layers.

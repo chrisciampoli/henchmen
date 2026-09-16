@@ -119,6 +119,13 @@ Cloud Run (services: Dispatch, Mastermind, Forge), Cloud Run Jobs (Operative), P
   port before any `Settings` exist; `--port` is copied into it)
 - Credential settings accept both `HENCHMEN_X` and the bare name a Cloud Run
   secret mount injects (`GITHUB_TOKEN`, `SLACK_BOT_TOKEN`, ...) via `AliasChoices`
+- GitHub tokens come from `henchmen.utils.github_auth.get_github_token_async`
+  (or `get_github_token` in sync code), never `settings.github_token`: it returns
+  a repository-scoped GitHub App installation token when an App is configured
+  and the PAT otherwise. Only operative-side code reads the injected token directly.
+- Console step routers write configuration only through
+  `henchmen.console.config_store.ConfigStore` and complete a step only through
+  `SetupStateStore.record_step_complete`, after validation succeeded.
 
 ## Task Completion Checklist
 
@@ -241,3 +248,7 @@ gcloud run jobs update henchmen-${ENV}-lair-template \
 - Don't give an operative the internal push token — it gets only `HENCHMEN_OPERATIVE_TASK_TOKEN` for its own task
 - Don't write a secret file by hand — use `henchmen.config.secret_files` (0600, O_BINARY, atomic)
 - Don't let a client write setup completion — steps record it through `SetupStateStore.record_step_complete`
+- Don't read `settings.github_token` in server code — use the credentials
+  provider (`tests/unit/test_github_auth.py` enforces it)
+- Don't return a saved secret from a Console route — report it as `"configured"`
+- Don't request the `workflows` permission for the GitHub App — operatives must not change CI workflows
