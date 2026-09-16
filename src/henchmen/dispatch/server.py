@@ -321,6 +321,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     for problem in settings.validate_for_runtime():
         logger.warning("[dispatch] Configuration problem: %s", problem)
+    for notice in settings.runtime_notices():
+        logger.warning("[dispatch] Configuration notice: %s", notice)
     if not fail_open_allowed(settings) and not settings.dispatch_api_token:
         logger.warning(
             "[dispatch] Configuration problem: HENCHMEN_DISPATCH_API_TOKEN is empty, so POST /api/v1/tasks "

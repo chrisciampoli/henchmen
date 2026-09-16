@@ -859,6 +859,38 @@ def test_run_mode_start_keeps_the_key_the_environment_names(monkeypatch: pytest.
     assert not stale[1].exists()
 
 
+def test_run_mode_starts_with_a_github_app_created_but_not_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A1: an abandoned reconnect leaves app id + key path with no installation id.
+
+    Nothing was broken before the user pressed "Create GitHub App", so the next
+    restart must start services normally and only say what is left to finish.
+    """
+    from henchmen.cli import _serve
+    from henchmen.console.state import SetupState, SetupStep
+    from henchmen.utils.github_auth import APP_AWAITING_INSTALLATION_MESSAGE
+
+    monkeypatch.setenv("HENCHMEN_LOCAL_SERVE_PORT", "8000")
+    monkeypatch.setenv("HENCHMEN_DATA_DIR", str(tmp_path))
+    current, _unrelated, _stale = _github_app_keys(tmp_path)
+    _run_mode_config(tmp_path, f"HENCHMEN_GITHUB_APP_ID=2\nHENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH={current}\n")
+    SetupStateStore(tmp_path / "setup-state.json").save(
+        SetupState(completed_steps=[SetupStep.AI_PROVIDER, SetupStep.GITHUB], completed=True)
+    )
+    with (
+        patch("henchmen.cli.serve.build_serve_app", return_value=MagicMock()) as build_services,
+        patch("henchmen.cli.serve.serve_app", return_value=0) as run,
+        caplog.at_level(logging.WARNING, logger="henchmen"),
+        pytest.raises(SystemExit) as exit_info,
+    ):
+        _serve(_serve_args())
+    assert exit_info.value.code == 0
+    build_services.assert_called_once()
+    assert run.call_args.args[0] is build_services.return_value
+    assert APP_AWAITING_INSTALLATION_MESSAGE in caplog.text
+
+
 def test_setup_and_attention_modes_remove_no_github_app_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from henchmen.cli import _serve
     from henchmen.console.state import SetupState, SetupStep

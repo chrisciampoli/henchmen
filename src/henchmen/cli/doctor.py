@@ -436,16 +436,24 @@ def check_jira(settings: Settings, *, offline: bool = False) -> CheckResult:
 
 
 def check_runtime_config(settings: Settings) -> CheckResult:
-    """Surface every problem ``Settings.validate_for_runtime`` knows about."""
+    """Surface every problem ``Settings.validate_for_runtime`` knows about, and every notice.
+
+    A notice (``Settings.runtime_notices``) is a half-finished setup step, not a
+    broken configuration: it never fails the check on its own -- it warns, so it
+    is never silently dropped either.
+    """
     problems = settings.validate_for_runtime()
-    if not problems:
-        return CheckResult(name="Runtime config", status=CheckStatus.OK, message="no configuration problems found")
-    return CheckResult(
-        name="Runtime config",
-        status=CheckStatus.FAIL,
-        message=f"{len(problems)} problem(s): " + " ".join(problems),
-        hint="Run `henchmen init` to fix these interactively.",
-    )
+    notices = settings.runtime_notices()
+    if problems:
+        return CheckResult(
+            name="Runtime config",
+            status=CheckStatus.FAIL,
+            message=f"{len(problems)} problem(s): " + " ".join([*problems, *notices]),
+            hint="Run `henchmen init` to fix these interactively.",
+        )
+    if notices:
+        return CheckResult(name="Runtime config", status=CheckStatus.WARN, message=" ".join(notices))
+    return CheckResult(name="Runtime config", status=CheckStatus.OK, message="no configuration problems found")
 
 
 def check_operative_image(image: str = DEFAULT_LOCAL_OPERATIVE_IMAGE) -> CheckResult:
