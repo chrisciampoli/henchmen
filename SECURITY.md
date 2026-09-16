@@ -162,7 +162,10 @@ accepted, pre-existing exposure, not a new one introduced by refreshing.
 
 The GitHub callbacks the Console exposes without a session are
 authorised by single-use state values that expire after an hour, stored as
-SHA-256 digests. Revoking access is done on GitHub (uninstall or delete the
+SHA-256 digests. Single use is a guarantee within one process — `henchmen
+serve` is one process, so it holds for a desktop install; several Henchmen
+processes sharing one data directory could each consume the same state once.
+Revoking access is done on GitHub (uninstall or delete the
 App); Henchmen then fails closed with a "reconnect GitHub" message.
 
 ## Reporting a Vulnerability

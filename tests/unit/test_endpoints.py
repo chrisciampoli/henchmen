@@ -21,6 +21,21 @@ def _config(tmp_path: Path, text: str) -> Path:
     return path
 
 
+def test_the_settings_model_is_built_once_per_masking_choice(tmp_path: Path) -> None:
+    """C2: the resolver runs on every Console call; rebuilding a pydantic model each time was waste."""
+    from henchmen.utils.endpoints import _endpoint_settings_class
+
+    assert _endpoint_settings_class(frozenset()) is _endpoint_settings_class(frozenset())
+    masked = frozenset({"github_api_url"})
+    assert _endpoint_settings_class(masked) is _endpoint_settings_class(masked)
+    assert _endpoint_settings_class(masked) is not _endpoint_settings_class(frozenset())
+    # Caching must not make the resolver stale: it still reads the file on every call.
+    config = _config(tmp_path, "HENCHMEN_GITHUB_WEB_URL=https://one.example.test\n")
+    assert resolve_github_endpoints(config).web_url == "https://one.example.test"
+    config.write_text("HENCHMEN_GITHUB_WEB_URL=https://two.example.test\n", encoding="utf-8")
+    assert resolve_github_endpoints(config).web_url == "https://two.example.test"
+
+
 def test_defaults_without_a_file(tmp_path: Path) -> None:
     expected = GitHubEndpoints(api_url="https://api.github.com", web_url="https://github.com")
     assert resolve_github_endpoints(tmp_path / "missing.env") == expected

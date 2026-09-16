@@ -28,6 +28,7 @@ Phase 2C's other configurable endpoints (C14) belong in this module too.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -80,7 +81,16 @@ class _MaskedEnvironment(PydanticBaseSettingsSource):
         return {key: value for key, value in self._inner().items() if key.lower() not in self._masked}
 
 
+@cache
 def _endpoint_settings_class(masked_fields: frozenset[str]) -> type[BaseSettings]:
+    """The settings model for a masking choice, built once per choice and reused.
+
+    :func:`resolve_github_endpoints` runs on every Console call that touches
+    GitHub, and the class it needs depends only on which fields are masked --
+    at most the four subsets of the two endpoint fields -- so building a new
+    pydantic model (and its core schema) each time was pure waste.
+    """
+
     class _GitHubEndpointSettings(BaseSettings):
         model_config = SettingsConfigDict(
             env_prefix="HENCHMEN_",

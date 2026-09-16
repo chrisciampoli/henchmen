@@ -112,6 +112,20 @@ WORKSPACE_CHOICE = "slack_workspace"
 _TEST_MESSAGE_COOLDOWN_SECONDS = 30.0
 _last_test_message: dict[tuple[str, str], float] = {}
 
+
+def _remember_test_message(key: tuple[str, str], now: float) -> None:
+    """Record a posted test message, dropping every entry whose cooldown has already passed.
+
+    The map is keyed on ``(workspace fingerprint, channel id)`` and lives for the
+    life of the process, so it is swept on each write: an entry past the cooldown
+    window can no longer skip anything, and keeping it would only let a long-lived
+    Console grow one entry per channel ever chosen.
+    """
+    for stale in [entry for entry, sent in _last_test_message.items() if now - sent >= _TEST_MESSAGE_COOLDOWN_SECONDS]:
+        del _last_test_message[stale]
+    _last_test_message[key] = now
+
+
 SLACK_BOT_SCOPES: tuple[str, ...] = (
     "app_mentions:read",
     "chat:write",
@@ -432,7 +446,7 @@ async def choose_channel(body: ChannelChoice, config: ConfigDep, setup: SetupDep
     else:
         posted = await run_in_threadpool(checks.post_slack_message, bot_token, selected.id, TEST_MESSAGE)
         if posted.status == CheckStatus.OK:
-            _last_test_message[(fingerprint, selected.id)] = time.monotonic()
+            _remember_test_message((fingerprint, selected.id), time.monotonic())
     if posted.status != CheckStatus.OK:
         return step_failed(STEP, problem_from_check(posted, field="channel_id"))
     test_message_state = "already confirmed" if skipped else "posted"
