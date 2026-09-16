@@ -141,7 +141,11 @@ with a plain-language message rather than retried or silently dropped. A
 partly configured App (some but not all of `HENCHMEN_GITHUB_APP_ID`,
 `HENCHMEN_GITHUB_APP_INSTALLATION_ID`, `HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH`
 set) fails every GitHub call closed — it never falls back to
-`HENCHMEN_GITHUB_TOKEN`.
+`HENCHMEN_GITHUB_TOKEN`. Scoping a token to one repository means a task with
+no resolvable repository gets no token at all rather than one that reaches
+every repository the App can see; a task dispatched without a repository
+fails immediately instead of running (see `docs/troubleshooting.md`, "With a
+GitHub App, a task with no repository fails immediately").
 
 Cloud Run App operatives are the one exception to "operatives only ever
 receive a refreshable token": with no desktop lair to bind a refresh request

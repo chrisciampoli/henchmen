@@ -402,3 +402,29 @@ follow-up, not yet implemented.
 `henchmen init`/`henchmen doctor` from a machine that can reach the provider
 APIs directly, or complete `.env.local` by hand and skip the affected Console
 steps.
+
+## 18. With a GitHub App, a task with no repository fails immediately
+
+**Symptom:** A task dispatched without a repository (a Jira issue with no
+repo custom field and no `HENCHMEN_GITHUB_DEFAULT_REPO`, or a CLI/`henchmen
+chat` task with no `--repo`) fails right away with a message about having no
+repository. No operative container ever starts — there's nothing in the logs
+about a lair, a clone, or a timeout, because the failure happens before any of
+that.
+
+**Diagnosis:** With a GitHub App configured, Henchmen mints installation
+tokens scoped to exactly one repository (never one for the whole
+installation, which would reach every repository the App can see), so
+`LairManager` refuses to create a lair for a task with no resolvable
+repository (`GitHubRepositoryReferenceError`,
+`src/henchmen/mastermind/lair_manager.py`). This is deliberate — a
+narrower failure than silently handing an operative a token that can act
+across every repository the App is installed on — not a bug. It only affects
+installs with a GitHub App; with a classic personal access token instead, the
+same task still runs, just with an empty workspace (the operative logs "No
+REPO_URL set; workspace will be empty" and has nothing to change).
+
+**Fix:** Set a default repository in the Console's GitHub step (or
+`HENCHMEN_GITHUB_DEFAULT_REPO`), or make sure the task itself names one —
+an explicit `owner/name` on the CLI, or the Jira repo custom field
+(`HENCHMEN_JIRA_REPO_FIELD`) filled in on the issue.
