@@ -55,11 +55,11 @@ _BASIC_AUTH_PATTERN = re.compile(r"\b(?i:(basic))[ \t]+(?=[A-Za-z0-9+/=]*[A-Z0-9
 # message cut at 200 characters) is therefore redacted from its header up to
 # the next ``-----`` or, when there is none, to the end of the text -- which
 # can take ordinary text after the key with it (deliberate: fail closed). A
-# run of headers with no footer (``"-----BEGIN PRIVATE KEY-----" * N``) ends
+# run of headers with no footer (a repeated PEM header) ends
 # each match at the next ``-----`` instead of rescanning to the end of the
 # input from every header.
 _PEM_PRIVATE_KEY_PATTERN = re.compile(
-    r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----(?:[^-]|-(?!----))*(?:-----END [A-Z ]{0,40}PRIVATE KEY-----)?"
+    r"-{5}BEGIN [A-Z ]{0,40}PRIVATE KEY-{5}(?:[^-]|-(?!----))*(?:-{5}END [A-Z ]{0,40}PRIVATE KEY-{5})?"
 )
 
 # A JSON Web Token: three base64url segments separated by dots, the header
