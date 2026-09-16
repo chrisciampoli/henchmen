@@ -870,6 +870,43 @@ def test_a_held_mint_lock_is_never_swept(key_file: Path, github: FakeGitHub, clo
     assert provider._sync_locks["acme/webapp"] is held
 
 
+@pytest.mark.asyncio
+async def test_minting_sweeps_the_per_loop_async_locks_too(key_file: Path, github: FakeGitHub, clock: _Clock) -> None:
+    """The async path is the one the servers use, so its per-loop lock map is swept by the same rule."""
+    provider = _provider(key_file, github, clock)
+    github.repositories = [FakeGitHub.repository("acme/webapp"), FakeGitHub.repository("acme/api")]
+    await provider.token_async("acme/webapp")
+    await provider.token_async("acme/api")
+    loop = asyncio.get_running_loop()
+    assert sorted(provider._async_locks[loop]) == ["acme/api", "acme/webapp"]
+
+    # acme/webapp's token is long gone; acme/api's is re-minted here, so its lock stays.
+    clock.now += github.token_lifetime_seconds + github_auth.TOKEN_SWEEP_AFTER_SECONDS + 1
+    await provider.token_async("acme/api")
+
+    assert list(provider._tokens) == ["acme/api"]
+    assert list(provider._async_locks[loop]) == ["acme/api"]
+
+
+@pytest.mark.asyncio
+async def test_a_held_async_mint_lock_is_never_swept(key_file: Path, github: FakeGitHub, clock: _Clock) -> None:
+    provider = _provider(key_file, github, clock)
+    github.repositories = [FakeGitHub.repository("acme/webapp")]
+    await provider.token_async("acme/webapp")
+    loop = asyncio.get_running_loop()
+    held = provider._async_locks[loop]["acme/webapp"]
+    await held.acquire()
+    try:
+        with provider._lock:
+            provider._sweep_locked(
+                clock.now + github.token_lifetime_seconds + github_auth.TOKEN_SWEEP_AFTER_SECONDS + 1
+            )
+    finally:
+        held.release()
+    assert provider._tokens == {}
+    assert provider._async_locks[loop]["acme/webapp"] is held
+
+
 def test_app_awaiting_installation_only_matches_the_created_not_installed_shape() -> None:
     assert github_auth.app_awaiting_installation("4242", "/k.pem", "  ") is True
     assert github_auth.app_awaiting_installation("4242", "/k.pem", "99") is False
