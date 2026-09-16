@@ -428,3 +428,43 @@ REPO_URL set; workspace will be empty" and has nothing to change).
 `HENCHMEN_GITHUB_DEFAULT_REPO`), or make sure the task itself names one —
 an explicit `owner/name` on the CLI, or the Jira repo custom field
 (`HENCHMEN_JIRA_REPO_FIELD`) filled in on the issue.
+
+---
+
+## 19. Every GitHub operation says the App is "only partly configured"
+
+**Symptom:** You pressed **Create GitHub App** in the Console's GitHub step but
+never finished installing it — the github.com tab was closed, or your
+organisation's owner has to approve the app first. Henchmen starts normally, but
+every GitHub operation fails with *"The GitHub App is only partly configured:
+set HENCHMEN_GITHUB_APP_INSTALLATION_ID"*, and any task dispatched in that
+window fails before an operative container starts. `henchmen doctor` reports it
+as a **warning**, not a failure: *"The GitHub App has been created but not
+installed yet — finish the GitHub step in the Console."* The Console's GitHub
+step shows the app as created but not installed, and the step re-opens.
+
+**Diagnosis:** Creating the app writes `HENCHMEN_GITHUB_APP_ID` and
+`HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH` and clears
+`HENCHMEN_GITHUB_APP_INSTALLATION_ID` in one write — an installation belongs to
+one app, so the previous one can never carry over. Until the new app is
+installed there is no installation to mint tokens from, and Henchmen fails
+closed rather than quietly falling back to `HENCHMEN_GITHUB_TOKEN`: someone set
+out to use a GitHub App, so silently using the PAT would hide the mistake.
+
+This one half-finished state deliberately does **not** stop Henchmen from
+starting (everything else that is only partly configured does). Nothing was
+broken a moment before the app was created, so taking the whole install into
+needs-attention mode on the next restart — with no services and no way to
+finish the step — would be worse than the problem.
+
+**Fix:** Open the Console and finish the GitHub step:
+
+- If the install tab was closed, choose **Install on GitHub** for a fresh
+  install link, then pick the account that owns your repositories.
+- If an organisation owner has to approve the app, send them the request text
+  the step shows, then choose **Check again** once they have approved it.
+- Finally choose the default repository — the step is complete only once an
+  installation *and* a repository are saved.
+
+Then re-run any task that failed in the meantime. If the app was deleted on
+github.com, choose **Create GitHub App** and start over.

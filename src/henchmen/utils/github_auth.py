@@ -492,16 +492,26 @@ class GitHubCredentialsProvider:
     def _sweep_locked(self, now: float) -> None:
         """Drop tokens expired longer than :data:`TOKEN_SWEEP_AFTER_SECONDS`, and their idle locks.
 
-        Call with ``self._lock`` held. A lock another thread is currently
-        holding is kept: removing it would let the next caller create a second
-        lock for the same repository and mint twice in parallel.
+        Call with ``self._lock`` held. Both lock maps are swept by the same rule
+        -- the async one per event loop, since that is how it is keyed, and it is
+        the map the servers actually fill (Mastermind and Forge mint on the loop).
+        A lock somebody is currently holding is always kept: removing it would let
+        the next caller create a second lock for the same repository and mint
+        twice in parallel. ``asyncio.Lock.locked()`` is a plain flag read, so it
+        is safe to ask from this thread.
         """
         stale = [key for key, token in self._tokens.items() if token.expires_at + TOKEN_SWEEP_AFTER_SECONDS < now]
         for key in stale:
             del self._tokens[key]
-            lock = self._sync_locks.get(key)
-            if lock is not None and not lock.locked():
+            sync_lock = self._sync_locks.get(key)
+            if sync_lock is not None and not sync_lock.locked():
                 del self._sync_locks[key]
+            # list(...): the WeakKeyDictionary must not be iterated lazily while a
+            # loop it still references could be collected mid-sweep.
+            for locks in list(self._async_locks.values()):
+                async_lock = locks.get(key)
+                if async_lock is not None and not async_lock.locked():
+                    del locks[key]
 
     def _cached(self, cache_key: str, margin: int) -> InstallationToken | None:
         """The cached token for ``cache_key`` if it outlives ``margin`` seconds from now."""
