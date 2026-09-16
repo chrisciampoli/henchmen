@@ -124,7 +124,14 @@ def test_without_a_submit_time_the_queued_state_is_not_bounded() -> None:
 
 @pytest.mark.parametrize(
     ("value", "expected_tzinfo"),
-    [("", None), ("not-a-time", None), ("2026-09-15T10:00:00+00:00", UTC), ("2026-09-15T10:00:00", UTC)],
+    [
+        ("", None),
+        ("not-a-time", None),
+        # A naive timestamp is refused, not guessed at as UTC: this module always
+        # writes an aware stamp, so a naive one means its zone is genuinely unknown.
+        ("2026-09-15T10:00:00", None),
+        ("2026-09-15T10:00:00+00:00", UTC),
+    ],
 )
 def test_parse_submitted_at(value: str, expected_tzinfo: object) -> None:
     parsed = parse_submitted_at(value)

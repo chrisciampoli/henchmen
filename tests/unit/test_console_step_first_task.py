@@ -198,6 +198,15 @@ def test_a_progress_read_that_fails_is_a_clear_problem(harness: ConsoleHarness, 
     assert body["problems"][0]["action"]
 
 
+def test_a_corrupt_setup_state_file_is_a_clear_problem_not_a_500(harness: ConsoleHarness) -> None:
+    """A corrupt state file must not turn a live-task poll into a 500 (carry-over fix)."""
+    harness.setup_store.path.write_text("not json", encoding="utf-8")
+    body = harness.get(f"{BASE}/tasks/{TASK_ID}").json()
+    assert body["ok"] is False
+    assert "setup progress" in body["problems"][0]["message"].lower()
+    assert body["problems"][0]["action"]
+
+
 def test_progress_in_setup_mode_explains_that_henchmen_must_start_first(tmp_path: Path) -> None:
     harness = make_harness(tmp_path)
     body = harness.get(f"{BASE}/tasks/{TASK_ID}").json()

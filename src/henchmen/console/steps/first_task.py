@@ -338,7 +338,17 @@ async def task_progress(
             action="Choose Try again. If it keeps failing, copy diagnostics from the Henchmen app.",
         )
         return step_failed(STEP, problem)
-    choices = setup.load().server_choices
+    try:
+        choices = setup.load().server_choices
+    except ValueError as exc:
+        # A corrupted setup-state file must read as a plain problem, not a 500 --
+        # the task itself is still running regardless of whether this file is intact.
+        logger.warning("Could not read setup progress while polling task %s: %s", task_id, redact(str(exc)))
+        problem = StepProblem(
+            message="Henchmen could not read your setup progress.",
+            action="Check that the Henchmen data folder is intact, then try again.",
+        )
+        return step_failed(STEP, problem)
     is_own_task = choices.get(FIRST_TASK_CHOICE) == task_id
     # The submit time is known only for the task this Console submitted; any other id
     # keeps the unbounded queued reading, since there is nothing to measure against.
