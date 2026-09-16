@@ -473,7 +473,6 @@ def test_an_expired_state_never_calls_github(tmp_path: Path, github: FakeGitHub)
         {"code": "code123", "state": "forged"},
         {"code": "code123"},
         {},
-        {"code": "code123", "state": "x" * 5000},
         {"code": "code123", "state": "forged", "redirect": "https://evil.example", "next": "//evil.example"},
     ],
 )
@@ -943,6 +942,36 @@ def test_installation_link_uses_the_configured_github_urls(tmp_path: Path, githu
     }
 
 
+def test_installation_link_asks_github_for_a_missing_slug(tmp_path: Path, github: FakeGitHub) -> None:
+    """B2: a lost display-only slug must not read as "create a second GitHub App"."""
+    harness = _harness(tmp_path, github)
+    _created_app(harness, github)
+    harness.setup_store.set_server_choices({"github_app_slug": ""})
+
+    body = harness.post(f"{BASE}/installation/link").json()
+
+    assert body["ok"] is True
+    assert body["details"]["install_url"].startswith(f"https://github.com/apps/{github.app_slug}/installations/new?")
+    assert [request.url.path for request in github.requests] == ["/app"]
+    # Recorded, so the next call needs no second round trip.
+    assert harness.setup_store.load().server_choices["github_app_slug"] == github.app_slug
+
+
+def test_installation_link_reports_a_deleted_app_instead_of_the_network(tmp_path: Path, github: FakeGitHub) -> None:
+    """B2 + B4: GitHub refusing the App's own JWT is not "check your internet connection"."""
+    harness = _harness(tmp_path, github)
+    _created_app(harness, github)
+    harness.setup_store.set_server_choices({"github_app_slug": ""})
+    github.app_id = "999999"  # the saved key no longer signs for an App GitHub knows
+
+    body = harness.post(f"{BASE}/installation/link").json()
+
+    assert body["ok"] is False
+    assert "Create GitHub App" in body["problems"][0]["action"]
+    assert "internet connection" not in body["problems"][0]["action"]
+    assert not harness.app.state.callback_states.path.exists()
+
+
 def test_installation_link_without_an_app(tmp_path: Path, github: FakeGitHub) -> None:
     harness = _harness(tmp_path, github)
     body = harness.post(f"{BASE}/installation/link").json()
@@ -1264,14 +1293,20 @@ def test_a_different_installation_from_check_again_reopens_the_step(tmp_path: Pa
     assert harness.get(BASE).json()["details"]["completed"] is False
 
 
-def test_status_completed_needs_an_installation_and_a_default_repo(tmp_path: Path, github: FakeGitHub) -> None:
+def test_status_completed_needs_the_app_an_installation_and_a_default_repo(tmp_path: Path, github: FakeGitHub) -> None:
     harness = _harness(tmp_path, github)
     harness.setup_store.record_step_complete(SetupStep.GITHUB)
     assert harness.get(BASE).json()["details"]["completed"] is False
     harness.config_store.update({"HENCHMEN_GITHUB_APP_INSTALLATION_ID": "77"}, section="GitHub")
     assert harness.get(BASE).json()["details"]["completed"] is False
     harness.config_store.update({"HENCHMEN_GITHUB_DEFAULT_REPO": REPO}, section="GitHub")
+    # Still not complete: nothing can mint a token without the App and its key file (B3).
+    assert harness.get(BASE).json()["details"]["completed"] is False
+    key_path = _created_app(harness, github)
     assert harness.get(BASE).json()["details"]["completed"] is True
+    key_path.unlink()
+    assert harness.get(BASE).json()["details"]["app_created"] is False
+    assert harness.get(BASE).json()["details"]["completed"] is False
 
 
 def test_a_stale_saved_slug_never_refuses_the_right_app(tmp_path: Path, github: FakeGitHub) -> None:
@@ -1314,6 +1349,20 @@ def test_installed_callback_parameters_are_length_bounded(
     assert "location" not in response.headers
     assert github.requests == []
     assert harness.config_store.config_file.read_bytes() == config_before
+
+
+@pytest.mark.parametrize("params", [{"code": "c", "state": "x" * 513}, {"code": "c" * 257, "state": "s"}])
+def test_manifest_callback_parameters_are_length_bounded(
+    tmp_path: Path, github: FakeGitHub, params: dict[str, str]
+) -> None:
+    """B5: the manifest callback bounds its query the same way ``installed`` does."""
+    harness = _harness(tmp_path, github, signed_in=False)
+    _add_conversion(github)
+    response = harness.get(CALLBACK, **params)
+    assert response.status_code == 422
+    assert "location" not in response.headers
+    assert github.requests == []
+    assert not harness.config_store.config_file.exists()
 
 
 def test_repositories_report_a_truncated_listing(tmp_path: Path, github: FakeGitHub) -> None:

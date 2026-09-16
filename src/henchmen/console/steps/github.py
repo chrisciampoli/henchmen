@@ -61,7 +61,8 @@ sends the UI to its waiting state.
 The session routes resolve the GitHub URLs fresh on every call:
 
 * ``POST /installation/link`` issues a new install URL with a fresh state for a
-  lost or closed install tab (ruling C9);
+  lost or closed install tab (ruling C9), asking GitHub for the App's own name
+  when the display-only slug in ``server_choices`` is missing;
 * ``POST /installation/check`` ("Check again") finds this App's installation
   with the app JWT;
 * ``GET /repositories`` lists what the installation can access, with an
@@ -225,8 +226,12 @@ async def status(config: ConfigDep, setup: SetupDep) -> StepSuccess:
             "installed": config.is_set(INSTALLATION_ID_KEY),
             "default_repo": config.get(DEFAULT_REPO_KEY),
             "private_key": CONFIGURED if created else "",
-            # A recorded completion counts only while what it verified is still configured.
+            # A recorded completion counts only while what it verified is still configured:
+            # the App itself (its id *and* the key file that signs for it), the installation
+            # and the chosen repository. Without the key nothing can mint a token, so a
+            # completion over a missing key file would be a connection that does not exist.
             "completed": STEP in state.completed_steps
+            and created
             and config.is_set(INSTALLATION_ID_KEY)
             and config.is_set(DEFAULT_REPO_KEY),
         },
@@ -309,8 +314,8 @@ async def manifest_callback(
     setup: SetupDep,
     states: StatesDep,
     http: HttpDep,
-    code: str = "",
-    state: str = "",
+    code: Annotated[str, Query(max_length=256)] = "",
+    state: Annotated[str, Query(max_length=512)] = "",
 ) -> RedirectResponse:
     """Public: verify state, convert the code into an App, store it and send the browser to install it."""
     data = states.consume(github_app.MANIFEST_PURPOSE, state)
@@ -439,10 +444,18 @@ def _credentials_problem(exc: GitHubAuthError) -> StepProblem:
 
 
 def _api_problem(exc: github_app.GitHubAppApiError) -> StepProblem:
-    return StepProblem(
-        message=f"GitHub did not answer as expected: {redact(str(exc))}",
-        action="Check your internet connection and choose Check again.",
+    """GitHub answered, but not as expected. 401/403/404 mean this App, not the network.
+
+    A missing or rejected App (deleted on github.com, or a key that is no longer
+    the App's) is not something "check your internet connection" can fix, and the
+    only way out is to create the App again -- so say that instead.
+    """
+    action = (
+        "The App may have been deleted -- choose Create GitHub App to start over."
+        if exc.status in (401, 403, 404)
+        else "Check your internet connection and choose Check again."
     )
+    return StepProblem(message=f"GitHub did not answer as expected: {redact(str(exc))}", action=action)
 
 
 def _install_request(web_url: str, slug: str) -> str:
@@ -609,19 +622,47 @@ async def installed(
     return back_to_console(github="installed")
 
 
+def _record_slug(setup: SetupStateStore, slug: str) -> None:
+    """Display-only: the App's own name as GitHub spells it. A failure is logged, never fatal."""
+    try:
+        setup.set_server_choices({SLUG_CHOICE: slug})
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not record the GitHub App name (%s)", type(exc).__name__)
+
+
 @router.post("/installation/link")
 async def installation_link(
-    config: ConfigDep, setup: SetupDep, states: StatesDep, seeded_env: SeededEnvDep
+    config: ConfigDep, setup: SetupDep, states: StatesDep, http: HttpDep, seeded_env: SeededEnvDep
 ) -> StepSuccess | StepFailure:
-    """A fresh install URL (new single-use state) for the saved App, for a lost or closed install tab (C9)."""
-    slug = setup.load().server_choices.get(SLUG_CHOICE, "")
-    if not app_created(config) or not github_app.is_valid_slug(slug):
+    """A fresh install URL (new single-use state) for the saved App, for a lost or closed install tab (C9).
+
+    The slug is a display value in ``server_choices``, so it can be missing
+    (a setup-state file restored from elsewhere, a failed write at step 5 of the
+    manifest callback) while the App itself is perfectly usable. GitHub knows the
+    App's own name, so it is asked for it -- ``GET /app`` with this App's JWT --
+    rather than the user being told to create a second App.
+    """
+    if not app_created(config):
         return step_failed(STEP, _not_created_problem())
     try:
         endpoints = github_app.github_endpoints(config.config_file, seeded_env=seeded_env)
     except github_app.EndpointError as exc:
         logger.warning("Refused to issue a GitHub App install link: %s", exc)
         return step_failed(STEP, endpoint_problem(exc))
+    slug = setup.load().server_choices.get(SLUG_CHOICE, "")
+    if not github_app.is_valid_slug(slug):
+        # The App JWT is signed from the app id and key file alone: a credentials
+        # provider needs an installation id, which is exactly what this route exists
+        # to go and get.
+        try:
+            app_jwt = _app_jwt(config)
+            async with http() as client:
+                slug = await github_app.get_app_slug(client, endpoints.api_url, app_jwt)
+        except GitHubAuthError as exc:
+            return step_failed(STEP, _credentials_problem(exc))
+        except github_app.GitHubAppApiError as exc:
+            return step_failed(STEP, _api_problem(exc))
+        _record_slug(setup, slug)
     try:
         state = states.issue(
             github_app.INSTALL_PURPOSE, {"slug": slug, "api_url": endpoints.api_url, "web_url": endpoints.web_url}
