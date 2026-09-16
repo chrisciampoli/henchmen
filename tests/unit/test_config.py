@@ -1,8 +1,34 @@
 """Unit tests for Settings configuration (env var binding, Pub/Sub prefix logic, defaults)."""
 
+from pathlib import Path
+
 import pytest
 
 from henchmen.config.settings import Environment, Settings, get_settings, require_secure_service_url
+
+# ---------------------------------------------------------------------------
+# The repository's own dotenv files never reach a Settings build (A4)
+# ---------------------------------------------------------------------------
+
+
+class TestRepositoryDotenvIsNeutralised:
+    """CI has no dotenv file; a developer's ``.env.local`` must not make tests pass locally."""
+
+    def test_a_default_settings_build_matches_one_with_no_dotenv_at_all(self) -> None:
+        assert Settings().model_dump() == Settings(_env_file=None).model_dump()  # type: ignore[call-arg]
+
+    def test_get_settings_matches_one_with_no_dotenv_at_all(self) -> None:
+        assert get_settings().model_dump() == Settings(_env_file=None).model_dump()  # type: ignore[call-arg]
+
+    def test_only_the_repository_dotenv_files_are_dropped(self, tmp_path: Path) -> None:
+        from tests.conftest import _REPO_ROOT, _without_repo_dotenv
+
+        assert _without_repo_dotenv((str(_REPO_ROOT / ".env.local"), str(_REPO_ROOT / ".env"))) is None
+        mine = str(tmp_path / ".env.local")
+        assert _without_repo_dotenv(mine) == (mine,)
+        assert _without_repo_dotenv((mine, str(_REPO_ROOT / ".env"))) == (mine,)
+        assert _without_repo_dotenv(None) is None
+
 
 # ---------------------------------------------------------------------------
 # Environment enum
