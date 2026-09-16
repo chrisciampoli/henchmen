@@ -18,6 +18,7 @@ from fastapi import Request
 
 from henchmen.console.callback_state import CallbackStateStore
 from henchmen.console.config_store import ConfigStore
+from henchmen.console.task_gateway import TaskGateway
 
 HttpClientFactory = Callable[[], httpx.AsyncClient]
 DEFAULT_HTTP_TIMEOUT = 10.0
@@ -52,3 +53,13 @@ def get_seeded_env(request: Request) -> dict[str, str]:
 def get_callback_states(request: Request) -> CallbackStateStore:
     """Single-use state values for the public GitHub callbacks."""
     return cast(CallbackStateStore, request.app.state.callback_states)
+
+
+def get_task_gateway(request: Request) -> TaskGateway | None:
+    """The run-mode task gateway (injected by ``build_serve_app``), or ``None`` in setup mode.
+
+    ``None`` is a real answer, not a failure: setup mode runs no services, so
+    the first-task step explains that Henchmen has to be started first (A6)
+    rather than hanging or raising.
+    """
+    return cast("TaskGateway | None", getattr(request.app.state, "task_gateway", None))

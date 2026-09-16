@@ -239,6 +239,11 @@ def build_serve_app(
             return {"status": "ok", "mode": "local", "services": ["dispatch", "mastermind", "forge"]}
 
         if console is not None:
+            from henchmen.console.task_gateway import ServiceTaskGateway
+
+            # The first-task step submits through the same broker and reads the same store as
+            # the services (A10: in-process, desktop only, authorised by the Console session).
+            console.state.task_gateway = ServiceTaskGateway(settings=settings, broker=shared_broker, store=shared_store)
             # Mounted last so it only receives paths no service or /health claims.
             app.mount("/", console)
 

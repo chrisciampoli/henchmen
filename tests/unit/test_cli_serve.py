@@ -317,6 +317,15 @@ def test_serve_app_mounts_the_console_after_the_services(serve_env: Path) -> Non
     assert client.get("/console/api/status").json()["mode"] == "run"
 
 
+def test_serve_app_gives_the_console_a_task_gateway(serve_env: Path) -> None:
+    from henchmen.config.settings import get_settings
+    from henchmen.console.task_gateway import ServiceTaskGateway
+
+    console = _console_app(serve_env, ConsoleMode.RUN)
+    build_serve_app(get_settings(), 8000, console=console)
+    assert isinstance(console.state.task_gateway, ServiceTaskGateway)
+
+
 def test_serve_app_without_console_is_unchanged(serve_env: Path) -> None:
     from henchmen.config.settings import get_settings
 
