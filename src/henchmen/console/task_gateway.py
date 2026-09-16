@@ -185,7 +185,14 @@ def _detail(execution: Mapping[str, Any], final_status: str) -> str:
 
 
 def parse_submitted_at(value: str) -> datetime | None:
-    """An ISO-8601 timestamp recorded in ``server_choices``, or ``None`` when absent or unreadable."""
+    """An ISO-8601 timestamp recorded in ``server_choices``.
+
+    ``None`` when absent, unreadable, or naive -- this module always writes an
+    aware UTC timestamp (`create_first_task` uses ``datetime.now(UTC)``), so a
+    naive value here means the stamp came from somewhere else and its zone is
+    unknown; guessing UTC could under- or over-state how long a task has been
+    queued, which is exactly what :data:`QUEUE_TIMEOUT_SECONDS` must get right.
+    """
     text = (value or "").strip()
     if not text:
         return None
@@ -193,7 +200,7 @@ def parse_submitted_at(value: str) -> datetime | None:
         stamp = datetime.fromisoformat(text)
     except ValueError:
         return None
-    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=UTC)
+    return stamp if stamp.tzinfo is not None else None
 
 
 def _queued(task_id: str, submitted_at: datetime | None, now: datetime | None) -> TaskTimeline:
