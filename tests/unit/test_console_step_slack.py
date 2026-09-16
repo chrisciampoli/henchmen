@@ -484,6 +484,17 @@ def test_cooldown_skips_a_second_post_to_the_same_channel_within_30_seconds(
     assert posts_after == posts_before
 
 
+def test_recording_a_test_message_sweeps_entries_past_the_cooldown() -> None:
+    """C1: the per-process cooldown map is bounded -- an entry that can no longer skip anything goes."""
+    now = 1_000.0
+    slack_step._last_test_message[("T1", "C-expired")] = now - slack_step._TEST_MESSAGE_COOLDOWN_SECONDS - 1
+    slack_step._last_test_message[("T1", "C-live")] = now - 1
+
+    slack_step._remember_test_message(("T1", "C-new"), now)
+
+    assert sorted(slack_step._last_test_message) == [("T1", "C-live"), ("T1", "C-new")]
+
+
 def test_cooldown_is_per_channel(harness: ConsoleHarness, slack: FakeSlack) -> None:
     _save_tokens(harness)
     assert harness.post(f"{BASE}/channel", {"channel_id": "C0001"}).json()["ok"] is True

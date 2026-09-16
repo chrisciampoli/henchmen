@@ -56,6 +56,12 @@ _KEY_FILE_NAME = "console-session.key"
 SETUP_TOKEN_FILE_NAME = "setup-token"
 _SEEDED_MARKER_SUFFIX = ".seeded"
 _SETUP_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
+# The exact host names a loopback browser sends, matched literally against a Host or Origin
+# header. Deliberately *not* the same set as ``henchmen.config.settings._LOOPBACK_NAMES``, and
+# the two must not be merged: that one answers "may a configured base URL use plain http?" and
+# parses any IP literal with ``ipaddress`` (so every address in 127.0.0.0/8 qualifies there),
+# while an allowlist for a request header must stay a fixed, literal set -- widening it to the
+# whole loopback network would accept spellings no browser sends.
 _LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _DEFAULT_PORTS: dict[str, int] = {"http": 80, "https": 443, "ws": 80, "wss": 443}
