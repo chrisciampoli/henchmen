@@ -280,8 +280,9 @@ def current_estimate(config: ConfigStore) -> tuple[float, float] | None:
     ``estimate_feature_task_cost`` behind :func:`estimate_task_cost`. The
     estimate is returned unrounded, because a ceiling a fraction of a cent below
     it is still a ceiling the executor's own gate would stop on. The ceiling is
-    the saved one, or -- when nothing is saved yet -- the recommendation for the
-    saved models, exactly as ``GET ""`` reports it.
+    :func:`effective_ceiling_usd` -- what the gate will really enforce -- never
+    the recommendation ``GET ""`` displays, or a config with no saved ceiling
+    would be warned about nothing and then refused at dispatch.
 
     ``None`` means "no opinion": no provider or model is saved yet, or pricing
     failed. The executor's pre-dispatch cost gate stays the enforcement point in
@@ -298,7 +299,7 @@ def current_estimate(config: ConfigStore) -> tuple[float, float] | None:
     if priced is None:
         return None
     raw_estimate, _rounded = priced
-    return raw_estimate, _ceiling(config, provider, models)
+    return raw_estimate, effective_ceiling_usd(config)
 
 
 def _spending_limit_explanation(estimate: float, recommended: float) -> str:
@@ -382,14 +383,37 @@ def _saved_models(config: ConfigStore, provider: str) -> dict[str, str]:
     return {_tier_key(tier): config.get(_env_key(name)) for tier, name in TIER_FIELDS[provider].items()}
 
 
-def _ceiling(config: ConfigStore, provider: str, models: dict[str, str]) -> float:
-    """The saved ceiling, or -- once a provider is saved -- the recommendation for it."""
+def _saved_ceiling(config: ConfigStore) -> float | None:
+    """The per-task limit written in the config file, or ``None`` when none is saved or it is unreadable."""
     saved = config.get(_CEILING_KEY).strip()
-    if saved:
-        try:
-            return float(saved)
-        except ValueError:
-            logger.warning("Ignoring non-numeric %s in the config file: %r", _CEILING_KEY, saved)
+    if not saved:
+        return None
+    try:
+        return float(saved)
+    except ValueError:
+        logger.warning("Ignoring non-numeric %s in the config file: %r", _CEILING_KEY, saved)
+        return None
+
+
+def effective_ceiling_usd(config: ConfigStore) -> float:
+    """The per-task limit the executor's cost gate will actually enforce.
+
+    The saved value, else the ``Settings`` default -- which is what an unset
+    ``HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD`` resolves to at runtime.
+    Deliberately *not* the recommendation this step would display: a config
+    written by ``henchmen init`` (or any config that predates this step) has no
+    saved ceiling, and treating the recommendation as the limit would show no
+    warning for a task the executor then refuses at dispatch.
+    """
+    saved = _saved_ceiling(config)
+    return saved if saved is not None else float(Settings.model_fields["operative_task_cost_ceiling_usd"].default)
+
+
+def _ceiling(config: ConfigStore, provider: str, models: dict[str, str]) -> float:
+    """For display: the saved ceiling, or -- once a provider is saved -- the recommendation for it."""
+    saved = _saved_ceiling(config)
+    if saved is not None:
+        return saved
     default = float(Settings.model_fields["operative_task_cost_ceiling_usd"].default)
     if provider in TIER_FIELDS and all(models.values()):
         try:
