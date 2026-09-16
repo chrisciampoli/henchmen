@@ -271,6 +271,36 @@ def recommended_ceiling_usd(estimate: float) -> float:
     return float(max(default, math.ceil(estimate * 1.5)))
 
 
+def current_estimate(config: ConfigStore) -> tuple[float, float] | None:
+    """``(estimate, ceiling)`` in USD for what is saved now, or ``None`` when it cannot be priced.
+
+    The first-task step warns before starting a task the cost gate would refuse
+    (ruling C2a), and must price it exactly the way this step does: the same
+    provider Settings, the same saved token budgets and the same
+    ``estimate_feature_task_cost`` behind :func:`estimate_task_cost`. The
+    estimate is returned unrounded, because a ceiling a fraction of a cent below
+    it is still a ceiling the executor's own gate would stop on. The ceiling is
+    the saved one, or -- when nothing is saved yet -- the recommendation for the
+    saved models, exactly as ``GET ""`` reports it.
+
+    ``None`` means "no opinion": no provider or model is saved yet, or pricing
+    failed. The executor's pre-dispatch cost gate stays the enforcement point in
+    that case; this warning only moves the refusal earlier, where it can be
+    explained.
+    """
+    provider = normalize_llm_provider(config.get("HENCHMEN_LLM_PROVIDER"))
+    if provider not in TIER_FIELDS:
+        return None
+    models = _saved_models(config, provider)
+    if not all(models.values()):
+        return None
+    priced = _price_or_none(provider, models, config)
+    if priced is None:
+        return None
+    raw_estimate, _rounded = priced
+    return raw_estimate, _ceiling(config, provider, models)
+
+
 def _spending_limit_explanation(estimate: float, recommended: float) -> str:
     return (
         f"A feature task, including one round of test fixes, can cost up to about ${estimate:.2f} "
