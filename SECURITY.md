@@ -124,6 +124,43 @@ A data-directory install (`HENCHMEN_DATA_DIR`, the local image) is treated as a 
   needs `GITHUB_TOKEN` (for example, GitHub Packages) fails its local gate — a deliberate fail-closed
   trade-off. The cloud CI path is unchanged.
 
+## GitHub App credentials (desktop installs)
+
+The setup Console creates a private GitHub App for each install. Its private
+key is stored only in the data volume at `secrets/github-app-<app_id>.pem`
+(mode 0600) and never leaves the Henchmen server process; unreferenced key
+files (an earlier App, before a reconnect) are removed at the next run-mode
+start, never mid-request. Henchmen signs short-lived app JWTs with it and
+exchanges them for installation tokens, which expire after an hour; operative
+containers receive only such a token, scoped to the task's repository, and
+refresh it through a task-token-authenticated internal route that only issues
+tokens for that task's own repository while the task runs. The App never has
+the `workflows` permission, so operatives cannot change CI workflows, and a
+push that touches `.github/workflows/` is refused by GitHub and escalated
+with a plain-language message rather than retried or silently dropped. A
+partly configured App (some but not all of `HENCHMEN_GITHUB_APP_ID`,
+`HENCHMEN_GITHUB_APP_INSTALLATION_ID`, `HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH`
+set) fails every GitHub call closed — it never falls back to
+`HENCHMEN_GITHUB_TOKEN`.
+
+Cloud Run App operatives are the one exception to "operatives only ever
+receive a refreshable token": with no desktop lair to bind a refresh request
+to, they receive their installation token as a plain, unencrypted job
+environment variable (not a Secret Manager mount) and cannot refresh it, so a
+Cloud Run node whose timeout leaves the token expiring mid-run will see the
+push or API call fail closed rather than refresh. The token is retained in
+the Cloud Run job resource for up to about an hour. On both desktop and
+cloud, a refreshed or injected token reaches git as an argument to
+`git remote set-url` inside the operative container — the same argv exposure
+the initial clone already has (visible to other processes in that container,
+and on desktop to `docker run -e` in the host process list) — this is an
+accepted, pre-existing exposure, not a new one introduced by refreshing.
+
+The GitHub callbacks the Console exposes without a session are
+authorised by single-use state values that expire after an hour, stored as
+SHA-256 digests. Revoking access is done on GitHub (uninstall or delete the
+App); Henchmen then fails closed with a "reconnect GitHub" message.
+
 ## Reporting a Vulnerability
 
 Please use GitHub Security Advisories:

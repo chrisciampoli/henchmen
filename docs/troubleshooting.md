@@ -360,3 +360,45 @@ exits (for example on a configuration error in `.env.local`), the stack flaps.
 1. Check `docker logs henchmen-ollama` and `docker logs henchmen` for the error.
 2. Pre-pull the model once: `docker exec henchmen-ollama ollama pull qwen2.5-coder:7b`.
 3. Restart the stack: `docker compose up -d`.
+
+## 16. A first task on a Python repo fails the test gate over a missing dependency
+
+**Symptom:** The guided setup Console's "first task" step (or any task on a
+Python project) fails at `run_tests` / `fix_tests` with an import error for a
+package that is listed in the project's own `requirements.txt` or
+`pyproject.toml` — not a Henchmen problem, just a dependency the test run
+never installed.
+
+**Diagnosis:** Neither the local gate container nor the cloud test-runner path
+installs a Python project's dependencies before running its tests (tracked for
+a future phase; see `src/henchmen/console/steps/first_task.py`'s
+`DEPENDENCY_NOTE`). A task whose tests need anything beyond the standard
+library cannot pass the test gate yet, regardless of the change's own
+correctness.
+
+**Fix:** For the guided setup's first task, pick a documentation-only sample
+(the Console's own suggestions are chosen for exactly this reason) or a small
+change with no test dependencies. For a Python repository more generally, keep
+using it for tasks whose tests already pass with no extra install, or
+`henchmen chat`/CLI dispatch with a change scoped the same way, until dependency
+installation lands.
+
+## 17. The Console's setup steps can't reach a provider through a corporate proxy
+
+**Symptom:** `henchmen serve`'s setup Console times out or fails to reach
+GitHub, Slack, Jira, or an LLM provider's API from a machine that only has
+network access through an HTTP(S) proxy, even though `HTTP_PROXY`/`HTTPS_PROXY`
+are set in the environment.
+
+**Diagnosis:** The Console's step routers (AI provider, GitHub, Slack, Jira)
+build their own `httpx` clients with `trust_env=False`, so they never pick up
+`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` from the process environment — this is
+deliberate (it keeps a step's checks from silently depending on ambient
+environment state), but it means there is currently no way to route setup
+traffic through a proxy. An explicit, `Settings`-backed proxy option is a
+follow-up, not yet implemented.
+
+**Fix:** None yet if the setup machine truly has no direct route. Run
+`henchmen init`/`henchmen doctor` from a machine that can reach the provider
+APIs directly, or complete `.env.local` by hand and skip the affected Console
+steps.
