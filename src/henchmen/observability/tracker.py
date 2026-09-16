@@ -497,10 +497,23 @@ class TaskTracker:
     # Read helpers
     # ------------------------------------------------------------------
 
+    async def get_task_strict(self, task_id: str) -> dict[str, Any] | None:
+        """Read a single task execution record, letting a store failure propagate.
+
+        The same single read path as :meth:`get_task` (ruling C1), for the one
+        kind of caller that must tell "Mastermind has not written a document for
+        this task yet" apart from "the store could not be read at all": the
+        Console's first-task progress view, which shows the first as the queued
+        phase and the second as a problem. Everything else wants
+        :meth:`get_task`, whose swallowed failure keeps telemetry from ever
+        blocking task execution.
+        """
+        return await self._store.get(_COLLECTION, task_id)
+
     async def get_task(self, task_id: str) -> dict[str, Any] | None:
-        """Read a single task execution record."""
+        """Read a single task execution record; ``None`` when it is missing *or* unreadable."""
         try:
-            return await self._store.get(_COLLECTION, task_id)
+            return await self.get_task_strict(task_id)
         except Exception as exc:
             logger.warning("Failed to get task %s: %s", task_id, exc)
             return None

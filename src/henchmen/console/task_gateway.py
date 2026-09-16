@@ -15,11 +15,19 @@ Dispatch's own default-repository fallback rather than duplicating it here
 (note M-16).
 
 Progress comes from the tracker's ``task_executions`` document, read through
-:meth:`~henchmen.observability.tracker.TaskTracker.get_task` -- the one reader
-every other consumer of task state uses (ruling C1), never a second lookup path
-of its own -- and is mapped onto five plain-language phases. Scheme checkpoints
-are written after each node finishes, so the active phase is the phase of the
-latest checkpointed node.
+:meth:`~henchmen.observability.tracker.TaskTracker.get_task_strict` -- the same
+single read path every other consumer of task state uses (ruling C1), never a
+second lookup path of its own, but in the variant that lets a store failure
+propagate: for this one caller "no document yet" and "the store cannot be read"
+mean completely different things to the person watching, and the swallowing
+``get_task`` would show an outage as a task that is merely queued. The document
+is mapped onto five plain-language phases. Scheme checkpoints are written after
+each node finishes, so the active phase is the phase of the latest checkpointed
+node.
+
+A task Mastermind never picks up has no document at all, so the queued phase
+would otherwise sit there for ever; given the submit time, the timeline gives
+up after :data:`QUEUE_TIMEOUT_SECONDS`.
 
 Nothing a timeline carries is a secret: the phase list, the pull-request URL
 and a length-capped, redacted escalation reason. Raw operative output never
@@ -29,6 +37,7 @@ reaches it.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
@@ -43,7 +52,7 @@ if TYPE_CHECKING:
     from henchmen.providers.interfaces.message_broker import MessageBroker
 
 PhaseState = Literal["done", "active", "pending", "failed"]
-Outcome = Literal["running", "succeeded", "failed"]
+Outcome = Literal["running", "succeeded", "finished_without_pr", "failed"]
 
 PHASES: tuple[tuple[str, str], ...] = (
     ("queued", "Getting started"),
@@ -74,11 +83,21 @@ NODE_PHASES: dict[str, str] = {
 FAILURE_MESSAGE = "Henchmen stopped before finishing and needs a person to take a look."
 QUEUED_MESSAGE = "Henchmen hasn't picked this task up yet."
 RUNNING_MESSAGE = "Henchmen is working on this task."
-SUCCESS_MESSAGE = "Henchmen finished this task."
+SUCCESS_MESSAGE = "Henchmen finished this task and opened a pull request."
+NO_PR_MESSAGE = "Henchmen finished the task but didn't open a pull request."
+NOT_PICKED_UP_MESSAGE = "Henchmen hasn't picked this task up, so it hasn't started."
 
 #: The escalation reason is written by the scheme executor and can quote a tool's
 #: output; it is redacted and cut to this many characters before a browser sees it.
 MAX_FAILURE_DETAIL = 500
+
+#: How long a task may sit with no execution document before the timeline stops
+#: calling it "queued". Mastermind writes the document as soon as it takes the
+#: task off the task-intake topic, so anything beyond a few seconds means nothing
+#: is consuming that topic (Mastermind down, or the broker not forwarding). Three
+#: minutes is far longer than any healthy pickup and short enough that the person
+#: watching is told rather than left on a spinner.
+QUEUE_TIMEOUT_SECONDS = 180
 
 
 class TaskGateway(Protocol):
@@ -114,7 +133,9 @@ class ServiceTaskGateway:
         return str(result["task_id"])
 
     async def execution(self, task_id: str) -> dict[str, Any] | None:
-        return await self._tracker.get_task(task_id)
+        # `get_task_strict`, not `get_task`: a store that cannot be read must reach
+        # the step as an error, not as an indistinguishable "no document yet".
+        return await self._tracker.get_task_strict(task_id)
 
 
 class TimelinePhase(BaseModel):
@@ -129,7 +150,7 @@ class TaskTimeline(BaseModel):
     """What the Console shows while the first task runs."""
 
     task_id: str = Field(..., description="Task id")
-    outcome: Outcome = Field(..., description="running, succeeded or failed")
+    outcome: Outcome = Field(..., description="running, succeeded, finished_without_pr or failed")
     status_message: str = Field(..., description="Plain-language sentence for the current outcome")
     phases: list[TimelinePhase] = Field(..., description="Phases in order")
     pr_url: str | None = Field(default=None, description="Pull request, once opened")
@@ -163,32 +184,88 @@ def _detail(execution: Mapping[str, Any], final_status: str) -> str:
     return detail if len(detail) <= MAX_FAILURE_DETAIL else f"{detail[:MAX_FAILURE_DETAIL]}..."
 
 
-def build_timeline(task_id: str, execution: Mapping[str, Any] | None) -> TaskTimeline:
+def parse_submitted_at(value: str) -> datetime | None:
+    """An ISO-8601 timestamp recorded in ``server_choices``, or ``None`` when absent or unreadable."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=UTC)
+
+
+def _queued(task_id: str, submitted_at: datetime | None, now: datetime | None) -> TaskTimeline:
+    """No execution document: queued, unless it has been queued longer than anything healthy."""
+    if submitted_at is not None:
+        waited = ((now or datetime.now(UTC)) - submitted_at).total_seconds()
+        if waited > QUEUE_TIMEOUT_SECONDS:
+            return TaskTimeline(
+                task_id=task_id,
+                outcome="failed",
+                status_message=NOT_PICKED_UP_MESSAGE,
+                phases=_phases(0, failed=True),
+                failure_message=NOT_PICKED_UP_MESSAGE,
+            )
+    return TaskTimeline(task_id=task_id, outcome="running", status_message=QUEUED_MESSAGE, phases=_phases(0))
+
+
+def build_timeline(
+    task_id: str,
+    execution: Mapping[str, Any] | None,
+    *,
+    submitted_at: datetime | None = None,
+    now: datetime | None = None,
+) -> TaskTimeline:
     """Map a ``task_executions`` document (or its absence) onto the timeline.
 
     A document that is not there yet is the queued state: Mastermind writes one
     as soon as it picks the task up off the task-intake topic, so between the
-    Console's ``submit`` and that moment there is nothing to read.
+    Console's ``submit`` and that moment there is nothing to read. With
+    ``submitted_at`` (the moment the Console published the task) that state is
+    bounded: past :data:`QUEUE_TIMEOUT_SECONDS` it becomes a failed timeline,
+    because nothing is consuming the topic. Without it -- a task this Console
+    did not submit, or one submitted before the time was recorded -- the queued
+    state is reported as before.
 
-    Any terminal status that is not in
+    Success means a pull request exists: ``pr_created``, or ``completed`` with a
+    ``pr_url``. A ``completed`` run that opened no pull request is its own
+    outcome (``finished_without_pr``) and never counts as the first task
+    succeeding -- spec §1 promises the owner sees a pull request. Any terminal
+    status that is not in
     :data:`~henchmen.observability.tracker.SUCCESS_STATUSES` is a failure --
     ``timed_out`` included, which is never reported as success.
     """
     if execution is None:
-        return TaskTimeline(task_id=task_id, outcome="running", status_message=QUEUED_MESSAGE, phases=_phases(0))
+        return _queued(task_id, submitted_at, now)
 
     final_status = str(execution.get("final_status") or "").strip().lower()
     nodes = [*list(execution.get("nodes_executed") or []), execution.get("current_node_id")]
     reached = [index for index in (_phase_index(node) for node in nodes) if index is not None]
     current = max(reached, default=_PHASE_IDS.index("reading_code"))
+    pr_url = str(execution.get("pr_url") or "").strip() or None
 
     if final_status in SUCCESS_STATUSES:
+        if pr_url is None:
+            # The scheme ran to the end without producing a pull request (a create_pr
+            # that found nothing to open, a scheme with no such node). Nothing failed,
+            # but there is nothing for the owner to review either, so this is neither
+            # success nor an escalation -- and it must not complete the setup step.
+            return TaskTimeline(
+                task_id=task_id,
+                outcome="finished_without_pr",
+                status_message=NO_PR_MESSAGE,
+                phases=_phases(_PHASE_IDS.index("opening_pr"), failed=True),
+                failure_message=NO_PR_MESSAGE,
+                failure_detail=final_status,
+            )
         return TaskTimeline(
             task_id=task_id,
             outcome="succeeded",
             status_message=SUCCESS_MESSAGE,
             phases=_phases(len(PHASES), all_done=True),
-            pr_url=str(execution.get("pr_url") or "") or None,
+            pr_url=pr_url,
         )
     if final_status:
         escalated_at = _phase_index(execution.get("escalation_node"))
