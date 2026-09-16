@@ -101,6 +101,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     for problem in settings.validate_for_runtime():
         logger.error("[forge] Configuration problem: %s", problem)
+    for notice in settings.runtime_notices():
+        logger.warning("[forge] Configuration notice: %s", notice)
 
     init_tracing("forge", project_id=settings.gcp_project_id)
     instrument_fastapi(app)

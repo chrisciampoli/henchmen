@@ -842,6 +842,12 @@ def _serve_data_dir(
         logger.warning("%s", forward_problem)
         sys.exit(needs_attention([forward_problem], int(settings.local_serve_port)))
 
+    # Half-finished setup steps (an App created but not installed, say). They must never
+    # enter needs-attention mode -- services start normally -- but they are said out loud
+    # here as well as in the Console's own GitHub step, so nothing goes unnoticed.
+    for notice in settings.runtime_notices():
+        logger.warning("%s", redact(notice))
+
     # Run mode only, before any service is built: no process is signing with a key that a
     # reconnect replaced, so unreferenced GitHub App keys can go. Setup and attention modes
     # skip it (they start no services, and the next run-mode start cleans up anyway).

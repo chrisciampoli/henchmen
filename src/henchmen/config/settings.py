@@ -21,6 +21,12 @@ from urllib.parse import urlparse
 from pydantic import AliasChoices, Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Deliberately *not* the same set as ``henchmen.console.auth._LOOPBACK_NAMES``, and the two
+# must not be merged: this one answers "may a configured base URL use plain http?", where an
+# IP literal in any spelling is handled by ``ipaddress`` below (so only the *name* localhost
+# belongs here), while the Console's answers "is this Host/Origin header one of the exact
+# names a loopback browser sends?" -- a header is matched literally, never parsed as a
+# network, so it lists "127.0.0.1" and "::1" as names and accepts no other loopback address.
 _LOOPBACK_NAMES = frozenset({"localhost"})
 # A Docker Compose service name: a letter first, then lowercase letters, digits and hyphens.
 # Never an IP literal in any spelling (dotted, decimal ``2130706433``, hex ``0x7f000001``).
@@ -306,7 +312,10 @@ class Settings(BaseSettings):
     )
     github_app_private_key_path: str = Field(
         default="",
-        description="Path to the GitHub App's PEM private key (mode 0600; <data dir>/secrets/github-app.pem)",
+        description=(
+            "Path to the GitHub App's PEM private key (mode 0600; the Console writes one file per App at "
+            "<data dir>/secrets/github-app-<app id>.pem)"
+        ),
     )
     github_api_url: str = Field(
         default="https://api.github.com",
@@ -768,12 +777,18 @@ class Settings(BaseSettings):
             problems.append(f"No model configured for LLM tier(s): {', '.join(sorted(missing_tiers))}.")
 
         from henchmen.config.secret_files import SecretFileError, check_secret_path
-        from henchmen.utils.github_auth import partial_app_message
+        from henchmen.utils.github_auth import app_awaiting_installation, partial_app_message
 
         partial_app = partial_app_message(
             self.github_app_id, self.github_app_private_key_path, self.github_app_installation_id
         )
-        if partial_app:
+        # "Created but not installed yet" is reported by `runtime_notices` instead: it is a
+        # step to finish, not a reason to refuse to start (an abandoned reconnect would
+        # otherwise take a working install down on its next restart). Every other partial
+        # combination stays blocking, and token calls still raise either way (D-P11).
+        if partial_app and not app_awaiting_installation(
+            self.github_app_id, self.github_app_private_key_path, self.github_app_installation_id
+        ):
             problems.append(partial_app)
         key_path = self.github_app_private_key_path.strip()
         if key_path:
@@ -817,6 +832,23 @@ class Settings(BaseSettings):
                 problems.append(f"HENCHMEN_{field_name.upper()} must be greater than 0.")
 
         return problems
+
+    def runtime_notices(self) -> list[str]:
+        """States worth telling the owner about that must never stop a service from starting.
+
+        The counterpart of :meth:`validate_for_runtime`: everything here is a
+        half-finished setup step, not a broken configuration, so callers report
+        it (``henchmen serve`` and every service logs it at boot; ``henchmen
+        doctor`` shows it as a warning) and carry on.
+        """
+        from henchmen.utils.github_auth import APP_AWAITING_INSTALLATION_MESSAGE, app_awaiting_installation
+
+        notices: list[str] = []
+        if app_awaiting_installation(
+            self.github_app_id, self.github_app_private_key_path, self.github_app_installation_id
+        ):
+            notices.append(APP_AWAITING_INSTALLATION_MESSAGE)
+        return notices
 
     @property
     def local_forward_base(self) -> str:

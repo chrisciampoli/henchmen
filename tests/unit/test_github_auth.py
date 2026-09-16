@@ -11,7 +11,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import httpx
 import jwt
@@ -713,14 +713,18 @@ _APP_FIELDS = {
     "github_app_installation_id": ("HENCHMEN_GITHUB_APP_INSTALLATION_ID", "99"),
     "github_app_private_key_path": ("HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH", "<key file>"),
 }
+# The App was created but not installed yet: still a partial App for the credentials
+# provider (token calls raise), but a non-blocking notice for the startup gate.
+_AWAITING_INSTALLATION = ("github_app_id", "github_app_private_key_path")
 _PARTIAL_COMBINATIONS = [
     ("github_app_id",),
     ("github_app_installation_id",),
     ("github_app_private_key_path",),
     ("github_app_id", "github_app_installation_id"),
-    ("github_app_id", "github_app_private_key_path"),
+    _AWAITING_INSTALLATION,
     ("github_app_installation_id", "github_app_private_key_path"),
 ]
+_BLOCKING_COMBINATIONS = [present for present in _PARTIAL_COMBINATIONS if present != _AWAITING_INSTALLATION]
 
 
 def _partial_settings(present: tuple[str, ...], key_file: Path) -> Settings:
@@ -775,12 +779,103 @@ async def test_partly_configured_app_never_uses_the_pat(
     assert not provider.uses_app
 
 
-@pytest.mark.parametrize("present", _PARTIAL_COMBINATIONS)
+@pytest.mark.parametrize("present", _BLOCKING_COMBINATIONS)
 def test_partly_configured_app_is_a_runtime_problem(key_file: Path, present: tuple[str, ...]) -> None:
-    problems = _partial_settings(present, key_file).validate_for_runtime()
+    settings = _partial_settings(present, key_file)
+    problems = settings.validate_for_runtime()
     (problem,) = [problem for problem in problems if "only partly configured" in problem]
     for field, (env_name, _value) in _APP_FIELDS.items():
         assert (env_name in problem) is (field not in present)
+    assert settings.runtime_notices() == []
+
+
+def test_an_app_created_but_not_installed_is_a_notice_not_a_startup_problem(key_file: Path) -> None:
+    """A1: an abandoned reconnect must not take the install down on the next restart."""
+    settings = _partial_settings(_AWAITING_INSTALLATION, key_file)
+    assert [problem for problem in settings.validate_for_runtime() if "GITHUB_APP" in problem] == []
+    assert settings.runtime_notices() == [github_auth.APP_AWAITING_INSTALLATION_MESSAGE]
+    assert "not installed yet" in github_auth.APP_AWAITING_INSTALLATION_MESSAGE
+
+
+def test_an_app_created_but_not_installed_still_refuses_to_hand_out_a_token(
+    monkeypatch: pytest.MonkeyPatch, key_file: Path
+) -> None:
+    """A1 keeps D-P11: the provider's fail-closed behaviour is untouched; the PAT is never used."""
+
+    def no_http() -> httpx.Client:
+        raise AssertionError("no HTTP for a partly configured App")
+
+    monkeypatch.setattr(github_auth, "_default_client", no_http)
+    monkeypatch.setattr(github_auth, "_default_async_client", no_http)
+    settings = _partial_settings(_AWAITING_INSTALLATION, key_file)
+    with pytest.raises(GitHubAuthError, match="only partly configured"):
+        get_github_token("acme/webapp", settings=settings)
+    assert not get_credentials_provider(settings).uses_app
+
+
+@pytest.mark.asyncio
+async def test_async_minting_signs_the_app_jwt_off_the_event_loop(
+    key_file: Path, github: FakeGitHub, clock: _Clock
+) -> None:
+    """C6: reading the key file and signing RS256 is blocking work; it never runs on the loop."""
+    provider = _provider(key_file, github, clock)
+    github.repositories = [FakeGitHub.repository("acme/webapp")]
+    loop_thread = threading.get_ident()
+    signing_threads: list[int] = []
+    real_app_jwt = provider.app_jwt
+
+    def record() -> str:
+        signing_threads.append(threading.get_ident())
+        return real_app_jwt()
+
+    with patch.object(provider, "app_jwt", record):
+        await provider.token_async("acme/webapp")
+    assert signing_threads and loop_thread not in signing_threads
+
+
+def test_minting_sweeps_long_expired_tokens_and_their_idle_locks(
+    key_file: Path, github: FakeGitHub, clock: _Clock
+) -> None:
+    """C1: the per-repository caches must not grow for the life of the process."""
+    provider = _provider(key_file, github, clock)
+    github.repositories = [FakeGitHub.repository("acme/webapp"), FakeGitHub.repository("acme/api")]
+    provider.token("acme/webapp")
+    provider.token("acme/api")
+    assert sorted(provider._tokens) == ["acme/api", "acme/webapp"]
+    assert sorted(provider._sync_locks) == ["acme/api", "acme/webapp"]
+
+    # acme/webapp's token is long gone; acme/api's was just re-minted, so it stays.
+    clock.now += github.token_lifetime_seconds + github_auth.TOKEN_SWEEP_AFTER_SECONDS + 1
+    provider.token("acme/api")
+
+    assert list(provider._tokens) == ["acme/api"]
+    assert list(provider._sync_locks) == ["acme/api"]
+
+
+def test_a_held_mint_lock_is_never_swept(key_file: Path, github: FakeGitHub, clock: _Clock) -> None:
+    """A lock in use is kept: dropping it would let a second caller mint in parallel."""
+    provider = _provider(key_file, github, clock)
+    github.repositories = [FakeGitHub.repository("acme/webapp")]
+    provider.token("acme/webapp")
+    held = provider._sync_locks["acme/webapp"]
+    held.acquire()
+    try:
+        with provider._lock:
+            provider._sweep_locked(
+                clock.now + github.token_lifetime_seconds + github_auth.TOKEN_SWEEP_AFTER_SECONDS + 1
+            )
+    finally:
+        held.release()
+    assert provider._tokens == {}
+    assert provider._sync_locks["acme/webapp"] is held
+
+
+def test_app_awaiting_installation_only_matches_the_created_not_installed_shape() -> None:
+    assert github_auth.app_awaiting_installation("4242", "/k.pem", "  ") is True
+    assert github_auth.app_awaiting_installation("4242", "/k.pem", "99") is False
+    assert github_auth.app_awaiting_installation("4242", "", "") is False
+    assert github_auth.app_awaiting_installation("", "/k.pem", "") is False
+    assert github_auth.app_awaiting_installation(MagicMock(), MagicMock(), MagicMock()) is False
 
 
 def test_partial_app_message_ignores_non_strings() -> None:

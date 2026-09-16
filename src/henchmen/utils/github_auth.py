@@ -65,6 +65,10 @@ REFRESH_MARGIN_SECONDS = 5 * 60
 # 50 minutes, which leaves at least 10 minutes of tolerance for clock skew between this
 # server and GitHub before a freshly minted token fails the lifetime check.
 MAX_MIN_TTL_SECONDS = 50 * 60
+# A cached installation token is dropped once it has been expired for this long. The cache is
+# keyed per repository, so without this a long-lived process (Mastermind, Forge) that touches
+# many repositories would keep an entry -- and its mint lock -- for every one of them forever.
+TOKEN_SWEEP_AFTER_SECONDS = 60 * 60
 _HTTP_TIMEOUT = 10.0
 _ERROR_MESSAGE_LIMIT = 200
 # ``owner/name`` with a GitHub login (letters, digits, hyphens) and a repository name.
@@ -78,6 +82,12 @@ _APP_SETTING_NAMES = (
     "HENCHMEN_GITHUB_APP_ID",
     "HENCHMEN_GITHUB_APP_PRIVATE_KEY_PATH",
     "HENCHMEN_GITHUB_APP_INSTALLATION_ID",
+)
+#: Reported by ``Settings.runtime_notices`` for :func:`app_awaiting_installation`: a state
+#: to finish, never a reason to refuse to start (the services would have started fine a
+#: moment before the App was created).
+APP_AWAITING_INSTALLATION_MESSAGE = (
+    "The GitHub App has been created but not installed yet -- finish the GitHub step in the Console."
 )
 
 SyncClientFactory = Callable[[], httpx.Client]
@@ -158,6 +168,28 @@ def partial_app_message(app_id: object, private_key_path: object, installation_i
         return None
     missing = [name for name, is_set in zip(_APP_SETTING_NAMES, present, strict=True) if not is_set]
     return f"The GitHub App is only partly configured: set {', '.join(missing)}."
+
+
+def app_awaiting_installation(app_id: object, private_key_path: object, installation_id: object) -> bool:
+    """True for the one partial shape that means "created, not installed yet" rather than "misconfigured".
+
+    The Console's manifest callback writes the App id and its key file and
+    clears the installation id in one update (an installation belongs to one
+    App), so this is exactly the state an owner is left in between "Create
+    GitHub App" and finishing the install -- including when they abandon the
+    reconnect and restart Henchmen. It is *not* a reason to refuse to start:
+    nothing was broken before the App was created, and the GitHub step is
+    where it gets finished. Every other partial combination stays a blocking
+    problem.
+
+    The credentials provider is unaffected (D-P11): :func:`partial_app_message`
+    still reports this shape, so every token call still raises and the PAT is
+    never silently used instead.
+    """
+    app, key, installation = (
+        value.strip() if isinstance(value, str) else "" for value in (app_id, private_key_path, installation_id)
+    )
+    return bool(app) and bool(key) and not installation
 
 
 class InstallationToken(BaseModel):
@@ -395,7 +427,9 @@ class GitHubCredentialsProvider:
             if cached is not None:
                 return cached
             url, body = self._token_request(app, repository)
-            headers = api_headers(self.app_jwt())
+            # Reading the key file and signing an RS256 JWT is blocking work (tens of
+            # milliseconds), so it never runs on the event loop; the sync path signs inline.
+            headers = api_headers(await asyncio.to_thread(self.app_jwt))
             try:
                 async with self._async_client_factory() as client:
                     response = await client.post(url, json=body, headers=headers)
@@ -455,6 +489,20 @@ class GitHubCredentialsProvider:
             )
         return min(max(min_ttl_seconds, REFRESH_MARGIN_SECONDS), MAX_MIN_TTL_SECONDS)
 
+    def _sweep_locked(self, now: float) -> None:
+        """Drop tokens expired longer than :data:`TOKEN_SWEEP_AFTER_SECONDS`, and their idle locks.
+
+        Call with ``self._lock`` held. A lock another thread is currently
+        holding is kept: removing it would let the next caller create a second
+        lock for the same repository and mint twice in parallel.
+        """
+        stale = [key for key, token in self._tokens.items() if token.expires_at + TOKEN_SWEEP_AFTER_SECONDS < now]
+        for key in stale:
+            del self._tokens[key]
+            lock = self._sync_locks.get(key)
+            if lock is not None and not lock.locked():
+                del self._sync_locks[key]
+
     def _cached(self, cache_key: str, margin: int) -> InstallationToken | None:
         """The cached token for ``cache_key`` if it outlives ``margin`` seconds from now."""
         with self._lock:
@@ -510,6 +558,7 @@ class GitHubCredentialsProvider:
                 f"less than the {wanted}s required; check the server clock"
             )
         with self._lock:
+            self._sweep_locked(self._clock())
             self._tokens[cache_key] = issued
         logger.info("Issued a GitHub installation token for %s (expires %s)", scope, issued.expires_at_iso())
         return issued

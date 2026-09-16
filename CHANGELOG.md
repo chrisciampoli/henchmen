@@ -125,6 +125,13 @@ silently ignored, and the Dispatch container never ran its own HTTP app.
   `HENCHMEN_GITHUB_WEB_URL`, `HENCHMEN_GITHUB_TOKEN_EXPIRES_AT`, `HENCHMEN_JIRA_INTAKE_LABEL`.
 - `henchmen init` and `henchmen doctor` validate AWS Bedrock live, and doctor
   verifies GitHub App token minting.
+- `Settings.runtime_notices()` — half-finished setup states that must never
+  stop a service from starting, the counterpart of `validate_for_runtime()`.
+  A GitHub App created but not yet installed is reported here, so an abandoned
+  reconnect cannot take a working install into needs-attention mode on its
+  next restart; `henchmen serve` and every service log it and `henchmen doctor`
+  shows it as a warning. Token calls on such a configuration still fail closed,
+  and every other partly configured App still refuses to start.
 
 ### Changed
 - Operative containers no longer inherit the GitHub token implicitly from

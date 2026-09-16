@@ -128,6 +128,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # hours later (missing API key, empty tier model, missing OIDC audience).
     for problem in settings.validate_for_runtime():
         logger.error("[mastermind] Configuration problem: %s", problem)
+    for notice in settings.runtime_notices():
+        logger.warning("[mastermind] Configuration notice: %s", notice)
 
     # A deterministic node with no handler is a gate that silently never runs.
     for scheme_id in SchemeRegistry.list_schemes():
