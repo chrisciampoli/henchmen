@@ -88,6 +88,49 @@ def test_samples_and_default_repo(harness: ConsoleHarness) -> None:
     assert [sample["id"] for sample in details["samples"]] == [sample["id"] for sample in SAMPLE_TASKS]
 
 
+def test_samples_qualify_a_legacy_bare_default_repo(harness: ConsoleHarness) -> None:
+    """C3: an older configuration keeps the repository name and its owner in two settings."""
+    harness.config_store.update(
+        {"HENCHMEN_GITHUB_DEFAULT_REPO": "webapp", "HENCHMEN_GITHUB_DEFAULT_ORG": "acme"}, section="GitHub"
+    )
+    assert harness.get(f"{BASE}/samples").json()["details"]["default_repo"] == "acme/webapp"
+
+
+def test_a_bare_default_repo_with_no_org_is_refused_with_a_clear_message(
+    harness: ConsoleHarness, gateway: FakeGateway
+) -> None:
+    """C3: better a plain problem here than an opaque failure at lair creation."""
+    harness.config_store.update(
+        {"HENCHMEN_GITHUB_DEFAULT_REPO": "webapp"}, section="GitHub", unset=["HENCHMEN_GITHUB_DEFAULT_ORG"]
+    )
+    body = harness.post(BASE, {"sample_id": SAMPLE_TASKS[0]["id"]}).json()
+    assert body["ok"] is False
+    assert body["problems"][0]["field"] == "repo"
+    assert "owner/name" in body["problems"][0]["message"]
+    assert gateway.submitted == []
+
+
+def test_a_legacy_bare_default_repo_is_submitted_qualified(harness: ConsoleHarness, gateway: FakeGateway) -> None:
+    harness.config_store.update(
+        {"HENCHMEN_GITHUB_DEFAULT_REPO": "webapp", "HENCHMEN_GITHUB_DEFAULT_ORG": "acme"}, section="GitHub"
+    )
+    body = harness.post(BASE, {"sample_id": SAMPLE_TASKS[0]["id"]}).json()
+    assert body["ok"] is True
+    assert body["details"]["repo"] == "acme/webapp"
+    assert [request.repo for request in gateway.submitted] == ["acme/webapp"]
+
+
+def test_samples_report_completed_only_for_a_recorded_first_task(harness: ConsoleHarness) -> None:
+    """A2: 2C reads ``completed`` from this step's GET like every other step's."""
+    from henchmen.console.steps.first_task import FIRST_TASK_CHOICE
+
+    assert harness.get(f"{BASE}/samples").json()["details"]["completed"] is False
+    harness.setup_store.record_step_complete(SetupStep.FIRST_TASK)
+    assert harness.get(f"{BASE}/samples").json()["details"]["completed"] is False
+    harness.setup_store.set_server_choices({FIRST_TASK_CHOICE: TASK_ID})
+    assert harness.get(f"{BASE}/samples").json()["details"]["completed"] is True
+
+
 def test_samples_warn_that_the_test_gate_installs_no_dependencies(harness: ConsoleHarness) -> None:
     """Ruling PI-13 (decision C19): the limitation is stated where a sample is chosen."""
     note = harness.get(f"{BASE}/samples").json()["details"]["note"]

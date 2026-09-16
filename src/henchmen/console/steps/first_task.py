@@ -68,11 +68,13 @@ from henchmen.console.steps.ai_provider import current_estimate
 from henchmen.console.task_gateway import QUEUE_TIMEOUT_SECONDS, TaskGateway, build_timeline, parse_submitted_at
 from henchmen.dispatch.api_models import CreateTaskRequest
 from henchmen.utils.redaction import redact
+from henchmen.utils.repositories import is_owner_name, qualify_repo
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 STEP = SetupStep.FIRST_TASK
 DEFAULT_REPO_KEY = "HENCHMEN_GITHUB_DEFAULT_REPO"
+DEFAULT_ORG_KEY = "HENCHMEN_GITHUB_DEFAULT_ORG"
 FIRST_TASK_CHOICE = "first_task_id"
 FIRST_TASK_SUBMITTED_AT_CHOICE = "first_task_submitted_at"
 _UUID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -161,6 +163,28 @@ class FirstTaskRequest(BaseModel):
         return value
 
 
+def _default_repo(config: ConfigStore) -> str:
+    """The configured default repository as ``owner/name``.
+
+    The Console's GitHub step always saves ``owner/name``, but a configuration
+    written by ``henchmen init`` (or by hand) can still hold a bare repository
+    name next to ``github_default_org``. :func:`qualify_repo` is the one shared
+    rule for joining the two -- the same one Dispatch's normalizer, ``henchmen
+    chat`` and ``henchmen doctor`` use -- so resolving it here means an owner
+    reads a plain problem in this step instead of watching the task fail at
+    lair creation.
+    """
+    return qualify_repo(config.get(DEFAULT_REPO_KEY), config.get(DEFAULT_ORG_KEY))
+
+
+def _unusable_repo(repo: str) -> StepProblem:
+    return StepProblem(
+        field="repo",
+        message=f"The repository saved for Henchmen ({redact(repo)}) is not written as owner/name.",
+        action="Choose the repository again in the GitHub step, or type it here as owner/name.",
+    )
+
+
 def _for_log(text: str) -> str:
     """A short, single-line, redacted excerpt of user text, safe to put in a log line."""
     collapsed = " ".join(redact(text).split())
@@ -226,14 +250,22 @@ def _over_limit(estimate: float, ceiling: float) -> StepProblem:
 
 
 @router.get("/samples")
-async def samples(config: ConfigDep) -> StepSuccess:
-    """Suggested first tasks, the default repository and the test-gate caveat. Never completes the step."""
+async def samples(config: ConfigDep, setup: SetupDep) -> StepSuccess:
+    """Suggested first tasks, the default repository and the test-gate caveat. Never completes the step.
+
+    ``completed`` is what 2C reads for this step, the way every other step's GET
+    reports it. Completion here is bound to one run: only the task recorded in
+    ``server_choices`` can complete the step (ruling PB-1), so a recorded
+    completion counts only while that id is still there.
+    """
+    state = setup.load()
     return StepSuccess(
         step=STEP,
         details={
             "samples": [dict(sample) for sample in SAMPLE_TASKS],
-            "default_repo": config.get(DEFAULT_REPO_KEY),
+            "default_repo": _default_repo(config),
             "note": DEPENDENCY_NOTE,
+            "completed": STEP in state.completed_steps and bool(state.server_choices.get(FIRST_TASK_CHOICE, "")),
         },
     )
 
@@ -259,12 +291,17 @@ async def create_first_task(
             field="title", message="Describe a small change for Henchmen to make.", action="Or pick a sample task."
         )
         return step_failed(STEP, problem)
-    repo = body.repo or config.get(DEFAULT_REPO_KEY)
+    repo = body.repo or _default_repo(config)
     if not repo:
         problem = StepProblem(
             field="repo", message="Choose the repository to change.", action="Finish the GitHub step first."
         )
         return step_failed(STEP, problem)
+    if not is_owner_name(repo):
+        # `body.repo` is already pattern-checked, so this is a legacy configured default
+        # that `github_default_org` could not qualify. Refuse it here, where it can be
+        # explained, rather than at lair creation where it is an opaque failure.
+        return step_failed(STEP, _unusable_repo(repo))
 
     priced = current_estimate(config)
     if priced is not None and not body.confirm_over_limit:

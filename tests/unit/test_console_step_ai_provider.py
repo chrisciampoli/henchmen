@@ -375,6 +375,31 @@ def test_current_masks_the_saved_key(harness: ConsoleHarness, monkeypatch: pytes
     assert KEY not in response.text
 
 
+def test_current_reports_completed_and_reopens_it_when_a_credential_or_model_goes(
+    harness: ConsoleHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A2: ``completed`` is stricter than ``completed_steps`` here, as in every other step."""
+    _fake_anthropic(monkeypatch)
+    assert harness.get(BASE).json()["details"]["completed"] is False
+
+    harness.post(BASE, _save_body())
+    assert SetupStep.AI_PROVIDER in harness.setup_store.load().completed_steps
+    assert harness.get(BASE).json()["details"]["completed"] is True
+
+    complex_key = f"HENCHMEN_{TIER_FIELDS['anthropic'][ModelTier.COMPLEX].upper()}"
+    harness.config_store.update({}, section="LLM", unset=["HENCHMEN_ANTHROPIC_API_KEY"])
+    assert harness.get(BASE).json()["details"]["completed"] is False
+    harness.config_store.update({"HENCHMEN_ANTHROPIC_API_KEY": KEY}, section="LLM")
+    assert harness.get(BASE).json()["details"]["completed"] is True
+    harness.config_store.update({}, section="LLM", unset=[complex_key])
+    assert harness.get(BASE).json()["details"]["completed"] is False
+
+
+def test_current_reports_not_completed_without_a_saved_provider(harness: ConsoleHarness) -> None:
+    harness.setup_store.record_step_complete(SetupStep.AI_PROVIDER)
+    assert harness.get(BASE).json()["details"]["completed"] is False
+
+
 def test_current_normalizes_a_saved_provider_alias(harness: ConsoleHarness) -> None:
     harness.config_store.update({"HENCHMEN_LLM_PROVIDER": "vertex"}, section="LLM")
     body = harness.get(BASE).json()

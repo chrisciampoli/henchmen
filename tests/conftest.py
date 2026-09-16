@@ -12,6 +12,12 @@ Conventions enforced here (see CONTRIBUTING.md for the full rationale):
 * ``mock_settings`` returns a real ``Settings`` instance constructed from
   environment variables, avoiding the duplicated ``_mock_settings()``
   helpers that used to live in ~8 test modules.
+* ``_no_repository_dotenv`` is a session-scoped autouse fixture that keeps the
+  repository's own ``.env.local``/``.env`` out of every ``Settings`` build.
+  ``_hermetic_settings_env`` only strips ``HENCHMEN_*`` from the *environment*;
+  ``Settings.model_config`` (and ``paths.env_files()``) also name those two
+  files, so without this a developer's dotenv silently supplied values CI never
+  has. A dotenv a test writes itself (under ``tmp_path``) is unaffected.
 * No test may touch the developer's real ``~/.henchmen`` (the local
   DocumentStore, ObjectStore and eval history default there). Two layers keep
   it out of reach: :func:`pytest_configure` points ``Path.home()`` at a
@@ -24,6 +30,7 @@ Conventions enforced here (see CONTRIBUTING.md for the full rationale):
   fails the session.
 """
 
+import inspect
 import os
 import pathlib
 import shutil
@@ -34,6 +41,7 @@ from contextlib import suppress
 from typing import Any
 
 import pytest
+from pydantic_settings import BaseSettings
 
 from henchmen.config.settings import Settings, get_settings
 from henchmen.models.dossier import Dossier, RuleFile
@@ -115,6 +123,74 @@ def real_home_henchmen_dir(config: pytest.Config) -> pathlib.Path:
 
 
 _SERVER_MODULES = ("henchmen.forge.server", "henchmen.mastermind.server", "henchmen.dispatch.server")
+
+# ---------------------------------------------------------------------------
+# The repository's own .env.local / .env never reach a Settings build
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+_ENV_FILE_SENTINEL = inspect.signature(BaseSettings.__init__).parameters["_env_file"].default
+
+
+def _repo_dotenv_paths() -> frozenset[pathlib.Path]:
+    paths: set[pathlib.Path] = set()
+    for name in (".env.local", ".env"):
+        with suppress(OSError):
+            paths.add((_REPO_ROOT / name).resolve())
+    return frozenset(paths)
+
+
+def _without_repo_dotenv(env_file: Any) -> Any:
+    """``env_file`` with the repository's own dotenv files removed (``None`` when nothing is left).
+
+    Only *those* files are dropped, and only by resolved path: a test that
+    chdirs into ``tmp_path`` and writes its own ``.env.local`` there (several
+    do) still gets it read, because it resolves somewhere else entirely.
+    """
+    if env_file is None:
+        return None
+    candidates = env_file if isinstance(env_file, list | tuple) else (env_file,)
+    repo_dotenvs = _repo_dotenv_paths()
+    kept = []
+    for candidate in candidates:
+        try:
+            resolved = pathlib.Path(candidate).resolve()
+        except OSError:  # pragma: no cover - an unresolvable path is left for pydantic to handle
+            kept.append(candidate)
+            continue
+        if resolved not in repo_dotenvs:
+            kept.append(candidate)
+    return tuple(kept) or None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_repository_dotenv() -> Iterator[None]:
+    """Keep the repository's ``.env.local``/``.env`` out of every ``Settings`` build in the suite.
+
+    ``_hermetic_settings_env`` strips ``HENCHMEN_*`` from the environment, but
+    ``Settings.model_config`` names ``(".env.local", ".env")`` and
+    ``paths.env_files()`` hands the same two names to ``get_settings()``, so on
+    a developer's machine the repository's own dotenv file silently supplied
+    values that CI (which has no dotenv) never sees. This wraps
+    ``Settings.__init__`` -- inherited by the subclasses
+    ``henchmen.config.validation`` builds -- and drops exactly those two files,
+    whether they arrive through the model config or as an explicit
+    ``_env_file``. Everything else is passed through untouched.
+    """
+    original = Settings.__init__
+
+    def _init(self: Settings, **values: Any) -> None:
+        env_file = values.get("_env_file", _ENV_FILE_SENTINEL)
+        if env_file is _ENV_FILE_SENTINEL:
+            env_file = type(self).model_config.get("env_file")
+        values["_env_file"] = _without_repo_dotenv(env_file)
+        original(self, **values)  # type: ignore[arg-type]
+
+    Settings.__init__ = _init  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        Settings.__init__ = original  # type: ignore[method-assign]
 
 
 @pytest.fixture(autouse=True)

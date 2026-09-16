@@ -100,6 +100,16 @@ _API_KEY_SETTINGS: dict[str, str] = {
     "anthropic": "HENCHMEN_ANTHROPIC_API_KEY",
     "openai": "HENCHMEN_OPENAI_API_KEY",
 }
+# The one setting that has to be present for each provider to be reachable at all --
+# the same value `_verify` refuses to run without. `GET ""` uses it to decide
+# `completed`, so a credential removed from the configuration reopens the step.
+_CREDENTIAL_KEYS: dict[str, str] = {
+    "anthropic": _API_KEY_SETTINGS["anthropic"],
+    "openai": _API_KEY_SETTINGS["openai"],
+    "gcp": "HENCHMEN_GCP_PROJECT_ID",
+    "aws": "HENCHMEN_AWS_REGION",
+    "local": "HENCHMEN_LLM_OLLAMA_BASE_URL",
+}
 _CEILING_KEY = "HENCHMEN_OPERATIVE_TASK_COST_CEILING_USD"
 _OLLAMA_IN_CONTAINER_ACTION = (
     "If Ollama runs on this computer, use http://host.docker.internal:11434 — inside Henchmen, "
@@ -450,8 +460,24 @@ def _config_values(body: AiProviderSave, api_key: str, config: ConfigStore, ceil
     return values
 
 
+def step_completed(config: ConfigStore, setup: SetupStateStore, provider: str, models: dict[str, str]) -> bool:
+    """True when the step is recorded complete *and* what it verified is still configured.
+
+    Stricter than ``completed_steps`` alone, the same way the GitHub and Slack
+    steps are: a save that was later undone (the API key removed from the
+    configuration file, a tier model cleared) must reopen the step rather than
+    leave the guide showing a connection that no longer exists.
+    """
+    if STEP not in setup.load().completed_steps or provider not in TIER_FIELDS:
+        return False
+    credential_key = _CREDENTIAL_KEYS.get(provider)
+    if credential_key is None or not config.is_set(credential_key):
+        return False
+    return bool(models) and all(models.values())
+
+
 @router.get("")
-async def current(config: ConfigDep) -> StepSuccess:
+async def current(config: ConfigDep, setup: SetupDep) -> StepSuccess:
     """Provider options and what is saved now (secrets masked)."""
     provider = normalize_llm_provider(config.get("HENCHMEN_LLM_PROVIDER"))
     models = _saved_models(config, provider)
@@ -465,6 +491,7 @@ async def current(config: ConfigDep) -> StepSuccess:
             "models": models,
             "credential": credential,
             "task_cost_ceiling_usd": _ceiling(config, provider, models),
+            "completed": step_completed(config, setup, provider, models),
         },
     )
 
