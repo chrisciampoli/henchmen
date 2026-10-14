@@ -1,5 +1,5 @@
 # --- Builder stage ---
-FROM python:3.14.7-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f AS builder
+FROM python:3.15.0rc3-slim-bookworm@sha256:ea93de1a70a03fffd10ad8cfde8f4ba969fe2658f0578af02855d1d32f49e6c2 AS builder
 
 WORKDIR /build
 
@@ -15,7 +15,7 @@ COPY pyproject.toml README.md ./
 RUN pip install --no-cache-dir --prefix=/install -e ".[observability]"
 
 # --- Runtime stage ---
-FROM python:3.14.7-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f
+FROM python:3.15.0rc3-slim-bookworm@sha256:ea93de1a70a03fffd10ad8cfde8f4ba969fe2658f0578af02855d1d32f49e6c2
 
 # bash runs entrypoint.sh. Dispatch only normalizes and publishes: repository
 # indexing (which needs git) runs in Mastermind's image.
