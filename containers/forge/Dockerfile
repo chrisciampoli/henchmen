@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir --prefix=/install -e ".[observability]"
 # --- Node.js builder stage ---
 # Forge runs the target repo's test suite. Without Node every JS/TS PR's tests
 # were reported as skipped, which makes the CI result incomplete, never passed.
-FROM node:24.21.0-bookworm-slim@sha256:2fe369e969550cde8e867afc3fe370b260140cab4a23d467074295b42163d553 AS node-builder
+FROM node:24.22.3-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS node-builder
 
 RUN npm install -g pnpm@9 && pnpm --version
 
